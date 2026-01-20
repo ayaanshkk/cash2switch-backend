@@ -1,0 +1,1997 @@
+# models.py - Updated schema to align with the data model spec
+# Notes:
+# - Switch to UUIDs for Customer.id and Job.id (string-based UUIDs)
+# - Normalise deposits/payments via a Payment model
+# - Add CountingSheet/CountingItem, RemedialAction/RemedialItem
+# - Add DocumentTemplate, AuditLog, VersionedSnapshot
+# - Strengthen enums for controlled vocabularies
+# - Fix FK type mismatches (e.g., Job.customer_id -> String(36) FK to customers.id)
+
+import uuid
+import secrets
+from datetime import datetime, timedelta
+
+from database import db  # Import SQLAlchemy instance
+from werkzeug.security import generate_password_hash, check_password_hash
+import jwt
+
+# ----------------------------------
+# Helpers / Enums
+# ----------------------------------
+
+JOB_STAGE_ENUM = Enum(
+    'Lead', 'Quote', 'Consultation', 'Survey', 'Measure', 'Design', 'Quoted', 'Accepted',
+    'Rejected', 'Ordered', 'Production', 'Delivery', 'Installation', 'Complete', 'Remedial', 'Cancelled',
+    name='job_stage_enum'
+)
+
+JOB_TYPE_ENUM = Enum(
+    'Kitchen', 'Bedroom', 'Wardrobe', 'Remedial', 'Other',
+    name='job_type_enum'
+)
+
+CONTACT_MADE_ENUM = Enum('Yes', 'No', 'Unknown', name='contact_made_enum')
+PREFERRED_CONTACT_ENUM = Enum('Phone', 'Email', 'WhatsApp', name='preferred_contact_enum')
+
+CHECKLIST_TEMPLATE_ENUM = Enum(
+    'BedroomChecklist', 'KitchenChecklist', 'PaymentTerms', 'CustomerSatisfaction',
+    'RemedialAction', 'PromotionalOffer', name='checklist_template_enum'
+)
+
+DOCUMENT_TEMPLATE_TYPE_ENUM = Enum(
+    'Invoice', 'Receipt', 'Quotation', 'Warranty', 'Terms', 'Other', name='document_template_type_enum'
+)
+
+PAYMENT_METHOD_ENUM = Enum('BACS', 'Cash', 'Card', 'Other', name='payment_method_enum')
+
+AUDIT_ACTION_ENUM = Enum('create', 'update', 'delete', name='audit_action_enum')
+
+# ----------------------------------
+# Auth & Security
+# ----------------------------------
+
+class User(Base):
+    __tablename__ = 'users'
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String(120), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+
+    # Profile
+    first_name = Column(String(50), nullable=False)
+    last_name = Column(String(50), nullable=False)
+    phone = Column(String(20))
+
+    # Role & permissions
+    role = Column(String(20), default='user')
+    department = Column(String(50))
+
+    # Account status
+    is_active = Column(Boolean, default=True)
+    is_verified = Column(Boolean, default=False)
+
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_login = Column(DateTime)
+
+    # Password reset
+    reset_token = Column(String(100))
+    reset_token_expires = Column(DateTime)
+
+    # Email verification
+    verification_token = Column(String(100))
+
+    def __repr__(self):
+        return f'<User {self.email}>'
+
+    # Password utils
+    def set_password(self, password: str) -> None:
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password: str) -> bool:
+        return check_password_hash(self.password_hash, password)
+
+    def get_full_name(self) -> str:
+        return f"{self.first_name} {self.last_name}"
+
+    # Tokens
+    def generate_reset_token(self) -> str:
+        self.reset_token = secrets.token_urlsafe(32)
+        self.reset_token_expires = datetime.utcnow() + timedelta(hours=1)
+        return self.reset_token
+
+    def generate_verification_token(self) -> str:
+        self.verification_token = secrets.token_urlsafe(32)
+        return self.verification_token
+
+    def generate_jwt_token(self, secret_key: str) -> str:
+        payload = {
+            'user_id': self.id,
+            'email': self.email,
+            'role': self.role,
+            'exp': datetime.utcnow() + timedelta(days=7),
+            'iat': datetime.utcnow(),
+        }
+        return jwt.encode(payload, secret_key, algorithm='HS256')
+
+    @staticmethod
+    def verify_jwt_token(token: str, secret_key: str):
+        try:
+            payload = jwt.decode(token, secret_key, algorithms=['HS256'])
+            user = User.query.get(payload['user_id'])
+            return user if user and user.is_active else None
+        except jwt.ExpiredSignatureError:
+            return None
+        except jwt.InvalidTokenError:
+            return None
+
+    def to_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'email': self.email,
+            'first_name': self.first_name,
+            'last_name': self.last_name,
+            'full_name': self.get_full_name(),
+            'phone': self.phone,
+            'role': self.role,
+            'department': self.department,
+            'is_active': self.is_active,
+            'is_verified': self.is_verified,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'last_login': self.last_login.isoformat() if self.last_login else None,
+        }
+
+
+class LoginAttempt(Base):
+    __tablename__ = 'login_attempts'
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String(120), nullable=False, index=True)
+    ip_address = Column(String(45), nullable=False)
+    success = Column(Boolean, default=False)
+    attempted_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<LoginAttempt {self.email} - {"Success" if self.success else "Failed"}>'
+
+
+class Session(Base):
+    __tablename__ = 'user_sessions'
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    session_token = Column(String(255), unique=True, nullable=False)
+    ip_address = Column(String(45))
+    user_agent = Column(Text)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship('User', backref='sessions')
+
+    def is_expired(self) -> bool:
+        return datetime.utcnow() > self.expires_at
+
+
+# ----------------------------------
+# Core CRM Entities
+# ----------------------------------
+
+class Customer(Base):
+    __tablename__ = 'customers'
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    date_of_measure = Column(Date)
+    name = Column(String(200), nullable=False)
+    address = Column(Text)
+    postcode = Column(String(20))
+    phone = Column(String(50))
+    email = Column(String(200))
+    contact_made = Column(CONTACT_MADE_ENUM, default='Unknown')
+    preferred_contact_method = Column(PREFERRED_CONTACT_ENUM)
+    marketing_opt_in = Column(Boolean, default=False)
+    notes = Column(Text)
+    
+    # NEW: Add stage field that mirrors the job stage
+    stage = Column(JOB_STAGE_ENUM, default='Lead')
+
+    # ADD THESE TWO NEW FIELDS:
+    project_types = Column(JSON)  # Can store ["Bedroom", "Kitchen"] or ["Bedroom"] etc.
+    salesperson = Column(String(200))
+
+    # Audit
+    created_by = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(200))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Backward compatibility / soft status
+    status = Column(String(50), default='Active')
+
+    # relationships
+    jobs = relationship('Job', back_populates='customer', lazy=True, cascade='all, delete-orphan')
+    quotations = relationship('Quotation', back_populates='customer', lazy=True, cascade='all, delete-orphan')
+    form_data = relationship('CustomerFormData', back_populates='customer', lazy=True, cascade='all, delete-orphan')
+    form_submissions = relationship('FormSubmission', back_populates='customer', lazy=True)
+
+    def extract_postcode_from_address(self):
+        if not self.address:
+            return None
+        import re
+        pattern = r'\b[A-Z]{1,2}[0-9][A-Z0-9]? ?[0-9][A-Z]{2}\b'
+        match = re.search(pattern, self.address.upper())
+        return match.group(0) if match else None
+
+    def update_stage_from_job(self):
+        """Update customer stage based on their primary job's stage"""
+        primary_job = self.get_primary_job()
+        if primary_job:
+            self.stage = primary_job.stage
+            session = SessionLocal()
+# ...do stuff...
+session.add(...)
+session.commit()
+session.close()
+.commit()
+
+    def get_primary_job(self):
+        """Get the customer's primary (most recent or active) job"""
+        return self.jobs.filter(Job.stage != 'Cancelled').order_by(Job.created_at.desc()).first()
+
+    def save(self):
+        if not self.postcode and self.address:
+            self.postcode = self.extract_postcode_from_address()
+        session = SessionLocal()
+# ...do stuff...
+session.add(...)
+session.commit()
+session.close()
+.add(self)
+        session = SessionLocal()
+# ...do stuff...
+session.add(...)
+session.commit()
+session.close()
+.commit()
+
+    def __repr__(self):
+        return f'<Customer {self.name}>'
+
+class Team(Base):
+    __tablename__ = 'teams'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), nullable=False)
+    specialty = Column(String(100))
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    members = relationship('Fitter', back_populates='team', lazy=True)
+
+
+class Fitter(Base):
+    __tablename__ = 'fitters'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), nullable=False)
+    team_id = Column(Integer, ForeignKey('teams.id'))
+    skills = Column(Text)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    team = relationship('Team', back_populates='members')
+
+
+class Salesperson(Base):
+    __tablename__ = 'salespeople'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), nullable=False)
+    email = Column(String(120))
+    phone = Column(String(20))
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Job(Base):
+    __tablename__ = 'jobs'
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))  # UUID
+    customer_id = Column(String(36), ForeignKey('customers.id'), nullable=False)
+
+    # Basic job info
+    job_reference = Column(String(100), unique=True)
+    job_name = Column(String(200))
+    job_type = Column(JOB_TYPE_ENUM, nullable=False, default='Kitchen')
+    stage = Column(JOB_STAGE_ENUM, nullable=False, default='Lead')
+    priority = Column(String(20), default='Medium')
+
+    # Pricing
+    quote_price = Column(Numeric(10, 2))
+    agreed_price = Column(Numeric(10, 2))
+    sold_amount = Column(Numeric(10, 2))  # NEW
+    deposit1 = Column(Numeric(10, 2))     # NEW
+    deposit2 = Column(Numeric(10, 2))     # NEW
+
+    # Dates
+    delivery_date = Column(DateTime)
+    measure_date = Column(DateTime)
+    completion_date = Column(DateTime)
+    deposit_due_date = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Additional info
+    installation_address = Column(Text)
+    notes = Column(Text)
+
+    # Team assignments
+    salesperson_name = Column(String(100))
+    assigned_team_name = Column(String(100))
+    primary_fitter_name = Column(String(100))
+
+    assigned_team_id = Column(Integer, ForeignKey('teams.id'))
+    primary_fitter_id = Column(Integer, ForeignKey('fitters.id'))
+    salesperson_id = Column(Integer, ForeignKey('salespeople.id'))
+
+    # Links
+    quote_id = Column(Integer, ForeignKey('quotations.id'))
+
+    # Boolean flags
+    has_counting_sheet = Column(Boolean, default=False)
+    has_schedule = Column(Boolean, default=False)
+    has_invoice = Column(Boolean, default=False)
+
+    # relationships
+    customer = relationship('Customer', back_populates='jobs')
+    quotation = relationship('Quotation', foreign_keys=[quote_id], back_populates='job', uselist=False)
+    assigned_team = relationship('Team', foreign_keys=[assigned_team_id])
+    primary_fitter = relationship('Fitter', foreign_keys=[primary_fitter_id])
+    salesperson = relationship('Salesperson', foreign_keys=[salesperson_id])
+
+    documents = relationship('JobDocument', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    checklists = relationship('JobChecklist', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    schedule_items = relationship('ScheduleItem', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    rooms = relationship('Room', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    form_links = relationship('JobFormLink', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    job_notes = relationship('JobNote', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    invoices = relationship('Invoice', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    counting_sheets = relationship('CountingSheet', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    remedials = relationship('RemedialAction', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    payments = relationship('Payment', back_populates='job', lazy=True, cascade='all, delete-orphan')
+
+    def __repr__(self):
+        return f'<Job {self.job_reference or self.id}: {self.job_name or self.job_type}>'
+
+
+# ----------------------------------
+# Documents / Checklists / Rooms
+# ----------------------------------
+
+class JobDocument(Base):
+    __tablename__ = 'job_documents'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    filename = Column(String(255), nullable=False)
+    original_filename = Column(String(255), nullable=False)
+    file_path = Column(String(500), nullable=False)
+    file_size = Column(Integer)
+    mime_type = Column(String(100))
+    category = Column(String(50))
+    uploaded_by = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    job = relationship('Job', back_populates='documents')
+
+
+class JobChecklist(Base):
+    __tablename__ = 'job_checklists'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    name = Column(String(200), nullable=False)
+    description = Column(Text)
+    template_type = Column(CHECKLIST_TEMPLATE_ENUM, nullable=True)
+    template_version = Column(Integer, default=1)
+    status = Column(String(20), default='Not Started')
+    filled_by = Column(String(200))
+    filled_at = Column(DateTime)
+    fields = Column(JSON)  # JSON key/value for flexible templates
+    signed = Column(Boolean, default=False)
+    signature_path = Column(String(500))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    job = relationship('Job', back_populates='checklists')
+    items = relationship('ChecklistItem', back_populates='checklist', lazy=True, cascade='all, delete-orphan')
+
+
+class ChecklistItem(Base):
+    __tablename__ = 'checklist_items'
+
+    id = Column(Integer, primary_key=True)
+    checklist_id = Column(Integer, ForeignKey('job_checklists.id'), nullable=False)
+    text = Column(String(500), nullable=False)
+    completed = Column(Boolean, default=False)
+    completed_at = Column(DateTime)
+    completed_by = Column(String(200))
+    notes = Column(Text)
+    order_index = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    checklist = relationship('JobChecklist', back_populates='items')
+
+
+class ScheduleItem(Base):
+    __tablename__ = 'schedule_items'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    title = Column(String(200), nullable=False)
+    description = Column(Text)
+    start_date = Column(DateTime, nullable=False)
+    end_date = Column(DateTime)
+    all_day = Column(Boolean, default=False)
+    status = Column(String(20), default='Scheduled')
+    assigned_team_id = Column(Integer, ForeignKey('teams.id'))
+    assigned_fitter_id = Column(Integer, ForeignKey('fitters.id'))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    job = relationship('Job', back_populates='schedule_items')
+    assigned_team = relationship('Team')
+    assigned_fitter = relationship('Fitter')
+
+
+class Room(Base):
+    __tablename__ = 'rooms'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    name = Column(String(100), nullable=False)
+    room_type = Column(String(50), nullable=False)
+    measurements = Column(Text)  # could be JSON
+    notes = Column(Text)
+    order_index = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    job = relationship('Job', back_populates='rooms')
+    appliances = relationship('RoomAppliance', back_populates='room', lazy=True, cascade='all, delete-orphan')
+
+
+class RoomAppliance(Base):
+    __tablename__ = 'room_appliances'
+
+    id = Column(Integer, primary_key=True)
+    room_id = Column(Integer, ForeignKey('rooms.id'), nullable=False)
+    appliance_type = Column(String(100), nullable=False)
+    brand = Column(String(100))
+    model = Column(String(100))
+    specifications = Column(Text)
+    installation_notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    room = relationship('Room', back_populates='appliances')
+
+
+class JobFormLink(Base):
+    __tablename__ = 'job_form_links'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    form_submission_id = Column(Integer, ForeignKey('form_submissions.id'), nullable=False)
+    linked_at = Column(DateTime, default=datetime.utcnow)
+    linked_by = Column(String(200))
+
+    job = relationship('Job', back_populates='form_links')
+    form_submission = relationship('FormSubmission', back_populates='job_links')
+
+
+class JobNote(Base):
+    __tablename__ = 'job_notes'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    content = Column(Text, nullable=False)
+    note_type = Column(String(50), default='general')
+    author = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    job = relationship('Job', back_populates='job_notes')
+
+
+# ----------------------------------
+# Quotation / Products Catalogue
+# ----------------------------------
+
+class ApplianceCategory(Base):
+    __tablename__ = 'appliance_categories'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False, unique=True)
+    description = Column(Text)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    products = relationship('Product', back_populates='category', lazy=True)
+
+    def __repr__(self):
+        return f'<ApplianceCategory {self.name}>'
+
+
+class Brand(Base):
+    __tablename__ = 'brands'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False, unique=True)
+    logo_url = Column(String(255))
+    website = Column(String(255))
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    products = relationship('Product', back_populates='brand', lazy=True)
+
+    def __repr__(self):
+        return f'<Brand {self.name}>'
+
+
+class Product(Base):
+    __tablename__ = 'products'
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(Integer, ForeignKey('brands.id'), nullable=False)
+    category_id = Column(Integer, ForeignKey('appliance_categories.id'), nullable=False)
+
+    model_code = Column(String(100), nullable=False, unique=True)
+    series = Column(String(100))
+    name = Column(String(200), nullable=False)
+    description = Column(Text)
+
+    base_price = Column(Numeric(10, 2))
+    low_tier_price = Column(Numeric(10, 2))
+    mid_tier_price = Column(Numeric(10, 2))
+    high_tier_price = Column(Numeric(10, 2))
+
+    dimensions = Column(Text)  # JSON string (W/H/D)
+    weight = Column(Numeric(8, 2))
+    color_options = Column(Text)  # JSON array
+
+    pack_name = Column(String(200))
+    notes = Column(Text)
+    energy_rating = Column(String(10))
+    warranty_years = Column(Integer)
+
+    active = Column(Boolean, default=True)
+    in_stock = Column(Boolean, default=True)
+    lead_time_weeks = Column(Integer)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    brand = relationship('Brand', back_populates='products')
+    category = relationship('ApplianceCategory', back_populates='products')
+    quote_items = relationship('ProductQuoteItem', back_populates='product', lazy=True)
+
+    def __repr__(self):
+        brand_name = self.brand.name if getattr(self, 'brand', None) else 'Unknown'
+        return f'<Product {brand_name} {self.model_code}>'
+
+    def get_price_for_tier(self, tier='mid'):
+        tier_map = {
+            'low': self.low_tier_price or self.base_price,
+            'mid': self.mid_tier_price or self.base_price,
+            'high': self.high_tier_price or self.base_price,
+        }
+        return tier_map.get(tier.lower(), self.base_price)
+
+    def get_dimensions_dict(self):
+        if self.dimensions:
+            try:
+                import json
+                return json.loads(self.dimensions)
+            except Exception:
+                return {}
+        return {}
+
+    def get_color_options_list(self):
+        if self.color_options:
+            try:
+                import json
+                return json.loads(self.color_options)
+            except Exception:
+                return []
+        return []
+
+
+class Quotation(Base):
+    __tablename__ = 'quotations'
+
+    id = Column(Integer, primary_key=True)
+    customer_id = Column(String(36), ForeignKey('customers.id'), nullable=False)
+    reference_number = Column(String(50), unique=True)
+    total = Column(Numeric(10, 2), nullable=False)
+    status = Column(String(20), default='Draft')
+    valid_until = Column(Date)
+    notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    customer = relationship('Customer', back_populates='quotations')
+    items = relationship('QuotationItem', back_populates='quotation', lazy=True, cascade='all, delete-orphan')
+    product_items = relationship('ProductQuoteItem', back_populates='quotation', lazy=True, cascade='all, delete-orphan')
+    job = relationship('Job', back_populates='quotation', uselist=False)
+
+
+class QuotationItem(Base):
+    __tablename__ = 'quotation_items'
+
+    id = Column(Integer, primary_key=True)
+    quotation_id = Column(Integer, ForeignKey('quotations.id'), nullable=False)
+    item = Column(String(100), nullable=False)
+    description = Column(Text)
+    color = Column(String(50))
+    amount = Column(Float, nullable=False)
+
+    quotation = relationship('Quotation', back_populates='items')
+
+    def __repr__(self):
+        return f'<QuotationItem {self.item} (Quotation {self.quotation_id})>'
+
+
+class ProductQuoteItem(Base):
+    __tablename__ = 'product_quote_items'
+
+    id = Column(Integer, primary_key=True)
+    quotation_id = Column(Integer, ForeignKey('quotations.id'), nullable=False)
+    product_id = Column(Integer, ForeignKey('products.id'), nullable=False)
+
+    quantity = Column(Integer, default=1)
+    quoted_price = Column(Numeric(10, 2), nullable=False)
+    tier_used = Column(String(10))
+    selected_color = Column(String(50))
+    custom_notes = Column(Text)
+
+    line_total = Column(Numeric(10, 2))
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    quotation = relationship('Quotation', back_populates='product_items')
+    product = relationship('Product', back_populates='quote_items')
+
+    def __repr__(self):
+        code = self.product.model_code if getattr(self, 'product', None) else 'Unknown'
+        return f'<ProductQuoteItem {code} x{self.quantity}>'
+
+    def calculate_line_total(self):
+        self.line_total = (self.quoted_price or 0) * (self.quantity or 0)
+        return self.line_total
+
+
+# ----------------------------------
+# Invoicing & Payments
+# ----------------------------------
+
+class Invoice(Base):
+    __tablename__ = 'invoices'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    invoice_number = Column(String(50), unique=True, nullable=False)
+    status = Column(String(20), default='Draft')
+    due_date = Column(Date)
+    paid_date = Column(Date)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    job = relationship('Job', back_populates='invoices')
+    line_items = relationship('InvoiceLineItem', back_populates='invoice', lazy=True, cascade='all, delete-orphan')
+    payments = relationship('Payment', back_populates='invoice', lazy=True)
+
+    @property
+    def amount_due(self):
+        total = sum([(li.quantity or 0) * (li.unit_price or 0) for li in self.line_items])
+        return total
+
+    @property
+    def amount_paid(self):
+        return sum([p.amount or 0 for p in self.payments if p.cleared])
+
+    @property
+    def balance(self):
+        return (self.amount_due or 0) - (self.amount_paid or 0)
+
+
+class InvoiceLineItem(Base):
+    __tablename__ = 'invoice_line_items'
+
+    id = Column(Integer, primary_key=True)
+    invoice_id = Column(Integer, ForeignKey('invoices.id'), nullable=False)
+    description = Column(String(255), nullable=False)
+    quantity = Column(Integer, default=1)
+    unit_price = Column(Numeric(10, 2), nullable=False)
+    vat_rate = Column(Numeric(5, 2), default=0)  # e.g. 20.00 for 20%
+
+    invoice = relationship('Invoice', back_populates='line_items')
+
+
+class Payment(Base):
+    __tablename__ = 'payments'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    invoice_id = Column(Integer, ForeignKey('invoices.id'))  # optional link to invoice
+
+    date = Column(Date, default=datetime.utcnow)
+    amount = Column(Numeric(10, 2), nullable=False)
+    method = Column(PAYMENT_METHOD_ENUM, default='BACS')
+    reference = Column(String(120))
+    bank_details_used = Column(String(255))
+    notes = Column(Text)
+
+    cleared = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    job = relationship('Job', back_populates='payments')
+    invoice = relationship('Invoice', back_populates='payments')
+
+
+# ----------------------------------
+# Counting Sheets
+# ----------------------------------
+
+class CountingSheet(Base):
+    __tablename__ = 'counting_sheets'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    room_id = Column(Integer, ForeignKey('rooms.id'))  # optional, per-room counting
+    template_type = Column(Enum('KitchenCountingSheet', 'BedCountingSheet', name='counting_template_enum'), nullable=False)
+    status = Column(Enum('Draft', 'Finalised', name='counting_status_enum'), default='Draft')
+
+    created_by = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(200))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    job = relationship('Job', back_populates='counting_sheets')
+    room = relationship('Room')
+    items = relationship('CountingItem', back_populates='sheet', lazy=True, cascade='all, delete-orphan')
+
+
+class CountingItem(Base):
+    __tablename__ = 'counting_items'
+
+    id = Column(Integer, primary_key=True)
+    sheet_id = Column(Integer, ForeignKey('counting_sheets.id'), nullable=False)
+
+    description = Column(String(255), nullable=False)   # ITEM
+    quantity_requested = Column(Integer, default=0)     # ORDERED
+    quantity_ordered = Column(Integer, default=0)
+    quantity_counted = Column(Integer, default=0)       # COUNTED
+    unit = Column(String(50))
+    supplier = Column(String(120))
+    customer_supplied = Column(Boolean, default=False)
+    notes = Column(Text)
+
+    sheet = relationship('CountingSheet', back_populates='items')
+
+
+# ----------------------------------
+# Remedial Actions
+# ----------------------------------
+
+class RemedialAction(Base):
+    __tablename__ = 'remedial_actions'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+
+    date = Column(Date, default=datetime.utcnow)
+    assigned_to = Column(String(200))  # could be fitter/team/user
+    status = Column(Enum('Submitted', 'Reviewed', 'Actioned', name='remedial_status_enum'), default='Submitted')
+    notes = Column(Text)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    job = relationship('Job', back_populates='remedials')
+    items = relationship('RemedialItem', back_populates='remedial', lazy=True, cascade='all, delete-orphan')
+
+
+class RemedialItem(Base):
+    __tablename__ = 'remedial_items'
+
+    id = Column(Integer, primary_key=True)
+    remedial_id = Column(Integer, ForeignKey('remedial_actions.id'), nullable=False)
+
+    number = Column(Integer)  # No
+    item = Column(String(120))
+    remedial_action = Column(String(255))
+    colour = Column(String(50))
+    size = Column(String(50))
+    quantity = Column(Integer, default=1)
+    status = Column(String(50), default='Pending')
+
+    remedial = relationship('RemedialAction', back_populates='items')
+
+
+# ----------------------------------
+# Templates Library
+# ----------------------------------
+
+class DocumentTemplate(Base):
+    __tablename__ = 'document_templates'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(120), nullable=False)
+    template_type = Column(DOCUMENT_TEMPLATE_TYPE_ENUM, nullable=False)
+    file_path = Column(String(500), nullable=False)  # points to uploaded file
+    merge_fields = Column(JSON)  # list/structure of exposed merge fields
+    uploaded_by = Column(String(200))
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ----------------------------------
+# Audit & Versioning
+# ----------------------------------
+
+class AuditLog(Base):
+    __tablename__ = 'audit_logs'
+
+    id = Column(Integer, primary_key=True)
+    entity_type = Column(String(120), nullable=False)
+    entity_id = Column(String(120), nullable=False)
+    action = Column(AUDIT_ACTION_ENUM, nullable=False)
+    changed_by = Column(String(200))
+    changed_at = Column(DateTime, default=datetime.utcnow)
+    change_summary = Column(JSON)  # JSON diff summary
+    previous_snapshot = Column(JSON)
+    new_snapshot = Column(JSON)
+
+
+class VersionedSnapshot(Base):
+    __tablename__ = 'versioned_snapshots'
+
+    id = Column(Integer, primary_key=True)
+    entity_type = Column(String(120), nullable=False)
+    entity_id = Column(String(120), nullable=False)
+    version_number = Column(Integer, nullable=False)
+    reason = Column(String(255))
+    snapshot = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    created_by = Column(String(200))
+
+
+# ----------------------------------
+# Forms / Submissions / Imports
+# ----------------------------------
+
+class FormSubmission(Base):
+    __tablename__ = 'form_submissions'
+
+    id = Column(Integer, primary_key=True)
+    customer_id = Column(String(36), ForeignKey('customers.id'))
+    form_data = Column(Text, nullable=False)
+    source = Column(String(100))
+    submitted_at = Column(DateTime, default=datetime.utcnow)
+    processed = Column(Boolean, default=False)
+    processed_at = Column(DateTime)
+
+    customer = relationship('Customer', back_populates='form_submissions')
+    job_links = relationship('JobFormLink', back_populates='form_submission', lazy=True, cascade='all, delete-orphan')
+
+
+class CustomerFormData(Base):
+    __tablename__ = 'customer_form_data'
+
+    id = Column(Integer, primary_key=True)
+    customer_id = Column(String(36), ForeignKey('customers.id'), nullable=False)
+    form_data = Column(Text, nullable=False)
+    token_used = Column(String(64), nullable=False)
+    submitted_at = Column(DateTime, default=datetime.utcnow)
+
+    customer = relationship('Customer', back_populates='form_data')
+
+    def __repr__(self):
+        return f'<CustomerFormData {self.id} for Customer {self.customer_id}>'
+
+
+class DataImport(Base):
+    __tablename__ = 'data_imports'
+
+    id = Column(Integer, primary_key=True)
+    filename = Column(String(255), nullable=False)
+    import_type = Column(String(50), nullable=False)  # 'appliance_matrix', 'kbb_pricelist'
+    status = Column(String(20), default='processing')  # processing, completed, failed
+    records_processed = Column(Integer, default=0)
+    records_failed = Column(Integer, default=0)
+    error_log = Column(Text)
+    imported_by = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime)
+
+    def __repr__(self):
+        return f'<DataImport {self.filename} ({self.status})>'
+
+
+# Add this to your models.py file
+
+ASSIGNMENT_TYPE_ENUM = Enum('job', 'off', 'delivery', 'note', name='assignment_type_enum')
+
+class Assignment(Base):
+    __tablename__ = 'assignments'
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    
+    # Basic assignment info
+    type = Column(ASSIGNMENT_TYPE_ENUM, nullable=False, default='job')
+    title = Column(String(255), nullable=False)
+    date = Column(Date, nullable=False)
+    
+    # Staff assignment - now just a string field
+    team_member = Column(String(200))  # Store name as string
+    
+    # Job-related fields
+    job_id = Column(String(36), ForeignKey('jobs.id'))
+    customer_id = Column(String(36), ForeignKey('customers.id'))
+    
+    # Time fields
+    start_time = Column(db.Time)
+    end_time = Column(db.Time)
+    estimated_hours = Column(Float)  # Calculated from start/end time or manually set
+    
+    # Additional info
+    notes = Column(Text)
+    priority = Column(String(20), default='Medium')
+    status = Column(String(20), default='Scheduled')  # Scheduled, In Progress, Completed, Cancelled
+    
+    # Audit fields
+    created_by = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(200))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # relationships
+    job = relationship('Job', backref='assignments')
+    customer = relationship('Customer', backref='assignments')
+    
+    def __repr__(self):
+        return f'<Assignment {self.id}: {self.title} on {self.date}>'
+    
+    def calculate_hours(self):
+        """Calculate hours from start_time and end_time"""
+        if self.start_time and self.end_time:
+            start_datetime = datetime.combine(datetime.today(), self.start_time)
+            end_datetime = datetime.combine(datetime.today(), self.end_time)
+            duration = end_datetime - start_datetime
+            return duration.total_seconds() / 3600
+        return self.estimated_hours or 0
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'type': self.type,
+            'title': self.title,
+            'date': self.date.isoformat() if self.date else None,
+            'team_member': self.team_member,  # Return as string
+            'job_id': self.job_id,
+            'customer_id': self.customer_id,
+            'start_time': self.start_time.strftime('%H:%M') if self.start_time else None,
+            'end_time': self.end_time.strftime('%H:%M') if self.end_time else None,
+            'estimated_hours': self.estimated_hours,
+            'notes': self.notes,
+            'priority': self.priority,
+            'status': self.status,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            # Include related data
+            'job_reference': self.job.job_reference if self.job else None,
+            'customer_name': self.customer.name if self.customer else None,
+        }# models.py - Updated schema with Approval System
+# Added approval fields to CustomerFormData for invoice/receipt/checklist approval workflow
+
+import uuid
+import secrets
+from datetime import datetime, timedelta
+
+from database import db  # Import SQLAlchemy instance
+from werkzeug.security import generate_password_hash, check_password_hash
+import jwt
+
+# ----------------------------------
+# Helpers / Enums
+# ----------------------------------
+
+JOB_STAGE_ENUM = Enum(
+    'Lead', 'Quote', 'Consultation', 'Survey', 'Measure', 'Design', 'Quoted', 'Accepted',
+    'Rejected', 'Ordered', 'Production', 'Delivery', 'Installation', 'Complete', 'Remedial', 'Cancelled',
+    name='job_stage_enum'
+)
+
+JOB_TYPE_ENUM = Enum(
+    'Kitchen', 'Bedroom', 'Wardrobe', 'Remedial', 'Other',
+    name='job_type_enum'
+)
+
+CONTACT_MADE_ENUM = Enum('Yes', 'No', 'Unknown', name='contact_made_enum')
+PREFERRED_CONTACT_ENUM = Enum('Phone', 'Email', 'WhatsApp', name='preferred_contact_enum')
+
+CHECKLIST_TEMPLATE_ENUM = Enum(
+    'BedroomChecklist', 'KitchenChecklist', 'PaymentTerms', 'CustomerSatisfaction',
+    'RemedialAction', 'PromotionalOffer', name='checklist_template_enum'
+)
+
+DOCUMENT_TEMPLATE_TYPE_ENUM = Enum(
+    'Invoice', 'Receipt', 'Quotation', 'Warranty', 'Terms', 'Other', name='document_template_type_enum'
+)
+
+PAYMENT_METHOD_ENUM = Enum('BACS', 'Cash', 'Card', 'Other', name='payment_method_enum')
+
+AUDIT_ACTION_ENUM = Enum('create', 'update', 'delete', name='audit_action_enum')
+
+# NEW: Approval Status Enum
+APPROVAL_STATUS_ENUM = Enum('pending', 'approved', 'rejected', name='approval_status_enum')
+
+ASSIGNMENT_TYPE_ENUM = Enum('job', 'off', 'delivery', 'note', name='assignment_type_enum')
+
+# ----------------------------------
+# Auth & Security
+# ----------------------------------
+
+class User(Base):
+    __tablename__ = 'users'
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String(120), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+
+    # Profile
+    first_name = Column(String(50), nullable=False)
+    last_name = Column(String(50), nullable=False)
+    phone = Column(String(20))
+    name = Column(String(100))  # Full name for convenience
+
+    # Role & permissions
+    role = Column(String(20), default='user')
+    department = Column(String(50))
+
+    # Account status
+    is_active = Column(Boolean, default=True)
+    is_verified = Column(Boolean, default=False)
+
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_login = Column(DateTime)
+
+    # Password reset
+    reset_token = Column(String(100))
+    reset_token_expires = Column(DateTime)
+
+    # Email verification
+    verification_token = Column(String(100))
+
+    # relationships for approval system
+    approved_submissions = relationship('CustomerFormData', foreign_keys='CustomerFormData.approved_by', backref='approver', lazy=True)
+    created_submissions = relationship('CustomerFormData', foreign_keys='CustomerFormData.created_by', backref='creator', lazy=True)
+
+    def __repr__(self):
+        return f'<User {self.email}>'
+
+    # Password utils
+    def set_password(self, password: str) -> None:
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password: str) -> bool:
+        return check_password_hash(self.password_hash, password)
+
+    def get_full_name(self) -> str:
+        return f"{self.first_name} {self.last_name}"
+
+    # Tokens
+    def generate_reset_token(self) -> str:
+        self.reset_token = secrets.token_urlsafe(32)
+        self.reset_token_expires = datetime.utcnow() + timedelta(hours=1)
+        return self.reset_token
+
+    def generate_verification_token(self) -> str:
+        self.verification_token = secrets.token_urlsafe(32)
+        return self.verification_token
+
+    def generate_jwt_token(self, secret_key: str) -> str:
+        payload = {
+            'user_id': self.id,
+            'email': self.email,
+            'role': self.role,
+            'exp': datetime.utcnow() + timedelta(days=7),
+            'iat': datetime.utcnow(),
+        }
+        return jwt.encode(payload, secret_key, algorithm='HS256')
+
+    @staticmethod
+    def verify_jwt_token(token: str, secret_key: str):
+        try:
+            payload = jwt.decode(token, secret_key, algorithms=['HS256'])
+            user = User.query.get(payload['user_id'])
+            return user if user and user.is_active else None
+        except jwt.ExpiredSignatureError:
+            return None
+        except jwt.InvalidTokenError:
+            return None
+
+    def to_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'email': self.email,
+            'first_name': self.first_name,
+            'last_name': self.last_name,
+            'full_name': self.get_full_name(),
+            'phone': self.phone,
+            'role': self.role,
+            'department': self.department,
+            'is_active': self.is_active,
+            'is_verified': self.is_verified,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'last_login': self.last_login.isoformat() if self.last_login else None,
+        }
+
+
+class LoginAttempt(Base):
+    __tablename__ = 'login_attempts'
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String(120), nullable=False, index=True)
+    ip_address = Column(String(45), nullable=False)
+    success = Column(Boolean, default=False)
+    attempted_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<LoginAttempt {self.email} - {"Success" if self.success else "Failed"}>'
+
+
+class Session(Base):
+    __tablename__ = 'user_sessions'
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    session_token = Column(String(255), unique=True, nullable=False)
+    ip_address = Column(String(45))
+    user_agent = Column(Text)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship('User', backref='sessions')
+
+    def is_expired(self) -> bool:
+        return datetime.utcnow() > self.expires_at
+
+
+# ----------------------------------
+# Core CRM Entities
+# ----------------------------------
+
+class Customer(Base):
+    __tablename__ = 'customers'
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    date_of_measure = Column(Date)
+    name = Column(String(200), nullable=False)
+    address = Column(Text)
+    postcode = Column(String(20))
+    phone = Column(String(50))
+    email = Column(String(200))
+    contact_made = Column(CONTACT_MADE_ENUM, default='Unknown')
+    preferred_contact_method = Column(PREFERRED_CONTACT_ENUM)
+    marketing_opt_in = Column(Boolean, default=False)
+    notes = Column(Text)
+    
+    stage = Column(JOB_STAGE_ENUM, default='Lead')
+    project_types = Column(JSON)
+    salesperson = Column(String(200))
+
+    # Audit
+    created_by = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(200))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    status = Column(String(50), default='Active')
+
+    # relationships
+    jobs = relationship('Job', back_populates='customer', lazy=True, cascade='all, delete-orphan')
+    quotations = relationship('Quotation', back_populates='customer', lazy=True, cascade='all, delete-orphan')
+    form_data = relationship('CustomerFormData', back_populates='customer', lazy=True, cascade='all, delete-orphan')
+    form_submissions = relationship('FormSubmission', back_populates='customer', lazy=True)
+
+    def extract_postcode_from_address(self):
+        if not self.address:
+            return None
+        import re
+        pattern = r'\b[A-Z]{1,2}[0-9][A-Z0-9]? ?[0-9][A-Z]{2}\b'
+        match = re.search(pattern, self.address.upper())
+        return match.group(0) if match else None
+
+    def update_stage_from_job(self):
+        primary_job = self.get_primary_job()
+        if primary_job:
+            self.stage = primary_job.stage
+            session = SessionLocal()
+# ...do stuff...
+session.add(...)
+session.commit()
+session.close()
+.commit()
+
+    def get_primary_job(self):
+        return self.jobs.filter(Job.stage != 'Cancelled').order_by(Job.created_at.desc()).first()
+
+    def save(self):
+        if not self.postcode and self.address:
+            self.postcode = self.extract_postcode_from_address()
+        session = SessionLocal()
+# ...do stuff...
+session.add(...)
+session.commit()
+session.close()
+.add(self)
+        session = SessionLocal()
+# ...do stuff...
+session.add(...)
+session.commit()
+session.close()
+.commit()
+
+    def __repr__(self):
+        return f'<Customer {self.name}>'
+
+class Team(Base):
+    __tablename__ = 'teams'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), nullable=False)
+    specialty = Column(String(100))
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    members = relationship('Fitter', back_populates='team', lazy=True)
+
+
+class Fitter(Base):
+    __tablename__ = 'fitters'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), nullable=False)
+    team_id = Column(Integer, ForeignKey('teams.id'))
+    skills = Column(Text)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    team = relationship('Team', back_populates='members')
+
+
+class Salesperson(Base):
+    __tablename__ = 'salespeople'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), nullable=False)
+    email = Column(String(120))
+    phone = Column(String(20))
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Job(Base):
+    __tablename__ = 'jobs'
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    customer_id = Column(String(36), ForeignKey('customers.id'), nullable=False)
+
+    job_reference = Column(String(100), unique=True)
+    job_name = Column(String(200))
+    job_type = Column(JOB_TYPE_ENUM, nullable=False, default='Kitchen')
+    stage = Column(JOB_STAGE_ENUM, nullable=False, default='Lead')
+    priority = Column(String(20), default='Medium')
+
+    quote_price = Column(Numeric(10, 2))
+    agreed_price = Column(Numeric(10, 2))
+    sold_amount = Column(Numeric(10, 2))
+    deposit1 = Column(Numeric(10, 2))
+    deposit2 = Column(Numeric(10, 2))
+
+    delivery_date = Column(DateTime)
+    measure_date = Column(DateTime)
+    completion_date = Column(DateTime)
+    deposit_due_date = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    installation_address = Column(Text)
+    notes = Column(Text)
+
+    salesperson_name = Column(String(100))
+    assigned_team_name = Column(String(100))
+    primary_fitter_name = Column(String(100))
+
+    assigned_team_id = Column(Integer, ForeignKey('teams.id'))
+    primary_fitter_id = Column(Integer, ForeignKey('fitters.id'))
+    salesperson_id = Column(Integer, ForeignKey('salespeople.id'))
+
+    quote_id = Column(Integer, ForeignKey('quotations.id'))
+
+    has_counting_sheet = Column(Boolean, default=False)
+    has_schedule = Column(Boolean, default=False)
+    has_invoice = Column(Boolean, default=False)
+
+    customer = relationship('Customer', back_populates='jobs')
+    quotation = relationship('Quotation', foreign_keys=[quote_id], back_populates='job', uselist=False)
+    assigned_team = relationship('Team', foreign_keys=[assigned_team_id])
+    primary_fitter = relationship('Fitter', foreign_keys=[primary_fitter_id])
+    salesperson = relationship('Salesperson', foreign_keys=[salesperson_id])
+
+    documents = relationship('JobDocument', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    checklists = relationship('JobChecklist', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    schedule_items = relationship('ScheduleItem', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    rooms = relationship('Room', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    form_links = relationship('JobFormLink', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    job_notes = relationship('JobNote', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    invoices = relationship('Invoice', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    counting_sheets = relationship('CountingSheet', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    remedials = relationship('RemedialAction', back_populates='job', lazy=True, cascade='all, delete-orphan')
+    payments = relationship('Payment', back_populates='job', lazy=True, cascade='all, delete-orphan')
+
+    def __repr__(self):
+        return f'<Job {self.job_reference or self.id}: {self.job_name or self.job_type}>'
+
+
+# ----------------------------------
+# Documents / Checklists / Rooms
+# ----------------------------------
+
+class JobDocument(Base):
+    __tablename__ = 'job_documents'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    filename = Column(String(255), nullable=False)
+    original_filename = Column(String(255), nullable=False)
+    file_path = Column(String(500), nullable=False)
+    file_size = Column(Integer)
+    mime_type = Column(String(100))
+    category = Column(String(50))
+    uploaded_by = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    job = relationship('Job', back_populates='documents')
+
+
+class JobChecklist(Base):
+    __tablename__ = 'job_checklists'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    name = Column(String(200), nullable=False)
+    description = Column(Text)
+    template_type = Column(CHECKLIST_TEMPLATE_ENUM, nullable=True)
+    template_version = Column(Integer, default=1)
+    status = Column(String(20), default='Not Started')
+    filled_by = Column(String(200))
+    filled_at = Column(DateTime)
+    fields = Column(JSON)
+    signed = Column(Boolean, default=False)
+    signature_path = Column(String(500))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    job = relationship('Job', back_populates='checklists')
+    items = relationship('ChecklistItem', back_populates='checklist', lazy=True, cascade='all, delete-orphan')
+
+
+class ChecklistItem(Base):
+    __tablename__ = 'checklist_items'
+
+    id = Column(Integer, primary_key=True)
+    checklist_id = Column(Integer, ForeignKey('job_checklists.id'), nullable=False)
+    text = Column(String(500), nullable=False)
+    completed = Column(Boolean, default=False)
+    completed_at = Column(DateTime)
+    completed_by = Column(String(200))
+    notes = Column(Text)
+    order_index = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    checklist = relationship('JobChecklist', back_populates='items')
+
+
+class ScheduleItem(Base):
+    __tablename__ = 'schedule_items'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    title = Column(String(200), nullable=False)
+    description = Column(Text)
+    start_date = Column(DateTime, nullable=False)
+    end_date = Column(DateTime)
+    all_day = Column(Boolean, default=False)
+    status = Column(String(20), default='Scheduled')
+    assigned_team_id = Column(Integer, ForeignKey('teams.id'))
+    assigned_fitter_id = Column(Integer, ForeignKey('fitters.id'))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    job = relationship('Job', back_populates='schedule_items')
+    assigned_team = relationship('Team')
+    assigned_fitter = relationship('Fitter')
+
+
+class Room(Base):
+    __tablename__ = 'rooms'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    name = Column(String(100), nullable=False)
+    room_type = Column(String(50), nullable=False)
+    measurements = Column(Text)
+    notes = Column(Text)
+    order_index = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    job = relationship('Job', back_populates='rooms')
+    appliances = relationship('RoomAppliance', back_populates='room', lazy=True, cascade='all, delete-orphan')
+
+
+class RoomAppliance(Base):
+    __tablename__ = 'room_appliances'
+
+    id = Column(Integer, primary_key=True)
+    room_id = Column(Integer, ForeignKey('rooms.id'), nullable=False)
+    appliance_type = Column(String(100), nullable=False)
+    brand = Column(String(100))
+    model = Column(String(100))
+    specifications = Column(Text)
+    installation_notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    room = relationship('Room', back_populates='appliances')
+
+
+class JobFormLink(Base):
+    __tablename__ = 'job_form_links'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    form_submission_id = Column(Integer, ForeignKey('form_submissions.id'), nullable=False)
+    linked_at = Column(DateTime, default=datetime.utcnow)
+    linked_by = Column(String(200))
+
+    job = relationship('Job', back_populates='form_links')
+    form_submission = relationship('FormSubmission', back_populates='job_links')
+
+
+class JobNote(Base):
+    __tablename__ = 'job_notes'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    content = Column(Text, nullable=False)
+    note_type = Column(String(50), default='general')
+    author = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    job = relationship('Job', back_populates='job_notes')
+
+
+# ----------------------------------
+# Quotation / Products Catalogue
+# ----------------------------------
+
+class ApplianceCategory(Base):
+    __tablename__ = 'appliance_categories'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False, unique=True)
+    description = Column(Text)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    products = relationship('Product', back_populates='category', lazy=True)
+
+    def __repr__(self):
+        return f'<ApplianceCategory {self.name}>'
+
+
+class Brand(Base):
+    __tablename__ = 'brands'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False, unique=True)
+    logo_url = Column(String(255))
+    website = Column(String(255))
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    products = relationship('Product', back_populates='brand', lazy=True)
+
+    def __repr__(self):
+        return f'<Brand {self.name}>'
+
+
+class Product(Base):
+    __tablename__ = 'products'
+
+    id = Column(Integer, primary_key=True)
+    brand_id = Column(Integer, ForeignKey('brands.id'), nullable=False)
+    category_id = Column(Integer, ForeignKey('appliance_categories.id'), nullable=False)
+
+    model_code = Column(String(100), nullable=False, unique=True)
+    series = Column(String(100))
+    name = Column(String(200), nullable=False)
+    description = Column(Text)
+
+    base_price = Column(Numeric(10, 2))
+    low_tier_price = Column(Numeric(10, 2))
+    mid_tier_price = Column(Numeric(10, 2))
+    high_tier_price = Column(Numeric(10, 2))
+
+    dimensions = Column(Text)
+    weight = Column(Numeric(8, 2))
+    color_options = Column(Text)
+
+    pack_name = Column(String(200))
+    notes = Column(Text)
+    energy_rating = Column(String(10))
+    warranty_years = Column(Integer)
+
+    active = Column(Boolean, default=True)
+    in_stock = Column(Boolean, default=True)
+    lead_time_weeks = Column(Integer)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    brand = relationship('Brand', back_populates='products')
+    category = relationship('ApplianceCategory', back_populates='products')
+    quote_items = relationship('ProductQuoteItem', back_populates='product', lazy=True)
+
+    def __repr__(self):
+        brand_name = self.brand.name if getattr(self, 'brand', None) else 'Unknown'
+        return f'<Product {brand_name} {self.model_code}>'
+
+    def get_price_for_tier(self, tier='mid'):
+        tier_map = {
+            'low': self.low_tier_price or self.base_price,
+            'mid': self.mid_tier_price or self.base_price,
+            'high': self.high_tier_price or self.base_price,
+        }
+        return tier_map.get(tier.lower(), self.base_price)
+
+    def get_dimensions_dict(self):
+        if self.dimensions:
+            try:
+                import json
+                return json.loads(self.dimensions)
+            except Exception:
+                return {}
+        return {}
+
+    def get_color_options_list(self):
+        if self.color_options:
+            try:
+                import json
+                return json.loads(self.color_options)
+            except Exception:
+                return []
+        return []
+
+
+class Quotation(Base):
+    __tablename__ = 'quotations'
+
+    id = Column(Integer, primary_key=True)
+    customer_id = Column(String(36), ForeignKey('customers.id'), nullable=False)
+    reference_number = Column(String(50), unique=True)
+    total = Column(Numeric(10, 2), nullable=False)
+    status = Column(String(20), default='Draft')
+    valid_until = Column(Date)
+    notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    customer = relationship('Customer', back_populates='quotations')
+    items = relationship('QuotationItem', back_populates='quotation', lazy=True, cascade='all, delete-orphan')
+    product_items = relationship('ProductQuoteItem', back_populates='quotation', lazy=True, cascade='all, delete-orphan')
+    job = relationship('Job', back_populates='quotation', uselist=False)
+
+
+class QuotationItem(Base):
+    __tablename__ = 'quotation_items'
+
+    id = Column(Integer, primary_key=True)
+    quotation_id = Column(Integer, ForeignKey('quotations.id'), nullable=False)
+    item = Column(String(100), nullable=False)
+    description = Column(Text)
+    color = Column(String(50))
+    amount = Column(Float, nullable=False)
+
+    quotation = relationship('Quotation', back_populates='items')
+
+    def __repr__(self):
+        return f'<QuotationItem {self.item} (Quotation {self.quotation_id})>'
+
+
+class ProductQuoteItem(Base):
+    __tablename__ = 'product_quote_items'
+
+    id = Column(Integer, primary_key=True)
+    quotation_id = Column(Integer, ForeignKey('quotations.id'), nullable=False)
+    product_id = Column(Integer, ForeignKey('products.id'), nullable=False)
+
+    quantity = Column(Integer, default=1)
+    quoted_price = Column(Numeric(10, 2), nullable=False)
+    tier_used = Column(String(10))
+    selected_color = Column(String(50))
+    custom_notes = Column(Text)
+
+    line_total = Column(Numeric(10, 2))
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    quotation = relationship('Quotation', back_populates='product_items')
+    product = relationship('Product', back_populates='quote_items')
+
+    def __repr__(self):
+        code = self.product.model_code if getattr(self, 'product', None) else 'Unknown'
+        return f'<ProductQuoteItem {code} x{self.quantity}>'
+
+    def calculate_line_total(self):
+        self.line_total = (self.quoted_price or 0) * (self.quantity or 0)
+        return self.line_total
+
+
+# ----------------------------------
+# Invoicing & Payments
+# ----------------------------------
+
+class Invoice(Base):
+    __tablename__ = 'invoices'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    invoice_number = Column(String(50), unique=True, nullable=False)
+    status = Column(String(20), default='Draft')
+    due_date = Column(Date)
+    paid_date = Column(Date)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    job = relationship('Job', back_populates='invoices')
+    line_items = relationship('InvoiceLineItem', back_populates='invoice', lazy=True, cascade='all, delete-orphan')
+    payments = relationship('Payment', back_populates='invoice', lazy=True)
+
+    @property
+    def amount_due(self):
+        total = sum([(li.quantity or 0) * (li.unit_price or 0) for li in self.line_items])
+        return total
+
+    @property
+    def amount_paid(self):
+        return sum([p.amount or 0 for p in self.payments if p.cleared])
+
+    @property
+    def balance(self):
+        return (self.amount_due or 0) - (self.amount_paid or 0)
+
+
+class InvoiceLineItem(Base):
+    __tablename__ = 'invoice_line_items'
+
+    id = Column(Integer, primary_key=True)
+    invoice_id = Column(Integer, ForeignKey('invoices.id'), nullable=False)
+    description = Column(String(255), nullable=False)
+    quantity = Column(Integer, default=1)
+    unit_price = Column(Numeric(10, 2), nullable=False)
+    vat_rate = Column(Numeric(5, 2), default=0)
+
+    invoice = relationship('Invoice', back_populates='line_items')
+
+
+class Payment(Base):
+    __tablename__ = 'payments'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    invoice_id = Column(Integer, ForeignKey('invoices.id'))
+
+    date = Column(Date, default=datetime.utcnow)
+    amount = Column(Numeric(10, 2), nullable=False)
+    method = Column(PAYMENT_METHOD_ENUM, default='BACS')
+    reference = Column(String(120))
+    bank_details_used = Column(String(255))
+    notes = Column(Text)
+
+    cleared = Column(Boolean, default=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    job = relationship('Job', back_populates='payments')
+    invoice = relationship('Invoice', back_populates='payments')
+
+
+# ----------------------------------
+# Counting Sheets
+# ----------------------------------
+
+class CountingSheet(Base):
+    __tablename__ = 'counting_sheets'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+    room_id = Column(Integer, ForeignKey('rooms.id'))
+    template_type = Column(Enum('KitchenCountingSheet', 'BedCountingSheet', name='counting_template_enum'), nullable=False)
+    status = Column(Enum('Draft', 'Finalised', name='counting_status_enum'), default='Draft')
+
+    created_by = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(200))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    job = relationship('Job', back_populates='counting_sheets')
+    room = relationship('Room')
+    items = relationship('CountingItem', back_populates='sheet', lazy=True, cascade='all, delete-orphan')
+
+
+class CountingItem(Base):
+    __tablename__ = 'counting_items'
+
+    id = Column(Integer, primary_key=True)
+    sheet_id = Column(Integer, ForeignKey('counting_sheets.id'), nullable=False)
+
+    description = Column(String(255), nullable=False)
+    quantity_requested = Column(Integer, default=0)
+    quantity_ordered = Column(Integer, default=0)
+    quantity_counted = Column(Integer, default=0)
+    unit = Column(String(50))
+    supplier = Column(String(120))
+    customer_supplied = Column(Boolean, default=False)
+    notes = Column(Text)
+
+    sheet = relationship('CountingSheet', back_populates='items')
+
+
+# ----------------------------------
+# Remedial Actions
+# ----------------------------------
+
+class RemedialAction(Base):
+    __tablename__ = 'remedial_actions'
+
+    id = Column(Integer, primary_key=True)
+    job_id = Column(String(36), ForeignKey('jobs.id'), nullable=False)
+
+    date = Column(Date, default=datetime.utcnow)
+    assigned_to = Column(String(200))
+    status = Column(Enum('Submitted', 'Reviewed', 'Actioned', name='remedial_status_enum'), default='Submitted')
+    notes = Column(Text)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    job = relationship('Job', back_populates='remedials')
+    items = relationship('RemedialItem', back_populates='remedial', lazy=True, cascade='all, delete-orphan')
+
+
+class RemedialItem(Base):
+    __tablename__ = 'remedial_items'
+
+    id = Column(Integer, primary_key=True)
+    remedial_id = Column(Integer, ForeignKey('remedial_actions.id'), nullable=False)
+
+    number = Column(Integer)
+    item = Column(String(120))
+    remedial_action = Column(String(255))
+    colour = Column(String(50))
+    size = Column(String(50))
+    quantity = Column(Integer, default=1)
+    status = Column(String(50), default='Pending')
+
+    remedial = relationship('RemedialAction', back_populates='items')
+
+
+# ----------------------------------
+# Templates Library
+# ----------------------------------
+
+class DocumentTemplate(Base):
+    __tablename__ = 'document_templates'
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(120), nullable=False)
+    template_type = Column(DOCUMENT_TEMPLATE_TYPE_ENUM, nullable=False)
+    file_path = Column(String(500), nullable=False)
+    merge_fields = Column(JSON)
+    uploaded_by = Column(String(200))
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ----------------------------------
+# Audit & Versioning
+# ----------------------------------
+
+class AuditLog(Base):
+    __tablename__ = 'audit_logs'
+
+    id = Column(Integer, primary_key=True)
+    entity_type = Column(String(120), nullable=False)
+    entity_id = Column(String(120), nullable=False)
+    action = Column(AUDIT_ACTION_ENUM, nullable=False)
+    changed_by = Column(String(200))
+    changed_at = Column(DateTime, default=datetime.utcnow)
+    change_summary = Column(JSON)
+    previous_snapshot = Column(JSON)
+    new_snapshot = Column(JSON)
+
+
+class VersionedSnapshot(Base):
+    __tablename__ = 'versioned_snapshots'
+
+    id = Column(Integer, primary_key=True)
+    entity_type = Column(String(120), nullable=False)
+    entity_id = Column(String(120), nullable=False)
+    version_number = Column(Integer, nullable=False)
+    reason = Column(String(255))
+    snapshot = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    created_by = Column(String(200))
+
+
+# ----------------------------------
+# Forms / Submissions / Imports
+# ----------------------------------
+
+class FormSubmission(Base):
+    __tablename__ = 'form_submissions'
+
+    id = Column(Integer, primary_key=True)
+    customer_id = Column(String(36), ForeignKey('customers.id'))
+    form_data = Column(Text, nullable=False)
+    source = Column(String(100))
+    submitted_at = Column(DateTime, default=datetime.utcnow)
+    processed = Column(Boolean, default=False)
+    processed_at = Column(DateTime)
+
+    customer = relationship('Customer', back_populates='form_submissions')
+    job_links = relationship('JobFormLink', back_populates='form_submission', lazy=True, cascade='all, delete-orphan')
+
+
+class CustomerFormData(Base):
+    """
+    Enhanced with approval workflow fields for invoices, receipts, and checklists
+    """
+    __tablename__ = 'customer_form_data'
+
+    id = Column(Integer, primary_key=True)
+    customer_id = Column(String(36), ForeignKey('customers.id'), nullable=False)
+    form_data = Column(Text, nullable=False)
+    token_used = Column(String(64), nullable=False)
+    submitted_at = Column(DateTime, default=datetime.utcnow)
+
+    # NEW APPROVAL WORKFLOW FIELDS
+    approval_status = Column(APPROVAL_STATUS_ENUM, default='pending')
+    approved_by = Column(Integer, ForeignKey('users.id'), nullable=True)
+    approval_date = Column(DateTime, nullable=True)
+    rejection_reason = Column(Text, nullable=True)
+    created_by = Column(Integer, ForeignKey('users.id'), nullable=True)
+
+    # relationships
+    customer = relationship('Customer', back_populates='form_data')
+    # approver and creator relationships defined in User model
+
+    def __repr__(self):
+        return f'<CustomerFormData {self.id} for Customer {self.customer_id}>'
+
+    def to_dict(self):
+        import json
+        form_data_dict = {}
+        try:
+            form_data_dict = json.loads(self.form_data)
+        except:
+            pass
+
+        return {
+            'id': self.id,
+            'customer_id': self.customer_id,
+            'form_data': form_data_dict,
+            'token_used': self.token_used,
+            'submitted_at': self.submitted_at.isoformat() if self.submitted_at else None,
+            'approval_status': self.approval_status,
+            'approved_by': self.approved_by,
+            'approval_date': self.approval_date.isoformat() if self.approval_date else None,
+            'rejection_reason': self.rejection_reason,
+            'created_by': self.created_by,
+        }
+
+
+class DataImport(Base):
+    __tablename__ = 'data_imports'
+
+    id = Column(Integer, primary_key=True)
+    filename = Column(String(255), nullable=False)
+    import_type = Column(String(50), nullable=False)
+    status = Column(String(20), default='processing')
+    records_processed = Column(Integer, default=0)
+    records_failed = Column(Integer, default=0)
+    error_log = Column(Text)
+    imported_by = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime)
+
+    def __repr__(self):
+        return f'<DataImport {self.filename} ({self.status})>'
+
+
+# ----------------------------------
+# Assignments / Scheduling
+# ----------------------------------
+
+class Assignment(Base):
+    __tablename__ = 'assignments'
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    
+    type = Column(ASSIGNMENT_TYPE_ENUM, nullable=False, default='job')
+    title = Column(String(255), nullable=False)
+    date = Column(Date, nullable=False)
+    
+    team_member = Column(String(200))
+    
+    job_id = Column(String(36), ForeignKey('jobs.id'))
+    customer_id = Column(String(36), ForeignKey('customers.id'))
+    
+    start_time = Column(db.Time)
+    end_time = Column(db.Time)
+    estimated_hours = Column(Float)
+    
+    notes = Column(Text)
+    priority = Column(String(20), default='Medium')
+    status = Column(String(20), default='Scheduled')
+    
+    created_by = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_by = Column(String(200))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    job = relationship('Job', backref='assignments')
+    customer = relationship('Customer', backref='assignments')
+    
+    def __repr__(self):
+        return f'<Assignment {self.id}: {self.title} on {self.date}>'
+    
+    def calculate_hours(self):
+        if self.start_time and self.end_time:
+            start_datetime = datetime.combine(datetime.today(), self.start_time)
+            end_datetime = datetime.combine(datetime.today(), self.end_time)
+            duration = end_datetime - start_datetime
+            return duration.total_seconds() / 3600
+        return self.estimated_hours or 0
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'type': self.type,
+            'title': self.title,
+            'date': self.date.isoformat() if self.date else None,
+            'team_member': self.team_member,
+            'job_id': self.job_id,
+            'customer_id': self.customer_id,
+            'start_time': self.start_time.strftime('%H:%M') if self.start_time else None,
+            'end_time': self.end_time.strftime('%H:%M') if self.end_time else None,
+            'estimated_hours': self.estimated_hours,
+            'notes': self.notes,
+            'priority': self.priority,
+            'status': self.status,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'job_reference': self.job.job_reference if self.job else None,
+            'customer_name': self.customer.name if self.customer else None,
+        }
+    
+    
