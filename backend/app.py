@@ -1,10 +1,18 @@
+# -*- coding: utf-8 -*-
+import sys
+import io
+# Set UTF-8 encoding for console output on Windows
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 import os
 from dotenv import load_dotenv
 
 from backend.routes import proposal_routes
-from .db import Base, engine, SessionLocal, test_connection, init_db
+from backend.db import Base, engine, SessionLocal, test_connection, init_db
 
 load_dotenv()
 
@@ -40,6 +48,7 @@ def create_app():
         print("   ✓ ActionItem")
         print("   ✓ DataImport")
         print("   ✓ TestResult")
+        print("   ✓ CustomerDocument")
         
         # ✅ CRITICAL: checkfirst=True ensures we don't drop existing tables
         Base.metadata.create_all(bind=engine, checkfirst=True)
@@ -114,6 +123,7 @@ def create_app():
         notification_routes, assignment_routes, 
         customer_routes, file_routes, job_routes, 
         test_grading_routes, proposal_routes,
+        crm_routes,  # NEW: StreemLyne CRM module
     )
 
     app.register_blueprint(auth_routes.auth_bp)
@@ -125,6 +135,7 @@ def create_app():
     app.register_blueprint(job_routes.job_bp)
     app.register_blueprint(proposal_routes.proposal_bp)
     app.register_blueprint(test_grading_routes.test_grading_bp)
+    app.register_blueprint(crm_routes.crm_bp)  # NEW: Register CRM blueprint
 
     # ============================================
     # HEALTH CHECK
