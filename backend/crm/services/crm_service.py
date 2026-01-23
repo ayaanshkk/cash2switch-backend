@@ -85,6 +85,84 @@ class CRMService:
             'interactions': interactions
         }
     
+    def create_lead(self, tenant_id: int, lead_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Create a new lead/opportunity
+        
+        Args:
+            tenant_id: Tenant identifier
+            lead_data: Lead information
+        
+        Returns:
+            Dictionary with created lead
+        """
+        lead = self.lead_repo.create_lead(tenant_id, lead_data)
+        
+        if not lead:
+            return {
+                'success': False,
+                'error': 'Failed to create lead',
+                'message': 'Could not create lead. Please try again.'
+            }
+        
+        return {
+            'success': True,
+            'data': lead,
+            'message': 'Lead created successfully'
+        }
+    
+    def update_lead(self, tenant_id: int, opportunity_id: int, lead_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Update an existing lead
+        
+        Args:
+            tenant_id: Tenant identifier
+            opportunity_id: Opportunity ID
+            lead_data: Updated lead information
+        
+        Returns:
+            Dictionary with updated lead
+        """
+        lead = self.lead_repo.update_lead(opportunity_id, tenant_id, lead_data)
+        
+        if not lead:
+            return {
+                'success': False,
+                'error': 'Failed to update lead',
+                'message': f'Could not update lead with ID {opportunity_id}'
+            }
+        
+        return {
+            'success': True,
+            'data': lead,
+            'message': 'Lead updated successfully'
+        }
+    
+    def delete_lead(self, tenant_id: int, opportunity_id: int) -> Dict[str, Any]:
+        """
+        Delete a lead/opportunity
+        
+        Args:
+            tenant_id: Tenant identifier
+            opportunity_id: Opportunity ID
+        
+        Returns:
+            Dictionary with deletion status
+        """
+        success = self.lead_repo.delete_lead(opportunity_id, tenant_id)
+        
+        if not success:
+            return {
+                'success': False,
+                'error': 'Failed to delete lead',
+                'message': f'Could not delete lead with ID {opportunity_id}'
+            }
+        
+        return {
+            'success': True,
+            'message': f'Lead {opportunity_id} deleted successfully'
+        }
+    
     # ========================================
     # PROJECT OPERATIONS
     # ========================================
