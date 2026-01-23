@@ -69,6 +69,85 @@ class CRMController:
                 'message': str(e)
             }), 500
     
+    def create_lead(self) -> tuple:
+        """
+        POST /api/crm/leads
+        Create a new lead
+        """
+        try:
+            tenant_id = g.tenant_id
+            lead_data = request.get_json()
+            
+            if not lead_data:
+                return jsonify({
+                    'success': False,
+                    'error': 'Invalid request',
+                    'message': 'Request body is required'
+                }), 400
+            
+            result = self.crm_service.create_lead(tenant_id, lead_data)
+            
+            if not result.get('success'):
+                return jsonify(result), 400
+            
+            return jsonify(result), 201
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+    
+    def update_lead(self, opportunity_id: int) -> tuple:
+        """
+        PUT /api/crm/leads/<opportunity_id>
+        Update an existing lead
+        """
+        try:
+            tenant_id = g.tenant_id
+            lead_data = request.get_json()
+            
+            if not lead_data:
+                return jsonify({
+                    'success': False,
+                    'error': 'Invalid request',
+                    'message': 'Request body is required'
+                }), 400
+            
+            result = self.crm_service.update_lead(tenant_id, opportunity_id, lead_data)
+            
+            if not result.get('success'):
+                return jsonify(result), 404
+            
+            return jsonify(result), 200
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+    
+    def delete_lead(self, opportunity_id: int) -> tuple:
+        """
+        DELETE /api/crm/leads/<opportunity_id>
+        Delete a lead
+        """
+        try:
+            tenant_id = g.tenant_id
+            
+            result = self.crm_service.delete_lead(tenant_id, opportunity_id)
+            
+            if not result.get('success'):
+                return jsonify(result), 404
+            
+            return jsonify(result), 200
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+    
     # ========================================
     # PROJECT ENDPOINTS
     # ========================================

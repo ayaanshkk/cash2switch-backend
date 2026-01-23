@@ -60,6 +60,79 @@ def get_lead_detail(opportunity_id):
     return crm_controller.get_lead_detail(opportunity_id)
 
 
+@crm_bp.route('/leads', methods=['POST'])
+@require_tenant
+def create_lead():
+    """
+    Create a new lead
+    
+    Request Body:
+        - opportunity_name: Lead/opportunity name (required)
+        - client_name: Client name (required)
+        - stage_id: Stage identifier (optional)
+        - status: Lead status (optional, default: 'Open')
+        - estimated_value: Estimated value (optional)
+        - assigned_to: Assigned user ID (optional)
+    
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+    
+    Returns:
+        201: Lead created successfully
+        400: Invalid request data
+        500: Internal server error
+    """
+    return crm_controller.create_lead()
+
+
+@crm_bp.route('/leads/<int:opportunity_id>', methods=['PUT'])
+@require_tenant
+def update_lead(opportunity_id):
+    """
+    Update an existing lead
+    
+    Path Parameters:
+        - opportunity_id: Opportunity identifier
+    
+    Request Body:
+        - opportunity_name: Lead/opportunity name (optional)
+        - client_name: Client name (optional)
+        - stage_id: Stage identifier (optional)
+        - status: Lead status (optional)
+        - estimated_value: Estimated value (optional)
+        - assigned_to: Assigned user ID (optional)
+    
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+    
+    Returns:
+        200: Lead updated successfully
+        404: Lead not found
+        500: Internal server error
+    """
+    return crm_controller.update_lead(opportunity_id)
+
+
+@crm_bp.route('/leads/<int:opportunity_id>', methods=['DELETE'])
+@require_tenant
+def delete_lead(opportunity_id):
+    """
+    Delete a lead
+    
+    Path Parameters:
+        - opportunity_id: Opportunity identifier
+    
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+    
+    Returns:
+        200: Lead deleted successfully
+        404: Lead not found
+        500: Internal server error
+    """
+    return crm_controller.delete_lead(opportunity_id)
+
+
 # ========================================
 # PROJECT ROUTES
 # ========================================
@@ -289,3 +362,28 @@ def health_check():
         'status': 'operational',
         'message': 'StreemLyne CRM module is running'
     }, 200
+
+
+@crm_bp.route('/debug/tenant/<int:tenant_id>', methods=['GET'])
+def debug_tenant_lookup(tenant_id):
+    """Debug endpoint to test tenant lookup directly (NO middleware)"""
+    try:
+        from backend.crm.repositories.tenant_repository import TenantRepository
+        repo = TenantRepository()
+        tenant = repo.get_tenant_by_id(tenant_id)
+        
+        return {
+            'success': True if tenant else False,
+            'tenant_id_requested': tenant_id,
+            'tenant_found': tenant is not None,
+            'tenant_data': tenant,
+            'message': 'Direct lookup (no middleware)'
+        }, 200 if tenant else 404
+    except Exception as e:
+        import traceback
+        return {
+            'success': False,
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }, 500
+
