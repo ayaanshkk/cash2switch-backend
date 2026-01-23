@@ -10,7 +10,7 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
-    print("⚠️ No DATABASE_URL found. Using SQLite.")
+    print("WARNING: No DATABASE_URL found. Using SQLite.")
     DATABASE_URL = "sqlite:///./local.db"
     use_sqlite = True
 else:
@@ -24,7 +24,7 @@ else:
     if not DATABASE_URL.startswith("postgresql+psycopg2://"):
         DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://")
     
-    print(f"✅ Using hosted PostgreSQL database.")
+    print("SUCCESS: Using hosted PostgreSQL database.")
 
 # Add essential connection parameters for Supabase
 if not use_sqlite:
@@ -117,10 +117,10 @@ def test_connection():
         from sqlalchemy import text
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-            print("✅ DB connection OK")
+            print("SUCCESS: DB connection OK")
             return True
     except Exception as e:
-        print(f"❌ DB connection failed: {e}")
+        print(f"ERROR: DB connection failed: {e}")
         return False
 
 
@@ -133,15 +133,16 @@ def init_db():
             Customer, Job, Assignment,
             Quotation, QuotationItem,
             Invoice, InvoiceLineItem, Payment,
-            AuditLog, ActionItem, DataImport
+            AuditLog, ActionItem, DataImport,
+            CustomerDocument
         )
 
         Base.metadata.create_all(bind=engine, checkfirst=True)
-        print("✅ Database tables initialized")
+        print("SUCCESS: Database tables initialized")
         return True
 
     except Exception as e:
-        print(f"❌ Failed to initialize database: {e}")
+        print(f"ERROR: Failed to initialize database: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -151,6 +152,6 @@ def close_all_sessions():
     """Close all active database sessions (for cleanup)"""
     try:
         engine.dispose()
-        print("✅ All database connections closed")
+        print("SUCCESS: All database connections closed")
     except Exception as e:
-        print(f"⚠️ Error closing connections: {e}")
+        print(f"WARNING: Error closing connections: {e}")

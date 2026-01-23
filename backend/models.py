@@ -692,3 +692,45 @@ class DataImport(Base):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'completed_at': self.completed_at.isoformat() if self.completed_at else None,
         }
+
+
+# ----------------------------------
+# Customer Documents
+# ----------------------------------
+
+class CustomerDocument(Base):
+    """Model for storing customer documents (contracts, forms, certificates, etc.)"""
+    __tablename__ = 'customer_documents'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    
+    # Foreign Keys (nullable with SET NULL on delete)
+    customer_id = Column(String(36), ForeignKey('customers.id', ondelete='SET NULL'), nullable=True, index=True)
+    proposal_id = Column(Integer, ForeignKey('proposals.id', ondelete='SET NULL'), nullable=True, index=True)
+    
+    # File Information
+    file_name = Column(String(255), nullable=False)
+    file_path = Column(Text, nullable=False)
+    file_type = Column(String(100), nullable=True)  # e.g., 'pdf', 'docx', 'image/png'
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    
+    # Relationships
+    customer = relationship('Customer', backref='documents', foreign_keys=[customer_id])
+    proposal = relationship('Proposal', backref='documents', foreign_keys=[proposal_id])
+    
+    def __repr__(self):
+        return f'<CustomerDocument {self.id} - {self.file_name}>'
+    
+    def to_dict(self):
+        """Convert document to dictionary"""
+        return {
+            'id': self.id,
+            'customer_id': self.customer_id,
+            'proposal_id': self.proposal_id,
+            'file_name': self.file_name,
+            'file_path': self.file_path,
+            'file_type': self.file_type,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
