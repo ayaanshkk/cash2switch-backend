@@ -4,6 +4,7 @@ from functools import wraps
 import os
 import json
 import base64
+import logging
 from datetime import datetime
 from typing import Dict, List, Optional
 from openai import OpenAI
@@ -382,46 +383,27 @@ def grade_with_corrections():
     """Step 2: Grade test with manually corrected answers and save to database"""
     db = SessionLocal()
     try:
-        print("\n" + "="*80)
-        print("📥 RECEIVED REQUEST TO /grade-with-corrections")
-        print("="*80)
-        
+        logging.info("Received request to /grade-with-corrections")
         data = request.get_json()
         
         if not data:
-            print("❌ ERROR: No data provided")
+            logging.error("No data provided to grade-with-corrections")
             return jsonify({"error": "No data provided"}), 400
         
-        print(f"✅ Data received: {list(data.keys())}")
-        
+        logging.info("Data received: %s", list(data.keys()))
         extracted_data = data.get("extracted_data", {})
         corrected_answers = data.get("corrected_answers", {})
-        
-        print(f"📊 Extracted data keys: {list(extracted_data.keys())}")
-        print(f"📝 Corrected answers count: {len(corrected_answers)}")
-        print(f"🖼️  Has image_base64: {'image_base64' in extracted_data}")
-        
+        logging.info("Extracted data keys: %s, corrected answers count: %s", list(extracted_data.keys()), len(corrected_answers))
         if 'image_base64' in extracted_data:
-            img_len = len(extracted_data['image_base64'])
-            print(f"🖼️  Image base64 length: {img_len:,} characters")
+            logging.info("Image base64 length: %s characters", len(extracted_data['image_base64']))
         
         # Save image before modifying extracted_data
         image_base64 = extracted_data.get("image_base64", "")
-        
         # Use corrected answers
         extracted_data["answers"] = corrected_answers
-        
-        print("🎯 Starting grading process...")
-        
-        # Grade the test
+        logging.info("Starting grading process")
         result = grade_test_internal(extracted_data)
-        
-        print(f"✅ Grading complete: {result['grade']} ({result['percentage']}%)")
-        print(f"💾 Preparing to save to database...")
-        print(f"   - User ID: {g.user_id}")
-        print(f"   - Participant: {result['participant_name']}")
-        print(f"   - MHE Type: {result['mhe_type']}")
-        print(f"   - Image size: {len(image_base64):,} chars")
+        logging.info("Grading complete: %s (%s%%)", result['grade'], result['percentage'])
         
         # Save to database
         test_result = TestResult(
@@ -441,39 +423,17 @@ def grade_with_corrections():
             image_base64=image_base64
         )
         
-        print("💾 Adding to database session...")
         db.add(test_result)
-        
-        print("💾 Committing to database...")
         db.commit()
-        
-        print("💾 Refreshing object...")
         db.refresh(test_result)
-        
-        print(f"✅ Successfully saved with ID: {test_result.id}")
-        
+        logging.info("Successfully saved test result with ID: %s", test_result.id)
         result["id"] = test_result.id
         result["created_at"] = test_result.created_at.isoformat() if test_result.created_at else None
-        
-        print("✅ Returning response to frontend")
-        print("="*80 + "\n")
-        
         return jsonify(result), 200
         
     except Exception as e:
         db.rollback()
-        
-        print("\n" + "="*80)
-        print("❌ ERROR IN grade_with_corrections")
-        print("="*80)
-        print(f"Error Type: {type(e).__name__}")
-        print(f"Error Message: {str(e)}")
-        print("\nFull Traceback:")
-        
-        import traceback
-        traceback.print_exc()
-        
-        print("="*80 + "\n")
+        logging.exception("Error in grade_with_corrections: %s", e)
         
         return jsonify({
             "error": str(e),

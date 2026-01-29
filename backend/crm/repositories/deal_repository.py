@@ -30,24 +30,24 @@ class DealRepository:
         query = """
             SELECT 
                 ecm.*,
-                um.user_name as owner_name
-            FROM "Energy_Contract_Master" ecm
-            LEFT JOIN "User_Master" um ON ecm.contract_owner_id = um.user_id
-            WHERE ecm.tenant_id = %s
+                um."user_name" as owner_name
+            FROM "StreemLyne_MT"."Energy_Contract_Master" ecm
+            LEFT JOIN "StreemLyne_MT"."User_Master" um ON ecm."contract_owner_id" = um."User_id"
+            WHERE ecm."Tenant_id" = %s
         """
         params = [tenant_id]
         
         # Apply filters if provided
         if filters:
             if filters.get('status'):
-                query += " AND ecm.contract_status = %s"
+                query += ' AND ecm."contract_status" = %s'
                 params.append(filters['status'])
             
             if filters.get('contract_owner_id'):
-                query += " AND ecm.contract_owner_id = %s"
+                query += ' AND ecm."contract_owner_id" = %s'
                 params.append(filters['contract_owner_id'])
         
-        query += " ORDER BY ecm.created_at DESC"
+        query += ' ORDER BY ecm."created_at" DESC'
         
         try:
             return self.db.execute_query(query, tuple(params))
@@ -69,11 +69,11 @@ class DealRepository:
         query = """
             SELECT 
                 ecm.*,
-                um.user_name as owner_name
-            FROM "Energy_Contract_Master" ecm
-            LEFT JOIN "User_Master" um ON ecm.contract_owner_id = um.user_id
-            WHERE ecm.tenant_id = %s
-            AND ecm.contract_id = %s
+                um."user_name" as owner_name
+            FROM "StreemLyne_MT"."Energy_Contract_Master" ecm
+            LEFT JOIN "StreemLyne_MT"."User_Master" um ON ecm."contract_owner_id" = um."User_id"
+            WHERE ecm."Tenant_id" = %s
+            AND ecm."Contract_id" = %s
             LIMIT 1
         """
         
@@ -96,12 +96,12 @@ class DealRepository:
         query = """
             SELECT 
                 COUNT(*) as total_contracts,
-                COUNT(CASE WHEN contract_status = 'Active' THEN 1 END) as active_contracts,
-                COUNT(CASE WHEN contract_status = 'Pending' THEN 1 END) as pending_contracts,
-                COUNT(CASE WHEN contract_status = 'Expired' THEN 1 END) as expired_contracts,
-                SUM(CASE WHEN contract_status = 'Active' THEN contract_value ELSE 0 END) as active_value
-            FROM "Energy_Contract_Master"
-            WHERE tenant_id = %s
+                COUNT(CASE WHEN "contract_status" = 'Active' THEN 1 END) as active_contracts,
+                COUNT(CASE WHEN "contract_status" = 'Pending' THEN 1 END) as pending_contracts,
+                COUNT(CASE WHEN "contract_status" = 'Expired' THEN 1 END) as expired_contracts,
+                SUM(CASE WHEN "contract_status" = 'Active' THEN "contract_value" ELSE 0 END) as active_value
+            FROM "StreemLyne_MT"."Energy_Contract_Master"
+            WHERE "Tenant_id" = %s
         """
         
         try:

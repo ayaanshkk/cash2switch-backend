@@ -1,8 +1,8 @@
 import os
+import logging
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.pool import NullPool, QueuePool
 from sqlalchemy.exc import SQLAlchemyError
 
 load_dotenv()
@@ -10,7 +10,7 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
-    print("WARNING: No DATABASE_URL found. Using SQLite.")
+    logging.warning("No DATABASE_URL found. Using SQLite.")
     DATABASE_URL = "sqlite:///./local.db"
     use_sqlite = True
 else:
@@ -24,24 +24,12 @@ else:
     if not DATABASE_URL.startswith("postgresql+psycopg2://"):
         DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://")
     
-    print("SUCCESS: Using hosted PostgreSQL database.")
-
-# Add essential connection parameters for Supabase
-if not use_sqlite:
-    # Parse URL to add parameters
-    if "?" in DATABASE_URL:
-        # Parameters already exist, append to them
-        if "sslmode" not in DATABASE_URL:
-            DATABASE_URL += "&sslmode=require"
-        if "connect_timeout" not in DATABASE_URL:
-            DATABASE_URL += "&connect_timeout=10"
-    else:
-        # No parameters yet, add them
-        DATABASE_URL += "?sslmode=require&connect_timeout=10"
+    logging.info("Using hosted PostgreSQL database.")
 
 # ============================================
 # ENGINE CONFIGURATION
 # ============================================
+# Supabase/PostgreSQL: do not add pgBouncer or extra URL params; use connect_args only.
 if use_sqlite:
     # SQLite config (for local development)
     engine = create_engine(
@@ -50,38 +38,14 @@ if use_sqlite:
         future=True
     )
 else:
-    # PostgreSQL/Supabase config
-    # Use QueuePool with strict limits for Supabase free tier
+    # PostgreSQL/Supabase: minimal engine options for SQLAlchemy compatibility.
+    # pool_pre_ping=True checks connections before use; sslmode=require for Supabase TLS.
+    # No pgBouncer-specific options are passed.
     engine = create_engine(
         DATABASE_URL,
-        poolclass=QueuePool,  # Changed from NullPool
-        pool_size=2,          # Very small pool for free tier
-        max_overflow=1,       # Allow 1 extra connection
-        pool_timeout=30,      # Wait up to 30 seconds for connection
-        pool_recycle=300,     # Recycle connections every 5 minutes
-        pool_pre_ping=True,   # Test connections before using
-        connect_args={
-            "connect_timeout": 10,
-            "options": "-c statement_timeout=30000",  # 30 second query timeout
-            "keepalives": 1,
-            "keepalives_idle": 30,
-            "keepalives_interval": 10,
-            "keepalives_count": 5,
-        },
-        future=True,
-        echo=False  # Set to True for SQL debugging
+        pool_pre_ping=True,
+        connect_args={"sslmode": "require"}
     )
-    
-    # Add connection pool event listeners to handle cleanup
-    @event.listens_for(engine, "connect")
-    def receive_connect(dbapi_conn, connection_record):
-        """Called when a connection is retrieved from the pool"""
-        pass
-    
-    @event.listens_for(engine, "close")
-    def receive_close(dbapi_conn, connection_record):
-        """Called when a connection is returned to the pool"""
-        pass
 
 # ============================================
 # SESSION CONFIGURATION
@@ -117,10 +81,10 @@ def test_connection():
         from sqlalchemy import text
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-            print("SUCCESS: DB connection OK")
+            logging.info("DB connection OK")
             return True
     except Exception as e:
-        print(f"ERROR: DB connection failed: {e}")
+        logging.error("DB connection failed: %s", e)
         return False
 
 
@@ -138,11 +102,11 @@ def init_db():
         )
 
         Base.metadata.create_all(bind=engine, checkfirst=True)
-        print("SUCCESS: Database tables initialized")
+        logging.info("Database tables initialized")
         return True
 
     except Exception as e:
-        print(f"ERROR: Failed to initialize database: {e}")
+        logging.error("Failed to initialize database: %s", e)
         import traceback
         traceback.print_exc()
         return False
@@ -152,6 +116,6 @@ def close_all_sessions():
     """Close all active database sessions (for cleanup)"""
     try:
         engine.dispose()
-        print("SUCCESS: All database connections closed")
+        logging.info("All database connections closed")
     except Exception as e:
-        print(f"WARNING: Error closing connections: {e}")
+        logging.warning("Error closing connections: %s", e)

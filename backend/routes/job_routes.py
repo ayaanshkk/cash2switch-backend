@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify
 from datetime import datetime
 import uuid
 import traceback
+import logging
 from ..models import Job, Customer, Assignment
 from ..db import SessionLocal
 from .auth_helpers import token_required
@@ -68,8 +69,7 @@ def get_jobs():
         
         return jsonify([serialize_job(job) for job in jobs]), 200
     except Exception as e:
-        print(f"Error fetching jobs: {str(e)}")
-        traceback.print_exc()
+        logging.error("Error fetching jobs: %s", e, exc_info=True)
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
@@ -89,8 +89,7 @@ def get_job(job_id):
             return jsonify({'error': 'Job not found'}), 404
         return jsonify(serialize_job(job)), 200
     except Exception as e:
-        print(f"Error fetching job {job_id}: {str(e)}")
-        traceback.print_exc()
+        logging.error("Error fetching job %s: %s", job_id, e, exc_info=True)
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
@@ -103,7 +102,7 @@ def create_job():
     session = SessionLocal()
     try:
         data = request.get_json()
-        print("Received data:", data)
+        logging.info("Received data: %s", data)
         
         # Validate required fields
         if not data.get('customer_id'):
@@ -116,7 +115,7 @@ def create_job():
         
         # Generate sequential job reference
         job_number = data.get('job_number') or generate_job_reference(session)
-        print(f"Generated job number: {job_number}")
+        logging.info("Generated job number: %s", job_number)
         
         # Parse dates safely
         def parse_date(date_str):
@@ -127,7 +126,7 @@ def create_job():
                         return datetime.strptime(date_str.split('T')[0], '%Y-%m-%d').date()
                     return datetime.strptime(date_str, '%Y-%m-%d').date()
                 except ValueError:
-                    print(f"Invalid date format: {date_str}")
+                    logging.warning("Invalid date format: %s", date_str)
                     return None
             return None
         
@@ -145,14 +144,14 @@ def create_job():
         session.add(job)
         session.flush()
         
-        print(f"✅ Created job with ID: {job.id}, Number: {job_number}")
+        logging.info("Created job with ID: %s, Number: %s", job.id, job_number)
         
         session.commit()
         
         return jsonify(serialize_job(job)), 201
         
     except Exception as e:
-        print(f"❌ Error creating job: {str(e)}")
+        logging.error("Error creating job: %s", e)
         traceback.print_exc()
         session.rollback()
         return jsonify({'error': str(e)}), 500
@@ -201,11 +200,11 @@ def update_job(job_id):
         
         session.commit()
         
-        print(f"✅ Updated job {job_id}")
+        logging.info("Updated job %s", job_id)
         
         return jsonify(serialize_job(job)), 200
     except Exception as e:
-        print(f"Error updating job {job_id}: {str(e)}")
+        logging.error("Error updating job %s: %s", job_id, e)
         traceback.print_exc()
         session.rollback()
         return jsonify({'error': str(e)}), 500
@@ -226,7 +225,7 @@ def delete_job(job_id):
         if not job:
             return jsonify({'error': 'Job not found'}), 404
             
-        print(f"Attempting to delete job {job_id} and its dependencies.")
+        logging.info("Attempting to delete job %s and its dependencies.", job_id)
 
         # Delete dependent assignments
         session.query(Assignment).filter(Assignment.job_id == job_id).delete(synchronize_session='fetch')
@@ -236,12 +235,12 @@ def delete_job(job_id):
         session.delete(job)
         session.commit()
         
-        print(f"✅ Successfully deleted job {job_id}.")
+        logging.info("Successfully deleted job %s.", job_id)
         return jsonify({'message': 'Job deleted successfully'}), 200
         
     except Exception as e:
         traceback.print_exc()
-        print(f"❌ Error deleting job {job_id}: {str(e)}")
+        logging.error("Error deleting job %s: %s", job_id, e)
         session.rollback()
         return jsonify({'error': f"Failed to delete job: {str(e)}"}), 500
     finally:
@@ -273,7 +272,7 @@ def get_job_stats():
         
         return jsonify(stats), 200
     except Exception as e:
-        print(f"Error fetching job stats: {str(e)}")
+        logging.error("Error fetching job stats: %s", e)
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
@@ -310,11 +309,11 @@ def update_job_status(job_id):
         
         session.commit()
         
-        print(f"✅ Updated job {job_id} status: {old_status} → {data['status']}")
+        logging.info("Updated job %s status: %s -> %s", job_id, old_status, data['status'])
         
         return jsonify(serialize_job(job)), 200
     except Exception as e:
-        print(f"Error updating status for job {job_id}: {str(e)}")
+        logging.error("Error updating status for job %s: %s", job_id, e)
         traceback.print_exc()
         session.rollback()
         return jsonify({'error': str(e)}), 500

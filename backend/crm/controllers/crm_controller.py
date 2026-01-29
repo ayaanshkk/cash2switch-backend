@@ -72,26 +72,41 @@ class CRMController:
     def create_lead(self) -> tuple:
         """
         POST /api/crm/leads
-        Create a new lead
+        Create a new lead. Supports either:
+          - Existing client: provide `client_id`
+          - Create client + lead: provide `client` object or `business_name`/`client_company_name`
+
+        Tenant ID is taken from `g.tenant_id` (middleware enforces presence).
         """
         try:
             tenant_id = g.tenant_id
-            lead_data = request.get_json()
-            
-            if not lead_data:
+            payload = request.get_json()
+
+            if not payload:
                 return jsonify({
                     'success': False,
                     'error': 'Invalid request',
                     'message': 'Request body is required'
                 }), 400
-            
-            result = self.crm_service.create_lead(tenant_id, lead_data)
-            
+
+            # Basic validation: either client_id OR client payload/company name must exist
+            if not payload.get('client_id') and not (payload.get('client') or payload.get('client_company_name') or payload.get('business_name')):
+                return jsonify({
+                    'success': False,
+                    'error': 'Validation error',
+                    'message': 'Provide client_id OR client (object) / business_name in the request body.'
+                }), 400
+
+            result = self.crm_service.create_lead(tenant_id, payload)
+
+            # Service returns structured error info
             if not result.get('success'):
-                return jsonify(result), 400
-            
+                status_code = 400 if result.get('error') and result.get('error').lower().startswith('validation') else 500
+                return jsonify(result), status_code
+
             return jsonify(result), 201
         except Exception as e:
+            logger.exception("create_lead controller error: %s", e)
             return jsonify({
                 'success': False,
                 'error': 'Internal server error',
@@ -329,6 +344,116 @@ class CRMController:
             return jsonify(result), 200
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
+    
+    def get_leads_table(self) -> tuple:
+        """
+        GET /api/crm/leads/table
+        Get leads table for CRM UI (flat rows with 14 columns from joined tables).
+        """
+        try:
+            tenant_id = g.tenant_id
+            result = self.crm_service.get_leads_table(tenant_id)
+            return jsonify(result), 200
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+
+    def get_leads_by_customer_type(self) -> tuple:
+        """
+        GET /api/crm/leads/customer-type?type=NEW|EXISTING
+        Get leads filtered by customer type
+        """
+        try:
+            tenant_id = g.tenant_id
+            customer_type_param = request.args.get('type', None)
+            
+            # Extract query parameters for filtering
+            filters = {}
+            if request.args.get('stage_id'):
+                filters['stage_id'] = int(request.args.get('stage_id'))
+            if request.args.get('lead_status'):
+                filters['lead_status'] = request.args.get('lead_status')
+            if request.args.get('assigned_employee_id'):
+                filters['assigned_employee_id'] = int(request.args.get('assigned_employee_id'))
+            
+            result = self.crm_service.get_leads_by_customer_type(
+                tenant_id, 
+                customer_type_param, 
+                filters if filters else None
+            )
+            return jsonify(result), 200
+        
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+    
+    def create_client(self) -> tuple:
+        """
+        POST /api/crm/clients
+        Create a new client in Client_Master and automatically create one
+        Opportunity_Details record (lead) for that client.
+        """
+        try:
+            tenant_id = g.tenant_id
+            data = request.get_json()
+            if not data:
+                return jsonify({
+                    'success': False,
+                    'error': 'Invalid request',
+                    'message': 'Request body is required'
+                }), 400
+            company = data.get('client_company_name') or data.get('business_name')
+            if not company:
+                return jsonify({
+                    'success': False,
+                    'error': 'Validation error',
+                    'message': 'client_company_name or business_name is required'
+                }), 400
+            result = self.crm_service.create_client(tenant_id, data)
+            if not result.get('success'):
+                return jsonify(result), 400
+            return jsonify(result), 201
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+
+    def create_call_summary(self, client_id: int) -> tuple:
+        """
+        POST /api/crm/clients/<client_id>/call-summary
+        Create a call summary/interaction record
+        """
+        try:
+            tenant_id = g.tenant_id
+            call_data = request.get_json()
+            
+            if not call_data:
+                return jsonify({
+                    'success': False,
+                    'error': 'Invalid request',
+                    'message': 'Request body is required'
+                }), 400
+            
+            result = self.crm_service.create_call_summary(tenant_id, client_id, call_data)
+            
+            if not result.get('success'):
+                return jsonify(result), 400
+            
+            return jsonify(result), 201
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
     
     # ========================================
     # DASHBOARD

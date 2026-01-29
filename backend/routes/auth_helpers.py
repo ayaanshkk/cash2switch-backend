@@ -2,6 +2,8 @@
 
 from functools import wraps
 from flask import request, jsonify, current_app
+# NOTE: authentication for CRM should use `UserMaster` (StreemLyne_MT.User_Master).
+#       The legacy `User` model is application-local and **must not** be used for CRM auth.
 from ..models import User  # Make sure User model is imported
 
 

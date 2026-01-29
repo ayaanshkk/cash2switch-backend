@@ -133,6 +133,94 @@ def delete_lead(opportunity_id):
     return crm_controller.delete_lead(opportunity_id)
 
 
+@crm_bp.route('/leads/table', methods=['GET'])
+@require_tenant
+def get_leads_table():
+    """
+    Get leads table for CRM UI (flat rows: id, name, business_name, contact_person,
+    tel_number, mpan_mpr, supplier, annual_usage, start_date, end_date, status,
+    assigned_to, callback_parameter, call_summary).
+
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+
+    Returns:
+        200: { success, data, count }
+        500: Internal server error
+    """
+    return crm_controller.get_leads_table()
+
+
+@crm_bp.route('/leads/customer-type', methods=['GET'])
+@require_tenant
+def get_leads_by_customer_type():
+    """
+    Get leads filtered by customer type (NEW/EXISTING)
+    
+    Query Parameters:
+        - type: 'NEW' or 'EXISTING' (optional, returns all if not specified)
+        - stage_id: Filter by stage
+        - lead_status: Filter by lead status
+        - assigned_employee_id: Filter by assigned employee
+    
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+    
+    Returns:
+        200: List of leads with customer_type classification
+        500: Internal server error
+    """
+    return crm_controller.get_leads_by_customer_type()
+
+
+@crm_bp.route('/clients', methods=['POST'])
+@require_tenant
+def create_client():
+    """
+    Create a new client (Client_Master). Automatically inserts one record
+    in Opportunity_Details so the client appears as a lead.
+
+    Request Body:
+        - client_company_name or business_name (required)
+        - client_contact_name, client_phone, client_email, address, etc. (optional)
+
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+
+    Returns:
+        201: { success, data: { client, opportunity }, message }
+        400: Validation error or missing body
+        500: Internal server error
+    """
+    return crm_controller.create_client()
+
+
+@crm_bp.route('/clients/<int:client_id>/call-summary', methods=['POST'])
+@require_tenant
+def create_call_summary(client_id):
+    """
+    Create a call summary/interaction record for a client
+    
+    Path Parameters:
+        - client_id: Client identifier
+    
+    Request Body:
+        - call_status: Call status (Phone, Email, Meeting, Other)
+        - call_result: Result of the call
+        - remarks: Additional remarks/notes
+        - next_follow_up_date: Next follow-up date (YYYY-MM-DD)
+    
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+    
+    Returns:
+        201: Call summary created successfully
+        400: Invalid request data
+        500: Internal server error
+    """
+    return crm_controller.create_call_summary(client_id)
+
+
 # ========================================
 # PROJECT ROUTES
 # ========================================
