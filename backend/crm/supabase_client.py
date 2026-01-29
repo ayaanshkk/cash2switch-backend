@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Supabase Client for StreemLyne CRM
-Connects to external Supabase database using environment variables
+Connects to external Supabase database using environment variables.
+When Supabase env vars are missing (local/test), returns a stub so app uses SQLite.
 """
 import os
 from typing import Optional, Dict, Any, List
@@ -11,6 +12,50 @@ from dotenv import load_dotenv
 from contextlib import contextmanager
 
 load_dotenv()
+
+
+def _supabase_env_configured() -> bool:
+    """True if we have enough env to build a Supabase DB connection."""
+    if not os.getenv("SUPABASE_URL") or not os.getenv("SUPABASE_SERVICE_ROLE_KEY"):
+        return False
+    if os.getenv("SUPABASE_DB_URL"):
+        return True
+    database_url = os.getenv("DATABASE_URL") or ""
+    if database_url and "supabase" in database_url:
+        return True
+    if os.getenv("SUPABASE_DB_PASSWORD"):
+        return True
+    return False
+
+
+class _LocalCRMDBStub:
+    """
+    Stub matching SupabaseClient interface when Supabase is not configured.
+    Used so local/test can run with SQLite without Supabase credentials.
+    """
+    @contextmanager
+    def get_connection(self):
+        yield None
+
+    def execute_query(
+        self, query: str, params: tuple = None, fetch_one: bool = False
+    ) -> Optional[List[Dict[str, Any]]]:
+        return None if fetch_one else []
+
+    def execute_insert(
+        self, query: str, params: tuple = None, returning: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        return None
+
+    def execute_update(self, query: str, params: tuple = None) -> int:
+        return 0
+
+    def execute_delete(self, query: str, params: tuple = None) -> int:
+        return 0
+
+    def test_connection(self) -> bool:
+        return True
+
 
 class SupabaseClient:
     """
@@ -25,22 +70,38 @@ class SupabaseClient:
         if not self.supabase_url or not self.service_role_key:
             raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment")
         
-        # Extract connection details from Supabase URL
-        # Format: https://PROJECT_ID.supabase.co
-        project_id = self.supabase_url.replace('https://', '').replace('.supabase.co', '')
-        
-        # Supabase connection string format
-        # Using direct connection for pooler compatibility
-        self.connection_string = f"postgresql://postgres.{project_id}:@aws-0-eu-central-1.pooler.supabase.com:6543/postgres"
-        
-        # Try to extract password from DATABASE_URL if available
-        database_url = os.getenv('DATABASE_URL')
-        if database_url and 'supabase' in database_url:
-            self.connection_string = database_url.replace('postgres://', 'postgresql://')
-            if not self.connection_string.startswith('postgresql+psycopg2://'):
-                self.connection_string = self.connection_string.replace('postgresql://', 'postgresql+psycopg2://')
-            # Remove the psycopg2 driver prefix for psycopg2 library
-            self.connection_string = self.connection_string.replace('postgresql+psycopg2://', 'postgresql://')
+        # Priority 1: Use SUPABASE_DB_URL if provided (dedicated CRM connection)
+        supabase_db_url = os.getenv('SUPABASE_DB_URL')
+        if supabase_db_url:
+            self.connection_string = supabase_db_url.replace('postgres://', 'postgresql://')
+            print(f"✅ SupabaseClient: Using SUPABASE_DB_URL")
+        else:
+            # Priority 2: Use DATABASE_URL if provided (contains password)
+            database_url = os.getenv('DATABASE_URL')
+            if database_url and 'supabase' in database_url:
+                # Clean up the connection string for psycopg2
+                self.connection_string = database_url.replace('postgres://', 'postgresql://')
+                self.connection_string = self.connection_string.replace('postgresql+psycopg2://', 'postgresql://')
+                print(f"✅ SupabaseClient: Using DATABASE_URL")
+            else:
+                # Priority 3: Try to use SUPABASE_DB_PASSWORD if set
+                db_password = os.getenv('SUPABASE_DB_PASSWORD')
+            
+            if db_password:
+                # Extract project ID from Supabase URL
+                # Format: https://PROJECT_ID.supabase.co
+                project_id = self.supabase_url.replace('https://', '').replace('.supabase.co', '')
+                
+                # Construct connection string with password
+                self.connection_string = f"postgresql://postgres.{project_id}:{db_password}@aws-0-eu-central-1.pooler.supabase.com:6543/postgres"
+                print(f"✅ SupabaseClient: Using SUPABASE_DB_PASSWORD")
+            else:
+                raise ValueError(
+                    "Supabase database password not found. Please set either:\n"
+                    "  1. DATABASE_URL (full connection string), OR\n"
+                    "  2. SUPABASE_DB_PASSWORD (database password only)\n"
+                    "Example: DATABASE_URL=postgresql+psycopg2://postgres.PROJECT_ID:PASSWORD@aws-0-eu-west-1.pooler.supabase.com:6543/postgres"
+                )
     
     @contextmanager
     def get_connection(self):
@@ -161,14 +222,20 @@ class SupabaseClient:
             return False
 
 
-# Singleton instance
+# Singleton instance (SupabaseClient or _LocalCRMDBStub)
 _supabase_client = None
 
-def get_supabase_client() -> SupabaseClient:
+
+def get_supabase_client():
     """
-    Get singleton Supabase client instance
+    Get singleton Supabase client instance.
+    When Supabase env vars are missing (local/test), returns a stub so
+    the app can run with SQLite without crashing.
     """
     global _supabase_client
     if _supabase_client is None:
-        _supabase_client = SupabaseClient()
+        if _supabase_env_configured():
+            _supabase_client = SupabaseClient()
+        else:
+            _supabase_client = _LocalCRMDBStub()
     return _supabase_client

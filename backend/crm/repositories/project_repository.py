@@ -30,24 +30,24 @@ class ProjectRepository:
         query = """
             SELECT 
                 pd.*,
-                um.user_name as project_manager_name
-            FROM "Project_Details" pd
-            LEFT JOIN "User_Master" um ON pd.project_manager_id = um.user_id
-            WHERE pd.tenant_id = %s
+                um."user_name" as project_manager_name
+            FROM "StreemLyne_MT"."Project_Details" pd
+            LEFT JOIN "StreemLyne_MT"."User_Master" um ON pd."project_manager_id" = um."User_id"
+            WHERE pd."Tenant_id" = %s
         """
         params = [tenant_id]
         
         # Apply filters if provided
         if filters:
             if filters.get('status'):
-                query += " AND pd.project_status = %s"
+                query += ' AND pd."project_status" = %s'
                 params.append(filters['status'])
             
             if filters.get('project_manager_id'):
-                query += " AND pd.project_manager_id = %s"
+                query += ' AND pd."project_manager_id" = %s'
                 params.append(filters['project_manager_id'])
         
-        query += " ORDER BY pd.created_at DESC"
+        query += ' ORDER BY pd."created_at" DESC'
         
         try:
             return self.db.execute_query(query, tuple(params))
@@ -69,11 +69,11 @@ class ProjectRepository:
         query = """
             SELECT 
                 pd.*,
-                um.user_name as project_manager_name
-            FROM "Project_Details" pd
-            LEFT JOIN "User_Master" um ON pd.project_manager_id = um.user_id
-            WHERE pd.tenant_id = %s
-            AND pd.project_id = %s
+                um."user_name" as project_manager_name
+            FROM "StreemLyne_MT"."Project_Details" pd
+            LEFT JOIN "StreemLyne_MT"."User_Master" um ON pd."project_manager_id" = um."User_id"
+            WHERE pd."Tenant_id" = %s
+            AND pd."Project_id" = %s
             LIMIT 1
         """
         
@@ -96,11 +96,11 @@ class ProjectRepository:
         query = """
             SELECT 
                 COUNT(*) as total_projects,
-                COUNT(CASE WHEN project_status = 'Active' THEN 1 END) as active_projects,
-                COUNT(CASE WHEN project_status = 'Completed' THEN 1 END) as completed_projects,
-                COUNT(CASE WHEN project_status = 'On Hold' THEN 1 END) as onhold_projects
-            FROM "Project_Details"
-            WHERE tenant_id = %s
+                COUNT(CASE WHEN "project_status" = 'Active' THEN 1 END) as active_projects,
+                COUNT(CASE WHEN "project_status" = 'Completed' THEN 1 END) as completed_projects,
+                COUNT(CASE WHEN "project_status" = 'On Hold' THEN 1 END) as onhold_projects
+            FROM "StreemLyne_MT"."Project_Details"
+            WHERE "Tenant_id" = %s
         """
         
         try:

@@ -1,7 +1,9 @@
 from flask import Blueprint, request, jsonify, current_app, g
-from ..models import User, LoginAttempt, Session
+from backend.crm.models.user_master import UserMaster
 from datetime import datetime, timedelta
 from functools import wraps
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 import secrets
 import re
 import jwt
@@ -77,11 +79,14 @@ def log_login_attempt(email, ip_address, success):
 # --- Decorators ---
 
 def token_required(f):
-    """Decorator to require valid JWT token"""
+    """Decorator to require valid JWT token (stateless).
+
+    Verifies the JWT signature and loads `UserMaster` by `employee_id` (or
+    legacy `user_id` in payload). Does NOT rely on `user_sessions` table.
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
         local_session = SessionLocal()
-        
         try:
             token = None
             if 'Authorization' in request.headers:
@@ -95,22 +100,23 @@ def token_required(f):
 
             try:
                 payload = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
-                
-                user = local_session.get(User, payload['user_id'])
-                
-                if not user or not user.is_active:
-                    return jsonify({'error': 'User not found or inactive'}), 401
 
-                session_record = local_session.query(Session).filter_by(
-                    session_token=token, 
-                    user_id=user.id
-                ).first()
-                
-                if not session_record or session_record.expires_at < datetime.utcnow():
-                    return jsonify({'error': 'Token expired'}), 401
+                user_id = payload.get('employee_id') or payload.get('user_id')
+                if user_id is None:
+                    current_app.logger.warning("token missing user identifier")
+                    return jsonify({'error': 'Invalid token payload'}), 401
+
+                user = local_session.get(UserMaster, user_id)
+
+                if not user:
+                    current_app.logger.warning(f"Auth token valid but UserMaster not found (id={user_id})")
+                    return jsonify({'error': 'User not found'}), 401
+
+                if not getattr(user, 'is_active', True):
+                    return jsonify({'error': 'User not active'}), 401
 
                 g.user = user
-                request.current_user = user  # For file uploads
+                request.current_user = user
 
             except jwt.ExpiredSignatureError:
                 return jsonify({'error': 'Token expired'}), 401
@@ -118,19 +124,23 @@ def token_required(f):
                 return jsonify({'error': 'Invalid token'}), 401
 
             return f(*args, **kwargs)
-            
         finally:
             local_session.close()
-            
     return decorated
 
 def admin_required(f):
-    """Decorator to require Admin access (Forklift Academy)"""
+    """Decorator to require Admin access (checks CRM `role_ids` / roles)."""
     @wraps(f)
     @token_required
     def decorated(*args, **kwargs):
-        ADMIN_ROLES = ['Admin']
-        if not hasattr(g.user, 'role') or g.user.role not in ADMIN_ROLES:
+        # `roles` helper on UserMaster returns a list; fall back to legacy `role` if present
+        roles = []
+        if hasattr(g.user, 'roles'):
+            roles = g.user.roles or []
+        elif hasattr(g.user, 'role'):
+            roles = [g.user.role]
+
+        if 'Admin' not in roles:
             return jsonify({'error': 'Admin access required'}), 403
         return f(*args, **kwargs)
     return decorated
@@ -269,104 +279,230 @@ def register():
 
 @auth_bp.route('/auth/login', methods=['POST'])
 def login():
+    """Tenant-resolved username login against StreemLyne_MT CRM tables.
+
+    - Accepts JSON: { "username", "password" }
+    - The tenant_id is resolved from the joined Employee_Master row (not supplied by client).
+    - Returns 401 "Invalid username or password" when credentials are incorrect or the username is not found
+    - If `is_active` column exists and is False → 403
+    - Returns JWT: { user_id, employee_id, tenant_id, user_name }
+    """
     session = SessionLocal()
     try:
         data = request.get_json() or {}
-        if not data.get('email') or not data.get('password'):
-            return jsonify({'error': 'Email and password required'}), 400
+        if not data.get('username') or not data.get('password'):
+            return jsonify({'error': 'username and password required'}), 400
 
-        email = data['email'].lower().strip()
-        ip = get_client_ip()
+        username = data['username'].strip()
+        input_password = data['password']
 
-        if not check_rate_limit(email):
-            return jsonify({'error': 'Too many failed attempts'}), 429
-        
-        user = session.query(User).filter_by(email=email).first()
+        sql = text('''
+            SELECT
+                u.user_id,
+                u.user_name,
+                u.password,
+                e.employee_id,
+                e.tenant_id,
+                e.employee_name
+            FROM "StreemLyne_MT"."User_Master" u
+            JOIN "StreemLyne_MT"."Employee_Master" e ON u.employee_id = e.employee_id
+            WHERE u.user_name = :username
+            LIMIT 1;
+        ''')
 
-        if not user or not user.check_password(data['password']):
-            log_login_attempt(email, ip, False)
-            current_app.logger.warning(f"❌ Login failed for: {email}")
-            return jsonify({'error': 'Invalid email or password'}), 401
+        row = session.execute(sql, {'username': username}).mappings().first()
 
-        if not user.is_active:
-            return jsonify({'error': 'Account disabled'}), 401
+        if not row:
+            current_app.logger.warning(f"Login failed: no matching username (user_name={username})")
+            return jsonify({'error': 'Invalid username or password'}), 401
 
-        user.last_login = datetime.utcnow()
+        db_password = row.get('password')
+        if db_password != input_password:
+            current_app.logger.warning(f"Login failed (bad password) for user_name={username} employee_id={row.get('employee_id')}")
+            return jsonify({'error': 'Invalid username or password'}), 401
+
+        # If the employee has an is_active column and it's explicitly False -> forbid
+        if 'is_active' in row.keys() and row.get('is_active') is False:
+            current_app.logger.info(f"Login blocked: inactive employee_id={row.get('employee_id')}")
+            return jsonify({'error': 'Account disabled'}), 403
 
         payload = {
-            'user_id': user.id,
+            'user_id': row.get('user_id'),
+            'employee_id': row.get('employee_id'),
+            'tenant_id': row.get('tenant_id'),
+            'user_name': row.get('user_name'),
             'exp': datetime.utcnow() + timedelta(days=7),
             'iat': datetime.utcnow()
         }
         token = jwt.encode(payload, current_app.config['SECRET_KEY'], algorithm='HS256')
 
-        session_record = Session(
-            user_id=user.id,
-            session_token=token,
-            ip_address=ip,
-            user_agent=request.headers.get('User-Agent', '')[:255],
-            expires_at=datetime.utcnow() + timedelta(days=7)
-        )
-        
-        session.add(user)
-        session.add(session_record)
+        user = {
+            'id': row.get('employee_id'),
+            'name': (row.get('employee_name') or row.get('user_name')),
+            'username': row.get('user_name'),
+            'tenant_id': row.get('tenant_id')
+        }
+
+        current_app.logger.info(f"✅ Tenant login successful: employee_id={row.get('employee_id')} user_name={username} tenant_id={row.get('tenant_id')}")
+        return jsonify({'success': True, 'token': token, 'user': user}), 200
+
+    except Exception as e:
+        current_app.logger.exception(f"❌ Login error (tenant-aware): {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+    finally:
+        session.close()
+
+
+@auth_bp.route('/auth/signup', methods=['POST'])
+def signup():
+    """Create CRM user: insert into Employee_Master then User_Master and return JWT.
+
+    Expected JSON: {
+      "tenant_id": <int>,
+      "employee_name": "...",
+      "email": "...",
+      "phone": "...",           # optional
+      "username": "...",
+      "password": "..."
+    }
+
+    - username must be unique in User_Master
+    - email must be unique in Employee_Master
+    - uses plain-text password (per spec)
+    """
+    session = SessionLocal()
+    try:
+        data = request.get_json() or {}
+        required = ['tenant_id', 'employee_name', 'email', 'username', 'password']
+        for f in required:
+            if not data.get(f):
+                return jsonify({'error': f'{f} is required'}), 400
+
+        tenant_id = data.get('tenant_id')
+        employee_name = data.get('employee_name').strip()
+        email = data.get('email').strip()
+        phone = data.get('phone')
+        username = data.get('username').strip()
+        password = data.get('password')
+
+        # Uniqueness checks
+        q_user_exists = text('SELECT 1 FROM "StreemLyne_MT"."User_Master" WHERE user_name = :username LIMIT 1')
+        if session.execute(q_user_exists, {'username': username}).first():
+            return jsonify({'error': 'username already exists'}), 400
+
+        q_email_exists = text('SELECT 1 FROM "StreemLyne_MT"."Employee_Master" WHERE email = :email LIMIT 1')
+        if session.execute(q_email_exists, {'email': email}).first():
+            return jsonify({'error': 'email already exists'}), 400
+
+        # Insert employee
+        insert_emp = text('''
+            INSERT INTO "StreemLyne_MT"."Employee_Master" (tenant_id, employee_name, email, phone)
+            VALUES (:tenant_id, :employee_name, :email, :phone)
+            RETURNING employee_id
+        ''')
+        emp_row = session.execute(insert_emp, {
+            'tenant_id': tenant_id,
+            'employee_name': employee_name,
+            'email': email,
+            'phone': phone
+        }).mappings().first()
+
+        if not emp_row or not emp_row.get('employee_id'):
+            session.rollback()
+            current_app.logger.error('Failed to create Employee_Master row')
+            return jsonify({'error': 'Could not create employee'}), 500
+
+        employee_id = emp_row.get('employee_id')
+
+        # Insert user
+        insert_user = text('''
+            INSERT INTO "StreemLyne_MT"."User_Master" (employee_id, user_name, password)
+            VALUES (:employee_id, :user_name, :password)
+            RETURNING user_id
+        ''')
+        user_row = session.execute(insert_user, {
+            'employee_id': employee_id,
+            'user_name': username,
+            'password': password
+        }).mappings().first()
+
+        if not user_row or not user_row.get('user_id'):
+            session.rollback()
+            current_app.logger.error('Failed to create User_Master row')
+            return jsonify({'error': 'Could not create user'}), 500
+
+        user_id = user_row.get('user_id')
+
         session.commit()
 
-        log_login_attempt(email, ip, True)
-        
-        current_app.logger.info(f"✅ Login successful: {email}")
+        # Build JWT per spec
+        payload = {
+            'user_id': user_id,
+            'employee_id': employee_id,
+            'tenant_id': tenant_id,
+            'user_name': username,
+            'exp': datetime.utcnow() + timedelta(days=7),
+            'iat': datetime.utcnow()
+        }
+        token = jwt.encode(payload, current_app.config['SECRET_KEY'], algorithm='HS256')
 
-        return jsonify({
-            'success': True,
-            'message': 'Login successful',
-            'token': token,
-            'user': user.to_dict()
-        }), 200
+        user_out = {
+            'user_id': user_id,
+            'employee_id': employee_id,
+            'user_name': username,
+            'tenant_id': tenant_id
+        }
+
+        current_app.logger.info(f"✅ CRM signup successful: user_id={user_id} user_name={username} tenant_id={tenant_id}")
+        return jsonify({'success': True, 'message': 'Signup successful', 'token': token, 'user': user_out}), 201
+
+    except IntegrityError as ie:
+        session.rollback()
+        # Handle rare race where uniqueness check passed but insert violated constraint
+        msg = str(ie.orig) if hasattr(ie, 'orig') else 'Integrity error'
+        current_app.logger.warning(f"Signup integrity error: {msg}")
+        return jsonify({'error': 'username or email already exists'}), 400
     except Exception as e:
         session.rollback()
-        current_app.logger.error(f"❌ Login error: {e}")
-        return jsonify({'error': str(e)}), 500
+        current_app.logger.exception(f"❌ Signup error (User_Master flow): {e}")
+        return jsonify({'error': 'Internal server error'}), 500
     finally:
         session.close()
 
 @auth_bp.route('/auth/logout', methods=['POST'])
 @token_required
 def logout():
-    """Logout user"""
-    session = SessionLocal()
+    """Stateless logout: token is JWT-only so simply acknowledge the request.
+
+    (If you need server-side revocation later, add a token blacklist table/Redis.)
+    """
     try:
-        token = request.headers.get('Authorization').split(" ")[1]
-        
-        session_record = session.query(Session).filter_by(session_token=token).first()
-        
-        if session_record:
-            session.delete(session_record)
-            session.commit()
-        
+        # token validity already enforced by token_required
         return jsonify({'message': 'Logged out successfully'}), 200
-        
     except Exception as e:
-        session.rollback()
-        current_app.logger.exception(f"Error logging out: {e}")
-        return jsonify({'error': str(e)}), 500
-    finally:
-        session.close()
+        current_app.logger.exception(f"Error during logout: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
 
 @auth_bp.route('/auth/me', methods=['GET'])
 @token_required
 def get_current_user():
-    """Get current user information"""
+    """Get current CRM user information (UserMaster-aware)"""
     try:
-        user_data = g.user.to_dict() if hasattr(g.user, 'to_dict') else {
-            'id': g.user.id,
-            'email': g.user.email,
-            'first_name': g.user.first_name,
-            'last_name': g.user.last_name,
-            'role': g.user.role
+        if hasattr(g.user, 'to_dict'):
+            return jsonify({'user': g.user.to_dict()}), 200
+
+        # legacy fallback
+        user_data = {
+            'id': getattr(g.user, 'id', None),
+            'email': getattr(g.user, 'email', None),
+            'first_name': getattr(g.user, 'first_name', None),
+            'last_name': getattr(g.user, 'last_name', None),
+            'role': getattr(g.user, 'role', None),
         }
         return jsonify({'user': user_data}), 200
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        current_app.logger.exception(f"Error in /auth/me: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
     
 @auth_bp.route('/auth/users/staff', methods=['GET'])
 @admin_required

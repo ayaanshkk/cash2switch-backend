@@ -1,20 +1,33 @@
 # -*- coding: utf-8 -*-
 import sys
 import io
-# Set UTF-8 encoding for console output on Windows
+import os
+import logging
+from dotenv import load_dotenv
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENV_PATH = os.path.join(BASE_DIR, ".env")
+
+load_dotenv(ENV_PATH)
+
+print("DEBUG ENV PATH =", ENV_PATH)
+print("DEBUG DATABASE_URL =", os.getenv("DATABASE_URL"))
+
 if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+    except Exception:
+        pass
 
 from flask import Flask, request, jsonify, g
 from flask_cors import CORS
-import os
-from dotenv import load_dotenv
 
 from backend.routes import proposal_routes
 from backend.db import Base, engine, SessionLocal, test_connection, init_db
-
-load_dotenv()
 
 
 def create_app():
@@ -28,36 +41,38 @@ def create_app():
     # ============================================
     # ⚙️ DATABASE INITIALIZATION (NEW LOCATION)
     # ============================================
-    print("🔧 Initializing database schema...")
+    logging.info("Initializing database schema...")
+
     try:
         # ✅ CRITICAL: Import models FIRST so SQLAlchemy knows about them
         # This ensures all enum types and tables are registered
         from backend import models
         
-        print("📋 Registered models:")
-        print("   ✓ User")
-        print("   ✓ LoginAttempt")
-        print("   ✓ Customer (with sales_stage and training_stage)")
-        print("   ✓ Quotation")
-        print("   ✓ QuotationItem")
-        print("   ✓ Invoice")
-        print("   ✓ InvoiceLineItem")
-        print("   ✓ Payment")
-        print("   ✓ Assignment")
-        print("   ✓ AuditLog")
-        print("   ✓ ActionItem")
-        print("   ✓ DataImport")
-        print("   ✓ TestResult")
-        print("   ✓ CustomerDocument")
+        logging.info("📋 Registered models:")
+        logging.info("   ✓ User")
+        logging.info("   ✓ LoginAttempt")
+        logging.info("   ✓ Customer (with sales_stage and training_stage)")
+        logging.info("   ✓ Quotation")
+        logging.info("   ✓ QuotationItem")
+        logging.info("   ✓ Invoice")
+        logging.info("   ✓ InvoiceLineItem")
+        logging.info("   ✓ Payment")
+        logging.info("   ✓ Assignment")
+        logging.info("   ✓ AuditLog")
+        logging.info("   ✓ ActionItem")
+        logging.info("   ✓ DataImport")
+        logging.info("   ✓ TestResult")
+        logging.info("   ✓ CustomerDocument")
         
-        # ✅ CRITICAL: checkfirst=True ensures we don't drop existing tables
-        Base.metadata.create_all(bind=engine, checkfirst=True)
+        # Create tables only for SQLite; Supabase/PostgreSQL schema is managed by migrations.
+        if "sqlite" in str(engine.url):
+            Base.metadata.create_all(bind=engine, checkfirst=True)
         
         # Verify tables
         from sqlalchemy import inspect
         inspector = inspect(engine)
         tables = inspector.get_table_names()
-        print(f"✅ Database schema initialized - {len(tables)} tables exist")
+        logging.info(f"✅ Database schema initialized - {len(tables)} tables exist")
         
         # ✅ NEW: Verify enum types exist
         try:
@@ -70,17 +85,17 @@ def create_app():
                 enum_types = [row[0] for row in result]
                 
                 if 'sales_stage_enum' in enum_types:
-                    print("   ✓ sales_stage_enum type exists")
+                    logging.info("   ✓ sales_stage_enum type exists")
                 if 'training_stage_enum' in enum_types:
-                    print("   ✓ training_stage_enum type exists")
+                    logging.info("   ✓ training_stage_enum type exists")
                 
                 if not enum_types:
-                    print("   ⚠️  Enum types not found - you may need to run migration")
+                    logging.info("   ⚠️  Enum types not found - you may need to run migration")
         except Exception as enum_check_error:
-            print(f"   ⚠️  Could not verify enum types: {enum_check_error}")
+            logging.info(f"   ⚠️  Could not verify enum types: {enum_check_error}")
         
     except Exception as e:
-        print(f"❌ Database initialization failed: {e}")
+        logging.error("Database initialization failed: %s", e)
         import traceback
         traceback.print_exc()
 
@@ -135,7 +150,20 @@ def create_app():
     app.register_blueprint(job_routes.job_bp)
     app.register_blueprint(proposal_routes.proposal_bp)
     app.register_blueprint(test_grading_routes.test_grading_bp)
-    app.register_blueprint(crm_routes.crm_bp)  # NEW: Register CRM blueprint
+    app.register_blueprint(crm_routes.crm_bp) # NEW: Register CRM blueprint
+    logging.info("CRM Blueprint registered successfully") 
+    
+    # Test CRM Supabase connection after blueprint registration
+    try:
+        from backend.crm.repositories.tenant_repository import TenantRepository
+        test_repo = TenantRepository()
+        test_tenant = test_repo.get_tenant_by_id(1)
+        if test_tenant:
+            logging.info(f"✅ CRM Supabase connection test: SUCCESS - Found tenant '{test_tenant.get('tenant_company_name')}'")
+        else:
+            logging.warning("CRM Supabase connection test: Tenant ID 1 not found")
+    except Exception as e:
+        logging.error("CRM Supabase connection test FAILED: %s", e)
 
     # ============================================
     # HEALTH CHECK
@@ -186,6 +214,7 @@ def create_app():
             },
             "version": "1.0"
         }), 200
+    logging.debug("App url_map: %s", app.url_map)
 
     return app
 
@@ -196,9 +225,9 @@ def create_app():
 if __name__ == "__main__":
     app = create_app()
 
-    print("=" * 60)
-    print("🔧 INITIALISING DATABASE...")
-    print("=" * 60)
+    logging.info("=" * 60)
+    logging.info("🔧 INITIALISING DATABASE...")
+    logging.info("=" * 60)
 
     # Import models to register metadata
     from backend import models
@@ -207,61 +236,66 @@ if __name__ == "__main__":
     from sqlalchemy import inspect
     inspector = inspect(engine)
     tables = inspector.get_table_names()
-    print(f"\n📋 {len(tables)} tables detected:")
+    logging.info(f"\n📋 {len(tables)} tables detected:")
     for t in sorted(tables):
-        print(f"   ✓ {t}")
+        logging.info(f"   ✓ {t}")
 
     # Check for dual pipeline fields
     try:
         columns = inspector.get_columns('customers')
         column_names = [col['name'] for col in columns]
         
-        print(f"\n📊 Customer table columns:")
+        logging.info(f"\n📊 Customer table columns:")
         if 'sales_stage' in column_names:
-            print("   ✅ sales_stage column exists")
+            logging.info("   ✅ sales_stage column exists")
         else:
-            print("   ⚠️  sales_stage column missing - run migration!")
+            logging.info("   ⚠️  sales_stage column missing - run migration!")
             
         if 'training_stage' in column_names:
-            print("   ✅ training_stage column exists")
+            logging.info("   ✅ training_stage column exists")
         else:
-            print("   ⚠️  training_stage column missing - run migration!")
+            logging.warning("training_stage column missing - run migration!")
             
         if 'pipeline_type' in column_names:
-            print("   ✅ pipeline_type column exists")
+            logging.info("   ✅ pipeline_type column exists")
         else:
-            print("   ⚠️  pipeline_type column missing - run migration!")
+            logging.info("   ⚠️  pipeline_type column missing - run migration!")
             
         if 'stage' in column_names:
-            print("   ⚠️  Old 'stage' column still exists - consider running migration")
+            logging.info("   ⚠️  Old 'stage' column still exists - consider running migration")
             
     except Exception as e:
-        print(f"   ⚠️  Could not check customer columns: {e}")
+        logging.info(f"   ⚠️  Could not check customer columns: {e}")
     
     # Check for test_results table
     try:
         if 'test_results' in tables:
-            print("\n✅ Test Results table exists")
+            logging.info("\n✅ Test Results table exists")
             test_columns = inspector.get_columns('test_results')
-            print(f"   ✓ {len(test_columns)} columns configured")
+            logging.info(f"   ✓ {len(test_columns)} columns configured")
         else:
-            print("\n⚠️  Test Results table missing - will be created on first run")
+            logging.info("\n⚠️  Test Results table missing - will be created on first run")
     except Exception as e:
-        print(f"   ⚠️  Could not check test_results table: {e}")
+        logging.info(f"   ⚠️  Could not check test_results table: {e}")
 
-    print("\n✅ Database initialised successfully!\n")
-    print("=" * 60)
+    logging.info("\n✅ Database initialised successfully!\n")
+    logging.info("=" * 60)
 
     port = int(os.getenv("PORT", 5000))
     debug_mode = os.getenv("DEV_MODE", "false").lower() == "true"
     
-    print(f"\n🚀 Starting server on port {port}")
-    print(f"   Debug mode: {debug_mode}")
-    print(f"   Access at: http://localhost:{port}")
-    print(f"   Health check: http://localhost:{port}/health")
-    print(f"   Pipeline info: http://localhost:{port}/pipeline-info")
-    print(f"   Test Grading info: http://localhost:{port}/test-grading-info")
-    print(f"   Test Grading API: http://localhost:{port}/api/test-grading/health")
-    print("\n" + "=" * 60 + "\n")
+    logging.info(f"\n🚀 Starting server on port {port}")
+    logging.info(f"   Debug mode: {debug_mode}")
+    logging.info(f"   Access at: http://localhost:{port}")
+    logging.info(f"   Health check: http://localhost:{port}/health")
+    logging.info(f"   Pipeline info: http://localhost:{port}/pipeline-info")
+    logging.info(f"   Test Grading info: http://localhost:{port}/test-grading-info")
+    logging.info(f"   Test Grading API: http://localhost:{port}/api/test-grading/health")
+    logging.info("\n" + "=" * 60 + "\n")
     
-    app.run(debug=debug_mode, host="0.0.0.0", port=port, threaded=True)
+    try:
+        app.run(debug=debug_mode, host="0.0.0.0", port=port, threaded=True)
+    except Exception as e:
+        logging.error("Server error: %s", e)
+        import traceback
+        traceback.print_exc()

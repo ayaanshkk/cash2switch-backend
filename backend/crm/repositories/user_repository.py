@@ -30,17 +30,17 @@ class UserRepository:
         query = """
             SELECT 
                 um.*,
-                rm.role_name,
-                rm.role_code
-            FROM "User_Master" um
-            LEFT JOIN "Role_Master" rm ON um.role_id = rm.role_id
-            WHERE um.tenant_id = %s
+                rm."role_name",
+                rm."role_code"
+            FROM "StreemLyne_MT"."User_Master" um
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON um."Role_id" = rm."Role_id"
+            WHERE um."Tenant_id" = %s
         """
         
         if active_only:
-            query += " AND um.is_active = TRUE"
+            query += ' AND um."is_active" = TRUE'
         
-        query += " ORDER BY um.user_name"
+        query += ' ORDER BY um."user_name"'
         
         try:
             return self.db.execute_query(query, (tenant_id,))
@@ -62,12 +62,12 @@ class UserRepository:
         query = """
             SELECT 
                 um.*,
-                rm.role_name,
-                rm.role_code
-            FROM "User_Master" um
-            LEFT JOIN "Role_Master" rm ON um.role_id = rm.role_id
-            WHERE um.tenant_id = %s
-            AND um.user_id = %s
+                rm."role_name",
+                rm."role_code"
+            FROM "StreemLyne_MT"."User_Master" um
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON um."Role_id" = rm."Role_id"
+            WHERE um."Tenant_id" = %s
+            AND um."User_id" = %s
             LIMIT 1
         """
         
@@ -91,14 +91,14 @@ class UserRepository:
         query = """
             SELECT 
                 um.*,
-                rm.role_name,
-                rm.role_code
-            FROM "User_Master" um
-            LEFT JOIN "Role_Master" rm ON um.role_id = rm.role_id
-            WHERE um.tenant_id = %s
-            AND um.role_id = %s
-            AND um.is_active = TRUE
-            ORDER BY um.user_name
+                rm."role_name",
+                rm."role_code"
+            FROM "StreemLyne_MT"."User_Master" um
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON um."Role_id" = rm."Role_id"
+            WHERE um."Tenant_id" = %s
+            AND um."Role_id" = %s
+            AND um."is_active" = TRUE
+            ORDER BY um."user_name"
         """
         
         try:

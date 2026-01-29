@@ -53,7 +53,7 @@ def get_customers():
 @customer_bp.route('/clients', methods=['POST'])
 @token_required
 def create_customer():
-    """Create a new customer"""
+    """Create a new customer and automatically create a lead in CRM"""
     session = SessionLocal()
     try:
         data = request.get_json()
@@ -64,7 +64,7 @@ def create_customer():
         if not data.get('phone'):
             return jsonify({'error': 'Phone is required'}), 400
         
-        # Create new customer
+        # Create new customer in local database
         new_customer = Customer(
             id=str(uuid.uuid4()),
             name=data.get('name'),
@@ -89,9 +89,34 @@ def create_customer():
         
         current_app.logger.info(f"✅ Customer {new_customer.id} created by user {request.current_user.id}")
         
+        # ✅ NEW: Create lead/opportunity in StreemLyne CRM
+        try:
+            from backend.crm.repositories.lead_repository import LeadRepository
+            lead_repo = LeadRepository()
+            
+            # Create lead in CRM with tenant ID 1 (default tenant for demo)
+            lead_data = {
+                'client_id': 1,  # Using default client for now
+                'opportunity_title': f"Lead: {new_customer.name}",
+                'opportunity_description': f"Phone: {new_customer.phone}\nEmail: {new_customer.email}\nAddress: {new_customer.address}\nNotes: {new_customer.notes}",
+                'stage_id': 1,  # Default to first stage
+                'opportunity_value': 0,
+                'opportunity_owner_employee_id': request.current_user.id if hasattr(request.current_user, 'id') else 1
+            }
+            
+            created_lead = lead_repo.create_lead(1, lead_data)  # Tenant ID 1
+            
+            if created_lead:
+                current_app.logger.info(f"✅ Lead created in CRM for customer {new_customer.id}")
+            else:
+                current_app.logger.warning(f"⚠️  Could not create lead in CRM for customer {new_customer.id}")
+        except Exception as crm_error:
+            # Log but don't fail - customer was created successfully
+            current_app.logger.warning(f"⚠️  CRM lead creation failed (non-critical): {crm_error}")
+        
         return jsonify({
             'success': True,
-            'message': 'Customer created successfully',
+            'message': 'Customer created successfully and added to leads',
             'customer': new_customer.to_dict()
         }), 201
         
