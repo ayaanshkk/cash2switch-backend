@@ -47,35 +47,43 @@ def token_required(f):
                 )
                 
                 logging.info(f"✅ Token decoded successfully")
+                logging.info(f"📦 Payload: employee_id={payload.get('employee_id')}, tenant_id={payload.get('tenant_id')}, user_id={payload.get('user_id')}")
                 
-                # Get user_id or employee_id from payload
-                user_id = payload.get('employee_id') or payload.get('user_id')
-                if not user_id:
-                    logging.warning("❌ Token missing user identifier")
+                # ✅ Get employee_id from payload (primary identifier in CRM)
+                employee_id = payload.get('employee_id') or payload.get('user_id')
+                
+                if not employee_id:
+                    logging.warning("❌ Token missing employee_id")
                     return jsonify({'error': 'Invalid token payload'}), 401
                 
-                logging.info(f"👤 Looking up user with employee_id: {user_id}")
+                logging.info(f"👤 Looking up user with employee_id: {employee_id}")
                 
-                # Import UserMaster (CRM model)
-                from backend.crm.models.user_master import UserMaster
+                # ✅ Import UserMaster from backend.models (not the shim)
+                from backend.models import UserMaster
                 
-                # Get user from database
-                user = local_session.get(UserMaster, user_id)
+                # ✅ Get user by employee_id using filter_by (not get which uses primary key)
+                user = local_session.query(UserMaster).filter_by(
+                    employee_id=employee_id
+                ).first()
                 
                 if not user:
-                    logging.warning(f"❌ UserMaster not found for employee_id={user_id}")
+                    logging.warning(f"❌ UserMaster not found for employee_id={employee_id}")
                     return jsonify({'error': 'User not found'}), 401
                 
                 # Check if user is active
                 if hasattr(user, 'is_active') and not user.is_active:
-                    logging.warning(f"❌ User {user_id} is inactive")
+                    logging.warning(f"❌ User {employee_id} is inactive")
                     return jsonify({'error': 'User account is inactive'}), 401
+                
+                # ✅ Attach tenant_id and employee_id from JWT to user object for easy access
+                user.tenant_id = payload.get('tenant_id')
+                user.employee_id = employee_id
                 
                 # Attach user to request and g
                 request.current_user = user
                 g.user = user
                 
-                logging.info(f"✅ User authenticated: employee_id={user_id}")
+                logging.info(f"✅ User authenticated: employee_id={employee_id}, tenant_id={user.tenant_id}")
                 
             except jwt.ExpiredSignatureError:
                 logging.warning("❌ Token has expired")
@@ -103,6 +111,8 @@ def admin_required(f):
     @token_required
     def decorated(*args, **kwargs):
         # Check if user has Admin role
+        # TODO: Implement proper role checking based on Employee_Master.role_ids
+        # For now, this is a placeholder
         roles = []
         if hasattr(g.user, 'roles'):
             roles = g.user.roles or []
@@ -110,7 +120,7 @@ def admin_required(f):
             roles = [g.user.role]
         
         if 'Admin' not in roles:
-            logging.warning(f"❌ User {g.user.id if hasattr(g.user, 'id') else 'unknown'} attempted admin access without permission")
+            logging.warning(f"❌ User {g.user.employee_id if hasattr(g.user, 'employee_id') else 'unknown'} attempted admin access without permission")
             return jsonify({'error': 'Admin access required'}), 403
         
         return f(*args, **kwargs)
