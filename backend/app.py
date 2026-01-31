@@ -23,10 +23,10 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
-from flask import Flask, request, jsonify, g
+from flask import Flask, app, request, jsonify, g
 from flask_cors import CORS
 
-from backend.routes import proposal_routes
+# from backend.routes import proposal_routes
 from backend.db import Base, engine, SessionLocal, test_connection, init_db
 
 
@@ -136,20 +136,18 @@ def create_app():
     from backend.routes import (
         auth_routes, db_routes,
         notification_routes, assignment_routes, 
-        customer_routes, file_routes, job_routes, 
-        test_grading_routes, proposal_routes,
-        crm_routes,  # NEW: StreemLyne CRM module
+        customer_routes, file_routes,
+        crm_routes,
     )
 
     app.register_blueprint(auth_routes.auth_bp)
-    app.register_blueprint(customer_routes.customer_bp)
+    app.register_blueprint(customer_routes.energy_customer_bp)
     app.register_blueprint(db_routes.db_bp)
     app.register_blueprint(notification_routes.notification_bp)
-    app.register_blueprint(assignment_routes.assignment_bp)
+    # app.register_blueprint(assignment_routes.assignment_bp)
     app.register_blueprint(file_routes.file_bp)
-    app.register_blueprint(job_routes.job_bp)
-    app.register_blueprint(proposal_routes.proposal_bp)
-    app.register_blueprint(test_grading_routes.test_grading_bp)
+    # app.register_blueprint(job_routes.job_bp)
+    # app.register_blueprint(proposal_routes.proposal_bp)
     app.register_blueprint(crm_routes.crm_bp) # NEW: Register CRM blueprint
     logging.info("CRM Blueprint registered successfully") 
     
