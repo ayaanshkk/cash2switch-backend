@@ -135,7 +135,7 @@ def create_app():
     # ============================================
     from backend.routes import (
         auth_routes, db_routes,
-        notification_routes, assignment_routes, 
+        notification_routes,
         customer_routes, file_routes,
         crm_routes,
     )

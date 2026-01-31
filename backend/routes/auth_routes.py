@@ -1,5 +1,6 @@
 from flask import Blueprint, request, jsonify, current_app, g
 from backend.models import UserMaster
+from .auth_helpers import token_required
 from datetime import datetime, timedelta
 from functools import wraps
 from sqlalchemy import text
