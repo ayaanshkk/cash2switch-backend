@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify, current_app, g
-from backend.crm.models.user_master import UserMaster
+from backend.models import UserMaster
 from datetime import datetime, timedelta
 from functools import wraps
 from sqlalchemy import text
