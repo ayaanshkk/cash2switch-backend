@@ -89,7 +89,7 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         
         # From Opportunity_Details
         'opportunity_id': opportunity.opportunity_id if opportunity else None,
-        'status': None,  # Will map from stage_id
+        'status': opportunity.Misc_Col1 if opportunity else None,
         'stage_id': opportunity.stage_id if opportunity else None,
         'opportunity_value': opportunity.opportunity_value if opportunity else None,
         'opportunity_title': opportunity.opportunity_title if opportunity else None,
@@ -512,6 +512,8 @@ def update_energy_customer(client_id):
                 opportunity.opportunity_owner_employee_id = data['assigned_to_id']
             if 'opportunity_value' in data:
                 opportunity.opportunity_value = data['opportunity_value']
+            if 'status' in data:
+                opportunity.Misc_Col1 = data['status']
         
         # Update Client_Interactions
         if data.get('callback_date'):
