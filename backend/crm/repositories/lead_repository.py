@@ -246,55 +246,121 @@ class LeadRepository:
             import traceback
             traceback.print_exc()
             raise
-    
-    def update_lead(self, opportunity_id: int, tenant_id: int, lead_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+
+    def import_opportunities_from_import(self, tenant_id: int, rows: list, created_by: int | None) -> Dict[str, Any]:
         """
-        Update an existing lead
-        
-        Args:
-            opportunity_id: Opportunity identifier
-            tenant_id: Tenant identifier
-            lead_data: Updated lead information
-        
-        Returns:
-            Updated lead record
+        Insert opportunities from a pre-validated import payload.
+
+        Rules:
+          - MPAN_MPR is used to resolve an existing client via Project_Details.mpan
+          - stage_id = 1 (New)
+          - tenant-scoped: client must belong to tenant
+          - if MPAN already has an Opportunity -> skip and report
+          - partial success allowed; per-row errors returned
         """
-        # Build dynamic update query based on provided fields
-        update_fields = []
-        params = []
-        
-        if 'opportunity_title' in lead_data and lead_data['opportunity_title'] is not None:
-            update_fields.append('"opportunity_title" = %s')
-            params.append(lead_data['opportunity_title'])
-        
-        if 'opportunity_description' in lead_data and lead_data['opportunity_description'] is not None:
-            update_fields.append('"opportunity_description" = %s')
-            params.append(lead_data['opportunity_description'])
-        
-        if 'stage_id' in lead_data and lead_data['stage_id'] is not None:
-            update_fields.append('"stage_id" = %s')
-            params.append(lead_data['stage_id'])
-        
-        if 'opportunity_value' in lead_data and lead_data['opportunity_value'] is not None:
-            update_fields.append('"opportunity_value" = %s')
-            params.append(lead_data['opportunity_value'])
-        
-        if 'opportunity_owner_employee_id' in lead_data and lead_data['opportunity_owner_employee_id'] is not None:
-            update_fields.append('"opportunity_owner_employee_id" = %s')
-            params.append(lead_data['opportunity_owner_employee_id'])
-        
-        if not update_fields:
-            print("No fields to update")
-            return self.get_lead_by_id(tenant_id, opportunity_id)
-        
-        # Validate tenant ownership through client_id
-        query = f"""
-            UPDATE "StreemLyne_MT"."Opportunity_Details" od
-            SET {', '.join(update_fields)}
-            FROM "StreemLyne_MT"."Client_Master" cm
-            WHERE od."client_id" = cm."client_id"
-            AND cm."tenant_id" = %s
-            AND od."opportunity_id" = %s
+        inserted = 0
+        skipped = 0
+        errors = []
+
+        for idx, raw in enumerate(rows or []):
+            # Accept either preview row shape ({row_number,data,is_valid,...}) or plain dict
+            row_number = raw.get('row_number') if isinstance(raw, dict) and raw.get('row_number') else (idx + 1)
+            data = raw.get('data') if isinstance(raw, dict) and raw.get('data') else (raw if isinstance(raw, dict) else {})
+
+            # Normalize keys to lowercase for tolerant access
+            def get_field(*names):
+                for n in names:
+                    if not n:
+                        continue
+                    # try exact key
+                    if n in data:
+                        return data.get(n)
+                    # try uppercase/lower variants
+                    low = n.lower()
+                    for k in data.keys():
+                        if k.lower().strip() == low:
+                            return data.get(k)
+                return None
+
+            mpan = (get_field('MPAN_MPR', 'mpan_mpr', 'mpan') or '')
+            mpan = mpan.strip() if isinstance(mpan, str) else str(mpan)
+
+            if not mpan:
+                skipped += 1
+                errors.append({'row': row_number, 'error': 'MPAN_MPR missing'})
+                logger.warning('import_opportunities_from_import skipped row=%s missing mpan', row_number)
+                continue
+
+            # Resolve client_id via Project_Details.mpan (tenant-scoped)
+            client_q = '''
+                SELECT pd."client_id" FROM "StreemLyne_MT"."Project_Details" pd
+                INNER JOIN "StreemLyne_MT"."Client_Master" cm ON pd."client_id" = cm."client_id"
+                WHERE pd."mpan" = %s AND cm."tenant_id" = %s
+                LIMIT 1
+            '''
+            try:
+                client_row = self.db.execute_query(client_q, (mpan, tenant_id), fetch_one=True)
+            except Exception as e:
+                logger.exception('import_opportunities_from_import client lookup failed row=%s mpan=%s: %s', row_number, mpan, e)
+                skipped += 1
+                errors.append({'row': row_number, 'mpan': mpan, 'error': 'Client lookup failed: ' + str(e)})
+                continue
+
+            if not client_row:
+                skipped += 1
+                errors.append({'row': row_number, 'mpan': mpan, 'error': 'No client/project found for MPAN_MPR'})
+                logger.info('import_opportunities_from_import no client for mpan=%s tenant=%s row=%s', mpan, tenant_id, row_number)
+                continue
+
+            client_id = client_row.get('client_id')
+
+            # Enforce MPAN uniqueness in DB: check if any existing Opportunity has a Project_Details with same mpan
+            dup_q = '''
+                SELECT 1 FROM "StreemLyne_MT"."Opportunity_Details" od
+                JOIN "StreemLyne_MT"."Project_Details" pd ON od."opportunity_id" = pd."opportunity_id"
+                JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
+                WHERE pd."mpan" = %s AND cm."tenant_id" = %s LIMIT 1
+            '''
+            try:
+                exists = self.db.execute_query(dup_q, (mpan, tenant_id), fetch_one=True)
+            except Exception as e:
+                logger.exception('import_opportunities_from_import duplicate check failed row=%s mpan=%s: %s', row_number, mpan, e)
+                errors.append({'row': row_number, 'mpan': mpan, 'error': 'Duplicate check failed: ' + str(e)})
+                skipped += 1
+                continue
+
+            if exists:
+                skipped += 1
+                errors.append({'row': row_number, 'mpan': mpan, 'error': 'MPAN_MPR already exists in the system'})
+                logger.info('import_opportunities_from_import skipped existing mpan=%s tenant=%s', mpan, tenant_id)
+                continue
+
+            # Map fields -> Opportunity_Details columns
+            title = get_field('Business_Name', 'business_name', 'client_company_name') or get_field('Contact_Person', 'contact_person') or f'Imported lead {mpan}'
+            description = get_field('Notes', 'notes', 'call_summary') or None
+
+            insert_q = '''
+                INSERT INTO "StreemLyne_MT"."Opportunity_Details"
+                ("client_id", "opportunity_title", "opportunity_description", "stage_id", "created_at", "created_by")
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, %s)
+                RETURNING "opportunity_id"
+            '''
+            try:
+                out = self.db.execute_insert(insert_q, (client_id, title, description, 1, created_by), returning=True)
+                if out and out.get('opportunity_id'):
+                    inserted += 1
+                    logger.info('import_opportunities_from_import inserted opportunity_id=%s client_id=%s mpan=%s', out.get('opportunity_id'), client_id, mpan)
+                else:
+                    skipped += 1
+                    errors.append({'row': row_number, 'mpan': mpan, 'error': 'Insert returned no id'})
+            except Exception as e:
+                logger.exception('import_opportunities_from_import insert failed row=%s mpan=%s: %s', row_number, mpan, e)
+                skipped += 1
+                errors.append({'row': row_number, 'mpan': mpan, 'error': 'DB insert failed: ' + str(e)})
+                # Continue with next row (partial success allowed)
+                continue
+
+        return {'inserted': inserted, 'skipped': skipped, 'errors': errors}
             RETURNING od.*
         """
         
@@ -723,4 +789,92 @@ class LeadRepository:
             print(f"Error fetching leads table for tenant {tenant_id}: {e}")
             import traceback
             traceback.print_exc()
+            return []
+
+    def get_leads_list(self, tenant_id: int, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """
+        Return a minimal, tenant-scoped list of leads (read-only projection).
+
+        Fields returned (strict):
+          - opportunity_id
+          - business_name
+          - contact_person
+          - tel_number
+          - email
+          - mpan_mpr
+          - start_date
+          - end_date
+          - stage_id
+          - stage_name
+          - created_at
+
+        Sorting: latest first (created_at DESC)
+        """
+        # Base query: project only the allowed fields and tenant-filter by Client_Master.tenant_id
+        query = '''
+            SELECT
+                od."opportunity_id",
+                cm."client_company_name" AS business_name,
+                cm."client_contact_name" AS contact_person,
+                cm."client_phone" AS tel_number,
+                cm."client_email" AS email,
+                (
+                    SELECT pd."mpan" FROM "StreemLyne_MT"."Project_Details" pd
+                    WHERE pd."opportunity_id" = od."opportunity_id"
+                    ORDER BY pd."project_id" LIMIT 1
+                ) AS mpan_mpr,
+                (
+                    SELECT ecm."contract_start_date"
+                    FROM "StreemLyne_MT"."Project_Details" pd
+                    INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON ecm."project_id" = pd."project_id"
+                    WHERE pd."opportunity_id" = od."opportunity_id"
+                    ORDER BY ecm."energy_contract_master_id" LIMIT 1
+                ) AS start_date,
+                (
+                    SELECT ecm."contract_end_date"
+                    FROM "StreemLyne_MT"."Project_Details" pd
+                    INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON ecm."project_id" = pd."project_id"
+                    WHERE pd."opportunity_id" = od."opportunity_id"
+                    ORDER BY ecm."energy_contract_master_id" LIMIT 1
+                ) AS end_date,
+                od."stage_id",
+                sm."stage_name",
+                od."created_at"
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            INNER JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
+            WHERE cm."tenant_id" = %s
+        '''
+
+        params = [tenant_id]
+        # support an optional stage_id filter (controller already extracts it)
+        if filters and isinstance(filters, dict) and filters.get('stage_id'):
+            query += ' AND od."stage_id" = %s'
+            params.append(int(filters.get('stage_id')))
+
+        query += ' ORDER BY od."created_at" DESC'
+
+        try:
+            rows = self.db.execute_query(query, tuple(params))
+            if not rows:
+                return []
+
+            out = []
+            for r in rows:
+                out.append({
+                    'opportunity_id': r.get('opportunity_id'),
+                    'business_name': r.get('business_name'),
+                    'contact_person': r.get('contact_person'),
+                    'tel_number': r.get('tel_number'),
+                    'email': r.get('email'),
+                    'mpan_mpr': r.get('mpan_mpr'),
+                    'start_date': r.get('start_date').isoformat() if getattr(r.get('start_date'), 'isoformat', None) else (r.get('start_date') or None),
+                    'end_date': r.get('end_date').isoformat() if getattr(r.get('end_date'), 'isoformat', None) else (r.get('end_date') or None),
+                    'stage_id': r.get('stage_id'),
+                    'stage_name': r.get('stage_name'),
+                    'created_at': r.get('created_at').isoformat() if getattr(r.get('created_at'), 'isoformat', None) else (r.get('created_at') or None),
+                })
+            return out
+        except Exception as e:
+            logger.exception('get_leads_list failed for tenant=%s: %s', tenant_id, e)
             return []

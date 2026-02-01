@@ -361,6 +361,76 @@ class CRMController:
                 'message': str(e)
             }), 500
 
+    def preview_lead_import(self) -> tuple:
+        """
+        POST /api/crm/leads/import/preview
+        Controller entrypoint for lead import preview. Expects multipart/form-data
+        with a file field named 'file'. Delegates parsing/validation to the
+        CRMService and returns the preview response (no DB writes).
+        """
+        try:
+            tenant_id = g.tenant_id
+
+            if 'file' not in request.files:
+                return jsonify({'success': False, 'error': 'No file provided', 'message': "Include a file under the 'file' form field."}), 400
+
+            file_storage = request.files.get('file')
+            result = self.crm_service.preview_lead_import(tenant_id, file_storage)
+
+            # Service returns { success: bool, ... }
+            status = 200 if result.get('success') else 400
+            return jsonify(result), status
+        except Exception as e:
+            logger.exception("preview_lead_import controller error: %s", e)
+            return jsonify({'success': False, 'error': 'Internal server error', 'message': str(e)}), 500
+
+    def import_leads_confirm(self) -> tuple:
+        """
+        POST /api/crm/leads/import/confirm
+        Accepts JSON payload: an array of rows (validated by preview). Delegates
+        insertion to CRMService.confirm_lead_import which performs tenant-scoped
+        inserts and returns a summary (partial success allowed).
+        """
+        try:
+            tenant_id = g.tenant_id
+            payload = request.get_json()
+
+            if not payload or not isinstance(payload, list):
+                return jsonify({'success': False, 'error': 'Invalid request', 'message': 'Expected a JSON array of rows.'}), 400
+
+            created_by = getattr(request.current_user, 'id', None)
+
+            result = self.crm_service.confirm_lead_import(tenant_id, payload, created_by)
+
+            status = 200 if result.get('success') else 400
+            return jsonify(result), status
+        except Exception as e:
+            logger.exception('import_leads_confirm controller error: %s', e)
+            return jsonify({'success': False, 'error': 'Internal server error', 'message': str(e)}), 500
+    def import_leads_preview(self) -> tuple:
+        """
+        POST /api/crm/leads/import/preview
+        Accepts multipart/form-data with a file (CSV or XLSX) and returns a
+        preview of validation results. DOES NOT write to the database.
+        """
+        try:
+            tenant_id = g.tenant_id
+
+            if 'file' not in request.files:
+                return jsonify({'success': False, 'error': 'No file provided'}), 400
+
+            file = request.files.get('file')
+            result = self.crm_service.preview_lead_import(tenant_id, file)
+
+            # Service returns structured response
+            status = 200 if result.get('success') else 400
+            return jsonify(result), status
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
     def get_leads_by_customer_type(self) -> tuple:
         """
         GET /api/crm/leads/customer-type?type=NEW|EXISTING

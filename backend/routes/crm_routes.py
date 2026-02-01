@@ -151,6 +151,41 @@ def get_leads_table():
     return crm_controller.get_leads_table()
 
 
+@crm_bp.route('/leads/import/preview', methods=['POST'])
+@require_tenant
+def import_leads_preview():
+    """
+    POST /api/crm/leads/import/preview
+    Accepts multipart/form-data with an Excel (.xlsx) or CSV (.csv) file and
+    returns a validation preview (no DB writes).
+
+    Request:
+      - file: file to import
+
+    Returns:
+      200: preview JSON (see API docs)
+      400: invalid request / unsupported file
+    """
+    return crm_controller.import_leads_preview()
+
+
+@crm_bp.route('/leads/import/confirm', methods=['POST'])
+@require_tenant
+def import_leads_confirm():
+    """
+    POST /api/crm/leads/import/confirm
+    Accepts JSON array (validated rows from preview) and inserts Opportunity_Details
+    where possible. Partial success allowed; duplicates/skipped rows reported.
+
+    Request body: [ { row_number, data: {...}, is_valid, errors }, ... ]
+
+    Returns:
+      200: { success, inserted, skipped, errors }
+      400: invalid request
+    """
+    return crm_controller.import_leads_confirm()
+
+
 @crm_bp.route('/leads/customer-type', methods=['GET'])
 @require_tenant
 def get_leads_by_customer_type():

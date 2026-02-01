@@ -5,6 +5,8 @@ Business logic layer for CRM operations
 """
 import logging
 from typing import Optional, Dict, Any, List
+import io
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 from backend.crm.repositories.lead_repository import LeadRepository
@@ -51,9 +53,10 @@ class CRMService:
         Returns:
             Dictionary with leads data
         """
-        leads = self.lead_repo.get_all_leads(tenant_id, filters)
+        # Use a projection that returns only the fields required by the frontend list view
+        leads = self.lead_repo.get_leads_list(tenant_id, filters if filters else None)
         stats = self.lead_repo.get_lead_stats(tenant_id)
-        
+
         return {
             'success': True,
             'data': leads,
@@ -433,6 +436,141 @@ class CRMService:
             'data': rows,
             'count': len(rows)
         }
+
+    def preview_lead_import(self, tenant_id: int, file_storage) -> Dict[str, Any]:
+        """
+        Parse uploaded CSV/XLSX and return a validation-only preview (no DB writes).
+        This is intentionally permissive about column names (case-insensitive)
+        and only validates the rules required by the UI preview.
+        """
+        import pandas as pd
+
+        if not file_storage or not getattr(file_storage, 'filename', None):
+            return {'success': False, 'error': 'No file provided', 'message': 'No file uploaded.'}
+
+        filename = file_storage.filename or ''
+        lower = filename.lower()
+        try:
+            if lower.endswith('.csv'):
+                df = pd.read_csv(file_storage.stream, dtype=str)
+            elif lower.endswith('.xlsx') or lower.endswith('.xls'):
+                df = pd.read_excel(file_storage.stream, engine='openpyxl', dtype=str)
+            else:
+                return {'success': False, 'error': 'Unsupported file type', 'message': 'Only .csv and .xlsx files are accepted.'}
+        except Exception as e:
+            logger.exception('preview_lead_import: failed to read uploaded file: %s', e)
+            return {'success': False, 'error': 'Failed to parse file', 'message': str(e)}
+
+        original_columns = list(df.columns)
+        col_map = {c.lower().strip(): c for c in original_columns}
+
+        def get_col(df_row, *names):
+            for n in names:
+                key = n.lower()
+                if key in col_map:
+                    val = df_row.get(col_map[key])
+                    if pd.isna(val):
+                        return None
+                    return str(val).strip()
+            return None
+
+        total_rows = len(df)
+        if total_rows == 0:
+            return {'success': False, 'error': 'Empty file', 'message': 'Uploaded file contains no data rows.'}
+
+        # Determine MPAN column
+        mpan_col_candidates = [k for k in col_map.keys() if k in ('mpan_mpr', 'mpan', 'mpr')]
+        if not mpan_col_candidates:
+            return {'success': False, 'error': 'Missing column', 'message': 'MPAN_MPR column is required in the uploaded file.'}
+        mpan_key = mpan_col_candidates[0]
+
+        series_mpan = df[col_map[mpan_key]].astype(str).fillna('').str.strip()
+        mpan_counts = series_mpan[series_mpan != ''].value_counts()
+        duplicated_values = set(mpan_counts[mpan_counts > 1].index.tolist())
+
+        rows_out = []
+        valid_count = 0
+        invalid_count = 0
+
+        for idx, row in df.iterrows():
+            row_number = int(idx) + 1
+            errors = []
+
+            try:
+                raw_mpan = row.get(col_map[mpan_key], None)
+                mpan_val = None if pd.isna(raw_mpan) else str(raw_mpan).strip()
+            except Exception:
+                mpan_val = None
+
+            if not mpan_val:
+                errors.append('MPAN_MPR is mandatory')
+            elif mpan_val in duplicated_values:
+                errors.append('MPAN_MPR must be unique within the uploaded file')
+
+            bname = get_col(row, 'business_name', 'client_company_name', 'business name')
+            contact = get_col(row, 'contact_person', 'client_contact_name', 'contact person')
+            if not (bname or contact):
+                errors.append('Business_Name OR Contact_Person must exist')
+
+            tel = get_col(row, 'tel_number', 'phone', 'telephone', 'tel number')
+            if not tel:
+                errors.append('Tel_Number must exist')
+
+            start_raw = get_col(row, 'start_date', 'contract_start_date', 'start date')
+            end_raw = get_col(row, 'end_date', 'contract_end_date', 'end date')
+            if not start_raw:
+                errors.append('Start_Date must exist')
+            else:
+                parsed = pd.to_datetime(start_raw, errors='coerce')
+                if pd.isna(parsed):
+                    errors.append('Start_Date is not a valid date')
+            if not end_raw:
+                errors.append('End_Date must exist')
+            else:
+                parsed = pd.to_datetime(end_raw, errors='coerce')
+                if pd.isna(parsed):
+                    errors.append('End_Date is not a valid date')
+
+            is_valid = len(errors) == 0
+            if is_valid:
+                valid_count += 1
+            else:
+                invalid_count += 1
+                logger.warning('lead import preview - tenant=%s row=%s mpan=%s errors=%s', tenant_id, row_number, mpan_val, errors)
+
+            data = {}
+            for c in original_columns:
+                v = row.get(c)
+                if pd.isna(v):
+                    data[c] = None
+                else:
+                    if hasattr(v, 'isoformat'):
+                        try:
+                            data[c] = v.isoformat()
+                        except Exception:
+                            data[c] = str(v)
+                    else:
+                        data[c] = None if (isinstance(v, float) and pd.isna(v)) else (str(v).strip())
+
+            rows_out.append({'row_number': row_number, 'data': data, 'is_valid': is_valid, 'errors': errors})
+
+        return {'success': True, 'total_rows': total_rows, 'valid_rows': valid_count, 'invalid_rows': invalid_count, 'rows': rows_out}
+
+    def confirm_lead_import(self, tenant_id: int, rows: list, created_by: int | None) -> Dict[str, Any]:
+        """
+        Confirm/import validated rows into Opportunity_Details.
+
+        - Uses MPAN_MPR to resolve existing client via Project_Details.mpan (tenant-scoped)
+        - Inserts Opportunity_Details with stage_id=1 (New)
+        - Skips rows where MPAN already exists in DB or client/project can't be resolved
+        - Partial success allowed; per-row errors returned
+        """
+        if not isinstance(rows, list) or len(rows) == 0:
+            return {'success': False, 'error': 'Invalid payload', 'message': 'Expected non-empty JSON array of validated rows.'}
+
+        # Delegate to repository which handles DB checks/inserts per-row
+        result = self.lead_repo.import_opportunities_from_import(tenant_id, rows, created_by)
+        return {'inserted': int(result.get('inserted', 0)), 'skipped': int(result.get('skipped', 0)), 'errors': result.get('errors', [])}
 
     def get_leads_by_customer_type(self, tenant_id: int, customer_type: Optional[str] = None, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
