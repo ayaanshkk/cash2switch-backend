@@ -271,10 +271,10 @@ class LeadRepository:
                 cm."client_phone",
                 cm."client_email"
             FROM "StreemLyne_MT"."Opportunity_Details" od
-            INNER JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
             LEFT JOIN "StreemLyne_MT"."User_Master" um ON od."opportunity_owner_employee_id" = um."user_id"
-            WHERE cm."tenant_id" = %s
+            -- NOTE: business rule change — leads are tenant-scoped on Opportunity_Details.tenant_id
+            WHERE od."tenant_id" = %s
         """
         params = [tenant_id]
         
@@ -369,14 +369,11 @@ class LeadRepository:
             SELECT 
                 od.*,
                 sm."stage_name",
-                um."user_name" as assigned_to_name,
-                cm."client_company_name",
-                cm."client_contact_name"
+                um."user_name" as assigned_to_name
             FROM "StreemLyne_MT"."Opportunity_Details" od
-            INNER JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
             LEFT JOIN "StreemLyne_MT"."User_Master" um ON od."opportunity_owner_employee_id" = um."user_id"
-            WHERE cm."tenant_id" = %s
+            WHERE od."tenant_id" = %s
             AND od."opportunity_id" = %s
             LIMIT 1
         """
@@ -402,14 +399,11 @@ class LeadRepository:
             SELECT 
                 od.*,
                 sm."stage_name",
-                um."user_name" as assigned_to_name,
-                cm."client_company_name",
-                cm."client_contact_name"
+                um."user_name" as assigned_to_name
             FROM "StreemLyne_MT"."Opportunity_Details" od
-            INNER JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
             LEFT JOIN "StreemLyne_MT"."User_Master" um ON od."opportunity_owner_employee_id" = um."user_id"
-            WHERE cm."tenant_id" = %s
+            WHERE od."tenant_id" = %s
             AND od."stage_id" = %s
             ORDER BY od."created_at" DESC
         """
@@ -435,8 +429,7 @@ class LeadRepository:
                 COUNT(*) as total_leads,
                 SUM(od."opportunity_value") as total_value
             FROM "StreemLyne_MT"."Opportunity_Details" od
-            INNER JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
-            WHERE cm."tenant_id" = %s
+            WHERE od."tenant_id" = %s
         """
         
         try:
@@ -501,69 +494,242 @@ class LeadRepository:
             import traceback
             traceback.print_exc()
             raise
-    
-    def update_lead(self, opportunity_id: int, tenant_id: int, lead_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+
+    def import_opportunities_from_import(self, tenant_id: int, rows: list, created_by: int | None, service_id: int) -> Dict[str, Any]:
         """
-        Update an existing lead
+        Insert opportunities from a pre-validated import payload.
+
+        Rules:
+          - MPAN_MPR is stored in Opportunity_Details.mpan_mpr
+          - stage_id = Not Called
+          - tenant-scoped via Opportunity_Details.tenant_id
+          - if MPAN already exists in Opportunity_Details -> skip and report
+          - partial success allowed; per-row errors returned
+          - NO joins to Project_Details or Client_Master
+        """
+        inserted = 0
+        skipped = 0
+        errors = []
+
+        # Resolve default stage_id for "Not Called"
+        default_stage_id = None
+        try:
+            default_stage = self.db.execute_query(
+                'SELECT "stage_id" FROM "StreemLyne_MT"."Stage_Master" WHERE LOWER("stage_name") = %s LIMIT 1',
+                ('not called',),
+                fetch_one=True
+            )
+            default_stage_id = default_stage.get('stage_id') if default_stage else None
+        except Exception as e:
+            logger.exception('Failed to resolve default stage_id for Not Called: %s', e)
+
+        if not default_stage_id:
+            # Fallback to legacy default when Not Called is missing
+            default_stage_id = 1
+
+        for idx, raw in enumerate(rows or []):
+            # Accept either preview row shape ({row_number,data,is_valid,...}) or plain dict
+            row_number = raw.get('row_number') if isinstance(raw, dict) and raw.get('row_number') else (idx + 1)
+            data = raw.get('data') if isinstance(raw, dict) and raw.get('data') else (raw if isinstance(raw, dict) else {})
+
+            # Normalize keys to lowercase for tolerant access
+            def get_field(*names):
+                for n in names:
+                    if not n:
+                        continue
+                    # try exact key
+                    if n in data:
+                        return data.get(n)
+                    # try uppercase/lower variants
+                    low = n.lower()
+                    for k in data.keys():
+                        if k.lower().strip() == low:
+                            return data.get(k)
+                return None
+
+            mpan = (get_field('MPAN_MPR', 'mpan_mpr', 'mpan') or '')
+            mpan = mpan.strip() if isinstance(mpan, str) else str(mpan)
+
+            if not mpan:
+                skipped += 1
+                errors.append({'row': row_number, 'error': 'MPAN_MPR missing'})
+                logger.warning('import_opportunities_from_import skipped row=%s missing mpan', row_number)
+                continue
+
+            # Enforce MPAN uniqueness: check if MPAN already exists in Opportunity_Details for this tenant
+            dup_q = '''
+                SELECT 1 FROM "StreemLyne_MT"."Opportunity_Details" od
+                WHERE od."mpan_mpr" = %s AND od."tenant_id" = %s LIMIT 1
+            '''
+            try:
+                exists = self.db.execute_query(dup_q, (mpan, tenant_id), fetch_one=True)
+            except Exception as e:
+                logger.exception('import_opportunities_from_import duplicate check failed row=%s mpan=%s: %s', row_number, mpan, e)
+                errors.append({'row': row_number, 'mpan': mpan, 'error': 'Duplicate check failed: ' + str(e)})
+                skipped += 1
+                continue
+
+            if exists:
+                skipped += 1
+                errors.append({'row': row_number, 'mpan': mpan, 'error': 'MPAN_MPR already exists in the system'})
+                logger.info('import_opportunities_from_import skipped existing mpan=%s tenant=%s', mpan, tenant_id)
+                continue
+
+            # Ensure default client exists (client_id is NOT NULL)
+            default_client_id = self._ensure_default_client(tenant_id)
+            if not default_client_id:
+                skipped += 1
+                errors.append({'row': row_number, 'mpan': mpan, 'error': 'Failed to create default client for tenant'})
+                logger.error('import_opportunities_from_import no default client for tenant=%s', tenant_id)
+                continue
+
+            # Map fields -> Opportunity_Details columns
+            title = get_field('Business_Name', 'business_name', 'client_company_name') or get_field('Contact_Person', 'contact_person') or f'Imported lead {mpan}'
+            description = get_field('Notes', 'notes', 'call_summary') or None
+            business_name = get_field('Business_Name', 'business_name', 'client_company_name') or None
+            contact_person = get_field('Contact_Person', 'contact_person', 'client_contact_name') or None
+            tel_number = get_field('Tel_Number', 'phone', 'tel_number', 'telephone') or None
+            email = get_field('Email', 'email') or None
+            start_date = get_field('Start_Date', 'start_date', 'contract_start_date') or None
+
+            insert_q = '''
+                INSERT INTO "StreemLyne_MT"."Opportunity_Details"
+                ("tenant_id", "client_id", "mpan_mpr", "opportunity_title", "opportunity_description", "business_name", "contact_person", "tel_number", "email", "start_date", "stage_id", "service_id", "created_at")
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                RETURNING "opportunity_id"
+            '''
+            try:
+                out = self.db.execute_insert(
+                    insert_q,
+                    (tenant_id, default_client_id, mpan, title, description, business_name, contact_person, tel_number, email, start_date, default_stage_id, service_id),
+                    returning=True
+                )
+                if out and out.get('opportunity_id'):
+                    inserted += 1
+                    logger.info('import_opportunities_from_import inserted opportunity_id=%s mpan=%s', out.get('opportunity_id'), mpan)
+                else:
+                    skipped += 1
+                    errors.append({'row': row_number, 'mpan': mpan, 'error': 'Insert returned no id'})
+            except Exception as e:
+                logger.exception('import_opportunities_from_import insert failed row=%s mpan=%s: %s', row_number, mpan, e)
+                skipped += 1
+                errors.append({'row': row_number, 'mpan': mpan, 'error': 'DB insert failed: ' + str(e)})
+                # Continue with next row (partial success allowed)
+                continue
+
+        return {'inserted': inserted, 'skipped': skipped, 'errors': errors}
+
+    def update_lead_status(self, tenant_id: int, opportunity_id: int, stage_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Update lead status (stage_id) with tenant isolation.
         
         Args:
-            opportunity_id: Opportunity identifier
             tenant_id: Tenant identifier
-            lead_data: Updated lead information
+            opportunity_id: Opportunity identifier
+            stage_id: New stage ID to set
         
         Returns:
-            Updated lead record
+            Dict with updated opportunity_id and stage_id, or None if not found/not owned
         """
-        # Build dynamic update query based on provided fields
-        update_fields = []
-        params = []
-        
-        if 'opportunity_title' in lead_data and lead_data['opportunity_title'] is not None:
-            update_fields.append('"opportunity_title" = %s')
-            params.append(lead_data['opportunity_title'])
-        
-        if 'opportunity_description' in lead_data and lead_data['opportunity_description'] is not None:
-            update_fields.append('"opportunity_description" = %s')
-            params.append(lead_data['opportunity_description'])
-        
-        if 'stage_id' in lead_data and lead_data['stage_id'] is not None:
-            update_fields.append('"stage_id" = %s')
-            params.append(lead_data['stage_id'])
-        
-        if 'opportunity_value' in lead_data and lead_data['opportunity_value'] is not None:
-            update_fields.append('"opportunity_value" = %s')
-            params.append(lead_data['opportunity_value'])
-        
-        if 'opportunity_owner_employee_id' in lead_data and lead_data['opportunity_owner_employee_id'] is not None:
-            update_fields.append('"opportunity_owner_employee_id" = %s')
-            params.append(lead_data['opportunity_owner_employee_id'])
-        
-        if not update_fields:
-            print("No fields to update")
-            return self.get_lead_by_id(tenant_id, opportunity_id)
-        
-        # Validate tenant ownership through client_id
-        query = f"""
-            UPDATE "StreemLyne_MT"."Opportunity_Details" od
-            SET {', '.join(update_fields)}
-            FROM "StreemLyne_MT"."Client_Master" cm
-            WHERE od."client_id" = cm."client_id"
-            AND cm."tenant_id" = %s
-            AND od."opportunity_id" = %s
-            RETURNING od.*
-        """
-        
-        params.extend([tenant_id, opportunity_id])
-        
         try:
-            result = self.db.execute_query(query, tuple(params), fetch_one=True)
-            return result
+            # Optional: get stage_name for logging
+            stage_query = 'SELECT "stage_name" FROM "StreemLyne_MT"."Stage_Master" WHERE "stage_id" = %s'
+            stage_result = self.db.execute_query(stage_query, (stage_id,), fetch_one=True)
+            stage_name = stage_result.get('stage_name') if stage_result else None
+
+            query = """
+                UPDATE "StreemLyne_MT"."Opportunity_Details"
+                SET "stage_id" = %s
+                WHERE "opportunity_id" = %s AND "tenant_id" = %s
+            """
+
+            updated_count = self.db.execute_update(query, (stage_id, opportunity_id, tenant_id))
+            if updated_count and updated_count > 0:
+                logger.info('Updated lead %s to stage %s (stage_name=%s) for tenant %s',
+                           opportunity_id, stage_id, stage_name, tenant_id)
+                return {"opportunity_id": opportunity_id, "stage_id": stage_id}
+
+            logger.warning('Lead %s not found or not owned by tenant %s', opportunity_id, tenant_id)
+            return None
         except Exception as e:
-            print(f"Error updating lead: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception('Error updating lead status: %s', e)
             return None
     
+    def get_leads_recycle_bin(self, tenant_id: int) -> List[Dict[str, Any]]:
+        """
+        Get all Lost leads (recycle bin) for a tenant.
+        
+        Args:
+            tenant_id: Tenant identifier
+        
+        Returns:
+            List of lost/deleted leads
+        """
+        query = '''
+            SELECT
+                od."opportunity_id",
+                COALESCE(od."business_name", od."opportunity_title") AS business_name,
+                od."contact_person",
+                od."mpan_mpr",
+                sm."stage_name",
+                od."start_date",
+                od."tel_number",
+                od."email"
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
+            WHERE od."tenant_id" = %s
+            AND sm."stage_name" = 'Lost'
+            ORDER BY od."created_at" DESC
+        '''
+        
+        try:
+            rows = self.db.execute_query(query, (tenant_id,))
+            if not rows:
+                return []
+            
+            out = []
+            for r in rows:
+                out.append({
+                    'opportunity_id': r.get('opportunity_id'),
+                    'business_name': r.get('business_name'),
+                    'contact_person': r.get('contact_person'),
+                    'mpan_mpr': r.get('mpan_mpr'),
+                    'stage_name': r.get('stage_name'),
+                    'start_date': r.get('start_date'),
+                    'tel_number': r.get('tel_number'),
+                    'email': r.get('email'),
+                })
+            return out
+        except Exception as e:
+            logger.exception('get_leads_recycle_bin failed for tenant=%s: %s', tenant_id, e)
+            return []
+    
+    def delete_expired_lost_leads(self, tenant_id: int, days: int = 30) -> int:
+        """
+        Permanently delete Lost leads older than specified days.
+        
+        Args:
+            tenant_id: Tenant identifier
+            days: Delete leads older than this many days (default 30)
+        
+        Returns:
+            Number of deleted records
+        """
+        query = """
+            DELETE FROM "StreemLyne_MT"."Opportunity_Details"
+            WHERE "tenant_id" = %s
+            AND "deleted_at" IS NOT NULL
+            AND "deleted_at" < NOW() - INTERVAL '%s days'
+        """
+        
+        try:
+            rows_affected = self.db.execute_delete(query, (tenant_id, days))
+            logger.info('Deleted %d expired lost leads for tenant %s', rows_affected, tenant_id)
+            return rows_affected
+        except Exception as e:
+            logger.exception('Error deleting expired lost leads for tenant %s: %s', tenant_id, e)
+            return 0
+
     def delete_lead(self, opportunity_id: int, tenant_id: int) -> bool:
         """
         Delete a lead/opportunity
@@ -575,13 +741,11 @@ class LeadRepository:
         Returns:
             True if deleted successfully
         """
-        # Validate tenant ownership through client_id before deletion
+        # Validate tenant ownership via Opportunity_Details.tenant_id
         query = """
-            DELETE FROM "StreemLyne_MT"."Opportunity_Details" od
-            USING "StreemLyne_MT"."Client_Master" cm
-            WHERE od."client_id" = cm."client_id"
-            AND cm."tenant_id" = %s
-            AND od."opportunity_id" = %s
+            DELETE FROM "StreemLyne_MT"."Opportunity_Details"
+            WHERE "tenant_id" = %s
+            AND "opportunity_id" = %s
         """
         
         try:
@@ -745,28 +909,22 @@ class LeadRepository:
 
     def create_client_and_lead_transaction(self, tenant_id: int, client_data: Dict[str, Any], lead_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Atomically create a Client_Master row and an Opportunity_Details row in one DB transaction.
-        - Returns { 'client': {...}, 'opportunity': {...} } on success
-        - Returns None on failure (caller should interpret and return appropriate HTTP error)
-
-        This uses the DB connection/transaction when available; falls back to separate
-        calls (non-atomic) when running with the local stub.
+        Create a client only. IMPORTANT: by business rule, creating a client MUST NOT create
+        an Opportunity_Details row. This method preserves the atomic client insert but will
+        NOT create or return an opportunity. Callers that previously relied on this behavior
+        should instead use the import flow to create leads.
+        Returns: {'client': <client_row>} on success, or None on failure.
         """
         # If running without a real DB connection, fall back to existing behavior
         try:
             with self.db.get_connection() as conn:
-                # When stubbed, conn will be None — fall back
+                # When stubbed, conn will be None — fall back to existing behavior that only creates the client
                 if conn is None:
-                    # Best-effort non-atomic fallback (useful for unit tests / local dev)
                     client = self.create_client(tenant_id, client_data)
-                    if not client:
-                        return None
-                    lead_data['client_id'] = client.get('client_id')
-                    opportunity = self.create_lead(tenant_id, lead_data)
-                    return {'client': client, 'opportunity': opportunity}
+                    return {'client': client} if client else None
 
                 with conn.cursor() as cur:
-                    # Insert client
+                    # Insert client (same as previous implementation)
                     insert_client_sql = (
                         'INSERT INTO "StreemLyne_MT"."Client_Master' \
                         '" ("tenant_id", "client_company_name", "client_contact_name", "address", '
@@ -795,40 +953,9 @@ class LeadRepository:
                         conn.rollback()
                         return None
 
-                    client_id = client_row.get('client_id')
-
-                    # Determine stage_id (use provided or default to first Stage_Master)
-                    stage_id = lead_data.get('stage_id')
-                    if stage_id is None:
-                        cur.execute('SELECT "stage_id" FROM "StreemLyne_MT"."Stage_Master" ORDER BY "stage_id" LIMIT 1')
-                        s = cur.fetchone()
-                        stage_id = s.get('stage_id') if s else None
-
-                    # Insert opportunity
-                    insert_opp_sql = (
-                        'INSERT INTO "StreemLyne_MT"."Opportunity_Details" '
-                        '("client_id", "opportunity_title", "opportunity_description", "stage_id", "opportunity_value", "opportunity_owner_employee_id", "created_at") '
-                        'VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP) RETURNING *'
-                    )
-                    cur.execute(
-                        insert_opp_sql,
-                        (
-                            client_id,
-                            lead_data.get('opportunity_title'),
-                            lead_data.get('opportunity_description', ''),
-                            stage_id,
-                            lead_data.get('opportunity_value', 0),
-                            lead_data.get('opportunity_owner_employee_id')
-                        )
-                    )
-                    opp_row = cur.fetchone()
-
-                    # Commit transaction and return normalized dicts
+                    # Commit transaction (client-only)
                     conn.commit()
-                    return {
-                        'client': dict(client_row),
-                        'opportunity': dict(opp_row) if opp_row else None
-                    }
+                    return {'client': dict(client_row)}
         except Exception as e:
             logger.exception("create_client_and_lead_transaction failed: %s", e)
             try:
