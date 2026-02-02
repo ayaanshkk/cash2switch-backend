@@ -188,13 +188,28 @@ def register():
             
             session.commit()
             
+            # Try to include tenant_id when the invited user is tenant-scoped
+            tenant_id = None
+            if hasattr(user, 'tenant_id') and getattr(user, 'tenant_id') is not None:
+                tenant_id = getattr(user, 'tenant_id')
+            elif hasattr(user, 'employee_id') and getattr(user, 'employee_id') is not None:
+                emp = session.execute(
+                    text('SELECT tenant_id FROM "StreemLyne_MT"."Employee_Master" WHERE employee_id = :id'),
+                    {'id': user.employee_id}
+                ).mappings().first()
+                tenant_id = emp.get('tenant_id') if emp else None
+
             payload = {
                 'user_id': user.id,
+                'employee_id': getattr(user, 'employee_id', None),
+                'tenant_id': tenant_id,
                 'exp': datetime.utcnow() + timedelta(days=7),
                 'iat': datetime.utcnow()
             }
+            # strip None values
+            payload = {k: v for k, v in payload.items() if v is not None}
             token = jwt.encode(payload, current_app.config['SECRET_KEY'], algorithm='HS256')
-            
+
             session_record = Session(
                 user_id=user.id,
                 session_token=token,
@@ -204,11 +219,11 @@ def register():
             )
             session.add(session_record)
             session.commit()
-            
+
             log_login_attempt(user.email, get_client_ip(), True)
-            
+
             current_app.logger.info(f"✅ Invitation registration completed: {user.email} as {user.role}")
-            
+
             return jsonify({
                 'success': True,
                 'message': 'Registration completed successfully',
@@ -334,6 +349,10 @@ def login():
             'exp': datetime.utcnow() + timedelta(days=7),
             'iat': datetime.utcnow()
         }
+        
+        # 🔍 TEMPORARY: Log payload before token generation
+        current_app.logger.info(f"🎫 Generating JWT for user_id={payload['user_id']}, tenant_id={payload['tenant_id']}")
+        
         token = jwt.encode(payload, current_app.config['SECRET_KEY'], algorithm='HS256')
 
         user = {
@@ -530,15 +549,35 @@ def refresh_token():
     session = SessionLocal()
     try:
         user = g.user
-        
+
+        # Preserve tenant and identity claims from the incoming token when present.
+        # Prefer claims from the incoming token (so refresh is idempotent),
+        # but fall back to attributes on the loaded user.
+        old_token = request.headers.get('Authorization').split(" ")[1]
+        old_payload = {}
+        try:
+            # decode without enforcing expiry so we can copy claims from an expired token
+            old_payload = jwt.decode(old_token, current_app.config['SECRET_KEY'], algorithms=['HS256'], options={'verify_exp': False})
+        except Exception:
+            old_payload = {}
+
+        employee_id = getattr(user, 'id', None) or old_payload.get('employee_id') or old_payload.get('user_id')
+        tenant_id = old_payload.get('tenant_id') or getattr(user, 'tenant_id', None)
+        user_name = old_payload.get('user_name') or getattr(user, 'user_name', None)
+
         payload = {
-            'user_id': user.id,
+            'user_id': employee_id,
+            'employee_id': employee_id,
+            'user_name': user_name,
+            'tenant_id': tenant_id,
             'exp': datetime.utcnow() + timedelta(days=7),
             'iat': datetime.utcnow()
         }
+        # keep token compact by removing None values
+        payload = {k: v for k, v in payload.items() if v is not None}
         new_token = jwt.encode(payload, current_app.config['SECRET_KEY'], algorithm='HS256')
-        
-        old_token = request.headers.get('Authorization').split(" ")[1]
+
+        old_token = old_token
         session_record = session.query(Session).filter_by(session_token=old_token).first()
 
         if session_record:

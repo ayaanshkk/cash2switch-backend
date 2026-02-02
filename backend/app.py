@@ -36,7 +36,11 @@ def create_app():
     # ============================================
     # CONFIG
     # ============================================
-    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production")
+    # JWT Secret - Single source of truth for token signing and verification
+    jwt_secret = os.getenv("JWT_SECRET_KEY") or os.getenv("SECRET_KEY")
+    if not jwt_secret:
+        raise ValueError("JWT_SECRET_KEY must be set in environment variables")
+    app.config["SECRET_KEY"] = jwt_secret
 
     # ============================================
     # ⚙️ DATABASE INITIALIZATION (NEW LOCATION)

@@ -44,88 +44,38 @@ def test_crud_operations():
     # Note: client_id must exist in Client_Master for the tenant
     # We'll use client_id=2 which we know exists from the setup script
     
-    print("\n[Step 1] CREATE a new lead...")
+    print("\n[Step 1] VERIFY API rejects direct lead creation (now import-only)...")
     new_lead = {
-        "client_id": 2,  # Must exist in Client_Master for this tenant
+        "client_id": 2,
         "opportunity_title": "Test Solar Installation Project",
         "opportunity_description": "Large scale solar panel installation for commercial building",
-        "stage_id": 1,  # Must exist in Stage_Master
-        "opportunity_value": 25000,  # Must be <= 32767 (smallint max)
-        "opportunity_owner_employee_id": None  # Optional field, can be NULL
+        "stage_id": 1,
+        "opportunity_value": 25000,
+        "opportunity_owner_employee_id": None
     }
-    
-    response = requests.post(f"{BASE_URL}/leads", headers=headers, json=new_lead)
-    print_response("CREATE Lead (POST /api/crm/leads)", response)
-    
-    if response.status_code != 201:
-        print("\nERROR: Failed to create lead. Check if:")
-        print("  1. client_id=2 exists in Client_Master for tenant_id=1")
-        print("  2. stage_id=1 exists in Stage_Master")
-        print("  3. Backend logs for detailed error")
-        print("\nStopping test...")
-        return
-    
-    created_lead = response.json().get('data', {})
-    lead_id = created_lead.get('opportunity_id')
-    
-    if not lead_id:
-        print("\nERROR: No opportunity_id returned from CREATE")
-        return
-    
-    print(f"\nCreated Lead ID: {lead_id}")
-    
-    # Step 2: READ the created lead
-    print(f"\n[Step 2] READ the created lead (ID: {lead_id})...")
-    response = requests.get(f"{BASE_URL}/leads", headers=headers)
-    print_response(f"READ Leads (GET /api/crm/leads)", response)
-    
-    # Step 3: READ single lead by ID
-    print(f"\n[Step 3] READ single lead by ID...")
-    # Note: We don't have a GET /leads/:id endpoint yet, so we'll verify from the list
-    
-    # Step 4: UPDATE the lead
-    print(f"\n[Step 4] UPDATE the lead (ID: {lead_id})...")
-    update_data = {
-        "opportunity_title": "UPDATED: Test Solar Installation Project",
-        "opportunity_value": 30000,  # Must be <= 32767 (smallint max)
-        "stage_id": 2  # Move to next stage
-    }
-    
-    response = requests.put(f"{BASE_URL}/leads/{lead_id}", headers=headers, json=update_data)
-    print_response(f"UPDATE Lead (PUT /api/crm/leads/{lead_id})", response)
-    
-    # Step 5: READ again to verify update
-    print(f"\n[Step 5] READ again to verify update...")
-    response = requests.get(f"{BASE_URL}/leads", headers=headers)
-    print_response("READ Leads after UPDATE", response)
-    
-    # Step 6: Test multi-tenant isolation (try with wrong tenant)
-    print(f"\n[Step 6] Test multi-tenant isolation (try with wrong tenant_id=999)...")
-    wrong_tenant_headers = {
-        "X-Tenant-ID": "999",
-        "Content-Type": "application/json"
-    }
-    response = requests.get(f"{BASE_URL}/leads", headers=wrong_tenant_headers)
-    print_response("READ Leads with wrong tenant (should be empty or error)", response)
-    
-    # Step 7: DELETE the lead
-    print(f"\n[Step 7] DELETE the lead (ID: {lead_id})...")
-    response = requests.delete(f"{BASE_URL}/leads/{lead_id}", headers=headers)
-    print_response(f"DELETE Lead (DELETE /api/crm/leads/{lead_id})", response)
-    
-    # Step 8: Verify deletion
-    print(f"\n[Step 8] Verify deletion...")
-    response = requests.get(f"{BASE_URL}/leads", headers=headers)
-    print_response("READ Leads after DELETE (should not contain deleted lead)", response)
 
-    print("\n" + "="*80)
-    print("CRUD Test Complete!")
-    print("="*80)
+    response = requests.post(f"{BASE_URL}/leads", headers=headers, json=new_lead)
+    print_response("ATTEMPT CREATE Lead (POST /api/crm/leads)", response)
+
+    # New business rule: leads must be created via Excel import only
+    assert response.status_code == 400, "Expected 400 Bad Request when creating leads via API"
+    body = response.json()
+    assert body.get('success') is False
+    assert 'Excel import' in body.get('message', '') or 'import' in body.get('message', '').lower()
+
+    print("\nConfirmed: direct lead creation via API is disallowed; use import/confirm.")
+
+    # Remaining CRUD steps require an existing Opportunity_Details row which must be created
+    # via the import flow. Stop here for API-level contract verification.
+    return
 
 
 def test_create_client_and_lead_in_single_call():
-    """Integration test: POST /api/crm/leads with client payload should create both records transactionally."""
-    print("\n[Integration] CREATE client + lead in a single POST /api/crm/leads call")
+    """Integration test: POST /api/crm/leads with client payload is no longer allowed.
+
+    Verifies API returns a validation error and instructs caller to use the import flow.
+    """
+    print("\n[Integration] ATTEMPT client + lead creation via POST /api/crm/leads (now disallowed)")
     payload = {
         "client": {
             "client_company_name": "ACME Transactional Test Ltd",
@@ -140,18 +90,38 @@ def test_create_client_and_lead_in_single_call():
     }
 
     response = requests.post(f"{BASE_URL}/leads", headers=headers, json=payload)
-    print_response("CREATE client+lead (POST /api/crm/leads)", response)
+    print_response("ATTEMPT CREATE client+lead (POST /api/crm/leads)", response)
 
-    assert response.status_code == 201, "Expected 201 Created for client+lead creation"
+    # API-level lead creation (including client+lead) is now disallowed — leads must come from import
+    assert response.status_code == 400, "Expected 400 Bad Request for client+lead creation via /leads"
     body = response.json()
-    assert body.get('success') is True
-    data = body.get('data')
-    assert data and data.get('client') and data.get('opportunity')
-    created_client = data['client']
-    created_opp = data['opportunity']
-    assert created_client.get('client_id') is not None
-    assert created_opp.get('opportunity_id') is not None
+    assert body.get('success') is False
+    assert 'import' in body.get('message', '').lower() or 'excel' in body.get('message', '').lower()
 
+
+def test_create_client_does_not_create_opportunity():
+    """Creating a client (POST /api/crm/clients) must NOT create an Opportunity_Details row."""
+    print("\n[Integration] CREATE client via POST /api/crm/clients and ensure no Opportunity_Details is created")
+    client_payload = {
+        "name": "NoOpp Test Co",
+        "phone": "+441234500000",
+        "email": "noopp@example.test"
+    }
+    resp = requests.post(f"http://127.0.0.1:5000/api/crm/clients", headers=headers, json=client_payload)
+    print_response("CREATE client (POST /api/crm/clients)", resp)
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body.get('success') is True
+    client = body.get('customer') or body.get('client') or {}
+    # Ensure API did not return an opportunity
+    assert 'opportunity' not in body.get('data', {})
+
+    # Now assert leads list does not include this company's name
+    leads_resp = requests.get(f"{BASE_URL}/leads", headers=headers)
+    print_response("GET /api/crm/leads after client create", leads_resp)
+    assert leads_resp.status_code == 200
+    lead_names = [r.get('business_name') for r in leads_resp.json().get('data', [])]
+    assert "NoOpp Test Co" not in lead_names, "Client creation must not create an Opportunity_Details row"
 
 if __name__ == "__main__":
     try:

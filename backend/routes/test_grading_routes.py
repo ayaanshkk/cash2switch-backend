@@ -40,8 +40,10 @@ def token_required(f):
             return jsonify({"error": "Authentication token is missing"}), 401
         
         try:
-            # Decode token
-            secret_key = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production")
+            # Decode token using the same secret as app.config
+            secret_key = os.getenv("JWT_SECRET_KEY") or os.getenv("SECRET_KEY")
+            if not secret_key:
+                return jsonify({"error": "JWT secret not configured"}), 500
             payload = jwt.decode(token, secret_key, algorithms=['HS256'])
             
             # Get user from database

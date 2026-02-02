@@ -37,9 +37,15 @@ def get_app():
 def test_confirm_endpoint_rejects_non_array_payload(monkeypatch):
     app = get_app()
     client = app.test_client()
-    headers = {"X-Tenant-ID": "1", "Content-Type": "application/json"}
 
-    resp = client.post('/api/crm/leads/import/confirm', data='{}', headers=headers)
+    # Inject a fake authenticated user (simulates decoded JWT with tenant_id)
+    from types import SimpleNamespace
+    @app.before_request
+    def _inject_current_user():
+        from flask import request
+        request.current_user = SimpleNamespace(id=2, tenant_id=1, full_name='Importer')
+
+    resp = client.post('/api/crm/leads/import/confirm', data='{}', content_type='application/json')
     assert resp.status_code == 400
     body = resp.get_json()
     assert body['success'] is False

@@ -11,8 +11,9 @@ except Exception:
 End-to-end tests for Leads implementation.
 
 Tests:
-  1) Create client via POST /api/crm/clients; verify Client_Master + Opportunity_Details.
-  2) GET /api/crm/leads/table returns new lead with 14 required keys.
+  1) Create client via POST /api/crm/clients; verify Client_Master (Leads must NOT be auto-created).
+  2) Create leads only via POST /api/crm/leads/import/confirm and verify they appear in
+     GET /api/crm/leads/table (14 required keys).
   3) Joins: stage_id->status, opportunity_owner_employee_id->assigned_to,
      Project_Details->annual_usage, Energy_Contract_Master->dates+supplier,
      Client_Interactions->callback_parameter, call_summary (latest).
@@ -140,6 +141,7 @@ def run_test_1_create_client(app, db, tenant_id):
         return None, None, None
 
     client_id = client_row["client_id"]
+    # Per business rule, creating a client must NOT create an Opportunity_Details row.
     opportunity_id = opportunity_row.get("opportunity_id") if opportunity_row else None
 
     ok("POST /api/crm/clients returned 201", "client_id={}, opportunity_id={}".format(client_id, opportunity_id))

@@ -32,7 +32,13 @@ def get_app():
 def test_csv_preview_validations():
     app = get_app()
     client = app.test_client()
-    headers = {"X-Tenant-ID": "1"}
+
+    # Simulate authenticated user with tenant_id in decoded JWT
+    from flask import request
+    from types import SimpleNamespace
+    @app.before_request
+    def _fake_current_user():
+        request.current_user = SimpleNamespace(id=11, tenant_id=1, full_name='Preview Tester')
 
     csv = (
         "MPAN_MPR,Business_Name,Contact_Person,Tel_Number,Start_Date,End_Date\n"
@@ -48,7 +54,7 @@ def test_csv_preview_validations():
         'file': (io.BytesIO(csv.encode('utf-8')), 'leads.csv')
     }
 
-    resp = client.post('/api/crm/leads/import/preview', data=data, headers=headers, content_type='multipart/form-data')
+    resp = client.post('/api/crm/leads/import/preview', data=data, content_type='multipart/form-data')
     assert resp.status_code == 200, resp.get_data(as_text=True)
     body = resp.get_json()
     assert body['success'] is True

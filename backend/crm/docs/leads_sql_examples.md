@@ -65,7 +65,7 @@ LIMIT 100;
 ## 5) Best-practices / security
 - Always use parameterised queries; never interpolate `tenant_id` or user input directly into SQL.
 - Validate tenant ownership on writes (INSERT/UPDATE/DELETE) by joining into `Client_Master` or filtering by `tenant_id` in the WHERE clause.
-- Perform client + lead creation inside a DB transaction to avoid orphaned rows.
+- Client + lead transactional creation is deprecated. Leads must be created via the Excel import flow to ensure a single source-of-truth (Opportunity_Details).
 - Use appropriate column types and validate numeric ranges (e.g. smallint limits) before inserting.
 
 If you want, I can generate ready-to-run SQL migration snippets or a SQL-only transaction example tailored to your DB schema/version.

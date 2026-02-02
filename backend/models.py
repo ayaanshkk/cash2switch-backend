@@ -151,117 +151,26 @@ class User(Base):
 
 
 class UserMaster(Base):
-    """SQLAlchemy mapping for StreemLyne_MT.User_Master (CRM users).
-
-    - Primary key: employee_id
-    - Safe `password_hash` support (nullable; may not exist in DB)
-    - `is_active` derived: if DB NULL => assume True
-    - Use `UserMaster` for CRM authentication (replaces legacy `User`)
-    """
     __tablename__ = 'User_Master'
     __table_args__ = {'schema': 'StreemLyne_MT'}
-
-    employee_id = Column(Integer, primary_key=True)
-    tenant_id = Column(Integer, nullable=True, index=True)
-    employee_name = Column(String(255), nullable=True)
-    phone = Column(String(50), nullable=True)
-    email = Column(String(255), nullable=True, index=True)
-    role_ids = Column(Text, nullable=True)
-    created_on = Column(DateTime, nullable=True)
-    updated_on = Column(DateTime, nullable=True)
-
-    # Optional; may not exist in older DBs — keep nullable and handle safely in code
-    password_hash = Column(String(255), nullable=True)
-
-    # Map the DB column `is_active` to a private attr so we can derive behavior in the property
-    _is_active = Column('is_active', Boolean, nullable=True)
-
-    def __repr__(self) -> str:
-        return f"<UserMaster {self.employee_id} {self.email}>"
-
-    @hybrid_property
-    def is_active(self) -> bool:
-        """Return derived active state: prefer DB value; if NULL assume True."""
-        if self._is_active is not None:
-            return bool(self._is_active)
-        # If DB is NULL, assume active (per new auth rules). Role-based derivation can be
-        # added here later if business rules are available.
-        return True
-
-    @is_active.setter
-    def is_active(self, value: bool) -> None:
-        self._is_active = value
-
-    def check_password(self, password: str) -> bool:
-        """Return True if provided password matches stored password_hash.
-
-        Uses werkzeug.security.check_password_hash; returns False if no hash present.
-        """
-        if not getattr(self, 'password_hash', None):
-            return False
-        return check_password_hash(self.password_hash, password)
-
+    
+    user_id = Column(Integer, primary_key=True)
+    employee_id = Column(Integer, nullable=True)
+    user_name = Column(String(255), nullable=True)
+    password = Column(String(255), nullable=True)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(Date, nullable=True)
+    
     @property
-    def roles(self):
-        """Return role ids as list (handles array-literals and comma-separated strings)."""
-        v = self.role_ids
-        if not v:
-            return []
-        if isinstance(v, (list, tuple)):
-            return list(v)
-        s = v.strip()
-        # Postgres array literal: {1,2}
-        if s.startswith('{') and s.endswith('}'):
-            s = s[1:-1]
-        return [part.strip() for part in s.split(',') if part.strip()]
-
-    def to_dict(self) -> dict:
-        return {
-            'employee_id': self.employee_id,
-            'tenant_id': self.tenant_id,
-            'employee_name': self.employee_name,
-            'phone': self.phone,
-            'email': self.email,
-            'roles': self.roles,
-            'created_on': self.created_on.isoformat() if self.created_on else None,
-            'updated_on': self.updated_on.isoformat() if self.updated_on else None,
-            'is_active': self.is_active,
-        }
-
-    @staticmethod
-    def verify_jwt_token(token: str, secret_key: str, session=None):
-        """Compatibility helper: decode JWT and return UserMaster when possible.
-
-        Accepts tokens that include either `employee_id` or legacy `user_id` in payload.
-        This allows a gradual migration from the legacy `User` model to `UserMaster`.
-        """
-        try:
-            payload = jwt.decode(token, secret_key, algorithms=['HS256'])
-            user_id = payload.get('employee_id') or payload.get('user_id')
-            if user_id is None:
-                return None
-
-            if session is None:
-                local_session = SessionLocal()
-            else:
-                local_session = session
-
-            user = local_session.get(UserMaster, user_id)
-
-            if session is None:
-                local_session.close()
-
-            return user if user and user.is_active else None
-
-        except jwt.ExpiredSignatureError:
-            return None
-        except jwt.InvalidTokenError:
-            return None
-        except Exception:
-            if session is None and 'local_session' in locals():
-                local_session.close()
-            return None
-
+    def id(self):
+        return self.user_id
+    
+    @property
+    def is_active(self):
+        return True
+    
+    def to_dict(self):
+        return {'id': self.user_id, 'employee_id': self.employee_id, 'user_name': self.user_name}
 
 class LoginAttempt(Base):
     __tablename__ = 'login_attempts'
@@ -854,3 +763,4 @@ class CustomerDocument(Base):
             'file_type': self.file_type,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
+

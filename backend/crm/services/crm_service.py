@@ -93,114 +93,46 @@ class CRMService:
             'interactions': interactions
         }
     
-    def create_lead(self, tenant_id: int, lead_data: Dict[str, Any]) -> Dict[str, Any]:
+    def update_lead_status(self, tenant_id: int, opportunity_id: int, stage_id: int) -> Dict[str, Any]:
         """
-        Create a new lead/opportunity.
-
-        Supports two payload shapes:
-        - Existing client: { "client_id": <id>, ... }
-        - Create client + lead in one call: { "client": { ...client fields... }, ...lead fields... }
-
-        Behavior:
-        - If `client_id` is provided, validates tenant ownership and creates the opportunity.
-        - If a `client` object or client company name is provided, creates the client and the
-          opportunity inside a single DB transaction (atomic).
-        - If `stage_id` is not provided, uses the first `Stage_Master` record as default.
-
-        Returns a consistent response dict (success, data, message / error).
+        Update lead status (stage_id) with tenant isolation
+        
+        Args:
+            tenant_id: Tenant identifier
+            opportunity_id: Opportunity ID
+            stage_id: New stage ID
+        
+        Returns:
+            Dictionary with success status and updated data
         """
-        # Case A: client + lead in one call (transactional)
-        try:
-            # Detect client creation intent
-            wants_create_client = bool(lead_data.get('client') or lead_data.get('client_company_name') or lead_data.get('business_name'))
-
-            if wants_create_client and not lead_data.get('client_id'):
-                # Prepare client payload (map API keys -> DB column names)
-                client_payload = lead_data.get('client') or {
-                    'client_company_name': lead_data.get('client_company_name') or lead_data.get('business_name'),
-                    'client_contact_name': lead_data.get('client_contact_name') or lead_data.get('contact_person'),
-                    'client_phone': lead_data.get('client_phone') or lead_data.get('phone') or lead_data.get('tel_number'),
-                    'client_email': lead_data.get('client_email') or lead_data.get('email'),
-                    'address': lead_data.get('address'),
-                    'country_id': lead_data.get('country_id'),
-                    'post_code': lead_data.get('post_code'),
-                }
-
-                if not (client_payload.get('client_company_name') or client_payload.get('client_contact_name')):
-                    return {
-                        'success': False,
-                        'error': 'Validation error',
-                        'message': 'client_company_name (or business_name) is required when creating a client.'
-                    }
-
-                # Lead-specific payload
-                lead_payload = {
-                    'opportunity_title': lead_data.get('opportunity_title') or lead_data.get('opportunity_name') or client_payload.get('client_company_name'),
-                    'opportunity_description': lead_data.get('opportunity_description', ''),
-                    'opportunity_value': lead_data.get('opportunity_value', 0),
-                    'opportunity_owner_employee_id': lead_data.get('opportunity_owner_employee_id') or lead_data.get('opportunity_owner_id')
-                }
-
-                # If stage_id provided at top-level prefer it
-                if lead_data.get('stage_id'):
-                    lead_payload['stage_id'] = lead_data.get('stage_id')
-                else:
-                    # Try to pick first stage from Stage_Master
-                    stages = self.stage_repo.get_all_stages()
-                    if stages:
-                        lead_payload['stage_id'] = stages[0].get('stage_id')
-
-                created = self.lead_repo.create_client_and_lead_transaction(tenant_id, client_payload, lead_payload)
-
-                if not created:
-                    return {
-                        'success': False,
-                        'error': 'Failed to create client and lead',
-                        'message': 'Could not create client and lead. Operation rolled back.'
-                    }
-
-                return {
-                    'success': True,
-                    'data': created,
-                    'message': 'Client and lead created successfully'
-                }
-
-            # Case B: create lead for existing client_id
-            client_id = lead_data.get('client_id')
-            if not client_id:
-                return {
-                    'success': False,
-                    'error': 'Validation error',
-                    'message': 'Either client_id or client (payload) must be provided.'
-                }
-
-            # Ensure default stage if none provided
-            if not lead_data.get('stage_id'):
-                stages = self.stage_repo.get_all_stages()
-                if stages:
-                    lead_data['stage_id'] = stages[0].get('stage_id')
-
-            lead = self.lead_repo.create_lead(tenant_id, lead_data)
-            if not lead:
-                return {
-                    'success': False,
-                    'error': 'Failed to create lead',
-                    'message': 'Could not create lead. Please check client_id and provided fields.'
-                }
-
-            return {
-                'success': True,
-                'data': lead,
-                'message': 'Lead created successfully'
-            }
-
-        except Exception as e:
-            logger.exception("create_lead error: %s", e)
+        result = self.lead_repo.update_lead_status(tenant_id, opportunity_id, stage_id)
+        
+        if not result:
             return {
                 'success': False,
-                'error': 'Internal server error',
-                'message': str(e)
+                'error': 'Lead not found',
+                'message': f'No lead found with ID {opportunity_id} or access denied'
             }
+        
+        return {
+            'success': True,
+            'data': result,
+            'message': 'Lead status updated successfully'
+        }
+    
+    def create_lead(self, tenant_id: int, lead_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Disabled: Leads must be created only via the Excel import-confirm flow.
+
+        This service method no longer permits creating leads via the API. Callers
+        should use POST /api/crm/leads/import/confirm which inserts into
+        Opportunity_Details and populates the required tenant-scoped fields.
+        """
+        return {
+            'success': False,
+            'error': 'Validation error',
+            'message': 'Leads must be created via Excel import. Use POST /api/crm/leads/import/confirm.'
+        }
     
     def update_lead(self, tenant_id: int, opportunity_id: int, lead_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -560,10 +492,11 @@ class CRMService:
         """
         Confirm/import validated rows into Opportunity_Details.
 
-        - Uses MPAN_MPR to resolve existing client via Project_Details.mpan (tenant-scoped)
-        - Inserts Opportunity_Details with stage_id=1 (New)
-        - Skips rows where MPAN already exists in DB or client/project can't be resolved
+        - Stores MPAN_MPR directly in Opportunity_Details.mpan_mpr
+        - Inserts Opportunity_Details with stage_id=1 (New), tenant_id from JWT
+        - Skips rows where MPAN already exists in Opportunity_Details
         - Partial success allowed; per-row errors returned
+        - NO dependency on Project_Details or Client_Master
         """
         if not isinstance(rows, list) or len(rows) == 0:
             return {'success': False, 'error': 'Invalid payload', 'message': 'Expected non-empty JSON array of validated rows.'}
@@ -651,34 +584,12 @@ class CRMService:
                 if default_stage and default_stage.get('stage_id') is not None:
                     default_stage_id = default_stage['stage_id']
 
-            # Always create Opportunity_Details when we have a stage
-            opportunity = None
-            if default_stage_id is not None:
-                opportunity_title = company_name or 'New Lead'
-                lead_data = {
-                    'client_id': client_id,
-                    'stage_id': default_stage_id,
-                    'opportunity_title': opportunity_title,
-                    'opportunity_description': data.get('opportunity_description', ''),
-                    'opportunity_value': data.get('opportunity_value', 0),
-                    'opportunity_owner_employee_id': data.get('opportunity_owner_employee_id'),
-                }
-                print("DEBUG client_id =", client_id)
-                print("DEBUG tenant_id =", tenant_id)
-                print("DEBUG stages =", stages)
-                print("DEBUG default_stage_id =", default_stage_id)
-                opportunity = self.lead_repo.create_lead(tenant_id, lead_data)
-                print("DEBUG opportunity =", opportunity)
-                if opportunity is None:
-                    raise RuntimeError(
-                        "create_lead returned None; client was created but opportunity insert failed. "
-                        "Check LeadRepository logs above for the exact SQL/DB error."
-                    )
-
+            # Per new business rule: creating a client MUST NOT create an Opportunity_Details row.
+            # Return the created client only and instruct callers to use the import flow for leads.
             return {
                 'success': True,
-                'data': {'client': client, 'opportunity': opportunity},
-                'message': 'Client and lead created successfully' if opportunity else 'Client created; opportunity could not be created.'
+                'data': {'client': client},
+                'message': 'Client created successfully. Leads must be created via Excel import (POST /api/crm/leads/import/confirm).'
             }
         except Exception as e:
             import logging
