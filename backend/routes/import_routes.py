@@ -544,6 +544,8 @@ def import_energy_customers():
                 
                 # 4. Create Energy_Contract_Master (if MPAN provided or supplier found)
                 if project and mpan_mpr:  # Only create if we have MPAN
+                    current_app.logger.info(f"   🔧 Creating contract: project_id={project.project_id}, mpan={mpan_mpr}")
+                    
                     # Log if supplier name was provided but not found
                     if supplier_name and not supplier_id:
                         current_app.logger.warning(f"⚠️ Row {index + 2}: Supplier '{supplier_name}' not found, using default")
@@ -565,6 +567,11 @@ def import_energy_customers():
                     )
                     session.add(contract)
                     session.flush()
+                    current_app.logger.info(f"   ✅ Created Energy_Contract_Master: {contract.energy_contract_master_id}")
+                elif not project:
+                    current_app.logger.warning(f"   ⚠️ No project created for {business_name} - cannot create contract")
+                elif not mpan_mpr:
+                    current_app.logger.warning(f"   ⚠️ No MPAN provided for {business_name} - skipping contract")
                 
                 success_count += 1
                 
