@@ -31,11 +31,13 @@ A production-ready, multi-tenant CRM API that connects to the external StreemLyn
 
 ### ✅ Task 2: Tenant Middleware
 - [x] Created tenant middleware (`backend/crm/middleware/tenant_middleware.py`)
-- [x] Extracts X-Tenant-ID from request headers
+- [x] Extracts X-Tenant-ID from request headers (most endpoints)
+- [x] For Leads endpoints: tenant_id is taken from the JWT (Authorization: Bearer <token>) — header is not accepted for Leads
 - [x] Validates tenant in Tenant_Master table
 - [x] Checks tenant is_active status
 - [x] Attaches tenant_id to Flask's g object
-- [x] Returns 400 if X-Tenant-ID missing
+- [x] Returns 400 if X-Tenant-ID missing on header-based endpoints
+- [x] Returns 401 if tenant_id missing from JWT for Leads endpoints
 - [x] Returns 404 if tenant not found
 - [x] Returns 403 if tenant inactive
 

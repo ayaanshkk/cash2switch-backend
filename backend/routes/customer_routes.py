@@ -121,79 +121,76 @@ def get_energy_customers():
     
     session = SessionLocal()
     try:
-        # ✅ Debug logging
-        current_app.logger.info(f"🔍 Current user: employee_id={request.current_user.employee_id if hasattr(request.current_user, 'employee_id') else 'N/A'}")
+        # Get all customers
+        customers = session.query(Customer).all()
         
-        tenant_id = get_tenant_id_from_user(request.current_user)
+        current_app.logger.info(f"📊 Fetching {len(customers)} customers")
         
-        current_app.logger.info(f"🏢 Tenant ID resolved: {tenant_id}")
+        result = []
+        for customer in customers:
+            customer_data = customer.to_dict()
+            result.append(customer_data)
+
+        current_app.logger.info(f"✅ Returning {len(result)} customers")
         
-        if not tenant_id:
-            return jsonify({'error': 'Tenant not found for user'}), 400
+        return jsonify(result), 200
+
+    except Exception as e:
+        current_app.logger.exception(f"❌ Error fetching customers: {e}")
+        return jsonify({'error': 'Failed to fetch customers'}), 500
+    finally:
+        session.close()
+
+
+@customer_bp.route('/clients', methods=['POST'])
+@token_required
+def create_customer():
+    """Create a new customer and automatically create a lead in CRM"""
+    session = SessionLocal()
+    try:
+        data = request.get_json()
         
-        # Complex query joining all relevant tables
-        query = session.query(
-            Client_Master,
-            Project_Details,
-            Energy_Contract_Master,
-            Opportunity_Details,
-            Client_Interactions,
-            Supplier_Master,
-            Employee_Master
-        ).outerjoin(
-            Project_Details, 
-            Client_Master.client_id == Project_Details.client_id
-        ).outerjoin(
-            Energy_Contract_Master,
-            Project_Details.project_id == Energy_Contract_Master.project_id
-        ).outerjoin(
-            Opportunity_Details,
-            Client_Master.client_id == Opportunity_Details.client_id
-        ).outerjoin(
-            Client_Interactions,
-            Client_Master.client_id == Client_Interactions.client_id
-        ).outerjoin(
-            Supplier_Master,
-            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
-        ).outerjoin(
-            Employee_Master,
-            Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
-        ).filter(
-            and_(
-                Client_Master.tenant_id == tenant_id,
-                Client_Master.client_company_name != '[IMPORTED LEADS]'  # ✅ FIX: Exclude placeholder client
-            )
-        ).order_by(
-            Client_Master.created_at.desc()
+        # Validate required fields
+        if not data.get('name'):
+            return jsonify({'error': 'Name is required'}), 400
+        if not data.get('phone'):
+            return jsonify({'error': 'Phone is required'}), 400
+        
+        # Create new customer in local database
+        new_customer = Customer(
+            id=str(uuid.uuid4()),
+            name=data.get('name'),
+            phone=data.get('phone'),
+            email=data.get('email', ''),
+            address=data.get('address', ''),
+            salesperson=data.get('salesperson', ''),
+            marketing_opt_in=data.get('marketing_opt_in', False),
+            notes=data.get('notes', ''),
+            contact_made=data.get('contact_made', 'No'),
+            preferred_contact_method=data.get('preferred_contact_method', 'Phone'),
+            sales_stage='Enquiry',  # Default to first stage in sales pipeline
+            pipeline_type='sales',   # Default to sales pipeline
+            status='Active',
+            created_at=datetime.utcnow(),
+            created_by=str(request.current_user.id) if hasattr(request.current_user, 'id') else None
         )
         
-        # ✅ Apply role-based filtering (TODO: implement proper role checking)
-        # Note: UserMaster doesn't have a 'role' field directly
-        # Will need to check Employee_Master.role_ids or implement custom role logic
+        session.add(new_customer)
+        session.commit()
+        session.refresh(new_customer)
         
-        results = query.all()
+        current_app.logger.info(f"✅ Customer {new_customer.id} created by user {request.current_user.id}")
         
-        current_app.logger.info(f"📊 Fetching {len(results)} energy customers for tenant {tenant_id}")
+        # Per business rule: creating a Customer MUST NOT create a Lead in CRM.
+        # Legacy behavior removed — log and continue.
+        current_app.logger.debug("Business rule: client creation does not create Opportunity_Details; skipping CRM lead creation.")
         
-        # Build response for each customer
-        customers = []
-        seen_clients = set()
+        return jsonify({
+            'success': True,
+            'message': 'Customer created successfully',
+            'customer': new_customer.to_dict()
+        }), 201
         
-        for client, project, contract, opportunity, interaction, supplier, employee in results:
-            # Avoid duplicates if a client has multiple projects/contracts
-            if client.client_id in seen_clients:
-                continue
-            seen_clients.add(client.client_id)
-            
-            customer_data = build_customer_response(
-                client, project, contract, opportunity, interaction, supplier, employee
-            )
-            customers.append(customer_data)
-        
-        current_app.logger.info(f"✅ Returning {len(customers)} unique energy customers")
-        
-        return jsonify(customers), 200
-
     except Exception as e:
         current_app.logger.exception(f"❌ Error fetching energy customers: {e}")
         return jsonify({'error': 'Failed to fetch energy customers'}), 500

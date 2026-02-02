@@ -19,7 +19,13 @@ def get_app():
 def test_get_leads_returns_expected_fields_and_order(monkeypatch):
     app = get_app()
     client = app.test_client()
-    headers = {"X-Tenant-ID": "1"}
+
+    # Inject a fake authenticated user (simulates decoded JWT with tenant_id)
+    from types import SimpleNamespace
+    @app.before_request
+    def _inject_current_user():
+        from flask import request
+        request.current_user = SimpleNamespace(id=1, tenant_id=1, full_name='Test User')
 
     sample_rows = [
         {
@@ -60,12 +66,30 @@ def test_get_leads_returns_expected_fields_and_order(monkeypatch):
 
     monkeypatch.setattr(LeadRepository, 'get_leads_list', fake_get_leads_list)
 
-    resp = client.get('/api/crm/leads', headers=headers)
+    resp = client.get('/api/crm/leads')
     assert resp.status_code == 200, resp.get_data(as_text=True)
     body = resp.get_json()
     assert body.get('success') is True
     assert isinstance(body.get('data'), list)
     assert body.get('count') == 2
+
+
+def test_get_leads_returns_401_when_tenant_missing_in_jwt(monkeypatch):
+    """If the authenticated token does not include tenant_id, return 401 (not 400)."""
+    app = get_app()
+    client = app.test_client()
+
+    # Inject a current_user WITHOUT tenant_id
+    from types import SimpleNamespace
+    @app.before_request
+    def _inject_current_user_missing_tenant():
+        from flask import request
+        request.current_user = SimpleNamespace(id=5, full_name='NoTenant')
+
+    resp = client.get('/api/crm/leads')
+    assert resp.status_code == 401
+    body = resp.get_json()
+    assert body.get('error') == 'Missing tenant in token'
 
     # Only allowed fields should be present on each row
     allowed = {
@@ -83,7 +107,13 @@ def test_get_leads_returns_expected_fields_and_order(monkeypatch):
 def test_get_leads_passes_stage_filter_and_tenant(monkeypatch):
     app = get_app()
     client = app.test_client()
-    headers = {"X-Tenant-ID": "2"}
+
+    # Simulate authenticated user (tenant_id comes from JWT/current_user)
+    from flask import request
+    from types import SimpleNamespace
+    @app.before_request
+    def _fake_current_user():
+        request.current_user = SimpleNamespace(id=123, tenant_id=2, full_name='Test User')
 
     from backend.crm.repositories.lead_repository import LeadRepository
 
@@ -95,9 +125,26 @@ def test_get_leads_passes_stage_filter_and_tenant(monkeypatch):
 
     monkeypatch.setattr(LeadRepository, 'get_leads_list', fake_get_leads_list)
 
-    resp = client.get('/api/crm/leads?stage_id=5', headers=headers)
+    resp = client.get('/api/crm/leads?stage_id=5')
     assert resp.status_code == 200
     body = resp.get_json()
     assert body.get('success') is True
     assert body.get('data') == []
     assert body.get('count') == 0
+
+
+def test_get_leads_requires_tenant_in_jwt_returns_401(app):
+    """If the authenticated token lacks tenant_id the endpoint must return 401"""
+    client = app.test_client()
+
+    from flask import request
+    from types import SimpleNamespace
+    @app.before_request
+    def _fake_current_user_missing_tenant():
+        # authenticated user but no tenant_id in token
+        request.current_user = SimpleNamespace(id=999, full_name='NoTenant')
+
+    resp = client.get('/api/crm/leads')
+    assert resp.status_code == 401
+    body = resp.get_json()
+    assert 'tenant' in body.get('error', '').lower() or 'tenant' in body.get('message', '').lower()

@@ -34,7 +34,15 @@ curl http://localhost:5000/api/crm/health
 curl -H 'X-Tenant-ID: 1' http://localhost:5000/api/crm/dashboard
 
 # Get leads
-curl -H 'X-Tenant-ID: 1' http://localhost:5000/api/crm/leads
+# For Leads: tenant_id must come from a valid JWT (Authorization header) and leads must be created via import
+# Example (read):
+curl -H 'Authorization: Bearer <JWT_WITH_tenant_id>' http://localhost:5000/api/crm/leads
+
+# Example (create via import):
+curl -X POST -H 'Authorization: Bearer <JWT_WITH_tenant_id>' -H 'Content-Type: application/json' \
+  -d '[{"row_number":1,"data":{"MPAN_MPR":"MPAN-1"},"is_valid":true}]' \
+  http://localhost:5000/api/crm/leads/import/confirm
+
 
 # Get projects
 curl -H 'X-Tenant-ID: 1' http://localhost:5000/api/crm/projects

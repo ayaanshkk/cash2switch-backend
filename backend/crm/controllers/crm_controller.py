@@ -69,13 +69,61 @@ class CRMController:
                 'message': str(e)
             }), 500
     
+    def update_lead_status(self, opportunity_id: int) -> tuple:
+        """
+        PATCH /api/crm/leads/<opportunity_id>/status
+        Update lead status (stage_id) only
+        """
+        try:
+            tenant_id = g.tenant_id
+            payload = request.get_json()
+            
+            if not payload:
+                return jsonify({
+                    'success': False,
+                    'error': 'Invalid request',
+                    'message': 'Request body is required'
+                }), 400
+            
+            stage_id = payload.get('stage_id')
+            if stage_id is None:
+                return jsonify({
+                    'success': False,
+                    'error': 'Validation error',
+                    'message': 'stage_id is required'
+                }), 400
+            
+            try:
+                stage_id = int(stage_id)
+            except (ValueError, TypeError):
+                return jsonify({
+                    'success': False,
+                    'error': 'Validation error',
+                    'message': 'stage_id must be a number'
+                }), 400
+            
+            result = self.crm_service.update_lead_status(tenant_id, opportunity_id, stage_id)
+            
+            if not result.get('success'):
+                return jsonify(result), 404
+            
+            return jsonify(result), 200
+        
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+    
     def create_lead(self) -> tuple:
         """
         POST /api/crm/leads
-        Create a new lead. Supports either:
-          - Existing client: provide `client_id`
-          - Create client + lead: provide `client` object or `business_name`/`client_company_name`
+        Create a new lead — DEPRECATED for manual creation.
+        Leads must be created only via the Excel import-confirm endpoint
+        (`POST /api/crm/leads/import/confirm`).
 
+        The API will return a 400 validation error for direct lead creation.
         Tenant ID is taken from `g.tenant_id` (middleware enforces presence).
         """
         try:
