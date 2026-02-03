@@ -144,13 +144,14 @@ def update_lead(opportunity_id):
 @tenant_from_jwt
 def update_lead_status(opportunity_id):
     """
-    Update lead status (stage_id) only
+    Update lead status (stage_id) only.
+    When stage becomes 'Lost', lead is soft-deleted (deleted_at=NOW()).
     
     Path Parameters:
         - opportunity_id: Opportunity identifier
     
     Request Body:
-        { "stage_name": "Called" | "Not Called" | "Priced" | "Rejected" }
+        { "stage_id": <number> }
     
     Authentication:
         - JWT (token must include `tenant_id`)
@@ -278,6 +279,47 @@ def import_leads_confirm():
       400: invalid request
     """
     return crm_controller.import_leads_confirm()
+
+
+@crm_bp.route('/leads/recycle-bin', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_recycle_bin():
+    """
+    Get all soft-deleted (Lost) leads for the tenant.
+    
+    Query Parameters:
+        - None
+    
+    Authentication:
+        - JWT (token must include `tenant_id`)
+    
+    Returns:
+        200: { success, data, count } - List of deleted leads with deleted_at timestamp
+        500: Internal server error
+    """
+    return crm_controller.get_recycle_bin()
+
+
+@crm_bp.route('/leads/cleanup', methods=['PATCH'])
+@token_required
+@tenant_from_jwt
+def delete_expired_lost_leads():
+    """
+    Permanently delete Lost leads older than N days.
+    Admin operation (controlled by token_required + tenant_from_jwt).
+    
+    Request Body (optional):
+        { "days": 30 }  # Default: 30 days. Records with deleted_at < NOW() - INTERVAL will be permanently removed.
+    
+    Authentication:
+        - JWT (token must include `tenant_id`)
+    
+    Returns:
+        200: { success, deleted_count, message }
+        500: Internal server error
+    """
+    return crm_controller.delete_expired_lost_leads()
 
 
 @crm_bp.route('/leads/import', methods=['POST'])
@@ -523,85 +565,6 @@ def update_lead_status(opportunity_id):
     """
     return crm_controller.update_lead_status(opportunity_id)
 
-@crm_bp.route('/priced', methods=['GET'])
-@require_tenant
-def get_priced_leads():
-    """
-    Get all priced leads for the current tenant
-    These are leads with stage_name = 'Priced'
-    
-    Query Parameters:
-        - assigned_to: Filter by assigned employee
-    
-    Headers:
-        - X-Tenant-ID: Tenant identifier (required)
-    
-    Returns:
-        200: List of priced leads
-        500: Internal server error
-    """
-    return crm_controller.get_priced_leads()
-
-
-@crm_bp.route('/priced/<int:opportunity_id>', methods=['GET'])
-@require_tenant
-def get_priced_lead_detail(opportunity_id):
-    """
-    Get details of a specific priced lead
-    
-    Path Parameters:
-        - opportunity_id: Opportunity identifier
-    
-    Headers:
-        - X-Tenant-ID: Tenant identifier (required)
-    
-    Returns:
-        200: Priced lead details
-        404: Lead not found
-        500: Internal server error
-    """
-    return crm_controller.get_priced_lead_detail(opportunity_id)
-
-
-@crm_bp.route('/priced/<int:opportunity_id>/move-to-leads', methods=['PATCH'])
-@require_tenant
-def move_priced_to_leads(opportunity_id):
-    """
-    Move a priced lead back to leads page
-    Changes stage from 'Priced' to 'Not Called'
-    
-    Path Parameters:
-        - opportunity_id: Opportunity identifier
-    
-    Headers:
-        - X-Tenant-ID: Tenant identifier (required)
-    
-    Returns:
-        200: Lead moved back to leads page
-        404: Lead not found
-        500: Internal server error
-    """
-    return crm_controller.move_priced_to_leads(opportunity_id)
-
-
-@crm_bp.route('/priced/stats', methods=['GET'])
-@require_tenant
-def get_priced_stats():
-    """
-    Get statistics for priced leads
-    
-    Headers:
-        - X-Tenant-ID: Tenant identifier (required)
-    
-    Returns:
-        200: {
-            "total_priced": 25,
-            "total_value": 150000,
-            "by_employee": {...}
-        }
-    """
-    return crm_controller.get_priced_stats()
-
 
 @crm_bp.route('/clients', methods=['POST'])
 @require_tenant
@@ -779,15 +742,16 @@ def get_roles():
 
 
 @crm_bp.route('/stages', methods=['GET'])
+@token_required
 def get_stages():
     """
     Get all pipeline stages
     
     Query Parameters:
-        - pipeline_type: Filter by pipeline type
+        - pipeline_type: Filter by pipeline type (lead, sales, training)
     
     Returns:
-        200: List of stages
+        200: List of stages with stage_id and stage_name
         500: Internal server error
     """
     return crm_controller.get_stages()
@@ -905,6 +869,42 @@ def debug_tenant_lookup(tenant_id):
             'traceback': traceback.format_exc()
         }, 500
 
+@crm_bp.route('/leads/import', methods=['POST'])
+@require_tenant
+def import_leads():
+    """
+    POST /api/crm/leads/import
+    Bulk import leads from Excel/CSV file
+    
+    Request:
+        - file: Excel (.xlsx, .xls) or CSV file
+    
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+    
+    Returns:
+        200: Import results (total, successful, failed, errors)
+        400: Invalid file or data
+        500: Internal server error
+    """
+    return crm_controller.import_leads()
+
+
+@crm_bp.route('/leads/import/template', methods=['GET'])
+@require_tenant
+def download_leads_template():
+    """
+    GET /api/crm/leads/import/template
+    Download Excel template for bulk lead import
+    
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+    
+    Returns:
+        200: Excel file download
+        500: Internal server error
+    """
+    return crm_controller.download_leads_template()
 @crm_bp.route('/leads/import', methods=['POST'])
 @require_tenant
 def import_leads():

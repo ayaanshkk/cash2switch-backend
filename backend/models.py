@@ -86,33 +86,6 @@ class User(Base):
         }
 
 
-# DEPRECATED: legacy `User` model (application-local users). For CRM authentication and
-# tenant users, use `UserMaster` (mapped to "StreemLyne_MT"."User_Master").
-# Do NOT use `User` for Supabase CRM authentication — it will be removed in a follow-up.
-
-
-class UserMaster(Base):
-    __tablename__ = 'User_Master'
-    __table_args__ = {'schema': 'StreemLyne_MT'}
-    
-    user_id = Column(Integer, primary_key=True)
-    employee_id = Column(Integer, nullable=True)
-    user_name = Column(String(255), nullable=True)
-    password = Column(String(255), nullable=True)
-    created_at = Column(DateTime, nullable=False)
-    updated_at = Column(Date, nullable=True)
-    
-    @property
-    def id(self):
-        return self.user_id
-    
-    @property
-    def is_active(self):
-        return True
-    
-    def to_dict(self):
-        return {'id': self.user_id, 'employee_id': self.employee_id, 'user_name': self.user_name}
-
 class LoginAttempt(Base):
     __tablename__ = 'login_attempts'
 
@@ -229,6 +202,7 @@ class Employee_Master(Base):
 class Client_Master(Base):
     __tablename__ = 'Client_Master'
     __table_args__ = {'schema': SCHEMA}
+>>>>>>> fc85af0 (fixing errors backend errors)
     
     client_id = Column(SmallInteger, primary_key=True, autoincrement=True)
     tenant_id = Column(SmallInteger, nullable=True)
@@ -328,6 +302,7 @@ class Supplier_Master(Base):
 class Stage_Master(Base):
     __tablename__ = 'Stage_Master'
     __table_args__ = {'schema': SCHEMA}
+>>>>>>> fc85af0 (fixing errors backend errors)
     
     stage_id = Column(SmallInteger, primary_key=True, autoincrement=True)
     stage_name = Column(String(100))
@@ -392,56 +367,9 @@ class Customer(Base):
     def to_dict(self):
         return {
             'id': self.id,
-            'filename': self.filename,
-            'import_type': self.import_type,
-            'status': self.status,
-            'records_processed': self.records_processed,
-            'records_failed': self.records_failed,
-            'error_log': self.error_log,
-            'imported_by': self.imported_by,
-            'created_at': self.created_at.isoformat() if self.created_at else None,
-            'completed_at': self.completed_at.isoformat() if self.completed_at else None,
-        }
-
-
-# ----------------------------------
-# Customer Documents
-# ----------------------------------
-
-class CustomerDocument(Base):
-    """Model for storing customer documents (contracts, forms, certificates, etc.)"""
-    __tablename__ = 'customer_documents'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    
-    # Foreign Keys (nullable with SET NULL on delete)
-    customer_id = Column(String(36), ForeignKey('customers.id', ondelete='SET NULL'), nullable=True, index=True)
-    proposal_id = Column(Integer, ForeignKey('proposals.id', ondelete='SET NULL'), nullable=True, index=True)
-    
-    # File Information
-    file_name = Column(String(255), nullable=False)
-    file_path = Column(Text, nullable=False)
-    file_type = Column(String(100), nullable=True)  # e.g., 'pdf', 'docx', 'image/png'
-    
-    # Timestamps
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    
-    # Relationships
-    customer = relationship('Customer', backref='documents', foreign_keys=[customer_id])
-    proposal = relationship('Proposal', backref='documents', foreign_keys=[proposal_id])
-    
-    def __repr__(self):
-        return f'<CustomerDocument {self.id} - {self.file_name}>'
-    
-    def to_dict(self):
-        """Convert document to dictionary"""
-        return {
-            'id': self.id,
-            'customer_id': self.customer_id,
-            'proposal_id': self.proposal_id,
-            'file_name': self.file_name,
-            'file_path': self.file_path,
-            'file_type': self.file_type,
+            'name': self.name,
+            'phone': self.phone,
+            'email': self.email,
+            'address': self.address,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
-

@@ -33,6 +33,10 @@ class CRMController:
             filters = {}
             if request.args.get('stage_id'):
                 filters['stage_id'] = int(request.args.get('stage_id'))
+            if request.args.get('stage'):
+                filters['stage'] = request.args.get('stage')
+            if request.args.get('exclude_stage'):
+                filters['exclude_stage'] = request.args.get('exclude_stage')
             if request.args.get('status'):
                 filters['status'] = request.args.get('status')
             if request.args.get('assigned_to'):
@@ -72,7 +76,8 @@ class CRMController:
     def update_lead_status(self, opportunity_id: int) -> tuple:
         """
         PATCH /api/crm/leads/<opportunity_id>/status
-        Update lead status (stage_name) only
+        Update lead status (stage_id) only.
+        When stage becomes 'Lost', lead is soft-deleted (deleted_at=NOW()).
         """
         try:
             tenant_id = g.tenant_id
@@ -85,35 +90,60 @@ class CRMController:
                     'message': 'Request body is required'
                 }), 400
             
-            stage_name = payload.get('stage_name')
-            if not stage_name:
+            stage_id = payload.get('stage_id')
+            if stage_id is None:
                 return jsonify({
                     'success': False,
                     'error': 'Validation error',
-                    'message': 'stage_name is required'
+                    'message': 'stage_id is required'
                 }), 400
-
-            if not isinstance(stage_name, str):
+            
+            try:
+                stage_id = int(stage_id)
+            except (ValueError, TypeError):
                 return jsonify({
                     'success': False,
                     'error': 'Validation error',
-                    'message': 'stage_name must be a string'
+                    'message': 'stage_id must be a number'
                 }), 400
-
-            allowed_statuses = {"Not Called", "Called", "Priced", "Rejected"}
-            if stage_name not in allowed_statuses:
+            
+            # Validate that stage_id exists in Stage_Master
+            from backend.crm.supabase_client import get_supabase_client
+            db = get_supabase_client()
+            stage_check = db.execute_query(
+                'SELECT "stage_id" FROM "StreemLyne_MT"."Stage_Master" WHERE "stage_id" = %s',
+                (stage_id,),
+                fetch_one=True
+            )
+            if not stage_check:
                 return jsonify({
                     'success': False,
                     'error': 'Validation error',
-                    'message': f'Invalid stage_name. Allowed: {", ".join(sorted(allowed_statuses))}'
+                    'message': 'Invalid stage_id'
                 }), 400
-
-            result = self.crm_service.update_lead_status(tenant_id, opportunity_id, stage_name)
-
+            
+            result = self.crm_service.update_lead_status(tenant_id, opportunity_id, stage_id)
+            
             if not result.get('success'):
-                status_code = 400 if result.get('error') == 'Validation error' else 404
-                return jsonify(result), status_code
+                return jsonify(result), 404
+            
+            return jsonify(result), 200
+        
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
 
+    def get_recycle_bin(self) -> tuple:
+        """
+        GET /api/crm/leads/recycle-bin
+        Get all soft-deleted (Lost) leads for the tenant.
+        """
+        try:
+            tenant_id = g.tenant_id
+            result = self.crm_service.get_recycle_bin(tenant_id)
             return jsonify(result), 200
         
         except Exception as e:
@@ -123,6 +153,32 @@ class CRMController:
                 'message': str(e)
             }), 500
     
+    def delete_expired_lost_leads(self) -> tuple:
+        """
+        PATCH /api/crm/leads/cleanup
+        Permanently delete Lost leads older than N days.
+        Admin operation (controlled by token_required + tenant_from_jwt).
+        """
+        try:
+            tenant_id = g.tenant_id
+            payload = request.get_json() or {}
+            days = payload.get('days', 30)
+            
+            try:
+                days = int(days)
+            except (ValueError, TypeError):
+                days = 30
+            
+            result = self.crm_service.delete_expired_lost_leads(tenant_id, days)
+            return jsonify(result), 200
+        
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+
     def create_lead(self) -> tuple:
         """
         POST /api/crm/leads
@@ -239,6 +295,49 @@ class CRMController:
                 'message': str(e)
             }), 500
     
+    def update_lead_status(self, opportunity_id: int) -> tuple:
+        """
+        PATCH /api/crm/leads/<opportunity_id>/status
+        Update only the status/stage of a lead
+        """
+        try:
+            tenant_id = g.tenant_id
+            data = request.get_json()
+            
+            if not data or 'stage_name' not in data:
+                return jsonify({
+                    'success': False,
+                    'error': 'Validation error',
+                    'message': 'stage_name is required in request body'
+                }), 400
+            
+            stage_name = data['stage_name']
+            
+            # Validate stage name
+            valid_stages = ['Not Called', 'Called', 'Priced', 'Rejected']
+            if stage_name not in valid_stages:
+                return jsonify({
+                    'success': False,
+                    'error': 'Validation error',
+                    'message': f'Invalid stage name. Must be one of: {", ".join(valid_stages)}'
+                }), 400
+            
+            # Update only the stage using the service layer
+            result = self.crm_service.update_lead_status(tenant_id, opportunity_id, stage_name)
+            
+            if not result.get('success'):
+                status_code = 404 if 'not found' in result.get('message', '').lower() else 500
+                return jsonify(result), status_code
+            
+            return jsonify(result), 200
+            
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+    
     def delete_lead(self, opportunity_id: int) -> tuple:
         """
         DELETE /api/crm/leads/<opportunity_id>
@@ -294,7 +393,7 @@ class CRMController:
                 }), 400
             
             # Get tenant_id from request context (set by middleware)
-            tenant_id = g.tenant_id
+            tenant_id = request.tenant_id
             
             # Call repository bulk delete method
             from backend.crm.repositories.lead_repository import LeadRepository
@@ -388,236 +487,6 @@ class CRMController:
                     'error': 'Internal server error',
                     'message': str(e)
                 }), 500
-            
-    def get_priced_leads(self):
-        """
-        Get all priced leads (stage_name = 'Priced')
-        
-        Returns:
-            200: List of priced leads
-            500: Internal server error
-        """
-        try:
-            from flask import request, jsonify
-            from backend.crm.repositories.lead_repository import LeadRepository
-            
-            # Get tenant_id from request context
-            tenant_id = g.tenant_id
-            
-            # Get optional filters
-            assigned_to = request.args.get('assigned_to')
-            
-            # Build filters
-            filters = {}
-            if assigned_to:
-                filters['assigned_employee_id'] = assigned_to
-            
-            # Get priced leads from repository
-            repo = LeadRepository()
-            
-            # Get the stage_id for "Priced" stage (stage_id = 8)
-            from backend.crm.repositories.stage_repository import StageRepository
-            stage_repo = StageRepository()
-            priced_stage = stage_repo.get_stage_by_name('Priced')
-            
-            if not priced_stage:
-                return jsonify({
-                    'success': False,
-                    'error': 'Priced stage not found in Stage_Master'
-                }), 500
-            
-            # Add stage filter
-            filters['stage_id'] = priced_stage['stage_id']
-            
-            # Get leads with this stage
-            leads = repo.get_all_leads(tenant_id, filters)
-            
-            return jsonify({
-                'success': True,
-                'data': leads,
-                'count': len(leads)
-            }), 200
-            
-        except Exception as e:
-            import traceback
-            print(f"Error in get_priced_leads: {e}")
-            traceback.print_exc()
-            
-            return jsonify({
-                'success': False,
-                'error': 'Failed to fetch priced leads',
-                'details': str(e)
-            }), 500
-
-
-    def get_priced_lead_detail(self, opportunity_id):
-        """
-        Get details of a specific priced lead
-        
-        Args:
-            opportunity_id: Opportunity identifier
-        
-        Returns:
-            200: Lead details
-            404: Lead not found
-            500: Internal server error
-        """
-        try:
-            from flask import request, jsonify
-            from backend.crm.repositories.lead_repository import LeadRepository
-            
-            tenant_id = g.tenant_id
-            repo = LeadRepository()
-            
-            lead = repo.get_lead_by_id(tenant_id, opportunity_id)
-            
-            if not lead:
-                return jsonify({
-                    'success': False,
-                    'error': 'Lead not found'
-                }), 404
-            
-            return jsonify({
-                'success': True,
-                'data': lead
-            }), 200
-            
-        except Exception as e:
-            import traceback
-            print(f"Error in get_priced_lead_detail: {e}")
-            traceback.print_exc()
-            
-            return jsonify({
-                'success': False,
-                'error': 'Failed to fetch lead details',
-                'details': str(e)
-            }), 500
-
-
-    def move_priced_to_leads(self, opportunity_id):
-        """
-        Move a priced lead back to leads page
-        Changes stage from 'Priced' (stage_id=8) to 'Not Called' (stage_id=6)
-        
-        Args:
-            opportunity_id: Opportunity identifier
-        
-        Returns:
-            200: Lead moved successfully
-            404: Lead not found
-            500: Internal server error
-        """
-        try:
-            from flask import request, jsonify
-            from backend.crm.repositories.lead_repository import LeadRepository
-            from backend.crm.repositories.stage_repository import StageRepository
-            
-            tenant_id = g.tenant_id
-            
-            # Get the "Not Called" stage (stage_id = 6)
-            stage_repo = StageRepository()
-            not_called_stage = stage_repo.get_stage_by_name('Not Called')
-            
-            if not not_called_stage:
-                return jsonify({
-                    'success': False,
-                    'error': 'Not Called stage not found'
-                }), 500
-            
-            # Update the lead's stage
-            repo = LeadRepository()
-            updated_lead = repo.update_lead(opportunity_id, tenant_id, {
-                'stage_id': not_called_stage['stage_id']
-            })
-            
-            if not updated_lead:
-                return jsonify({
-                    'success': False,
-                    'error': 'Lead not found or update failed'
-                }), 404
-            
-            return jsonify({
-                'success': True,
-                'message': 'Lead moved back to leads page',
-                'data': updated_lead
-            }), 200
-            
-        except Exception as e:
-            import traceback
-            print(f"Error in move_priced_to_leads: {e}")
-            traceback.print_exc()
-            
-            return jsonify({
-                'success': False,
-                'error': 'Failed to move lead',
-                'details': str(e)
-            }), 500
-
-
-    def get_priced_stats(self):
-        """
-        Get statistics for priced leads
-        
-        Returns:
-            200: Statistics object
-            500: Internal server error
-        """
-        try:
-            from flask import request, jsonify
-            from backend.crm.repositories.lead_repository import LeadRepository
-            from backend.crm.repositories.stage_repository import StageRepository
-            
-            tenant_id = g.tenant_id
-            
-            # Get priced stage (stage_id = 8)
-            stage_repo = StageRepository()
-            priced_stage = stage_repo.get_stage_by_name('Priced')
-            
-            if not priced_stage:
-                return jsonify({
-                    'success': False,
-                    'error': 'Priced stage not found'
-                }), 500
-            
-            # Get all priced leads
-            repo = LeadRepository()
-            priced_leads = repo.get_all_leads(tenant_id, {
-                'stage_id': priced_stage['stage_id']
-            })
-            
-            # Calculate statistics
-            total_priced = len(priced_leads)
-            total_value = sum(lead.get('opportunity_value', 0) for lead in priced_leads)
-            
-            # Group by employee
-            by_employee = {}
-            for lead in priced_leads:
-                employee_name = lead.get('assigned_to_name', 'Unassigned')
-                if employee_name not in by_employee:
-                    by_employee[employee_name] = {
-                        'count': 0,
-                        'total_value': 0
-                    }
-                by_employee[employee_name]['count'] += 1
-                by_employee[employee_name]['total_value'] += lead.get('opportunity_value', 0)
-            
-            return jsonify({
-                'success': True,
-                'total_priced': total_priced,
-                'total_value': total_value,
-                'by_employee': by_employee
-            }), 200
-            
-        except Exception as e:
-            import traceback
-            print(f"Error in get_priced_stats: {e}")
-            traceback.print_exc()
-            
-            return jsonify({
-                'success': False,
-                'error': 'Failed to fetch statistics',
-                'details': str(e)
-            }), 500
     
     def download_leads_template(self) -> tuple:
         """
@@ -934,7 +803,14 @@ class CRMController:
 
             created_by = getattr(request.current_user, 'id', None)
 
-            result = self.crm_service.confirm_lead_import(tenant_id, payload, created_by)
+            service_param = request.args.get('service')
+            service_value = service_param.strip().lower() if isinstance(service_param, str) else None
+            if service_value == 'water':
+                service_id = 2
+            else:
+                service_id = 1
+
+            result = self.crm_service.confirm_lead_import(tenant_id, payload, created_by, service_id)
 
             status = 200 if result.get('success') else 400
             return jsonify(result), status
