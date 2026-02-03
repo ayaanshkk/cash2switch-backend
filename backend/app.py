@@ -137,7 +137,7 @@ def create_app():
         auth_routes, db_routes,
         notification_routes,
         customer_routes, file_routes,
-        crm_routes, import_routes,
+        crm_routes, import_routes, energy_renewals_routes,
     )
 
     app.register_blueprint(auth_routes.auth_bp)
@@ -147,6 +147,7 @@ def create_app():
     app.register_blueprint(file_routes.file_bp)
     app.register_blueprint(crm_routes.crm_bp)
     app.register_blueprint(import_routes.import_bp)
+    app.register_blueprint(energy_renewals_routes.renewals_bp)
     logging.info("CRM Blueprint registered successfully") 
     
     # Test CRM Supabase connection after blueprint registration
