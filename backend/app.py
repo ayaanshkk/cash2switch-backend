@@ -144,11 +144,8 @@ def create_app():
     app.register_blueprint(customer_routes.energy_customer_bp)
     app.register_blueprint(db_routes.db_bp)
     app.register_blueprint(notification_routes.notification_bp)
-    # app.register_blueprint(assignment_routes.assignment_bp)
     app.register_blueprint(file_routes.file_bp)
-    # app.register_blueprint(job_routes.job_bp)
-    # app.register_blueprint(proposal_routes.proposal_bp)
-    app.register_blueprint(crm_routes.crm_bp) # NEW: Register CRM blueprint
+    app.register_blueprint(crm_routes.crm_bp)
     app.register_blueprint(import_routes.import_bp)
     logging.info("CRM Blueprint registered successfully") 
     

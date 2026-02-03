@@ -153,7 +153,176 @@ def upload_file():
 
 
 # =========================================================
-# DELETE FILE
+# ENERGY CLIENT DOCUMENTS UPLOAD (NEW)
+# =========================================================
+
+@file_bp.route("/upload-documents", methods=["POST", "OPTIONS"])
+@token_required
+def upload_energy_documents():
+    """
+    Upload multiple documents for energy clients.
+    Files are stored in Cloudinary under: energy-clients/documents/{client_id}/
+    Returns array of file URLs to be stored in Energy_Contract_Master.document_details
+    """
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+
+    try:
+        # Get client_id from form data
+        client_id = request.form.get("client_id")
+        if not client_id:
+            return jsonify({"error": "client_id is required"}), 400
+
+        # Get all uploaded files
+        files = request.files.getlist("documents")
+        if not files or len(files) == 0:
+            return jsonify({"error": "No files provided"}), 400
+
+        # Validate all files before uploading
+        for file in files:
+            if not file.filename:
+                return jsonify({"error": "Invalid file"}), 400
+            if not allowed_file(file.filename):
+                return jsonify({
+                    "error": f"File type not allowed: {file.filename}"
+                }), 400
+
+        # Upload all files to Cloudinary
+        uploaded_files = []
+        folder = f"energy-clients/documents/{client_id}"
+
+        for file in files:
+            try:
+                # Create unique filename
+                filename = secure_filename(file.filename)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                unique_filename = f"{timestamp}_{uuid.uuid4().hex[:8]}_{filename}"
+
+                # Upload to Cloudinary
+                url, public_id = upload_to_cloudinary(file, unique_filename, folder)
+
+                uploaded_files.append({
+                    "url": url,
+                    "public_id": public_id,
+                    "filename": filename,
+                    "uploaded_at": datetime.now().isoformat()
+                })
+
+            except Exception as e:
+                # If any file fails, log but continue with others
+                print(f"Error uploading {file.filename}: {str(e)}")
+                continue
+
+        if len(uploaded_files) == 0:
+            return jsonify({"error": "Failed to upload any files"}), 500
+
+        # Return URLs in format expected by frontend
+        file_paths = [f["url"] for f in uploaded_files]
+
+        uploaded_by = getattr(getattr(request, "current_user", None), "full_name", "System")
+
+        return jsonify({
+            "success": True,
+            "file_paths": file_paths,
+            "files": uploaded_files,
+            "uploaded_by": uploaded_by,
+            "count": len(uploaded_files)
+        }), 201
+
+    except Exception as e:
+        print(f"Error in upload_energy_documents: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+# =========================================================
+# DELETE ENERGY CLIENT DOCUMENT (NEW)
+# =========================================================
+
+@file_bp.route("/delete-document", methods=["POST", "OPTIONS"])
+@token_required
+def delete_energy_document():
+    """
+    Delete a single document from Cloudinary.
+    Accepts either public_id or file_url.
+    """
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+
+    try:
+        data = request.get_json() or {}
+        identifier = data.get("public_id") or data.get("file_url") or data.get("url")
+
+        if not identifier:
+            return jsonify({"error": "public_id, file_url, or url required"}), 400
+
+        # Delete from Cloudinary
+        if delete_from_cloudinary(identifier):
+            return jsonify({
+                "success": True,
+                "message": "Document deleted successfully"
+            }), 200
+
+        return jsonify({"error": "Failed to delete document"}), 500
+
+    except Exception as e:
+        print(f"Error in delete_energy_document: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+# =========================================================
+# LIST ENERGY CLIENT DOCUMENTS (NEW)
+# =========================================================
+
+@file_bp.route("/list-documents/<client_id>", methods=["GET", "OPTIONS"])
+@token_required
+def list_energy_documents(client_id):
+    """
+    List all documents for a specific energy client from Cloudinary.
+    """
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+
+    try:
+        ensure_cloudinary_configured()
+
+        folder = f"energy-clients/documents/{client_id}"
+
+        # Get both raw files (PDFs, docs, etc.) and images
+        result_raw = cloudinary.api.resources(
+            prefix=folder,
+            resource_type="raw",
+            max_results=500
+        )
+        result_img = cloudinary.api.resources(
+            prefix=folder,
+            resource_type="image",
+            max_results=500
+        )
+
+        files = []
+        for res in result_raw.get("resources", []) + result_img.get("resources", []):
+            files.append({
+                "public_id": res["public_id"],
+                "url": res["secure_url"],
+                "format": res.get("format", ""),
+                "size": res.get("bytes", 0),
+                "created_at": res.get("created_at", ""),
+                "filename": res["public_id"].split("/")[-1]
+            })
+
+        return jsonify({
+            "success": True,
+            "files": files,
+            "count": len(files)
+        }), 200
+
+    except Exception as e:
+        print(f"Error in list_energy_documents: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+# =========================================================
+# DELETE FILE (ORIGINAL)
 # =========================================================
 
 @file_bp.route("/files/delete", methods=["POST", "OPTIONS"])
@@ -175,7 +344,7 @@ def delete_file():
 
 
 # =========================================================
-# LIST FILES
+# LIST FILES (ORIGINAL)
 # =========================================================
 
 @file_bp.route("/files/list", methods=["GET", "OPTIONS"])
