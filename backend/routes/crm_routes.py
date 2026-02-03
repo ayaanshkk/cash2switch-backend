@@ -150,7 +150,7 @@ def update_lead_status(opportunity_id):
         - opportunity_id: Opportunity identifier
     
     Request Body:
-        { "stage_id": number }
+        { "stage_name": "Called" | "Not Called" | "Priced" | "Rejected" }
     
     Authentication:
         - JWT (token must include `tenant_id`)

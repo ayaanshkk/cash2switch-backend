@@ -93,18 +93,27 @@ class CRMService:
             'interactions': interactions
         }
     
-    def update_lead_status(self, tenant_id: int, opportunity_id: int, stage_id: int) -> Dict[str, Any]:
+    def update_lead_status(self, tenant_id: int, opportunity_id: int, stage_name: str) -> Dict[str, Any]:
         """
-        Update lead status (stage_id) with tenant isolation
+        Update lead status (stage_name) with tenant isolation
         
         Args:
             tenant_id: Tenant identifier
             opportunity_id: Opportunity ID
-            stage_id: New stage ID
+            stage_name: New stage name
         
         Returns:
             Dictionary with success status and updated data
         """
+        stage = self.stage_repo.get_stage_by_name(stage_name)
+        if not stage or not stage.get('stage_id'):
+            return {
+                'success': False,
+                'error': 'Validation error',
+                'message': f'Stage "{stage_name}" not found in Stage_Master'
+            }
+
+        stage_id = stage.get('stage_id')
         result = self.lead_repo.update_lead_status(tenant_id, opportunity_id, stage_id)
         
         if not result:
@@ -113,10 +122,12 @@ class CRMService:
                 'error': 'Lead not found',
                 'message': f'No lead found with ID {opportunity_id} or access denied'
             }
-        
+
+        updated_lead = self.lead_repo.get_lead_by_id(tenant_id, opportunity_id)
+
         return {
             'success': True,
-            'data': result,
+            'data': updated_lead or result,
             'message': 'Lead status updated successfully'
         }
     
