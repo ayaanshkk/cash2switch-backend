@@ -18,7 +18,7 @@ result = db.execute_query("""
     FROM information_schema.columns
     WHERE table_schema = 'StreemLyne_MT'
     AND table_name = 'User_Master'
-    ORDER BY ordinal_position
+    ORDER BY ordinal_positionw
 """)
 
 print("📋 Actual columns in StreemLyne_MT.User_Master:")

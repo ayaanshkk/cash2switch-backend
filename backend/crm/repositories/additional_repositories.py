@@ -139,6 +139,33 @@ class StageRepository:
             logger.exception("StageRepository.ensure_default_stage failed: %s", e)
         return None
 
+    def get_stage_by_name(self, stage_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a stage by exact name (case-insensitive).
+
+        Args:
+            stage_name: Stage name to look up
+
+        Returns:
+            Stage record or None if not found
+        """
+        if not stage_name:
+            return None
+
+        query = """
+            SELECT "stage_id", "stage_name", "stage_description",
+                   "preceding_stage_id", "stage_type"
+            FROM "StreemLyne_MT"."Stage_Master"
+            WHERE LOWER("stage_name") = LOWER(%s)
+            ORDER BY "stage_id"
+            LIMIT 1
+        """
+        try:
+            return self.db.execute_query(query, (stage_name,), fetch_one=True)
+        except Exception as e:
+            logger.exception("StageRepository.get_stage_by_name failed: %s", e)
+            return None
+
 
 class ServiceRepository:
     """Repository for Services_Master table"""

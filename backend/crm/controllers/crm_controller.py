@@ -72,7 +72,7 @@ class CRMController:
     def update_lead_status(self, opportunity_id: int) -> tuple:
         """
         PATCH /api/crm/leads/<opportunity_id>/status
-        Update lead status (stage_id) only
+        Update lead status (stage_name) only
         """
         try:
             tenant_id = g.tenant_id
@@ -85,28 +85,35 @@ class CRMController:
                     'message': 'Request body is required'
                 }), 400
             
-            stage_id = payload.get('stage_id')
-            if stage_id is None:
+            stage_name = payload.get('stage_name')
+            if not stage_name:
                 return jsonify({
                     'success': False,
                     'error': 'Validation error',
-                    'message': 'stage_id is required'
+                    'message': 'stage_name is required'
                 }), 400
-            
-            try:
-                stage_id = int(stage_id)
-            except (ValueError, TypeError):
+
+            if not isinstance(stage_name, str):
                 return jsonify({
                     'success': False,
                     'error': 'Validation error',
-                    'message': 'stage_id must be a number'
+                    'message': 'stage_name must be a string'
                 }), 400
-            
-            result = self.crm_service.update_lead_status(tenant_id, opportunity_id, stage_id)
-            
+
+            allowed_statuses = {"Not Called", "Called", "Priced", "Rejected"}
+            if stage_name not in allowed_statuses:
+                return jsonify({
+                    'success': False,
+                    'error': 'Validation error',
+                    'message': f'Invalid stage_name. Allowed: {", ".join(sorted(allowed_statuses))}'
+                }), 400
+
+            result = self.crm_service.update_lead_status(tenant_id, opportunity_id, stage_name)
+
             if not result.get('success'):
-                return jsonify(result), 404
-            
+                status_code = 400 if result.get('error') == 'Validation error' else 404
+                return jsonify(result), status_code
+
             return jsonify(result), 200
         
         except Exception as e:

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Lead/Opportunity Repository - WITH AUTO SEQUENCE RESET
+Lead/Opportunity Repository
 Handles database operations for Opportunity_Details table
 """
 import os
@@ -99,25 +99,17 @@ class LeadRepository:
     def get_all_leads(self, tenant_id: int, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
         Get all leads for a tenant
-        Handles both real clients and imported leads (stored in Misc_Col1)
         
         Args:
             tenant_id: Tenant identifier
-            filters: Optional filters
+            filters: Optional filters (stage, status, assigned_to, etc.)
         
         Returns:
-            List of lead records
+            List of lead/opportunity records
         """
         query = """
             SELECT 
-                od."opportunity_id",
-                od."client_id",
-                od."opportunity_title",
-                od."opportunity_description",
-                od."stage_id",
-                od."opportunity_value",
-                od."created_at",
-                od."Misc_Col1",
+                od.*,
                 sm."stage_name",
                 um."user_name" as assigned_to_name
             FROM "StreemLyne_MT"."Opportunity_Details" od
@@ -125,87 +117,31 @@ class LeadRepository:
             LEFT JOIN "StreemLyne_MT"."User_Master" um ON od."opportunity_owner_employee_id" = um."user_id"
             -- NOTE: business rule change — leads are tenant-scoped on Opportunity_Details.tenant_id
             WHERE od."tenant_id" = %s
-            -- NOTE: business rule change — leads are tenant-scoped on Opportunity_Details.tenant_id
-            WHERE od."tenant_id" = %s
         """
         params = [tenant_id]
         
-        # Apply filters
+        # Apply filters if provided
         if filters:
             if filters.get('stage_id'):
                 query += ' AND od."stage_id" = %s'
                 params.append(filters['stage_id'])
+            
             if filters.get('status'):
-                query += ' AND sm."stage_name" = %s'
+                query += ' AND od."status" = %s'
                 params.append(filters['status'])
+            
             if filters.get('assigned_to'):
                 query += ' AND od."opportunity_owner_employee_id" = %s'
                 params.append(filters['assigned_to'])
         
-        query += ' ORDER BY od."created_at" ASC'
+        query += ' ORDER BY od."created_at" DESC'
         
         try:
-            import json
-            results = self.db.execute_query(query, tuple(params))
-            parsed_results = []
-            
-            for row in results:
-                # Check if this is an imported lead (has data in Misc_Col1)
-                misc_data = row.get('Misc_Col1')
-                is_imported_lead = False
-                lead_data = {}
-                
-                if misc_data:
-                    try:
-                        lead_data = json.loads(misc_data)
-                        is_imported_lead = lead_data.get('is_placeholder', False)
-                    except:
-                        pass
-                
-                if is_imported_lead:
-                    # Imported lead - use data from Misc_Col1
-                    parsed_results.append({
-                        'opportunity_id': row.get('opportunity_id'),
-                        'client_id': row.get('client_id'),
-                        'business_name': row.get('opportunity_title'),
-                        'contact_person': lead_data.get('contact_person'),
-                        'tel_number': lead_data.get('tel_number'),
-                        'email': lead_data.get('email'),
-                        'mpan_mpr': lead_data.get('mpan_mpr'),
-                        'supplier': lead_data.get('supplier'),
-                        'start_date': lead_data.get('start_date'),
-                        'end_date': lead_data.get('end_date'),
-                        'stage_name': row.get('stage_name'),
-                        'stage_id': row.get('stage_id'),
-                        'created_at': row.get('created_at'),
-                        'is_imported': True
-                    })
-                else:
-                    # Real client - use data from Client_Master
-                    parsed_results.append({
-                        'opportunity_id': row.get('opportunity_id'),
-                        'client_id': row.get('client_id'),
-                        'business_name': row.get('client_company_name'),
-                        'contact_person': row.get('client_contact_name'),
-                        'tel_number': row.get('client_phone'),
-                        'email': row.get('client_email'),
-                        'mpan_mpr': None,
-                        'supplier': None,
-                        'start_date': None,
-                        'end_date': None,
-                        'stage_name': row.get('stage_name'),
-                        'stage_id': row.get('stage_id'),
-                        'created_at': row.get('created_at'),
-                        'is_imported': False
-                    })
-            
-            return parsed_results
+            return self.db.execute_query(query, tuple(params))
         except Exception as e:
-            print(f"Error fetching leads: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Error fetching leads for tenant {tenant_id}: {e}")
             return []
-        
+    
     def get_lead_by_id(self, tenant_id: int, opportunity_id: int) -> Optional[Dict[str, Any]]:
         """
         Get a specific lead by ID (with tenant isolation)
@@ -222,11 +158,9 @@ class LeadRepository:
                 od.*,
                 sm."stage_name",
                 um."user_name" as assigned_to_name
-                um."user_name" as assigned_to_name
             FROM "StreemLyne_MT"."Opportunity_Details" od
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
             LEFT JOIN "StreemLyne_MT"."User_Master" um ON od."opportunity_owner_employee_id" = um."user_id"
-            WHERE od."tenant_id" = %s
             WHERE od."tenant_id" = %s
             AND od."opportunity_id" = %s
             LIMIT 1
@@ -237,7 +171,7 @@ class LeadRepository:
         except Exception as e:
             print(f"Error fetching lead {opportunity_id}: {e}")
             return None
-        
+    
     def get_leads_by_stage(self, tenant_id: int, stage_id: int) -> List[Dict[str, Any]]:
         """
         Get all leads in a specific pipeline stage
@@ -254,11 +188,9 @@ class LeadRepository:
                 od.*,
                 sm."stage_name",
                 um."user_name" as assigned_to_name
-                um."user_name" as assigned_to_name
             FROM "StreemLyne_MT"."Opportunity_Details" od
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
             LEFT JOIN "StreemLyne_MT"."User_Master" um ON od."opportunity_owner_employee_id" = um."user_id"
-            WHERE od."tenant_id" = %s
             WHERE od."tenant_id" = %s
             AND od."stage_id" = %s
             ORDER BY od."created_at" DESC
@@ -285,7 +217,6 @@ class LeadRepository:
                 COUNT(*) as total_leads,
                 SUM(od."opportunity_value") as total_value
             FROM "StreemLyne_MT"."Opportunity_Details" od
-            WHERE od."tenant_id" = %s
             WHERE od."tenant_id" = %s
         """
         
@@ -358,11 +289,10 @@ class LeadRepository:
 
         Rules:
           - MPAN_MPR is stored in Opportunity_Details.mpan_mpr
-          - stage_id = 1 (New)
+          - stage_id = Not Called
           - tenant-scoped via Opportunity_Details.tenant_id
           - if MPAN already exists in Opportunity_Details -> skip and report
           - partial success allowed; per-row errors returned
-          - NO joins to Project_Details or Client_Master
           - NO joins to Project_Details or Client_Master
         """
         inserted = 0
@@ -415,10 +345,8 @@ class LeadRepository:
                 continue
 
             # Enforce MPAN uniqueness: check if MPAN already exists in Opportunity_Details for this tenant
-            # Enforce MPAN uniqueness: check if MPAN already exists in Opportunity_Details for this tenant
             dup_q = '''
                 SELECT 1 FROM "StreemLyne_MT"."Opportunity_Details" od
-                WHERE od."mpan_mpr" = %s AND od."tenant_id" = %s LIMIT 1
                 WHERE od."mpan_mpr" = %s AND od."tenant_id" = %s LIMIT 1
             '''
             try:
@@ -443,14 +371,6 @@ class LeadRepository:
                 logger.error('import_opportunities_from_import no default client for tenant=%s', tenant_id)
                 continue
 
-            # Ensure default client exists (client_id is NOT NULL)
-            default_client_id = self._ensure_default_client(tenant_id)
-            if not default_client_id:
-                skipped += 1
-                errors.append({'row': row_number, 'mpan': mpan, 'error': 'Failed to create default client for tenant'})
-                logger.error('import_opportunities_from_import no default client for tenant=%s', tenant_id)
-                continue
-
             # Map fields -> Opportunity_Details columns
             title = get_field('Business_Name', 'business_name', 'client_company_name') or get_field('Contact_Person', 'contact_person') or f'Imported lead {mpan}'
             description = get_field('Notes', 'notes', 'call_summary') or None
@@ -459,23 +379,21 @@ class LeadRepository:
             tel_number = get_field('Tel_Number', 'phone', 'tel_number', 'telephone') or None
             email = get_field('Email', 'email') or None
             start_date = get_field('Start_Date', 'start_date', 'contract_start_date') or None
-            business_name = get_field('Business_Name', 'business_name', 'client_company_name') or None
-            contact_person = get_field('Contact_Person', 'contact_person', 'client_contact_name') or None
-            tel_number = get_field('Tel_Number', 'phone', 'tel_number', 'telephone') or None
-            email = get_field('Email', 'email') or None
-            start_date = get_field('Start_Date', 'start_date', 'contract_start_date') or None
 
             insert_q = '''
                 INSERT INTO "StreemLyne_MT"."Opportunity_Details"
-                ("tenant_id", "client_id", "mpan_mpr", "opportunity_title", "opportunity_description", "business_name", "contact_person", "tel_number", "email", "start_date", "stage_id", "created_at")
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ("tenant_id", "client_id", "mpan_mpr", "opportunity_title", "opportunity_description", "business_name", "contact_person", "tel_number", "email", "start_date", "stage_id", "service_id", "created_at")
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                 RETURNING "opportunity_id"
             '''
             try:
-                out = self.db.execute_insert(insert_q, (tenant_id, default_client_id, mpan, title, description, business_name, contact_person, tel_number, email, start_date, 1), returning=True)
+                out = self.db.execute_insert(
+                    insert_q,
+                    (tenant_id, default_client_id, mpan, title, description, business_name, contact_person, tel_number, email, start_date, default_stage_id, service_id),
+                    returning=True
+                )
                 if out and out.get('opportunity_id'):
                     inserted += 1
-                    logger.info('import_opportunities_from_import inserted opportunity_id=%s mpan=%s', out.get('opportunity_id'), mpan)
                     logger.info('import_opportunities_from_import inserted opportunity_id=%s mpan=%s', out.get('opportunity_id'), mpan)
                 else:
                     skipped += 1
@@ -491,7 +409,7 @@ class LeadRepository:
 
     def update_lead_status(self, tenant_id: int, opportunity_id: int, stage_id: int) -> Optional[Dict[str, Any]]:
         """
-        Update lead status (stage_id) with tenant isolation
+        Update lead status (stage_id) with tenant isolation.
         
         Args:
             tenant_id: Tenant identifier
@@ -501,22 +419,27 @@ class LeadRepository:
         Returns:
             Dict with updated opportunity_id and stage_id, or None if not found/not owned
         """
-        query = """
-            UPDATE "StreemLyne_MT"."Opportunity_Details"
-            SET "stage_id" = %s
-            WHERE "opportunity_id" = %s AND "tenant_id" = %s
-            RETURNING "opportunity_id", "stage_id"
-        """
-        
         try:
-            result = self.db.execute_query(query, (stage_id, opportunity_id, tenant_id), fetch_one=True)
-            if result:
-                logger.info('Updated lead %s to stage %s for tenant %s', opportunity_id, stage_id, tenant_id)
-            else:
-                logger.warning('Lead %s not found or not owned by tenant %s', opportunity_id, tenant_id)
-            return result
+            # Optional: get stage_name for logging
+            stage_query = 'SELECT "stage_name" FROM "StreemLyne_MT"."Stage_Master" WHERE "stage_id" = %s'
+            stage_result = self.db.execute_query(stage_query, (stage_id,), fetch_one=True)
+            stage_name = stage_result.get('stage_name') if stage_result else None
+
+            query = """
+                UPDATE "StreemLyne_MT"."Opportunity_Details"
+                SET "stage_id" = %s
+                WHERE "opportunity_id" = %s AND "tenant_id" = %s
+            """
+
+            updated_count = self.db.execute_update(query, (stage_id, opportunity_id, tenant_id))
+            if updated_count and updated_count > 0:
+                logger.info('Updated lead %s to stage %s (stage_name=%s) for tenant %s',
+                           opportunity_id, stage_id, stage_name, tenant_id)
+                return {"opportunity_id": opportunity_id, "stage_id": stage_id}
+
+            logger.warning('Lead %s not found or not owned by tenant %s', opportunity_id, tenant_id)
+            return None
         except Exception as e:
-            logger.exception('Error updating lead status: %s', e)
             logger.exception('Error updating lead status: %s', e)
             return None
     
@@ -607,11 +530,7 @@ class LeadRepository:
             True if deleted successfully
         """
         # Validate tenant ownership via Opportunity_Details.tenant_id
-        # Validate tenant ownership via Opportunity_Details.tenant_id
         query = """
-            DELETE FROM "StreemLyne_MT"."Opportunity_Details"
-            WHERE "tenant_id" = %s
-            AND "opportunity_id" = %s
             DELETE FROM "StreemLyne_MT"."Opportunity_Details"
             WHERE "tenant_id" = %s
             AND "opportunity_id" = %s
@@ -783,24 +702,16 @@ class LeadRepository:
         NOT create or return an opportunity. Callers that previously relied on this behavior
         should instead use the import flow to create leads.
         Returns: {'client': <client_row>} on success, or None on failure.
-        Create a client only. IMPORTANT: by business rule, creating a client MUST NOT create
-        an Opportunity_Details row. This method preserves the atomic client insert but will
-        NOT create or return an opportunity. Callers that previously relied on this behavior
-        should instead use the import flow to create leads.
-        Returns: {'client': <client_row>} on success, or None on failure.
         """
         # If running without a real DB connection, fall back to existing behavior
         try:
             with self.db.get_connection() as conn:
                 # When stubbed, conn will be None — fall back to existing behavior that only creates the client
-                # When stubbed, conn will be None — fall back to existing behavior that only creates the client
                 if conn is None:
                     client = self.create_client(tenant_id, client_data)
                     return {'client': client} if client else None
-                    return {'client': client} if client else None
 
                 with conn.cursor() as cur:
-                    # Insert client (same as previous implementation)
                     # Insert client (same as previous implementation)
                     insert_client_sql = (
                         'INSERT INTO "StreemLyne_MT"."Client_Master' \
@@ -831,9 +742,7 @@ class LeadRepository:
                         return None
 
                     # Commit transaction (client-only)
-                    # Commit transaction (client-only)
                     conn.commit()
-                    return {'client': dict(client_row)}
                     return {'client': dict(client_row)}
         except Exception as e:
             logger.exception("create_client_and_lead_transaction failed: %s", e)
@@ -873,10 +782,10 @@ class LeadRepository:
         return None
 
     def get_leads_table(self, tenant_id: int) -> List[Dict[str, Any]]:
-            """
-            Get leads table for CRM UI: one row per opportunity with joined columns
-            from Client_Master, Stage_Master, Employee_Master, Project_Details,
-            Energy_Contract_Master, Supplier_Master, and latest Client_Interactions.
+        """
+        Get leads table for CRM UI: one row per opportunity with joined columns
+        from Client_Master, Stage_Master, Employee_Master, Project_Details,
+        Energy_Contract_Master, Supplier_Master, and latest Client_Interactions.
 
         Returns list of dicts with keys: id, name, business_name, contact_person,
         tel_number, mpan_mpr, supplier, annual_usage, start_date, end_date,
@@ -990,6 +899,7 @@ class LeadRepository:
     def get_leads_list(self, tenant_id: int, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
         Return a minimal, tenant-scoped list of leads (read-only projection).
+        By default, excludes Lost leads (deleted_at IS NULL).
 
         Fields returned (strict):
           - opportunity_id
@@ -1017,6 +927,7 @@ class LeadRepository:
                 od."mpan_mpr",
                 od."start_date",
                 NULL AS end_date,
+                od."service_id",
                 od."stage_id",
                 sm."stage_name",
                 od."created_at"
@@ -1026,10 +937,31 @@ class LeadRepository:
         '''
 
         params = [tenant_id]
-        # support an optional stage_id filter (controller already extracts it)
+        # support filtering by stage_id
         if filters and isinstance(filters, dict) and filters.get('stage_id'):
             query += ' AND od."stage_id" = %s'
             params.append(int(filters.get('stage_id')))
+        
+        # support filtering by stage_name (e.g., ?stage=Lost)
+        if filters and isinstance(filters, dict) and filters.get('stage'):
+            query += ' AND sm."stage_name" = %s'
+            params.append(filters.get('stage'))
+        
+        # support excluding by stage_name (e.g., ?exclude_stage=Lost)
+        if filters and isinstance(filters, dict) and filters.get('exclude_stage'):
+            query += ' AND (sm."stage_name" IS NULL OR sm."stage_name" != %s)'
+            params.append(filters.get('exclude_stage'))
+
+        service_id = None
+        if filters and isinstance(filters, dict) and filters.get('service'):
+            service_value = str(filters.get('service')).strip().lower()
+            if service_value == 'electricity':
+                service_id = 1
+            elif service_value == 'water':
+                service_id = 2
+
+        query += ' AND (%s IS NULL OR od."service_id" = %s)'
+        params.extend([service_id, service_id])
 
         query += ' ORDER BY od."created_at" DESC'
 
@@ -1049,10 +981,12 @@ class LeadRepository:
                     'mpan_mpr': r.get('mpan_mpr'),
                     'start_date': r.get('start_date').isoformat() if getattr(r.get('start_date'), 'isoformat', None) else (r.get('start_date') or None),
                     'end_date': r.get('end_date').isoformat() if getattr(r.get('end_date'), 'isoformat', None) else (r.get('end_date') or None),
+                    'service_id': r.get('service_id'),
                     'stage_id': r.get('stage_id'),
                     'stage_name': r.get('stage_name'),
                     'created_at': r.get('created_at').isoformat() if getattr(r.get('created_at'), 'isoformat', None) else (r.get('created_at') or None),
                 })
             return out
         except Exception as e:
-            logger.warning(f"Sequence reset failed: {e}")
+            logger.exception('get_leads_list failed for tenant=%s: %s', tenant_id, e)
+            return []
