@@ -159,7 +159,10 @@ def get_energy_customers():
             Employee_Master,
             Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
         ).filter(
-            Client_Master.tenant_id == tenant_id
+            and_(
+                Client_Master.tenant_id == tenant_id,
+                Client_Master.client_company_name != '[IMPORTED LEADS]'  # ✅ FIX: Exclude placeholder client
+            )
         ).order_by(
             Client_Master.created_at.desc()
         )
@@ -349,21 +352,8 @@ def create_energy_customer():
             session.flush()
             current_app.logger.info(f"✅ Created Energy_Contract_Master: {contract.energy_contract_master_id}")
         
-        # 4. Create Opportunity_Details (Sales Pipeline)
-        opportunity = Opportunity_Details(
-            client_id=client_id,
-            opportunity_title=f"Opportunity - {data.get('business_name', 'Unknown')}",
-            opportunity_description='Energy supply opportunity',
-            opportunity_date=datetime.utcnow().date(),
-            opportunity_owner_employee_id=data.get('assigned_to_id', request.current_user.employee_id),
-            stage_id=data.get('stage_id', 1),  # Default to first stage
-            opportunity_value=data.get('opportunity_value', 0),
-            currency_id=data.get('currency_id', 1),
-            created_at=datetime.utcnow()
-        )
-        session.add(opportunity)
-        session.flush()
-        current_app.logger.info(f"✅ Created Opportunity_Details: {opportunity.opportunity_id}")
+        # 4. ✅ REMOVED: Opportunity_Details creation (was creating duplicate leads)
+        # Renewals page (Client_Master) is now separate from Leads page (Opportunity_Details)
         
         # 5. Create Client_Interactions (if callback date provided)
         if data.get('callback_date'):
@@ -383,9 +373,9 @@ def create_energy_customer():
         # Fetch complete customer data
         session.refresh(new_client)
         
-        # Build response
+        # Build response (no opportunity parameter since we don't create it)
         response_data = build_customer_response(
-            new_client, project, contract, opportunity, None, None, None
+            new_client, project, contract, None, None, None, None
         )
         
         return jsonify({
