@@ -172,6 +172,29 @@ def get_leads_by_customer_type():
     """
     return crm_controller.get_leads_by_customer_type()
 
+@crm_bp.route('/leads/<int:opportunity_id>/status', methods=['PATCH'])
+@require_tenant
+def update_lead_status(opportunity_id):
+    """
+    Update the status/stage of a lead
+    
+    Path Parameters:
+        - opportunity_id: Opportunity identifier
+    
+    Request Body:
+        - stage_name: New stage name (e.g., "Called", "Priced", "Rejected", "Not Called")
+    
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+    
+    Returns:
+        200: Lead status updated successfully
+        404: Lead not found
+        400: Invalid stage name
+        500: Internal server error
+    """
+    return crm_controller.update_lead_status(opportunity_id)
+
 
 @crm_bp.route('/clients', methods=['POST'])
 @require_tenant
@@ -475,3 +498,39 @@ def debug_tenant_lookup(tenant_id):
             'traceback': traceback.format_exc()
         }, 500
 
+@crm_bp.route('/leads/import', methods=['POST'])
+@require_tenant
+def import_leads():
+    """
+    POST /api/crm/leads/import
+    Bulk import leads from Excel/CSV file
+    
+    Request:
+        - file: Excel (.xlsx, .xls) or CSV file
+    
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+    
+    Returns:
+        200: Import results (total, successful, failed, errors)
+        400: Invalid file or data
+        500: Internal server error
+    """
+    return crm_controller.import_leads()
+
+
+@crm_bp.route('/leads/import/template', methods=['GET'])
+@require_tenant
+def download_leads_template():
+    """
+    GET /api/crm/leads/import/template
+    Download Excel template for bulk lead import
+    
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+    
+    Returns:
+        200: Excel file download
+        500: Internal server error
+    """
+    return crm_controller.download_leads_template()
