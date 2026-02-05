@@ -225,6 +225,58 @@ class CRMService:
             'data': lead,
             'message': 'Lead updated successfully'
         }
+
+    def update_lead_status(self, tenant_id: int, opportunity_id: int, stage_name: str) -> Dict[str, Any]:
+            """
+            Update only the status/stage of a lead
+            
+            Args:
+                tenant_id: Tenant identifier
+                opportunity_id: Opportunity ID
+                stage_name: New stage name (e.g., "Called", "Priced", "Rejected", "Not Called")
+            
+            Returns:
+                Dictionary with updated lead
+            """
+            try:
+                # Check if lead exists
+                lead = self.lead_repo.get_lead_by_id(tenant_id, opportunity_id)
+                
+                if not lead:
+                    return {
+                        'success': False,
+                        'error': 'Lead not found',
+                        'message': f'No lead found with ID {opportunity_id}'
+                    }
+                
+                # Update only the stage_name field
+                update_data = {
+                    'stage_name': stage_name
+                }
+                
+                # Call repository to update the lead
+                updated_lead = self.lead_repo.update_lead(opportunity_id, tenant_id, update_data)
+                
+                if not updated_lead:
+                    return {
+                        'success': False,
+                        'error': 'Failed to update lead status',
+                        'message': f'Could not update status for lead with ID {opportunity_id}'
+                    }
+                
+                return {
+                    'success': True,
+                    'data': updated_lead,
+                    'message': f'Lead status updated to "{stage_name}" successfully'
+                }
+                
+            except Exception as e:
+                logger.exception("update_lead_status error: %s", e)
+                return {
+                    'success': False,
+                    'error': 'Internal server error',
+                    'message': str(e)
+                }
     
     def delete_lead(self, tenant_id: int, opportunity_id: int) -> Dict[str, Any]:
         """
@@ -250,6 +302,179 @@ class CRMService:
             'success': True,
             'message': f'Lead {opportunity_id} deleted successfully'
         }
+
+    def import_leads_from_file(self, tenant_id: int, file, file_ext: str) -> Dict[str, Any]:
+        """Import leads from Excel/CSV - stores in Misc_Col1"""
+        try:
+            import pandas as pd
+            
+            if file_ext == '.csv':
+                df = pd.read_csv(file)
+            else:
+                df = pd.read_excel(file)
+            
+            total_rows = len(df)
+            successful = 0
+            failed = 0
+            errors = []
+            
+            df.columns = df.columns.str.strip()
+            
+            column_mapping = {
+                'business_name': ['Business_Name', 'Business Name', 'business_name', 'Company', 'Name'],
+                'contact_person': ['Contact_Person', 'Contact Person', 'contact_person', 'Contact'],
+                'tel_number': ['Tel_Number', 'Tel Number', 'tel_number', 'Phone', 'Telephone'],
+                'email': ['Email', 'email'],
+                'mpan_mpr': ['Mpan_MPR', 'MPAN/MPR', 'MPAN', 'MPR', 'Meter_Ref'],
+                'start_date': ['Start_Date', 'Start Date', 'start_date'],
+                'end_date': ['End_Date', 'End Date', 'end_date'],
+                'supplier': ['Supplier', 'supplier'],
+                'annual_usage': ['Annual_Usage', 'Annual Usage', 'annual_usage'],
+            }
+            
+            found_columns = {}
+            for field, possible_names in column_mapping.items():
+                for col in df.columns:
+                    if col in possible_names:
+                        found_columns[field] = col
+                        break
+            
+            if 'business_name' not in found_columns:
+                return {
+                    'success': False,
+                    'error': 'Missing required column',
+                    'message': 'Business_Name column is required',
+                    'total_rows': 0,
+                    'successful': 0,
+                    'failed': 0
+                }
+            
+            stages = self.stage_repo.get_all_stages()
+            default_stage_id = stages[0]['stage_id'] if stages else None
+            
+            if not default_stage_id:
+                return {
+                    'success': False,
+                    'error': 'No default stage',
+                    'message': 'No stages configured',
+                    'total_rows': 0,
+                    'successful': 0,
+                    'failed': 0
+                }
+            
+            for index, row in df.iterrows():
+                try:
+                    row_num = index + 2
+                    
+                    business_col = found_columns['business_name']
+                    business_name = str(row.get(business_col, '')).strip()
+                    
+                    if not business_name or business_name == 'nan':
+                        errors.append(f'Row {row_num}: Business Name is empty')
+                        failed += 1
+                        continue
+                    
+                    # Build lead data object with all fields
+                    lead_data = {
+                        'opportunity_title': business_name,
+                        'opportunity_description': f'Imported lead from bulk import',
+                        'stage_id': default_stage_id,
+                        'opportunity_value': 0,
+                        'contact_person': '',
+                        'tel_number': '',
+                        'email': '',
+                        'mpan_mpr': '',
+                        'supplier': '',
+                        'start_date': '',
+                        'end_date': '',
+                        'annual_usage': ''
+                    }
+                    
+                    # Extract all optional fields
+                    if 'contact_person' in found_columns:
+                        contact = row.get(found_columns['contact_person'])
+                        if pd.notna(contact) and str(contact).strip():
+                            lead_data['contact_person'] = str(contact).strip()
+                    
+                    if 'tel_number' in found_columns:
+                        phone = row.get(found_columns['tel_number'])
+                        if pd.notna(phone) and str(phone).strip():
+                            lead_data['tel_number'] = str(phone).replace('.0', '').strip()
+                    
+                    if 'email' in found_columns:
+                        email = row.get(found_columns['email'])
+                        if pd.notna(email) and str(email).strip():
+                            lead_data['email'] = str(email).strip()
+                    
+                    if 'mpan_mpr' in found_columns:
+                        mpan = row.get(found_columns['mpan_mpr'])
+                        if pd.notna(mpan) and str(mpan).strip():
+                            lead_data['mpan_mpr'] = str(mpan).replace('.0', '').strip()
+                    
+                    if 'supplier' in found_columns:
+                        supplier = row.get(found_columns['supplier'])
+                        if pd.notna(supplier) and str(supplier).strip():
+                            lead_data['supplier'] = str(supplier).strip()
+                    
+                    if 'start_date' in found_columns:
+                        start = row.get(found_columns['start_date'])
+                        if pd.notna(start):
+                            try:
+                                start_date = pd.to_datetime(start)
+                                lead_data['start_date'] = start_date.strftime('%Y-%m-%d')
+                            except:
+                                pass
+                    
+                    if 'end_date' in found_columns:
+                        end = row.get(found_columns['end_date'])
+                        if pd.notna(end):
+                            try:
+                                end_date = pd.to_datetime(end)
+                                lead_data['end_date'] = end_date.strftime('%Y-%m-%d')
+                            except:
+                                pass
+                    
+                    if 'annual_usage' in found_columns:
+                        usage = row.get(found_columns['annual_usage'])
+                        if pd.notna(usage):
+                            try:
+                                lead_data['annual_usage'] = str(float(usage))
+                            except:
+                                pass
+                    
+                    # Create lead WITHOUT creating a client
+                    result = self.lead_repo.create_lead_without_client(tenant_id, lead_data)
+                    
+                    if result:
+                        successful += 1
+                    else:
+                        failed += 1
+                        errors.append(f'Row {row_num}: Failed to create lead')
+                
+                except Exception as e:
+                    failed += 1
+                    errors.append(f'Row {row_num}: {str(e)}')
+            
+            return {
+                'success': True,
+                'message': f'Import completed: {successful} successful, {failed} failed',
+                'total_rows': total_rows,
+                'successful': successful,
+                'failed': failed,
+                'errors': errors[:10] if errors else []
+            }
+            
+        except Exception as e:
+            logger.exception("import_leads_from_file error: %s", e)
+            return {
+                'success': False,
+                'error': 'File processing error',
+                'message': str(e),
+                'total_rows': 0,
+                'successful': 0,
+                'failed': 0,
+                'errors': []
+            }
     
     # ========================================
     # PROJECT OPERATIONS

@@ -51,24 +51,131 @@ class LeadRepository:
         else:
             self.db = _LocalCRMDBStub()
     
-    def get_all_leads(self, tenant_id: int, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def create_lead_without_client(self, tenant_id: int, lead_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Get all leads for a tenant
+        Create a lead WITHOUT a real client - uses a placeholder client
+        Stores lead data in Misc_Col1 as JSON
         
         Args:
             tenant_id: Tenant identifier
-            filters: Optional filters (stage, status, assigned_to, etc.)
+            lead_data: Lead information
         
         Returns:
-            List of lead/opportunity records
+            Created opportunity record
+        """
+        try:
+            import json
+            
+            # Get or create placeholder client for this tenant
+            placeholder_client = self._get_or_create_placeholder_client(tenant_id)
+            if not placeholder_client:
+                raise Exception("Failed to create placeholder client")
+            
+            # Store all lead data in Misc_Col1 as JSON
+            lead_metadata = {
+                'contact_person': lead_data.get('contact_person', ''),
+                'tel_number': lead_data.get('tel_number', ''),
+                'email': lead_data.get('email', ''),
+                'mpan_mpr': lead_data.get('mpan_mpr', ''),
+                'supplier': lead_data.get('supplier', ''),
+                'start_date': lead_data.get('start_date', ''),
+                'end_date': lead_data.get('end_date', ''),
+                'annual_usage': lead_data.get('annual_usage', ''),
+                'is_placeholder': True  # Flag to identify imported leads
+            }
+            
+            query = """
+                INSERT INTO "StreemLyne_MT"."Opportunity_Details"
+                ("client_id", "opportunity_title", "opportunity_description", 
+                 "stage_id", "opportunity_value", "opportunity_owner_employee_id", 
+                 "Misc_Col1", "created_at")
+                VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                RETURNING *
+            """
+            
+            return self.db.execute_insert(
+                query,
+                (
+                    placeholder_client['client_id'],
+                    lead_data.get('opportunity_title'),
+                    lead_data.get('opportunity_description', ''),
+                    lead_data.get('stage_id'),
+                    lead_data.get('opportunity_value', 0),
+                    lead_data.get('opportunity_owner_employee_id'),
+                    json.dumps(lead_metadata)
+                ),
+                returning=True
+            )
+        except Exception as e:
+            print(f"LeadRepository.create_lead_without_client error: {e!r}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    def _get_or_create_placeholder_client(self, tenant_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get or create a placeholder client for imported leads
+        This client acts as a container for leads that haven't been converted yet
+        """
+        # Check if placeholder client exists
+        query = """
+            SELECT * FROM "StreemLyne_MT"."Client_Master"
+            WHERE "tenant_id" = %s 
+            AND "client_company_name" = '[IMPORTED LEADS]'
+            LIMIT 1
+        """
+        
+        existing = self.db.execute_query(query, (tenant_id,), fetch_one=True)
+        if existing:
+            return existing
+        
+        # Get first country_id and currency_id
+        country_id = self.get_first_country_id()
+        currency_id = self.get_first_currency_id()
+        
+        # Create placeholder client
+        create_query = """
+            INSERT INTO "StreemLyne_MT"."Client_Master"
+            ("tenant_id", "client_company_name", "client_contact_name", 
+             "country_id", "default_currency_id", "created_at")
+            VALUES (%s, '[IMPORTED LEADS]', 'System Generated', %s, %s, CURRENT_TIMESTAMP)
+            RETURNING *
+        """
+        
+        return self.db.execute_insert(
+            create_query, 
+            (tenant_id, country_id, currency_id), 
+            returning=True
+        )
+
+    def get_all_leads(self, tenant_id: int, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """
+        Get all leads for a tenant
+        Handles both real clients and imported leads (stored in Misc_Col1)
+        
+        Args:
+            tenant_id: Tenant identifier
+            filters: Optional filters
+        
+        Returns:
+            List of lead records
         """
         query = """
             SELECT 
-                od.*,
+                od."opportunity_id",
+                od."client_id",
+                od."opportunity_title",
+                od."opportunity_description",
+                od."stage_id",
+                od."opportunity_value",
+                od."created_at",
+                od."Misc_Col1",
                 sm."stage_name",
                 um."user_name" as assigned_to_name,
                 cm."client_company_name",
-                cm."client_contact_name"
+                cm."client_contact_name",
+                cm."client_phone",
+                cm."client_email"
             FROM "StreemLyne_MT"."Opportunity_Details" od
             INNER JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
@@ -77,28 +184,82 @@ class LeadRepository:
         """
         params = [tenant_id]
         
-        # Apply filters if provided
+        # Apply filters
         if filters:
             if filters.get('stage_id'):
                 query += ' AND od."stage_id" = %s'
                 params.append(filters['stage_id'])
-            
             if filters.get('status'):
-                query += ' AND od."status" = %s'
+                query += ' AND sm."stage_name" = %s'
                 params.append(filters['status'])
-            
             if filters.get('assigned_to'):
                 query += ' AND od."opportunity_owner_employee_id" = %s'
                 params.append(filters['assigned_to'])
         
-        query += ' ORDER BY od."created_at" DESC'
+        query += ' ORDER BY od."created_at" ASC'
         
         try:
-            return self.db.execute_query(query, tuple(params))
+            import json
+            results = self.db.execute_query(query, tuple(params))
+            parsed_results = []
+            
+            for row in results:
+                # Check if this is an imported lead (has data in Misc_Col1)
+                misc_data = row.get('Misc_Col1')
+                is_imported_lead = False
+                lead_data = {}
+                
+                if misc_data:
+                    try:
+                        lead_data = json.loads(misc_data)
+                        is_imported_lead = lead_data.get('is_placeholder', False)
+                    except:
+                        pass
+                
+                if is_imported_lead:
+                    # Imported lead - use data from Misc_Col1
+                    parsed_results.append({
+                        'opportunity_id': row.get('opportunity_id'),
+                        'client_id': row.get('client_id'),
+                        'business_name': row.get('opportunity_title'),
+                        'contact_person': lead_data.get('contact_person'),
+                        'tel_number': lead_data.get('tel_number'),
+                        'email': lead_data.get('email'),
+                        'mpan_mpr': lead_data.get('mpan_mpr'),
+                        'supplier': lead_data.get('supplier'),
+                        'start_date': lead_data.get('start_date'),
+                        'end_date': lead_data.get('end_date'),
+                        'stage_name': row.get('stage_name'),
+                        'stage_id': row.get('stage_id'),
+                        'created_at': row.get('created_at'),
+                        'is_imported': True
+                    })
+                else:
+                    # Real client - use data from Client_Master
+                    parsed_results.append({
+                        'opportunity_id': row.get('opportunity_id'),
+                        'client_id': row.get('client_id'),
+                        'business_name': row.get('client_company_name'),
+                        'contact_person': row.get('client_contact_name'),
+                        'tel_number': row.get('client_phone'),
+                        'email': row.get('client_email'),
+                        'mpan_mpr': None,
+                        'supplier': None,
+                        'start_date': None,
+                        'end_date': None,
+                        'stage_name': row.get('stage_name'),
+                        'stage_id': row.get('stage_id'),
+                        'created_at': row.get('created_at'),
+                        'is_imported': False
+                    })
+            
+            return parsed_results
         except Exception as e:
-            print(f"Error fetching leads for tenant {tenant_id}: {e}")
+            print(f"Error fetching leads: {e}")
+            import traceback
+            traceback.print_exc()
             return []
-    
+        
     def get_lead_by_id(self, tenant_id: int, opportunity_id: int) -> Optional[Dict[str, Any]]:
         """
         Get a specific lead by ID (with tenant isolation)
@@ -131,7 +292,7 @@ class LeadRepository:
         except Exception as e:
             print(f"Error fetching lead {opportunity_id}: {e}")
             return None
-    
+        
     def get_leads_by_stage(self, tenant_id: int, stage_id: int) -> List[Dict[str, Any]]:
         """
         Get all leads in a specific pipeline stage

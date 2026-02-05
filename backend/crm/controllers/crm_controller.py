@@ -106,7 +106,6 @@ class CRMController:
 
             return jsonify(result), 201
         except Exception as e:
-            logger.exception("create_lead controller error: %s", e)
             return jsonify({
                 'success': False,
                 'error': 'Internal server error',
@@ -142,6 +141,49 @@ class CRMController:
                 'message': str(e)
             }), 500
     
+    def update_lead_status(self, opportunity_id: int) -> tuple:
+        """
+        PATCH /api/crm/leads/<opportunity_id>/status
+        Update only the status/stage of a lead
+        """
+        try:
+            tenant_id = g.tenant_id
+            data = request.get_json()
+            
+            if not data or 'stage_name' not in data:
+                return jsonify({
+                    'success': False,
+                    'error': 'Validation error',
+                    'message': 'stage_name is required in request body'
+                }), 400
+            
+            stage_name = data['stage_name']
+            
+            # Validate stage name
+            valid_stages = ['Not Called', 'Called', 'Priced', 'Rejected']
+            if stage_name not in valid_stages:
+                return jsonify({
+                    'success': False,
+                    'error': 'Validation error',
+                    'message': f'Invalid stage name. Must be one of: {", ".join(valid_stages)}'
+                }), 400
+            
+            # Update only the stage using the service layer
+            result = self.crm_service.update_lead_status(tenant_id, opportunity_id, stage_name)
+            
+            if not result.get('success'):
+                status_code = 404 if 'not found' in result.get('message', '').lower() else 500
+                return jsonify(result), status_code
+            
+            return jsonify(result), 200
+            
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+    
     def delete_lead(self, opportunity_id: int) -> tuple:
         """
         DELETE /api/crm/leads/<opportunity_id>
@@ -156,6 +198,135 @@ class CRMController:
                 return jsonify(result), 404
             
             return jsonify(result), 200
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+
+    def import_leads(self) -> tuple:
+            """
+            POST /api/crm/leads/import
+            Bulk import leads from Excel/CSV file
+            """
+            try:
+                tenant_id = g.tenant_id
+                
+                # Check if file is present
+                if 'file' not in request.files:
+                    return jsonify({
+                        'success': False,
+                        'error': 'No file provided',
+                        'message': 'Please upload a file'
+                    }), 400
+                
+                file = request.files['file']
+                
+                if file.filename == '':
+                    return jsonify({
+                        'success': False,
+                        'error': 'No file selected',
+                        'message': 'Please select a file to upload'
+                    }), 400
+                
+                # Validate file extension
+                allowed_extensions = {'.xlsx', '.xls', '.csv'}
+                file_ext = '.' + file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+                
+                if file_ext not in allowed_extensions:
+                    return jsonify({
+                        'success': False,
+                        'error': 'Invalid file type',
+                        'message': 'Only .xlsx, .xls, and .csv files are allowed'
+                    }), 400
+                
+                # Process the file
+                result = self.crm_service.import_leads_from_file(tenant_id, file, file_ext)
+                
+                if not result.get('success'):
+                    return jsonify(result), 400
+                
+                return jsonify(result), 200
+                
+            except Exception as e:
+                return jsonify({
+                    'success': False,
+                    'error': 'Internal server error',
+                    'message': str(e)
+                }), 500
+    
+    def download_leads_template(self) -> tuple:
+        """
+        GET /api/crm/leads/import/template
+        Download Excel template for bulk lead import
+        """
+        try:
+            from flask import send_file
+            import io
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill
+            
+            # Create workbook
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Leads Template"
+            
+            # Define headers
+            headers = [
+                'Business Name',
+                'Contact Person',
+                'Tel Number',
+                'Email',
+                'MPAN/MPR',
+                'Start Date',
+                'End Date'
+            ]
+            
+            # Write headers with styling
+            header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+            header_font = Font(bold=True, color='FFFFFF')
+            
+            for col, header in enumerate(headers, start=1):
+                cell = ws.cell(row=1, column=col, value=header)
+                cell.fill = header_fill
+                cell.font = header_font
+            
+            # Add example row
+            example_data = [
+                'ABC Energy Ltd',
+                'John Smith',
+                '01234567890',
+                'john.smith@abcenergy.com',
+                '1234567890123',
+                '2025-01-01',
+                '2026-01-01'
+            ]
+            
+            for col, value in enumerate(example_data, start=1):
+                ws.cell(row=2, column=col, value=value)
+            
+            # Set column widths
+            ws.column_dimensions['A'].width = 25
+            ws.column_dimensions['B'].width = 20
+            ws.column_dimensions['C'].width = 15
+            ws.column_dimensions['D'].width = 30
+            ws.column_dimensions['E'].width = 20
+            ws.column_dimensions['F'].width = 15
+            ws.column_dimensions['G'].width = 15
+            
+            # Save to BytesIO
+            output = io.BytesIO()
+            wb.save(output)
+            output.seek(0)
+            
+            return send_file(
+                output,
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                as_attachment=True,
+                download_name='leads_import_template.xlsx'
+            )
+            
         except Exception as e:
             return jsonify({
                 'success': False,
