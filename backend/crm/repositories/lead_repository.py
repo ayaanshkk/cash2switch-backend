@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Lead/Opportunity Repository
+Lead/Opportunity Repository - WITH AUTO SEQUENCE RESET
 Handles database operations for Opportunity_Details table
 """
 import os
@@ -50,6 +50,100 @@ class LeadRepository:
             self.db = get_supabase_client()
         else:
             self.db = _LocalCRMDBStub()
+    
+    def reset_sequence_if_empty(self, tenant_id: int, table_name: str, sequence_name: str, id_column: str):
+        """
+        Reset sequence to 1 if table is empty for this tenant
+        
+        Args:
+            tenant_id: Tenant identifier
+            table_name: Table to check (e.g., "Opportunity_Details")
+            sequence_name: Sequence to reset (e.g., "Opportunity_Details_opportunity_id_seq")
+            id_column: ID column name (e.g., "opportunity_id")
+        """
+        try:
+            # Check if table is empty for this tenant
+            if table_name == "Opportunity_Details":
+                # For Opportunity_Details, check via Client_Master join
+                count_query = f"""
+                    SELECT COUNT(*) as count
+                    FROM "StreemLyne_MT"."{table_name}" od
+                    INNER JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
+                    WHERE cm."tenant_id" = %s
+                """
+            elif table_name == "Client_Master":
+                # For Client_Master, direct tenant_id check
+                count_query = f"""
+                    SELECT COUNT(*) as count
+                    FROM "StreemLyne_MT"."{table_name}"
+                    WHERE "tenant_id" = %s
+                    AND "client_company_name" != '[IMPORTED LEADS]'
+                """
+            else:
+                # Generic case
+                count_query = f"""
+                    SELECT COUNT(*) as count
+                    FROM "StreemLyne_MT"."{table_name}"
+                    WHERE "tenant_id" = %s
+                """
+            
+            result = self.db.execute_query(count_query, (tenant_id,), fetch_one=True)
+            count = result.get('count', 0) if result else 0
+            
+            if count == 0:
+                # Table is empty for this tenant - reset sequence
+                reset_query = f'ALTER SEQUENCE "StreemLyne_MT"."{sequence_name}" RESTART WITH 1'
+                self.db.execute_query(reset_query)
+                logger.info(f"✅ Reset sequence {sequence_name} to 1 for tenant {tenant_id}")
+            else:
+                logger.debug(f"Sequence {sequence_name} not reset - {count} records remaining for tenant {tenant_id}")
+                
+        except Exception as e:
+            logger.warning(f"Could not reset sequence {sequence_name}: {e}")
+            # Don't fail the operation if sequence reset fails
+    
+    def bulk_delete_leads(self, tenant_id: int, opportunity_ids: List[int]) -> Dict[str, Any]:
+        """
+        Delete multiple leads at once and reset sequence if all deleted
+        
+        Args:
+            tenant_id: Tenant identifier
+            opportunity_ids: List of opportunity IDs to delete
+        
+        Returns:
+            Dictionary with success count and any errors
+        """
+        deleted_count = 0
+        errors = []
+        
+        try:
+            for opp_id in opportunity_ids:
+                try:
+                    success = self.delete_lead(opp_id, tenant_id)
+                    if success:
+                        deleted_count += 1
+                    else:
+                        errors.append(f"Lead {opp_id} not found or unauthorized")
+                except Exception as e:
+                    errors.append(f"Lead {opp_id}: {str(e)}")
+            
+            # After bulk delete, check if we should reset sequence
+            if deleted_count > 0:
+                self.reset_crm_sequences(tenant_id)
+            
+            return {
+                'deleted': deleted_count,
+                'errors': errors,
+                'total_requested': len(opportunity_ids)
+            }
+            
+        except Exception as e:
+            logger.exception(f"Bulk delete leads failed: {e}")
+            return {
+                'deleted': deleted_count,
+                'errors': errors + [str(e)],
+                'total_requested': len(opportunity_ids)
+            }
     
     def create_lead_without_client(self, tenant_id: int, lead_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
@@ -773,115 +867,138 @@ class LeadRepository:
         return None
 
     def get_leads_table(self, tenant_id: int) -> List[Dict[str, Any]]:
-        """
-        Get leads table for CRM UI: one row per opportunity with joined columns
-        from Client_Master, Stage_Master, Employee_Master, Project_Details,
-        Energy_Contract_Master, Supplier_Master, and latest Client_Interactions.
+            """
+            Get leads table for CRM UI: one row per opportunity with joined columns
+            from Client_Master, Stage_Master, Employee_Master, Project_Details,
+            Energy_Contract_Master, Supplier_Master, and latest Client_Interactions.
 
-        Returns list of dicts with keys: id, name, business_name, contact_person,
-        tel_number, mpan_mpr, supplier, annual_usage, start_date, end_date,
-        status, assigned_to, callback_parameter, call_summary.
-        """
-        query = """
-            SELECT
-                od."opportunity_id" AS id,
-                cm."client_contact_name" AS name,
-                cm."client_company_name" AS business_name,
-                cm."client_contact_name" AS contact_person,
-                cm."client_phone" AS tel_number,
-                (
-                    SELECT COALESCE(pd."mpan", ecm."mpan_number")
-                    FROM "StreemLyne_MT"."Project_Details" pd
-                    LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON ecm."project_id" = pd."project_id"
-                    WHERE pd."opportunity_id" = od."opportunity_id"
-                    ORDER BY pd."project_id"
-                    LIMIT 1
-                ) AS mpan_mpr,
-                (
-                    SELECT sm."supplier_company_name"
-                    FROM "StreemLyne_MT"."Project_Details" pd
-                    INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON ecm."project_id" = pd."project_id"
-                    LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON sm."supplier_id" = ecm."supplier_id"
-                    WHERE pd."opportunity_id" = od."opportunity_id"
-                    ORDER BY ecm."energy_contract_master_id"
-                    LIMIT 1
-                ) AS supplier,
-                (
-                    SELECT pd."annual_usage"
-                    FROM "StreemLyne_MT"."Project_Details" pd
-                    WHERE pd."opportunity_id" = od."opportunity_id"
-                    ORDER BY pd."project_id"
-                    LIMIT 1
-                ) AS annual_usage,
-                (
-                    SELECT ecm."contract_start_date"
-                    FROM "StreemLyne_MT"."Project_Details" pd
-                    INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON ecm."project_id" = pd."project_id"
-                    WHERE pd."opportunity_id" = od."opportunity_id"
-                    ORDER BY ecm."energy_contract_master_id"
-                    LIMIT 1
-                ) AS start_date,
-                (
-                    SELECT ecm."contract_end_date"
-                    FROM "StreemLyne_MT"."Project_Details" pd
-                    INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON ecm."project_id" = pd."project_id"
-                    WHERE pd."opportunity_id" = od."opportunity_id"
-                    ORDER BY ecm."energy_contract_master_id"
-                    LIMIT 1
-                ) AS end_date,
-                sm."stage_name" AS status,
-                em."employee_name" AS assigned_to,
-                (
-                    SELECT ci."next_steps"
-                    FROM "StreemLyne_MT"."Client_Interactions" ci
-                    WHERE ci."client_id" = od."client_id"
-                    ORDER BY ci."contact_date" DESC NULLS LAST
-                    LIMIT 1
-                ) AS callback_parameter,
-                (
-                    SELECT ci."notes"
-                    FROM "StreemLyne_MT"."Client_Interactions" ci
-                    WHERE ci."client_id" = od."client_id"
-                    ORDER BY ci."contact_date" DESC NULLS LAST
-                    LIMIT 1
-                ) AS call_summary
-            FROM "StreemLyne_MT"."Opportunity_Details" od
-            INNER JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
-            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
-            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
-            WHERE cm."tenant_id" = %s
-            ORDER BY od."created_at" DESC
-        """
-        try:
-            rows = self.db.execute_query(query, (tenant_id,))
-            if not rows:
-                logger.debug(
-                    "get_leads_table: empty result for tenant_id=%s, query result count=0",
-                    tenant_id,
-                )
+            Returns list of dicts with keys: id, name, business_name, contact_person,
+            tel_number, mpan_mpr, supplier, annual_usage, start_date, end_date,
+            status, assigned_to, callback_parameter, call_summary.
+            """
+            query = """
+                SELECT
+                    od."opportunity_id" AS id,
+                    cm."client_contact_name" AS name,
+                    cm."client_company_name" AS business_name,
+                    cm."client_contact_name" AS contact_person,
+                    cm."client_phone" AS tel_number,
+                    (
+                        SELECT COALESCE(pd."mpan", ecm."mpan_number")
+                        FROM "StreemLyne_MT"."Project_Details" pd
+                        LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON ecm."project_id" = pd."project_id"
+                        WHERE pd."opportunity_id" = od."opportunity_id"
+                        ORDER BY pd."project_id"
+                        LIMIT 1
+                    ) AS mpan_mpr,
+                    (
+                        SELECT sm."supplier_company_name"
+                        FROM "StreemLyne_MT"."Project_Details" pd
+                        INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON ecm."project_id" = pd."project_id"
+                        LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON sm."supplier_id" = ecm."supplier_id"
+                        WHERE pd."opportunity_id" = od."opportunity_id"
+                        ORDER BY ecm."energy_contract_master_id"
+                        LIMIT 1
+                    ) AS supplier,
+                    (
+                        SELECT pd."annual_usage"
+                        FROM "StreemLyne_MT"."Project_Details" pd
+                        WHERE pd."opportunity_id" = od."opportunity_id"
+                        ORDER BY pd."project_id"
+                        LIMIT 1
+                    ) AS annual_usage,
+                    (
+                        SELECT ecm."contract_start_date"
+                        FROM "StreemLyne_MT"."Project_Details" pd
+                        INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON ecm."project_id" = pd."project_id"
+                        WHERE pd."opportunity_id" = od."opportunity_id"
+                        ORDER BY ecm."energy_contract_master_id"
+                        LIMIT 1
+                    ) AS start_date,
+                    (
+                        SELECT ecm."contract_end_date"
+                        FROM "StreemLyne_MT"."Project_Details" pd
+                        INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON ecm."project_id" = pd."project_id"
+                        WHERE pd."opportunity_id" = od."opportunity_id"
+                        ORDER BY ecm."energy_contract_master_id"
+                        LIMIT 1
+                    ) AS end_date,
+                    sm."stage_name" AS status,
+                    em."employee_name" AS assigned_to,
+                    (
+                        SELECT ci."next_steps"
+                        FROM "StreemLyne_MT"."Client_Interactions" ci
+                        WHERE ci."client_id" = od."client_id"
+                        ORDER BY ci."contact_date" DESC NULLS LAST
+                        LIMIT 1
+                    ) AS callback_parameter,
+                    (
+                        SELECT ci."notes"
+                        FROM "StreemLyne_MT"."Client_Interactions" ci
+                        WHERE ci."client_id" = od."client_id"
+                        ORDER BY ci."contact_date" DESC NULLS LAST
+                        LIMIT 1
+                    ) AS call_summary
+                FROM "StreemLyne_MT"."Opportunity_Details" od
+                INNER JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
+                LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
+                LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
+                WHERE cm."tenant_id" = %s
+                AND cm."client_company_name" != '[IMPORTED LEADS]'
+                ORDER BY od."created_at" DESC
+            """
+            try:
+                rows = self.db.execute_query(query, (tenant_id,))
+                if not rows:
+                    logger.debug(
+                        "get_leads_table: empty result for tenant_id=%s, query result count=0",
+                        tenant_id,
+                    )
+                    return []
+                # Normalize to the 14 keys (dates as ISO strings if present)
+                result = []
+                for r in rows:
+                    result.append({
+                        'id': r.get('id'),
+                        'name': r.get('name'),
+                        'business_name': r.get('business_name'),
+                        'contact_person': r.get('contact_person'),
+                        'tel_number': r.get('tel_number'),
+                        'mpan_mpr': r.get('mpan_mpr'),
+                        'supplier': r.get('supplier'),
+                        'annual_usage': r.get('annual_usage'),
+                        'start_date': r.get('start_date').isoformat() if r.get('start_date') else None,
+                        'end_date': r.get('end_date').isoformat() if r.get('end_date') else None,
+                        'status': r.get('status'),
+                        'assigned_to': r.get('assigned_to'),
+                        'callback_parameter': r.get('callback_parameter'),
+                        'call_summary': r.get('call_summary'),
+                    })
+                return result
+            except Exception as e:
+                print(f"Error fetching leads table for tenant {tenant_id}: {e}")
+                import traceback
+                traceback.print_exc()
                 return []
-            # Normalize to the 14 keys (dates as ISO strings if present)
-            result = []
-            for r in rows:
-                result.append({
-                    'id': r.get('id'),
-                    'name': r.get('name'),
-                    'business_name': r.get('business_name'),
-                    'contact_person': r.get('contact_person'),
-                    'tel_number': r.get('tel_number'),
-                    'mpan_mpr': r.get('mpan_mpr'),
-                    'supplier': r.get('supplier'),
-                    'annual_usage': r.get('annual_usage'),
-                    'start_date': r.get('start_date').isoformat() if r.get('start_date') else None,
-                    'end_date': r.get('end_date').isoformat() if r.get('end_date') else None,
-                    'status': r.get('status'),
-                    'assigned_to': r.get('assigned_to'),
-                    'callback_parameter': r.get('callback_parameter'),
-                    'call_summary': r.get('call_summary'),
-                })
-            return result
+
+    def reset_crm_sequences(self, tenant_id: int):
+        """Reset sequences if tables are empty for this tenant"""
+        try:
+            # Check if Opportunity_Details is empty
+            count_query = """
+                SELECT COUNT(*) as count
+                FROM "StreemLyne_MT"."Opportunity_Details" od
+                INNER JOIN "StreemLyne_MT"."Client_Master" cm 
+                    ON od."client_id" = cm."client_id"
+                WHERE cm."tenant_id" = %s
+            """
+            result = self.db.execute_query(count_query, (tenant_id,), fetch_one=True)
+            
+            if result and result.get('count', 0) == 0:
+                # Reset sequence
+                self.db.execute_query(
+                    'ALTER SEQUENCE "StreemLyne_MT"."Opportunity_Details_opportunity_id_seq" RESTART WITH 1'
+                )
+                logger.info(f"✅ Reset Opportunity_Details sequence for tenant {tenant_id}")
         except Exception as e:
-            print(f"Error fetching leads table for tenant {tenant_id}: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
+            logger.warning(f"Sequence reset failed: {e}")

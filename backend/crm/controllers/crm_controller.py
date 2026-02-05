@@ -205,6 +205,84 @@ class CRMController:
                 'message': str(e)
             }), 500
 
+    def bulk_delete_leads(self):
+        """
+        Bulk delete multiple leads and automatically reset sequence if all deleted
+        
+        Request Body:
+            {
+                "opportunity_ids": [15, 16, 17, 18]
+            }
+        
+        Returns:
+            200: Deletion results with count
+            400: Invalid request
+            500: Internal server error
+        """
+        try:
+            from flask import request, jsonify
+            
+            # Get request data
+            data = request.get_json()
+            if not data or 'opportunity_ids' not in data:
+                return jsonify({
+                    'success': False,
+                    'error': 'opportunity_ids is required'
+                }), 400
+            
+            opportunity_ids = data.get('opportunity_ids', [])
+            
+            if not isinstance(opportunity_ids, list) or len(opportunity_ids) == 0:
+                return jsonify({
+                    'success': False,
+                    'error': 'opportunity_ids must be a non-empty list'
+                }), 400
+            
+            # Get tenant_id from request context (set by middleware)
+            tenant_id = request.tenant_id
+            
+            # Call repository bulk delete method
+            from backend.crm.repositories.lead_repository import LeadRepository
+            repo = LeadRepository()
+            result = repo.bulk_delete_leads(tenant_id, opportunity_ids)
+            
+            # Build response message
+            deleted = result.get('deleted', 0)
+            total = result.get('total_requested', 0)
+            errors = result.get('errors', [])
+            
+            # Check if sequence was reset
+            sequence_reset_message = ""
+            if deleted > 0:
+                # Check if all leads are deleted
+                remaining = repo.get_all_leads(tenant_id)
+                if len(remaining) == 0:
+                    sequence_reset_message = " ID sequence reset to 1."
+            
+            message = f"{deleted} lead(s) deleted successfully."
+            if deleted < total:
+                message += f" {total - deleted} failed."
+            message += sequence_reset_message
+            
+            return jsonify({
+                'success': True,
+                'deleted': deleted,
+                'total_requested': total,
+                'errors': errors,
+                'message': message
+            }), 200
+            
+        except Exception as e:
+            import traceback
+            print(f"Error in bulk_delete_leads: {e}")
+            traceback.print_exc()
+            
+            return jsonify({
+                'success': False,
+                'error': 'Failed to delete leads',
+                'details': str(e)
+            }), 500
+
     def import_leads(self) -> tuple:
             """
             POST /api/crm/leads/import
