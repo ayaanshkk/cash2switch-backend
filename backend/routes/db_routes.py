@@ -171,7 +171,7 @@ def handle_customers():
                 created_by=get_current_user_email(data)
             )
             
-            if data.get('date_of_measure'):
+            if data.get('date_of_measure') and hasattr(customer, 'date_of_measure'):
                 customer.date_of_measure = datetime.strptime(data['date_of_measure'], '%Y-%m-%d').date()
             
             session.add(customer)
@@ -231,7 +231,7 @@ def handle_single_customer(customer_id):
             customer.project_types = data.get('project_types', customer.project_types)
             customer.updated_by = get_current_user_email(data)
             
-            if 'date_of_measure' in data and data['date_of_measure']:
+            if 'date_of_measure' in data and data['date_of_measure'] and hasattr(customer, 'date_of_measure'):
                 customer.date_of_measure = datetime.strptime(data['date_of_measure'], '%Y-%m-%d').date()
             
             session.commit()

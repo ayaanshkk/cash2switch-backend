@@ -33,6 +33,10 @@ class CRMController:
             filters = {}
             if request.args.get('stage_id'):
                 filters['stage_id'] = int(request.args.get('stage_id'))
+            if request.args.get('stage'):
+                filters['stage'] = request.args.get('stage')
+            if request.args.get('exclude_stage'):
+                filters['exclude_stage'] = request.args.get('exclude_stage')
             if request.args.get('status'):
                 filters['status'] = request.args.get('status')
             if request.args.get('assigned_to'):
@@ -72,7 +76,8 @@ class CRMController:
     def update_lead_status(self, opportunity_id: int) -> tuple:
         """
         PATCH /api/crm/leads/<opportunity_id>/status
-        Update lead status (stage_name) only
+        Update lead status (stage_id) only.
+        When stage becomes 'Lost', lead is soft-deleted (deleted_at=NOW()).
         """
         try:
             tenant_id = g.tenant_id
@@ -85,35 +90,60 @@ class CRMController:
                     'message': 'Request body is required'
                 }), 400
             
-            stage_name = payload.get('stage_name')
-            if not stage_name:
+            stage_id = payload.get('stage_id')
+            if stage_id is None:
                 return jsonify({
                     'success': False,
                     'error': 'Validation error',
-                    'message': 'stage_name is required'
+                    'message': 'stage_id is required'
                 }), 400
-
-            if not isinstance(stage_name, str):
+            
+            try:
+                stage_id = int(stage_id)
+            except (ValueError, TypeError):
                 return jsonify({
                     'success': False,
                     'error': 'Validation error',
-                    'message': 'stage_name must be a string'
+                    'message': 'stage_id must be a number'
                 }), 400
-
-            allowed_statuses = {"Not Called", "Called", "Priced", "Rejected"}
-            if stage_name not in allowed_statuses:
+            
+            # Validate that stage_id exists in Stage_Master
+            from backend.crm.supabase_client import get_supabase_client
+            db = get_supabase_client()
+            stage_check = db.execute_query(
+                'SELECT "stage_id" FROM "StreemLyne_MT"."Stage_Master" WHERE "stage_id" = %s',
+                (stage_id,),
+                fetch_one=True
+            )
+            if not stage_check:
                 return jsonify({
                     'success': False,
                     'error': 'Validation error',
-                    'message': f'Invalid stage_name. Allowed: {", ".join(sorted(allowed_statuses))}'
+                    'message': 'Invalid stage_id'
                 }), 400
-
-            result = self.crm_service.update_lead_status(tenant_id, opportunity_id, stage_name)
-
+            
+            result = self.crm_service.update_lead_status(tenant_id, opportunity_id, stage_id)
+            
             if not result.get('success'):
-                status_code = 400 if result.get('error') == 'Validation error' else 404
-                return jsonify(result), status_code
+                return jsonify(result), 404
+            
+            return jsonify(result), 200
+        
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
 
+    def get_recycle_bin(self) -> tuple:
+        """
+        GET /api/crm/leads/recycle-bin
+        Get all soft-deleted (Lost) leads for the tenant.
+        """
+        try:
+            tenant_id = g.tenant_id
+            result = self.crm_service.get_recycle_bin(tenant_id)
             return jsonify(result), 200
         
         except Exception as e:
@@ -123,6 +153,32 @@ class CRMController:
                 'message': str(e)
             }), 500
     
+    def delete_expired_lost_leads(self) -> tuple:
+        """
+        PATCH /api/crm/leads/cleanup
+        Permanently delete Lost leads older than N days.
+        Admin operation (controlled by token_required + tenant_from_jwt).
+        """
+        try:
+            tenant_id = g.tenant_id
+            payload = request.get_json() or {}
+            days = payload.get('days', 30)
+            
+            try:
+                days = int(days)
+            except (ValueError, TypeError):
+                days = 30
+            
+            result = self.crm_service.delete_expired_lost_leads(tenant_id, days)
+            return jsonify(result), 200
+        
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+
     def create_lead(self) -> tuple:
         """
         POST /api/crm/leads
@@ -455,7 +511,14 @@ class CRMController:
 
             created_by = getattr(request.current_user, 'id', None)
 
-            result = self.crm_service.confirm_lead_import(tenant_id, payload, created_by)
+            service_param = request.args.get('service')
+            service_value = service_param.strip().lower() if isinstance(service_param, str) else None
+            if service_value == 'water':
+                service_id = 2
+            else:
+                service_id = 1
+
+            result = self.crm_service.confirm_lead_import(tenant_id, payload, created_by, service_id)
 
             status = 200 if result.get('success') else 400
             return jsonify(result), status

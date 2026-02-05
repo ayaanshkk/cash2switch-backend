@@ -4,11 +4,13 @@ Only includes Customer model with dual pipeline system
 Removed: Project, CustomerFormData, DrawingDocument, FormDocument, ProductionNotification
 """
 
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify, current_app, Response
 from ..models import Customer, User
 from .auth_helpers import token_required
 import uuid
 from datetime import datetime
+import io
+import pandas as pd
 
 from ..db import SessionLocal
 
@@ -105,6 +107,128 @@ def create_customer():
         return jsonify({'error': f'Failed to create customer: {str(e)}'}), 500
     finally:
         session.close()
+
+
+@customer_bp.route('/clients/import', methods=['POST'])
+@token_required
+def import_customers():
+    """Bulk import customers from CSV/XLSX."""
+    session = SessionLocal()
+    try:
+        if 'file' not in request.files:
+            return jsonify({
+                'success': False,
+                'message': 'No file provided',
+                'total_rows': 0,
+                'successful': 0,
+                'failed': 1,
+                'errors': ['No file uploaded']
+            }), 400
+
+        file = request.files.get('file')
+        filename = file.filename or ''
+        ext = filename.lower().split('.')[-1] if '.' in filename else ''
+
+        if ext not in ['csv', 'xlsx', 'xls']:
+            return jsonify({
+                'success': False,
+                'message': 'Invalid file type',
+                'total_rows': 0,
+                'successful': 0,
+                'failed': 1,
+                'errors': ['Upload a .csv, .xlsx, or .xls file']
+            }), 400
+
+        content = file.read()
+        if ext == 'csv':
+            df = pd.read_csv(io.BytesIO(content))
+        else:
+            df = pd.read_excel(io.BytesIO(content))
+
+        df_columns = {c: c.strip().lower() for c in df.columns}
+        df.rename(columns=df_columns, inplace=True)
+
+        def get_value(row, *keys):
+            for key in keys:
+                if key in row and pd.notna(row[key]):
+                    return str(row[key]).strip()
+            return ''
+
+        inserted = 0
+        skipped = 0
+        errors = []
+
+        for idx, row in df.iterrows():
+            name = get_value(row, 'name', 'customer_name', 'business_name', 'client_company_name')
+            phone = get_value(row, 'phone', 'tel_number', 'tel', 'contact_phone')
+            email = get_value(row, 'email', 'email_address')
+            address = get_value(row, 'address')
+            salesperson = get_value(row, 'salesperson', 'owner')
+            notes = get_value(row, 'notes')
+
+            if not name or not phone:
+                skipped += 1
+                errors.append({'row': int(idx) + 2, 'error': 'Missing required fields (name, phone)'})
+                continue
+
+            customer = Customer(
+                id=str(uuid.uuid4()),
+                name=name,
+                phone=phone,
+                email=email or '',
+                address=address or '',
+                salesperson=salesperson or '',
+                notes=notes or '',
+                contact_made='No',
+                preferred_contact_method='Phone',
+                sales_stage='Enquiry',
+                pipeline_type='sales',
+                status='Active',
+                created_at=datetime.utcnow(),
+                created_by=str(request.current_user.id) if hasattr(request.current_user, 'id') else None
+            )
+
+            session.add(customer)
+            inserted += 1
+
+        session.commit()
+
+        total_rows = len(df.index)
+        return jsonify({
+            'success': inserted > 0,
+            'message': f"Successfully imported {inserted} customer(s)" if inserted > 0 else "No customers imported",
+            'total_rows': total_rows,
+            'successful': inserted,
+            'failed': skipped,
+            'errors': errors
+        }), 200
+
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"❌ Error importing customers: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Import failed',
+            'total_rows': 0,
+            'successful': 0,
+            'failed': 1,
+            'errors': [str(e)]
+        }), 500
+    finally:
+        session.close()
+
+
+@customer_bp.route('/clients/import/template', methods=['GET'])
+@token_required
+def download_customer_import_template():
+    """Download CSV template for customer import."""
+    headers = ['name', 'phone', 'email', 'address', 'salesperson', 'notes']
+    csv_content = ','.join(headers) + '\n'
+    return Response(
+        csv_content,
+        mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename=customers_import_template.csv'}
+    )
 
 
 @customer_bp.route('/clients/<string:customer_id>', methods=['GET', 'OPTIONS'])

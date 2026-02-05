@@ -1,7 +1,7 @@
 import os
 import logging
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -46,6 +46,14 @@ else:
         pool_pre_ping=True,
         connect_args={"sslmode": "require"}
     )
+
+@event.listens_for(engine, "connect")
+def set_search_path(dbapi_connection, connection_record):
+    if dbapi_connection.__class__.__module__.startswith("sqlite3"):
+        return
+    cursor = dbapi_connection.cursor()
+    cursor.execute('SET search_path TO "StreemLyne_MT", public')
+    cursor.close()
 
 # ============================================
 # SESSION CONFIGURATION

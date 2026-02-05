@@ -44,11 +44,11 @@ class CRMService:
     
     def get_leads(self, tenant_id: int, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        Get all leads for a tenant
+        Get all leads for a tenant (excludes Lost leads by default)
         
         Args:
             tenant_id: Tenant identifier
-            filters: Optional filters
+            filters: Optional filters (stage_id, include_lost, etc.)
         
         Returns:
             Dictionary with leads data
@@ -93,27 +93,18 @@ class CRMService:
             'interactions': interactions
         }
     
-    def update_lead_status(self, tenant_id: int, opportunity_id: int, stage_name: str) -> Dict[str, Any]:
+    def update_lead_status(self, tenant_id: int, opportunity_id: int, stage_id: int) -> Dict[str, Any]:
         """
-        Update lead status (stage_name) with tenant isolation
+        Update lead status (stage_id) with tenant isolation.
         
         Args:
             tenant_id: Tenant identifier
             opportunity_id: Opportunity ID
-            stage_name: New stage name
+            stage_id: New stage ID
         
         Returns:
             Dictionary with success status and updated data
         """
-        stage = self.stage_repo.get_stage_by_name(stage_name)
-        if not stage or not stage.get('stage_id'):
-            return {
-                'success': False,
-                'error': 'Validation error',
-                'message': f'Stage "{stage_name}" not found in Stage_Master'
-            }
-
-        stage_id = stage.get('stage_id')
         result = self.lead_repo.update_lead_status(tenant_id, opportunity_id, stage_id)
         
         if not result:
@@ -197,29 +188,39 @@ class CRMService:
             'message': f'Lead {opportunity_id} deleted successfully'
         }
     
-    # ========================================
-    # PROJECT OPERATIONS
-    # ========================================
-    
-    def get_projects(self, tenant_id: int, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def get_recycle_bin(self, tenant_id: int) -> Dict[str, Any]:
         """
-        Get all projects for a tenant
+        Get all Lost leads (recycle bin) for a tenant
         
         Args:
             tenant_id: Tenant identifier
-            filters: Optional filters
         
         Returns:
-            Dictionary with projects data
+            Dictionary with recycle bin data
         """
-        projects = self.project_repo.get_all_projects(tenant_id, filters)
-        stats = self.project_repo.get_project_stats(tenant_id)
-        
+        leads = self.lead_repo.get_leads_recycle_bin(tenant_id)
         return {
             'success': True,
-            'data': projects,
-            'stats': stats,
-            'count': len(projects)
+            'data': leads,
+            'count': len(leads)
+        }
+    
+    def delete_expired_lost_leads(self, tenant_id: int, days: int = 30) -> Dict[str, Any]:
+        """
+        Permanently delete Lost leads older than specified days
+        
+        Args:
+            tenant_id: Tenant identifier
+            days: Delete leads older than this many days (default 30)
+        
+        Returns:
+            Dictionary with deletion count
+        """
+        deleted_count = self.lead_repo.delete_expired_lost_leads(tenant_id, days)
+        return {
+            'success': True,
+            'deleted_count': deleted_count,
+            'message': f'Deleted {deleted_count} expired lost leads'
         }
     
     def get_project_detail(self, tenant_id: int, project_id: int) -> Dict[str, Any]:
@@ -499,22 +500,31 @@ class CRMService:
 
         return {'success': True, 'total_rows': total_rows, 'valid_rows': valid_count, 'invalid_rows': invalid_count, 'rows': rows_out}
 
-    def confirm_lead_import(self, tenant_id: int, rows: list, created_by: int | None) -> Dict[str, Any]:
+    def confirm_lead_import(self, tenant_id: int, rows: list, created_by: int | None, service_id: int) -> Dict[str, Any]:
         """
         Confirm/import validated rows into Opportunity_Details.
 
         - Stores MPAN_MPR directly in Opportunity_Details.mpan_mpr
-        - Inserts Opportunity_Details with stage_id=1 (New), tenant_id from JWT
+        - Inserts Opportunity_Details with stage_id=Not Called, tenant_id from JWT
         - Skips rows where MPAN already exists in Opportunity_Details
         - Partial success allowed; per-row errors returned
         - NO dependency on Project_Details or Client_Master
         """
         if not isinstance(rows, list) or len(rows) == 0:
-            return {'success': False, 'error': 'Invalid payload', 'message': 'Expected non-empty JSON array of validated rows.'}
+            return {
+                'success': False,
+                'error': 'Invalid payload',
+                'message': 'Expected non-empty JSON array of validated rows.'
+            }
 
         # Delegate to repository which handles DB checks/inserts per-row
-        result = self.lead_repo.import_opportunities_from_import(tenant_id, rows, created_by)
-        return {'inserted': int(result.get('inserted', 0)), 'skipped': int(result.get('skipped', 0)), 'errors': result.get('errors', [])}
+        result = self.lead_repo.import_opportunities_from_import(tenant_id, rows, created_by, service_id)
+        return {
+            'success': True,
+            'inserted': int(result.get('inserted', 0)),
+            'skipped': int(result.get('skipped', 0)),
+            'errors': result.get('errors', [])
+        }
 
     def get_leads_by_customer_type(self, tenant_id: int, customer_type: Optional[str] = None, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """

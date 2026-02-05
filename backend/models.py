@@ -152,7 +152,6 @@ class User(Base):
 
 class UserMaster(Base):
     __tablename__ = 'User_Master'
-    __table_args__ = {'schema': 'StreemLyne_MT'}
     
     user_id = Column(Integer, primary_key=True)
     employee_id = Column(Integer, nullable=True)
@@ -211,7 +210,6 @@ class Customer(Base):
     __tablename__ = 'customers'
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    date_of_measure = Column(Date)
     name = Column(String(200), nullable=False)
     address = Column(Text)  # Contains full address including PIN code for India
     phone = Column(String(50))
@@ -290,7 +288,6 @@ class Customer(Base):
             'pipeline_type': self.pipeline_type or 'sales',
             'status': self.status or 'Active',
             'project_types': project_types_value,
-            'date_of_measure': self.date_of_measure.isoformat() if self.date_of_measure else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'created_by': self.created_by,

@@ -144,13 +144,14 @@ def update_lead(opportunity_id):
 @tenant_from_jwt
 def update_lead_status(opportunity_id):
     """
-    Update lead status (stage_id) only
+    Update lead status (stage_id) only.
+    When stage becomes 'Lost', lead is soft-deleted (deleted_at=NOW()).
     
     Path Parameters:
         - opportunity_id: Opportunity identifier
     
     Request Body:
-        { "stage_name": "Called" | "Not Called" | "Priced" | "Rejected" }
+        { "stage_id": <number> }
     
     Authentication:
         - JWT (token must include `tenant_id`)
@@ -247,6 +248,47 @@ def import_leads_confirm():
       400: invalid request
     """
     return crm_controller.import_leads_confirm()
+
+
+@crm_bp.route('/leads/recycle-bin', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_recycle_bin():
+    """
+    Get all soft-deleted (Lost) leads for the tenant.
+    
+    Query Parameters:
+        - None
+    
+    Authentication:
+        - JWT (token must include `tenant_id`)
+    
+    Returns:
+        200: { success, data, count } - List of deleted leads with deleted_at timestamp
+        500: Internal server error
+    """
+    return crm_controller.get_recycle_bin()
+
+
+@crm_bp.route('/leads/cleanup', methods=['PATCH'])
+@token_required
+@tenant_from_jwt
+def delete_expired_lost_leads():
+    """
+    Permanently delete Lost leads older than N days.
+    Admin operation (controlled by token_required + tenant_from_jwt).
+    
+    Request Body (optional):
+        { "days": 30 }  # Default: 30 days. Records with deleted_at < NOW() - INTERVAL will be permanently removed.
+    
+    Authentication:
+        - JWT (token must include `tenant_id`)
+    
+    Returns:
+        200: { success, deleted_count, message }
+        500: Internal server error
+    """
+    return crm_controller.delete_expired_lost_leads()
 
 
 @crm_bp.route('/leads/import', methods=['POST'])
@@ -646,15 +688,16 @@ def get_roles():
 
 
 @crm_bp.route('/stages', methods=['GET'])
+@token_required
 def get_stages():
     """
     Get all pipeline stages
     
     Query Parameters:
-        - pipeline_type: Filter by pipeline type
+        - pipeline_type: Filter by pipeline type (lead, sales, training)
     
     Returns:
-        200: List of stages
+        200: List of stages with stage_id and stage_name
         500: Internal server error
     """
     return crm_controller.get_stages()
