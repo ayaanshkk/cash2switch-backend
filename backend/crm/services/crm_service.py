@@ -13,9 +13,10 @@ from backend.crm.repositories.deal_repository import DealRepository
 from backend.crm.repositories.user_repository import UserRepository
 from backend.crm.repositories.tenant_repository import TenantRepository
 from backend.crm.repositories.additional_repositories import (
-    RoleRepository, StageRepository, ServiceRepository, 
+    RoleRepository, ServiceRepository,
     SupplierRepository, InteractionRepository
 )
+from backend.crm.repositories.stage_repository import StageRepository
 
 
 class CRMService:
@@ -227,56 +228,66 @@ class CRMService:
         }
 
     def update_lead_status(self, tenant_id: int, opportunity_id: int, stage_name: str) -> Dict[str, Any]:
-            """
-            Update only the status/stage of a lead
+        """
+        Update only the status/stage of a lead
+        
+        Args:
+            tenant_id: Tenant identifier
+            opportunity_id: Opportunity ID
+            stage_name: New stage name (e.g., "Called", "Priced", "Rejected", "Not Called")
+        
+        Returns:
+            Dictionary with updated lead
+        """
+        try:
+            # Check if lead exists
+            lead = self.lead_repo.get_lead_by_id(tenant_id, opportunity_id)
             
-            Args:
-                tenant_id: Tenant identifier
-                opportunity_id: Opportunity ID
-                stage_name: New stage name (e.g., "Called", "Priced", "Rejected", "Not Called")
-            
-            Returns:
-                Dictionary with updated lead
-            """
-            try:
-                # Check if lead exists
-                lead = self.lead_repo.get_lead_by_id(tenant_id, opportunity_id)
-                
-                if not lead:
-                    return {
-                        'success': False,
-                        'error': 'Lead not found',
-                        'message': f'No lead found with ID {opportunity_id}'
-                    }
-                
-                # Update only the stage_name field
-                update_data = {
-                    'stage_name': stage_name
-                }
-                
-                # Call repository to update the lead
-                updated_lead = self.lead_repo.update_lead(opportunity_id, tenant_id, update_data)
-                
-                if not updated_lead:
-                    return {
-                        'success': False,
-                        'error': 'Failed to update lead status',
-                        'message': f'Could not update status for lead with ID {opportunity_id}'
-                    }
-                
-                return {
-                    'success': True,
-                    'data': updated_lead,
-                    'message': f'Lead status updated to "{stage_name}" successfully'
-                }
-                
-            except Exception as e:
-                logger.exception("update_lead_status error: %s", e)
+            if not lead:
                 return {
                     'success': False,
-                    'error': 'Internal server error',
-                    'message': str(e)
+                    'error': 'Lead not found',
+                    'message': f'No lead found with ID {opportunity_id}'
                 }
+            
+            # ✅ FIX: Convert stage_name to stage_id
+            stage = self.stage_repo.get_stage_by_name(stage_name)
+            
+            if not stage:
+                return {
+                    'success': False,
+                    'error': 'Invalid stage',
+                    'message': f'Stage "{stage_name}" not found'
+                }
+            
+            # ✅ FIX: Update stage_id, not stage_name
+            update_data = {
+                'stage_id': stage['stage_id']  # ✅ Use stage_id!
+            }
+            
+            # Call repository to update the lead
+            updated_lead = self.lead_repo.update_lead(opportunity_id, tenant_id, update_data)
+            
+            if not updated_lead:
+                return {
+                    'success': False,
+                    'error': 'Failed to update lead status',
+                    'message': f'Could not update status for lead with ID {opportunity_id}'
+                }
+            
+            return {
+                'success': True,
+                'data': updated_lead,
+                'message': f'Lead status updated to "{stage_name}" successfully'
+            }
+            
+        except Exception as e:
+            logger.exception("update_lead_status error: %s", e)
+            return {
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }
     
     def delete_lead(self, tenant_id: int, opportunity_id: int) -> Dict[str, Any]:
         """

@@ -226,6 +226,85 @@ def update_lead_status(opportunity_id):
     """
     return crm_controller.update_lead_status(opportunity_id)
 
+@crm_bp.route('/priced', methods=['GET'])
+@require_tenant
+def get_priced_leads():
+    """
+    Get all priced leads for the current tenant
+    These are leads with stage_name = 'Priced'
+    
+    Query Parameters:
+        - assigned_to: Filter by assigned employee
+    
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+    
+    Returns:
+        200: List of priced leads
+        500: Internal server error
+    """
+    return crm_controller.get_priced_leads()
+
+
+@crm_bp.route('/priced/<int:opportunity_id>', methods=['GET'])
+@require_tenant
+def get_priced_lead_detail(opportunity_id):
+    """
+    Get details of a specific priced lead
+    
+    Path Parameters:
+        - opportunity_id: Opportunity identifier
+    
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+    
+    Returns:
+        200: Priced lead details
+        404: Lead not found
+        500: Internal server error
+    """
+    return crm_controller.get_priced_lead_detail(opportunity_id)
+
+
+@crm_bp.route('/priced/<int:opportunity_id>/move-to-leads', methods=['PATCH'])
+@require_tenant
+def move_priced_to_leads(opportunity_id):
+    """
+    Move a priced lead back to leads page
+    Changes stage from 'Priced' to 'Not Called'
+    
+    Path Parameters:
+        - opportunity_id: Opportunity identifier
+    
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+    
+    Returns:
+        200: Lead moved back to leads page
+        404: Lead not found
+        500: Internal server error
+    """
+    return crm_controller.move_priced_to_leads(opportunity_id)
+
+
+@crm_bp.route('/priced/stats', methods=['GET'])
+@require_tenant
+def get_priced_stats():
+    """
+    Get statistics for priced leads
+    
+    Headers:
+        - X-Tenant-ID: Tenant identifier (required)
+    
+    Returns:
+        200: {
+            "total_priced": 25,
+            "total_value": 150000,
+            "by_employee": {...}
+        }
+    """
+    return crm_controller.get_priced_stats()
+
 
 @crm_bp.route('/clients', methods=['POST'])
 @require_tenant
