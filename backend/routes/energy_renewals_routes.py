@@ -32,7 +32,7 @@ def get_renewals():
                 cm.client_email as email,
                 sm.supplier_company_name as supplier_name,
                 ecm.contract_end_date as end_date,
-                pd.Misc_Col2 as annual_usage,
+                pd."Misc_Col2" as annual_usage
                 (ecm.contract_end_date - CURRENT_DATE) as days_until_expiry,
                 COALESCE(
                     (SELECT ci.notes 
