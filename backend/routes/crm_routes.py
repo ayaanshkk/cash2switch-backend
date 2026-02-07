@@ -742,7 +742,7 @@ def get_roles():
 
 
 @crm_bp.route('/stages', methods=['GET'])
-@token_required
+@require_tenant
 def get_stages():
     """
     Get all pipeline stages

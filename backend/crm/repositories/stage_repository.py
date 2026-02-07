@@ -42,8 +42,13 @@ class StageRepository:
         else:
             self.db = _LocalCRMDBStub()
     
-    def get_all_stages(self) -> List[Dict[str, Any]]:
-        """Get all stages"""
+    def get_all_stages(self, tenant_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Get all stages
+        
+        Args:
+            tenant_id: Optional tenant filter (not used for stages as they're shared)
+        """
         query = """
             SELECT 
                 "stage_id",
