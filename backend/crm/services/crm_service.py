@@ -163,58 +163,6 @@ class CRMService:
             'data': lead,
             'message': 'Lead updated successfully'
         }
-
-    def update_lead_status(self, tenant_id: int, opportunity_id: int, stage_name: str) -> Dict[str, Any]:
-            """
-            Update only the status/stage of a lead
-            
-            Args:
-                tenant_id: Tenant identifier
-                opportunity_id: Opportunity ID
-                stage_name: New stage name (e.g., "Called", "Priced", "Rejected", "Not Called")
-            
-            Returns:
-                Dictionary with updated lead
-            """
-            try:
-                # Check if lead exists
-                lead = self.lead_repo.get_lead_by_id(tenant_id, opportunity_id)
-                
-                if not lead:
-                    return {
-                        'success': False,
-                        'error': 'Lead not found',
-                        'message': f'No lead found with ID {opportunity_id}'
-                    }
-                
-                # Update only the stage_name field
-                update_data = {
-                    'stage_name': stage_name
-                }
-                
-                # Call repository to update the lead
-                updated_lead = self.lead_repo.update_lead(opportunity_id, tenant_id, update_data)
-                
-                if not updated_lead:
-                    return {
-                        'success': False,
-                        'error': 'Failed to update lead status',
-                        'message': f'Could not update status for lead with ID {opportunity_id}'
-                    }
-                
-                return {
-                    'success': True,
-                    'data': updated_lead,
-                    'message': f'Lead status updated to "{stage_name}" successfully'
-                }
-                
-            except Exception as e:
-                logger.exception("update_lead_status error: %s", e)
-                return {
-                    'success': False,
-                    'error': 'Internal server error',
-                    'message': str(e)
-                }
     
     def delete_lead(self, tenant_id: int, opportunity_id: int) -> Dict[str, Any]:
         """
@@ -413,7 +361,6 @@ class CRMService:
                 'failed': 0,
                 'errors': []
             }
-        }
 
     def import_leads_from_file(self, tenant_id: int, file, file_ext: str) -> Dict[str, Any]:
         """Import leads from Excel/CSV - stores in Misc_Col1"""
@@ -1074,3 +1021,36 @@ class CRMService:
                 'deals': deal_stats
             }
         }
+
+    def get_priced(self, tenant_id: int) -> Dict[str, Any]:
+        """
+        Get all priced leads and renewals
+        
+        Args:
+            tenant_id: Tenant identifier
+        
+        Returns:
+            Dictionary with priced leads and renewals
+        """
+        try:
+            # Get priced leads (stage_id = 8)
+            priced_leads = self.lead_repo.get_priced_leads(tenant_id)
+            
+            # Get priced renewals (Misc_Col1 = 'priced')
+            priced_renewals = self.lead_repo.get_priced_renewals(tenant_id)
+            
+            return {
+                'success': True,
+                'leads': priced_leads,
+                'renewals': priced_renewals,
+                'total_leads': len(priced_leads),
+                'total_renewals': len(priced_renewals),
+                'total': len(priced_leads) + len(priced_renewals)
+            }
+        except Exception as e:
+            logger.exception("get_priced error: %s", e)
+            return {
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }

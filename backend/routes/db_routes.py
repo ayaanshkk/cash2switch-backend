@@ -119,12 +119,6 @@ def handle_legacy_customers():
                 address=data.get('address')
             )
             
-<<<<<<< HEAD
-            if data.get('date_of_measure') and hasattr(customer, 'date_of_measure'):
-                customer.date_of_measure = datetime.strptime(data['date_of_measure'], '%Y-%m-%d').date()
-            
-=======
->>>>>>> e453bfa (renewal database page working)
             session.add(customer)
             session.commit()
             session.refresh(customer)
@@ -170,24 +164,6 @@ def handle_single_legacy_customer(customer_id):
             customer.phone = data.get('phone', customer.phone)
             customer.email = data.get('email', customer.email)
             customer.address = data.get('address', customer.address)
-<<<<<<< HEAD
-            # NO POSTCODE - removed for India
-            customer.salesperson = data.get('salesperson', customer.salesperson)
-            customer.contact_made = data.get('contact_made', customer.contact_made)
-            customer.preferred_contact_method = data.get('preferred_contact_method', customer.preferred_contact_method)
-            customer.marketing_opt_in = data.get('marketing_opt_in', customer.marketing_opt_in)
-            customer.notes = data.get('notes', customer.notes)
-            customer.sales_stage = data.get('sales_stage', customer.sales_stage)
-            customer.training_stage = data.get('training_stage', customer.training_stage)
-            customer.pipeline_type = data.get('pipeline_type', customer.pipeline_type)
-            customer.status = data.get('status', customer.status)
-            customer.project_types = data.get('project_types', customer.project_types)
-            customer.updated_by = get_current_user_email(data)
-            
-            if 'date_of_measure' in data and data['date_of_measure'] and hasattr(customer, 'date_of_measure'):
-                customer.date_of_measure = datetime.strptime(data['date_of_measure'], '%Y-%m-%d').date()
-=======
->>>>>>> e453bfa (renewal database page working)
             
             session.commit()
             session.refresh(customer)

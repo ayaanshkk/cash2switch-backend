@@ -252,92 +252,6 @@ class CRMController:
                 'message': str(e)
             }), 500
     
-    def update_lead_status(self, opportunity_id: int) -> tuple:
-        """
-        PATCH /api/crm/leads/<opportunity_id>/status
-        Update only the status/stage of a lead
-        """
-        try:
-            tenant_id = g.tenant_id
-            data = request.get_json()
-            
-            if not data or 'stage_name' not in data:
-                return jsonify({
-                    'success': False,
-                    'error': 'Validation error',
-                    'message': 'stage_name is required in request body'
-                }), 400
-            
-            stage_name = data['stage_name']
-            
-            # Validate stage name
-            valid_stages = ['Not Called', 'Called', 'Priced', 'Rejected']
-            if stage_name not in valid_stages:
-                return jsonify({
-                    'success': False,
-                    'error': 'Validation error',
-                    'message': f'Invalid stage name. Must be one of: {", ".join(valid_stages)}'
-                }), 400
-            
-            # Update only the stage using the service layer
-            result = self.crm_service.update_lead_status(tenant_id, opportunity_id, stage_name)
-            
-            if not result.get('success'):
-                status_code = 404 if 'not found' in result.get('message', '').lower() else 500
-                return jsonify(result), status_code
-            
-            return jsonify(result), 200
-            
-        except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': 'Internal server error',
-                'message': str(e)
-            }), 500
-    
-    def update_lead_status(self, opportunity_id: int) -> tuple:
-        """
-        PATCH /api/crm/leads/<opportunity_id>/status
-        Update only the status/stage of a lead
-        """
-        try:
-            tenant_id = g.tenant_id
-            data = request.get_json()
-            
-            if not data or 'stage_name' not in data:
-                return jsonify({
-                    'success': False,
-                    'error': 'Validation error',
-                    'message': 'stage_name is required in request body'
-                }), 400
-            
-            stage_name = data['stage_name']
-            
-            # Validate stage name
-            valid_stages = ['Not Called', 'Called', 'Priced', 'Rejected']
-            if stage_name not in valid_stages:
-                return jsonify({
-                    'success': False,
-                    'error': 'Validation error',
-                    'message': f'Invalid stage name. Must be one of: {", ".join(valid_stages)}'
-                }), 400
-            
-            # Update only the stage using the service layer
-            result = self.crm_service.update_lead_status(tenant_id, opportunity_id, stage_name)
-            
-            if not result.get('success'):
-                status_code = 404 if 'not found' in result.get('message', '').lower() else 500
-                return jsonify(result), status_code
-            
-            return jsonify(result), 200
-            
-        except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': 'Internal server error',
-                'message': str(e)
-            }), 500
-    
     def delete_lead(self, opportunity_id: int) -> tuple:
         """
         DELETE /api/crm/leads/<opportunity_id>
@@ -559,6 +473,21 @@ class CRMController:
                 download_name='leads_import_template.xlsx'
             )
             
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+
+    def get_priced(self) -> tuple:
+        """
+        GET /api/crm/priced - Get all priced leads and renewals
+        """
+        try:
+            tenant_id = g.tenant_id
+            result = self.crm_service.get_priced(tenant_id)
+            return jsonify(result), 200
         except Exception as e:
             return jsonify({
                 'success': False,
@@ -817,6 +746,7 @@ class CRMController:
         except Exception as e:
             logger.exception('import_leads_confirm controller error: %s', e)
             return jsonify({'success': False, 'error': 'Internal server error', 'message': str(e)}), 500
+        
     def import_leads_preview(self) -> tuple:
         """
         POST /api/crm/leads/import/preview
@@ -950,3 +880,86 @@ class CRMController:
             return jsonify(result), 200
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
+
+def upload_document(self) -> tuple:
+    """
+    POST /api/crm/documents/upload
+    Upload a new document (admin)
+    """
+    try:
+        tenant_id = g.tenant_id
+        
+        if 'file' not in request.files:
+            return jsonify({
+                'success': False,
+                'error': 'No file provided'
+            }), 400
+        
+        file = request.files['file']
+        
+        document_data = {
+            'document_name': request.form.get('document_name', ''),
+            'document_description': request.form.get('document_description', ''),
+            'category': request.form.get('category', 'OTHER'),
+            'is_template': request.form.get('is_template', 'true').lower() == 'true'
+        }
+        
+        result = self.document_service.upload_document(
+            tenant_id, 
+            file, 
+            document_data,
+            uploaded_by_client=False
+        )
+        
+        if not result.get('success'):
+            return jsonify(result), 400
+        
+        return jsonify(result), 201
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+def client_upload_document(self, client_id: int) -> tuple:
+    """
+    POST /api/crm/clients/<client_id>/upload
+    Upload a document for a specific client (client upload)
+    """
+    try:
+        tenant_id = g.tenant_id
+        
+        if 'file' not in request.files:
+            return jsonify({
+                'success': False,
+                'error': 'No file provided'
+            }), 400
+        
+        file = request.files['file']
+        
+        document_data = {
+            'document_name': request.form.get('document_name', file.filename),
+            'document_description': request.form.get('document_description', ''),
+            'category': request.form.get('category', 'CLIENT_UPLOAD'),
+            'is_template': False
+        }
+        
+        result = self.document_service.upload_document(
+            tenant_id, 
+            file, 
+            document_data,
+            uploaded_by_client=True,
+            client_id=client_id
+        )
+        
+        if not result.get('success'):
+            return jsonify(result), 400
+        
+        return jsonify(result), 201
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500

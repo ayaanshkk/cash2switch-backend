@@ -201,9 +201,7 @@ class Employee_Master(Base):
 
 class Client_Master(Base):
     __tablename__ = 'Client_Master'
-    __table_args__ = {'schema': SCHEMA}
->>>>>>> fc85af0 (fixing errors backend errors)
-    
+    __table_args__ = {'schema': SCHEMA}    
     client_id = Column(SmallInteger, primary_key=True, autoincrement=True)
     tenant_id = Column(SmallInteger, nullable=True)
     client_company_name = Column(String(255))
@@ -302,8 +300,6 @@ class Supplier_Master(Base):
 class Stage_Master(Base):
     __tablename__ = 'Stage_Master'
     __table_args__ = {'schema': SCHEMA}
->>>>>>> fc85af0 (fixing errors backend errors)
-    
     stage_id = Column(SmallInteger, primary_key=True, autoincrement=True)
     stage_name = Column(String(100))
     stage_description = Column(String(255))

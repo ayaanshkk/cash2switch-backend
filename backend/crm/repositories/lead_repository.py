@@ -990,3 +990,86 @@ class LeadRepository:
         except Exception as e:
             logger.exception('get_leads_list failed for tenant=%s: %s', tenant_id, e)
             return []
+
+    def get_priced_leads(self, tenant_id: int) -> List[Dict[str, Any]]:
+        """
+        Get all leads with stage_id = 8 (Priced)
+        Joins Client_Master to get tenant_id and contact details
+        """
+        query = """
+            SELECT 
+                od.opportunity_id,
+                od.opportunity_title as business_name,
+                cm.client_contact_name as contact_person,
+                cm.client_phone as tel_number,
+                cm.client_email as email,
+                NULL as mpan_mpr,
+                NULL as supplier,
+                NULL as start_date,
+                NULL as end_date,
+                NULL as annual_usage,
+                em.employee_name as assigned_to_name,
+                od.created_at,
+                od.stage_id,
+                od.opportunity_value,
+                'lead' as source_type
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            INNER JOIN "StreemLyne_MT"."Client_Master" cm 
+                ON od.client_id = cm.client_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em 
+                ON od.opportunity_owner_employee_id = em.employee_id
+            WHERE od.stage_id = 8
+            AND cm.tenant_id = %s
+            ORDER BY od.created_at DESC
+        """
+        
+        try:
+            return self.db.execute_query(query, (tenant_id,))
+        except Exception as e:
+            logger.error(f"Error fetching priced leads: {e}")
+            return []
+
+    def get_priced_renewals(self, tenant_id: int) -> List[Dict[str, Any]]:
+        """
+        Get all renewals with Misc_Col1 = 'priced'
+        """
+        query = """
+            SELECT 
+                cm.client_id,
+                od.opportunity_id,
+                cm.client_company_name as business_name,
+                cm.client_contact_name as contact_person,
+                cm.client_phone as tel_number,
+                cm.client_email as email,
+                ecm.mpan_number as mpan_mpr,
+                sm.supplier_company_name as supplier,
+                ecm.contract_start_date as start_date,
+                ecm.contract_end_date as end_date,
+                NULL as annual_usage,
+                em.employee_name as assigned_to_name,
+                pd.created_at,
+                od.stage_id,
+                od.opportunity_value,
+                'renewal' as source_type
+            FROM "StreemLyne_MT"."Client_Master" cm
+            INNER JOIN "StreemLyne_MT"."Project_Details" pd 
+                ON cm.client_id = pd.client_id
+            INNER JOIN "StreemLyne_MT"."Opportunity_Details" od 
+                ON pd.opportunity_id = od.opportunity_id
+            LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm 
+                ON pd.project_id = ecm.project_id
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm 
+                ON ecm.supplier_id = sm.supplier_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em 
+                ON pd.employee_id = em.employee_id
+            WHERE cm.tenant_id = %s
+            AND cm.client_company_name != '[IMPORTED LEADS]'
+            AND LOWER(od."Misc_Col1") = 'priced'
+            ORDER BY pd.created_at DESC
+        """
+        
+        try:
+            return self.db.execute_query(query, (tenant_id,))
+        except Exception as e:
+            logger.error(f"Error fetching priced renewals: {e}")
+            return []

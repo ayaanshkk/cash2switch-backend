@@ -113,35 +113,26 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
     
     return response
 
-
 # ==========================================
 # GET ALL CUSTOMERS
 # ==========================================
 
 @energy_customer_bp.route('/energy-clients', methods=['GET', 'OPTIONS'])
-@energy_customer_bp.route('/energy-clients', methods=['GET', 'OPTIONS'])
 @token_required
 def get_energy_customers():
-    """Get all energy customers with joined data"""
-def get_energy_customers():
-    """Get all energy customers with joined data"""
+    """Get all energy customers EXCLUDING those with status='priced'"""
     
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
-        # ✅ Debug logging
-        current_app.logger.info(f"🔍 Current user: employee_id={request.current_user.employee_id if hasattr(request.current_user, 'employee_id') else 'N/A'}")
-        
         tenant_id = get_tenant_id_from_user(request.current_user)
-        
-        current_app.logger.info(f"🏢 Tenant ID resolved: {tenant_id}")
         
         if not tenant_id:
             return jsonify({'error': 'Tenant not found for user'}), 400
         
-        # Complex query joining all relevant tables
+        # Query with EXCLUSION of priced customers
         query = session.query(
             Client_Master,
             Project_Details,
@@ -171,26 +162,24 @@ def get_energy_customers():
         ).filter(
             and_(
                 Client_Master.tenant_id == tenant_id,
-                Client_Master.client_company_name != '[IMPORTED LEADS]'  # ✅ FIX: Exclude placeholder client
+                Client_Master.client_company_name != '[IMPORTED LEADS]',
+                # ✅ EXCLUDE customers where Misc_Col1 = 'priced'
+                or_(
+                    Opportunity_Details.Misc_Col1 == None,
+                    func.lower(Opportunity_Details.Misc_Col1) != 'priced'
+                )
             )
         ).order_by(
             Client_Master.created_at.desc()
         )
         
-        # ✅ Apply role-based filtering (TODO: implement proper role checking)
-        # Note: UserMaster doesn't have a 'role' field directly
-        # Will need to check Employee_Master.role_ids or implement custom role logic
-        
         results = query.all()
         
-        current_app.logger.info(f"📊 Fetching {len(results)} energy customers for tenant {tenant_id}")
-        
-        # Build response for each customer
+        # Build response
         customers = []
         seen_clients = set()
         
         for client, project, contract, opportunity, interaction, supplier, employee in results:
-            # Avoid duplicates if a client has multiple projects/contracts
             if client.client_id in seen_clients:
                 continue
             seen_clients.add(client.client_id)
@@ -200,7 +189,7 @@ def get_energy_customers():
             )
             customers.append(customer_data)
         
-        current_app.logger.info(f"✅ Returning {len(customers)} unique energy customers")
+        current_app.logger.info(f"✅ Returning {len(customers)} renewals (excluding priced)")
         
         return jsonify(customers), 200
 
@@ -262,43 +251,7 @@ def get_energy_customer(client_id):
         ).first()
         
         if not result:
-        tenant_id = get_tenant_id_from_user(request.current_user)
-        
-        # Query with all joins
-        result = session.query(
-            Client_Master,
-            Project_Details,
-            Energy_Contract_Master,
-            Opportunity_Details,
-            Client_Interactions,
-            Supplier_Master,
-            Employee_Master
-        ).outerjoin(
-            Project_Details, 
-            Client_Master.client_id == Project_Details.client_id
-        ).outerjoin(
-            Energy_Contract_Master,
-            Project_Details.project_id == Energy_Contract_Master.project_id
-        ).outerjoin(
-            Opportunity_Details,
-            Client_Master.client_id == Opportunity_Details.client_id
-        ).outerjoin(
-            Client_Interactions,
-            Client_Master.client_id == Client_Interactions.client_id
-        ).outerjoin(
-            Supplier_Master,
-            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
-        ).outerjoin(
-            Employee_Master,
-            Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
-        ).filter(
-            and_(
-                Client_Master.client_id == client_id,
-                Client_Master.tenant_id == tenant_id
-            )
-        ).first()
-        
-        if not result:
+            tenant_id = get_tenant_id_from_user(request.current_user)
             return jsonify({'error': 'Customer not found'}), 404
         
         client, project, contract, opportunity, interaction, supplier, employee = result
@@ -318,12 +271,6 @@ def get_energy_customer(client_id):
     finally:
         session.close()
 
-
-# ==========================================
-# CREATE CUSTOMER
-# ==========================================
-
-@energy_customer_bp.route('/energy-clients', methods=['POST'])
 # ==========================================
 # CREATE CUSTOMER
 # ==========================================
@@ -450,25 +397,14 @@ def create_energy_customer():
             'message': 'Energy customer created successfully',
             'customer': response_data
         }), 201
-            'message': 'Energy customer created successfully',
-            'customer': response_data
-        }), 201
         
     except Exception as e:
         session.rollback()
         current_app.logger.exception(f"❌ Error creating energy customer: {e}")
         return jsonify({'error': f'Failed to create customer: {str(e)}'}), 500
-        current_app.logger.exception(f"❌ Error creating energy customer: {e}")
-        return jsonify({'error': f'Failed to create customer: {str(e)}'}), 500
     finally:
         session.close()
 
-
-# ==========================================
-# UPDATE CUSTOMER
-# ==========================================
-
-@energy_customer_bp.route('/energy-clients/<int:client_id>', methods=['PUT', 'OPTIONS'])
 # ==========================================
 # UPDATE CUSTOMER
 # ==========================================
@@ -496,8 +432,8 @@ def update_energy_customer(client_id):
         ).first()
         
         if not client:
-        tenant_id = get_tenant_id_from_user(request.current_user)
-        data = request.get_json()
+            tenant_id = get_tenant_id_from_user(request.current_user)
+            data = request.get_json()
         
         # Fetch client
         client = session.query(Client_Master).filter_by(
@@ -648,43 +584,8 @@ def update_energy_customer(client_id):
         
         current_app.logger.info(f"✅ Energy customer {client_id} updated")
         
-        # Fetch updated data
-        updated_result = session.query(
-            Client_Master,
-            Project_Details,
-            Energy_Contract_Master,
-            Opportunity_Details,
-            Client_Interactions,
-            Supplier_Master,
-            Employee_Master
-        ).outerjoin(
-            Project_Details, Client_Master.client_id == Project_Details.client_id
-        ).outerjoin(
-            Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
-        ).outerjoin(
-            Opportunity_Details, Client_Master.client_id == Opportunity_Details.client_id
-        ).outerjoin(
-            Client_Interactions, Client_Master.client_id == Client_Interactions.client_id
-        ).outerjoin(
-            Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
-        ).outerjoin(
-            Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
-        ).filter(
-            Client_Master.client_id == client_id
-        ).first()
-        
-        client, project, contract, opportunity, interaction, supplier, employee = updated_result
-        
-        response_data = build_customer_response(
-            client, project, contract, opportunity, interaction, supplier, employee
-        )
-        
-        current_app.logger.info(f"✅ Energy customer {client_id} updated")
-        
         return jsonify({
             'success': True,
-            'message': 'Customer updated successfully',
-            'customer': response_data
             'message': 'Customer updated successfully',
             'customer': response_data
         }), 200
@@ -693,26 +594,15 @@ def update_energy_customer(client_id):
         session.rollback()
         current_app.logger.exception(f"❌ Error updating energy customer {client_id}: {e}")
         return jsonify({'error': f'Failed to update customer: {str(e)}'}), 500
-        current_app.logger.exception(f"❌ Error updating energy customer {client_id}: {e}")
-        return jsonify({'error': f'Failed to update customer: {str(e)}'}), 500
     finally:
         session.close()
 
-
-# ==========================================
-# DELETE CUSTOMER
-# ==========================================
-
-@energy_customer_bp.route('/energy-clients/<int:client_id>', methods=['DELETE', 'OPTIONS'])
 # ==========================================
 # DELETE CUSTOMER
 # ==========================================
 
 @energy_customer_bp.route('/energy-clients/<int:client_id>', methods=['DELETE', 'OPTIONS'])
 @token_required
-def delete_energy_customer(client_id):
-    """Delete customer and all related records (Admin only)"""
-    
 def delete_energy_customer(client_id):
     """Delete customer and all related records (Admin only)"""
     
@@ -778,28 +668,19 @@ def delete_energy_customer(client_id):
         session.commit()
         
         current_app.logger.info(f"✅ Energy customer {client_id} deleted successfully")
-        current_app.logger.info(f"✅ Energy customer {client_id} deleted successfully")
         
         return jsonify({
             'success': True,
-            'message': 'Customer and all related records deleted successfully'
             'message': 'Customer and all related records deleted successfully'
         }), 200
         
     except Exception as e:
         session.rollback()
         current_app.logger.exception(f"❌ Error deleting energy customer {client_id}: {e}")
-        current_app.logger.exception(f"❌ Error deleting energy customer {client_id}: {e}")
         return jsonify({'error': 'Failed to delete customer'}), 500
     finally:
         session.close()
 
-
-# ==========================================
-# SEARCH CUSTOMERS
-# ==========================================
-
-@energy_customer_bp.route('/energy-clients/search', methods=['GET', 'OPTIONS'])
 # ==========================================
 # SEARCH CUSTOMERS
 # ==========================================
@@ -808,10 +689,7 @@ def delete_energy_customer(client_id):
 @token_required
 def search_energy_customers():
     """Search energy customers"""
-    
-def search_energy_customers():
-    """Search energy customers"""
-    
+
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
@@ -819,34 +697,10 @@ def search_energy_customers():
     try:
         query_param = request.args.get('q', '').strip()
         tenant_id = get_tenant_id_from_user(request.current_user)
-        tenant_id = get_tenant_id_from_user(request.current_user)
         
         if not query_param:
             return jsonify([]), 200
         
-        # Search across multiple fields
-        results = session.query(
-            Client_Master,
-            Project_Details,
-            Energy_Contract_Master,
-            Supplier_Master
-        ).outerjoin(
-            Project_Details, Client_Master.client_id == Project_Details.client_id
-        ).outerjoin(
-            Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
-        ).outerjoin(
-            Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
-        ).filter(
-            and_(
-                Client_Master.tenant_id == tenant_id,
-                or_(
-                    Client_Master.client_company_name.ilike(f'%{query_param}%'),
-                    Client_Master.client_contact_name.ilike(f'%{query_param}%'),
-                    Client_Master.client_phone.ilike(f'%{query_param}%'),
-                    Client_Master.client_email.ilike(f'%{query_param}%'),
-                    Energy_Contract_Master.mpan_number.ilike(f'%{query_param}%')
-                )
-            )
         # Search across multiple fields
         results = session.query(
             Client_Master,
@@ -876,30 +730,17 @@ def search_energy_customers():
         for client, project, contract, supplier in results:
             customer_data = build_customer_response(client, project, contract, None, None, supplier, None)
             customers.append(customer_data)
-        customers = []
-        for client, project, contract, supplier in results:
-            customer_data = build_customer_response(client, project, contract, None, None, supplier, None)
-            customers.append(customer_data)
         
         current_app.logger.info(f"🔍 Search for '{query_param}' returned {len(customers)} results")
-        current_app.logger.info(f"🔍 Search for '{query_param}' returned {len(customers)} results")
         
-        return jsonify(customers), 200
         return jsonify(customers), 200
         
     except Exception as e:
-        current_app.logger.exception(f"❌ Error searching energy customers: {e}")
         current_app.logger.exception(f"❌ Error searching energy customers: {e}")
         return jsonify({'error': 'Failed to search customers'}), 500
     finally:
         session.close()
 
-
-# ==========================================
-# GET STATISTICS
-# ==========================================
-
-@energy_customer_bp.route('/energy-clients/stats', methods=['GET', 'OPTIONS'])
 # ==========================================
 # GET STATISTICS
 # ==========================================
@@ -907,9 +748,7 @@ def search_energy_customers():
 @energy_customer_bp.route('/energy-clients/stats', methods=['GET', 'OPTIONS'])
 @token_required
 def get_energy_customer_stats():
-def get_energy_customer_stats():
     """Get customer statistics"""
-    
     
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -917,19 +756,10 @@ def get_energy_customer_stats():
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
-        tenant_id = get_tenant_id_from_user(request.current_user)
         
         # Total customers
         total = session.query(Client_Master).filter_by(tenant_id=tenant_id).count()
-        total = session.query(Client_Master).filter_by(tenant_id=tenant_id).count()
         
-        # By stage
-        stage_counts = dict(
-            session.query(Stage_Master.stage_name, func.count(Opportunity_Details.opportunity_id))
-            .join(Opportunity_Details, Stage_Master.stage_id == Opportunity_Details.stage_id)
-            .join(Client_Master, Opportunity_Details.client_id == Client_Master.client_id)
-            .filter(Client_Master.tenant_id == tenant_id)
-            .group_by(Stage_Master.stage_name)
         # By stage
         stage_counts = dict(
             session.query(Stage_Master.stage_name, func.count(Opportunity_Details.opportunity_id))
@@ -940,14 +770,6 @@ def get_energy_customer_stats():
             .all()
         )
         
-        # By supplier
-        supplier_counts = dict(
-            session.query(Supplier_Master.supplier_company_name, func.count(Energy_Contract_Master.energy_contract_master_id))
-            .join(Energy_Contract_Master, Supplier_Master.supplier_id == Energy_Contract_Master.supplier_id)
-            .join(Project_Details, Energy_Contract_Master.project_id == Project_Details.project_id)
-            .join(Client_Master, Project_Details.client_id == Client_Master.client_id)
-            .filter(Client_Master.tenant_id == tenant_id)
-            .group_by(Supplier_Master.supplier_company_name)
         # By supplier
         supplier_counts = dict(
             session.query(Supplier_Master.supplier_company_name, func.count(Energy_Contract_Master.energy_contract_master_id))
@@ -977,9 +799,6 @@ def get_energy_customer_stats():
             'by_stage': stage_counts,
             'by_supplier': supplier_counts,
             'total_annual_usage': float(total_usage)
-            'by_stage': stage_counts,
-            'by_supplier': supplier_counts,
-            'total_annual_usage': float(total_usage)
         }
         
         return jsonify(stats), 200
@@ -988,82 +807,6 @@ def get_energy_customer_stats():
         current_app.logger.exception(f"❌ Error fetching energy customer stats: {e}")
         current_app.logger.exception(f"❌ Error fetching energy customer stats: {e}")
         return jsonify({'error': 'Failed to fetch statistics'}), 500
-    finally:
-        session.close()
-
-
-# ==========================================
-# HELPER ENDPOINTS
-# ==========================================
-
-@energy_customer_bp.route('/suppliers', methods=['GET'])
-@token_required
-def get_suppliers():
-    """Get all energy suppliers"""
-    session = SessionLocal()
-    try:
-        suppliers = session.query(Supplier_Master).all()
-        result = [{
-            'supplier_id': s.supplier_id,
-            'supplier_name': s.supplier_company_name,
-            'contact_name': s.supplier_contact_name,
-            'provisions': s.supplier_provisions,
-            'provisions_text': {
-                0: 'Generic',
-                1: 'Electricity Only',
-                2: 'Gas Only',
-                3: 'Electricity & Gas'
-            }.get(s.supplier_provisions, 'Unknown')
-        } for s in suppliers]
-        
-        return jsonify(result), 200
-    except Exception as e:
-        current_app.logger.exception(f"❌ Error fetching suppliers: {e}")
-        return jsonify({'error': 'Failed to fetch suppliers'}), 500
-    finally:
-        session.close()
-
-
-@energy_customer_bp.route('/stages', methods=['GET'])
-@token_required
-def get_stages():
-    """Get all opportunity stages"""
-    session = SessionLocal()
-    try:
-        stages = session.query(Stage_Master).order_by(Stage_Master.stage_id).all()
-        result = [{
-            'stage_id': s.stage_id,
-            'stage_name': s.stage_name,
-            'description': s.stage_description
-        } for s in stages]
-        
-        return jsonify(result), 200
-    except Exception as e:
-        current_app.logger.exception(f"❌ Error fetching stages: {e}")
-        return jsonify({'error': 'Failed to fetch stages'}), 500
-    finally:
-        session.close()
-
-
-@energy_customer_bp.route('/employees', methods=['GET'])
-@token_required
-def get_employees():
-    """Get all employees for assignment"""
-    session = SessionLocal()
-    try:
-        tenant_id = get_tenant_id_from_user(request.current_user)
-        employees = session.query(Employee_Master).filter_by(tenant_id=tenant_id).all()
-        
-        result = [{
-            'employee_id': e.employee_id,
-            'employee_name': e.employee_name,
-            'email': e.email
-        } for e in employees]
-        
-        return jsonify(result), 200
-    except Exception as e:
-        current_app.logger.exception(f"❌ Error fetching employees: {e}")
-        return jsonify({'error': 'Failed to fetch employees'}), 500
     finally:
         session.close()
 
