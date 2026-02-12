@@ -8,6 +8,7 @@ import requests
 import os
 from flask import g, request, jsonify
 from typing import Tuple
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +18,8 @@ class DocumentController:
     
     def __init__(self):
         self.blob_token = os.getenv('BLOB_READ_WRITE_TOKEN')
-        self.blob_url = 'https://blob.vercel-storage.com'
+        if not self.blob_token:
+            logger.warning("BLOB_READ_WRITE_TOKEN not set - document uploads will fail")
     
     def upload_document(self) -> Tuple:
         """POST /api/crm/documents/upload - Upload to Vercel Blob"""
@@ -51,18 +53,28 @@ class DocumentController:
             file_content = file.read()
             file_size = len(file_content)
             
-            # Upload to Vercel Blob
-            upload_url = f"{self.blob_url}/{blob_path}"
+            # ✅ Upload to Vercel Blob using proper API
+            upload_url = f"https://blob.vercel-storage.com/{blob_path}"
             
             headers = {
                 'Authorization': f'Bearer {self.blob_token}',
-                'x-content-type': file.content_type or 'application/octet-stream'
+                'Content-Type': file.content_type or 'application/octet-stream',
+                'x-api-version': '4',  # ✅ Add API version
             }
             
-            response = requests.put(upload_url, data=file_content, headers=headers)
+            params = {
+                'filename': document_name,
+            }
+            
+            response = requests.put(
+                upload_url,
+                data=file_content,
+                headers=headers,
+                params=params
+            )
             
             if response.status_code not in [200, 201]:
-                logger.error(f"Blob upload failed: {response.text}")
+                logger.error(f"Blob upload failed ({response.status_code}): {response.text}")
                 return jsonify({
                     'success': False,
                     'error': 'Upload failed',
@@ -72,6 +84,9 @@ class DocumentController:
             result = response.json()
             url = result.get('url')
             
+            # ✅ Add download URL
+            download_url = result.get('downloadUrl', url)
+            
             logger.info(f"Upload successful: {url}")
             
             return jsonify({
@@ -79,6 +94,7 @@ class DocumentController:
                 'data': {
                     'public_id': blob_path,
                     'url': url,
+                    'download_url': download_url,
                     'document_name': document_name,
                     'format': file_extension.replace('.', ''),
                     'file_size': file_size,
@@ -101,17 +117,21 @@ class DocumentController:
             tenant_id = g.tenant_id
             prefix = f"tenant_{tenant_id}/templates"
             
-            # List files from Vercel Blob
-            list_url = f"{self.blob_url}?prefix={prefix}"
+            # ✅ List files from Vercel Blob using proper API
+            list_url = "https://blob.vercel-storage.com/"
             
             headers = {
-                'Authorization': f'Bearer {self.blob_token}'
+                'Authorization': f'Bearer {self.blob_token}',
             }
             
-            response = requests.get(list_url, headers=headers)
+            params = {
+                'prefix': prefix,
+            }
+            
+            response = requests.get(list_url, headers=headers, params=params)
             
             if response.status_code != 200:
-                logger.error(f"Failed to list documents: {response.text}")
+                logger.error(f"Failed to list documents ({response.status_code}): {response.text}")
                 return jsonify({
                     'success': True,
                     'data': [],
@@ -128,15 +148,12 @@ class DocumentController:
                 file_format = os.path.splitext(filename)[1].replace('.', '')
                 
                 base_url = blob.get('url')
-                
-                # ✅ Add download=1 for download button, keep base URL for view
-                download_url = f"{base_url}?download=1"
-                view_url = base_url  # Without download param, it will display inline
+                download_url = blob.get('downloadUrl', base_url)
                 
                 documents.append({
                     'public_id': pathname,
                     'document_name': filename,
-                    'url': view_url,  # ✅ For viewing inline
+                    'url': base_url,  # ✅ For viewing inline
                     'download_url': download_url,  # ✅ For downloading
                     'format': file_format,
                     'file_size': blob.get('size', 0),
@@ -170,17 +187,17 @@ class DocumentController:
             if not public_id.startswith(f"tenant_{tenant_id}/"):
                 return jsonify({'success': False, 'error': 'Unauthorized'}), 403
             
-            # Delete from Vercel Blob
-            delete_url = f"{self.blob_url}/{public_id}"
+            # ✅ Delete from Vercel Blob using proper API
+            delete_url = f"https://blob.vercel-storage.com/{public_id}"
             
             headers = {
-                'Authorization': f'Bearer {self.blob_token}'
+                'Authorization': f'Bearer {self.blob_token}',
             }
             
             response = requests.delete(delete_url, headers=headers)
             
             if response.status_code not in [200, 204]:
-                logger.error(f"Delete failed: {response.text}")
+                logger.error(f"Delete failed ({response.status_code}): {response.text}")
                 return jsonify({'success': False, 'error': 'Failed to delete document'}), 400
             
             return jsonify({'success': True, 'message': 'Document deleted successfully'}), 200
