@@ -11,12 +11,15 @@ from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
-# Configure Cloudinary
+# Configure Cloudinary with connection pooling
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
     api_key=os.getenv("CLOUDINARY_API_KEY"),
     api_secret=os.getenv("CLOUDINARY_API_SECRET"),
-    secure=True
+    secure=True,
+    # ✅ Add connection pooling configuration
+    pool_maxsize=10,
+    pool_block=True   
 )
 
 
@@ -39,7 +42,7 @@ class CloudinaryClient:
         try:
             upload_options = {
                 'folder': folder,
-                'resource_type': 'auto',  # Automatically detect file type
+                'resource_type': 'auto',
                 'overwrite': False,
             }
             

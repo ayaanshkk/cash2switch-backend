@@ -22,14 +22,12 @@ def list_documents():
     """List all template documents from Cloudinary"""
     return document_controller.list_documents()
 
-
 @document_bp.route('/upload', methods=['POST'])
 @token_required
 @tenant_from_jwt
 def upload_document():
     """Upload a new template document"""
     return document_controller.upload_document()
-
 
 @document_bp.route('', methods=['DELETE'])
 @token_required
