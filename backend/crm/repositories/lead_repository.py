@@ -6,7 +6,9 @@ Handles database operations for Opportunity_Details table
 import os
 import logging
 from typing import Optional, Dict, Any, List
+from flask import request
 from backend.crm.supabase_client import get_supabase_client
+from backend.crm.utils.role_helpers import is_admin_user
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +144,7 @@ class LeadRepository:
             print(f"Error fetching leads for tenant {tenant_id}: {e}")
             return []
     
-    def get_lead_by_id(self, tenant_id: int, opportunity_id: int) -> Optional[Dict[str, Any]]:
+    def get_lead_by_id(self, tenant_id: int, opportunity_id: int, service_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """
         Get a specific lead by ID (with tenant isolation)
         
@@ -165,9 +167,13 @@ class LeadRepository:
             AND od."opportunity_id" = %s
             LIMIT 1
         """
-        
+        params = [tenant_id, opportunity_id]
+        if service_id is not None:
+            query = query.replace("LIMIT 1", "AND od.\"service_id\" = %s\n            LIMIT 1")
+            params.append(service_id)
+
         try:
-            return self.db.execute_query(query, (tenant_id, opportunity_id), fetch_one=True)
+            return self.db.execute_query(query, tuple(params), fetch_one=True)
         except Exception as e:
             print(f"Error fetching lead {opportunity_id}: {e}")
             return None
@@ -283,6 +289,129 @@ class LeadRepository:
             traceback.print_exc()
             raise
 
+    def update_lead(self, opportunity_id: int, tenant_id: int, lead_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Update an existing lead with security enforcement at the repository layer.
+        
+        SECURITY: This method enforces that non-admin users can NEVER change ownership fields,
+        regardless of what the request payload contains. Ownership fields are filtered out
+        for non-admin users before any database operation.
+        
+        Args:
+            opportunity_id: Opportunity ID to update
+            tenant_id: Tenant identifier (for isolation)
+            lead_data: Dictionary of fields to update
+        
+        Returns:
+            Updated lead record, or None if not found/not owned
+        
+        Security Rules:
+            - opportunity_owner_employee_id can ONLY be changed by admin users
+            - Non-admin users: ownership fields are automatically removed
+            - All updates are tenant-isolated
+            - Warning is logged if non-admin tries to change ownership
+        """
+        try:
+            # Create a copy to avoid mutating caller's data
+            update_data = dict(lead_data) if lead_data else {}
+            
+            # Get current user from Flask request context
+            current_user = getattr(request, 'current_user', None)
+            user_is_admin = is_admin_user(current_user) if current_user else False
+            
+            # Define ownership fields that require admin privilege
+            ownership_fields = {'opportunity_owner_employee_id', 'assigned_to_id'}
+            
+            # Define allowed fields for non-admin users
+            allowed_non_admin_fields = {
+                'opportunity_title',
+                'opportunity_description',
+                'stage_id',
+                'opportunity_value',
+                'contact_person',
+                'tel_number',
+                'email',
+                'start_date',
+                'end_date'
+            }
+            
+            # Check if non-admin is trying to modify ownership
+            attempted_ownership_change = any(field in update_data for field in ownership_fields)
+            
+            if not user_is_admin:
+                # SECURITY: Non-admin users cannot change ownership
+                if attempted_ownership_change:
+                    logger.warning(
+                        'SECURITY: User (id=%s, tenant=%s) attempted to change ownership field on lead %s - BLOCKED',
+                        getattr(current_user, 'id', 'unknown'),
+                        tenant_id,
+                        opportunity_id
+                    )
+                    # Remove all ownership fields from update data
+                    for field in ownership_fields:
+                        update_data.pop(field, None)
+                
+                # Filter to only allowed fields for non-admin
+                filtered_data = {}
+                for field, value in update_data.items():
+                    if field in allowed_non_admin_fields:
+                        filtered_data[field] = value
+                    else:
+                        # Log fields that were silently ignored (not ownership but not allowed)
+                        if field not in ('id', 'opportunity_id', 'tenant_id', 'client_id', 'created_at'):
+                            logger.debug(
+                                'Non-admin update_lead: ignoring field %s (not in allowed list)',
+                                field
+                            )
+                
+                update_data = filtered_data
+            
+            # If no fields left to update after filtering, return the current lead
+            if not update_data:
+                return self.get_lead_by_id(tenant_id, opportunity_id)
+            
+            # Build dynamic UPDATE query based on provided fields
+            set_clauses = []
+            params = []
+            
+            for field, value in update_data.items():
+                set_clauses.append(f'"{field}" = %s')
+                params.append(value)
+            
+            if not set_clauses:
+                # No valid fields to update
+                return self.get_lead_by_id(tenant_id, opportunity_id)
+            
+            # Add tenant_id and opportunity_id for WHERE clause
+            params.append(tenant_id)
+            params.append(opportunity_id)
+            
+            query = f"""
+                UPDATE "StreemLyne_MT"."Opportunity_Details"
+                SET {', '.join(set_clauses)}
+                WHERE "tenant_id" = %s AND "opportunity_id" = %s
+            """
+            
+            updated_count = self.db.execute_update(query, tuple(params))
+            
+            if updated_count and updated_count > 0:
+                logger.info(
+                    'Updated lead %s for tenant %s (admin=%s, fields=%s)',
+                    opportunity_id,
+                    tenant_id,
+                    user_is_admin,
+                    list(update_data.keys())
+                )
+                # Fetch and return the updated record
+                return self.get_lead_by_id(tenant_id, opportunity_id)
+            else:
+                logger.warning('Lead %s not found or not owned by tenant %s', opportunity_id, tenant_id)
+                return None
+                
+        except Exception as e:
+            logger.exception('Error updating lead %s: %s', opportunity_id, e)
+            return None
+
     def import_opportunities_from_import(self, tenant_id: int, rows: list, created_by: int | None, service_id: int) -> Dict[str, Any]:
         """
         Insert opportunities from a pre-validated import payload.
@@ -315,6 +444,9 @@ class LeadRepository:
             # Fallback to legacy default when Not Called is missing
             default_stage_id = 1
 
+        # Client_id is optional for leads (no client relationship yet)
+        default_client_id = None
+
         for idx, raw in enumerate(rows or []):
             # Accept either preview row shape ({row_number,data,is_valid,...}) or plain dict
             row_number = raw.get('row_number') if isinstance(raw, dict) and raw.get('row_number') else (idx + 1)
@@ -335,50 +467,47 @@ class LeadRepository:
                             return data.get(k)
                 return None
 
-            mpan = (get_field('MPAN_MPR', 'mpan_mpr', 'mpan') or '')
-            mpan = mpan.strip() if isinstance(mpan, str) else str(mpan)
-
-            if not mpan:
-                skipped += 1
-                errors.append({'row': row_number, 'error': 'MPAN_MPR missing'})
-                logger.warning('import_opportunities_from_import skipped row=%s missing mpan', row_number)
-                continue
-
-            # Enforce MPAN uniqueness: check if MPAN already exists in Opportunity_Details for this tenant
-            dup_q = '''
-                SELECT 1 FROM "StreemLyne_MT"."Opportunity_Details" od
-                WHERE od."mpan_mpr" = %s AND od."tenant_id" = %s LIMIT 1
-            '''
-            try:
-                exists = self.db.execute_query(dup_q, (mpan, tenant_id), fetch_one=True)
-            except Exception as e:
-                logger.exception('import_opportunities_from_import duplicate check failed row=%s mpan=%s: %s', row_number, mpan, e)
-                errors.append({'row': row_number, 'mpan': mpan, 'error': 'Duplicate check failed: ' + str(e)})
-                skipped += 1
-                continue
-
-            if exists:
-                skipped += 1
-                errors.append({'row': row_number, 'mpan': mpan, 'error': 'MPAN_MPR already exists in the system'})
-                logger.info('import_opportunities_from_import skipped existing mpan=%s tenant=%s', mpan, tenant_id)
-                continue
-
-            # Ensure default client exists (client_id is NOT NULL)
-            default_client_id = self._ensure_default_client(tenant_id)
-            if not default_client_id:
-                skipped += 1
-                errors.append({'row': row_number, 'mpan': mpan, 'error': 'Failed to create default client for tenant'})
-                logger.error('import_opportunities_from_import no default client for tenant=%s', tenant_id)
-                continue
+            mpan = (get_field('MPAN_MPR', 'mpan_mpr', 'mpan', 'MPAN', 'MPR') or '')
+            mpan = mpan.strip() if isinstance(mpan, str) else str(mpan) if mpan else ''
 
             # Map fields -> Opportunity_Details columns
-            title = get_field('Business_Name', 'business_name', 'client_company_name') or get_field('Contact_Person', 'contact_person') or f'Imported lead {mpan}'
-            description = get_field('Notes', 'notes', 'call_summary') or None
-            business_name = get_field('Business_Name', 'business_name', 'client_company_name') or None
-            contact_person = get_field('Contact_Person', 'contact_person', 'client_contact_name') or None
-            tel_number = get_field('Tel_Number', 'phone', 'tel_number', 'telephone') or None
-            email = get_field('Email', 'email') or None
-            start_date = get_field('Start_Date', 'start_date', 'contract_start_date') or None
+            business_name = get_field('Business_Name', 'business_name', 'client_company_name', 'Company_Name', 'Company') or None
+            contact_person = get_field('Contact_Person', 'contact_person', 'client_contact_name', 'Contact', 'Name') or None
+            tel_number = get_field('Tel_Number', 'phone', 'tel_number', 'telephone', 'Phone', 'Mobile') or None
+            email = get_field('Email', 'email', 'Email_Address') or None
+            start_date = get_field('Start_Date', 'start_date', 'contract_start_date', 'Contract_Start') or None
+            
+            # Generate title from business name or contact person if no explicit title provided
+            title = get_field('Title', 'opportunity_title') or business_name or contact_person or f'Imported lead {idx + 1}'
+            description = get_field('Notes', 'notes', 'call_summary', 'Description') or None
+
+            # Skip row only if it has no identifying information at all
+            if not mpan and not business_name and not contact_person and not email:
+                skipped += 1
+                errors.append({'row': row_number, 'error': 'Row has no identifying information (no MPAN, Business Name, Contact Person, or Email)'})
+                logger.warning('import_opportunities_from_import skipped row=%s - no identifying info', row_number)
+                continue
+
+            # Check duplicate only if MPAN is provided
+            if mpan:
+                # Enforce MPAN uniqueness: check if MPAN already exists in Opportunity_Details for this tenant
+                dup_q = '''
+                    SELECT 1 FROM "StreemLyne_MT"."Opportunity_Details" od
+                    WHERE od."mpan_mpr" = %s AND od."tenant_id" = %s AND od."service_id" = %s LIMIT 1
+                '''
+                try:
+                    exists = self.db.execute_query(dup_q, (mpan, tenant_id, service_id), fetch_one=True)
+                except Exception as e:
+                    logger.exception('import_opportunities_from_import duplicate check failed row=%s mpan=%s: %s', row_number, mpan, e)
+                    errors.append({'row': row_number, 'mpan': mpan, 'error': 'Duplicate check failed: ' + str(e)})
+                    skipped += 1
+                    continue
+
+                if exists:
+                    skipped += 1
+                    errors.append({'row': row_number, 'mpan': mpan, 'error': 'MPAN_MPR already exists in the system'})
+                    logger.info('import_opportunities_from_import skipped existing mpan=%s tenant=%s', mpan, tenant_id)
+                    continue
 
             insert_q = '''
                 INSERT INTO "StreemLyne_MT"."Opportunity_Details"
@@ -443,7 +572,7 @@ class LeadRepository:
             logger.exception('Error updating lead status: %s', e)
             return None
     
-    def get_leads_recycle_bin(self, tenant_id: int) -> List[Dict[str, Any]]:
+    def get_leads_recycle_bin(self, tenant_id: int, service_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Get all Lost leads (recycle bin) for a tenant.
         
@@ -459,6 +588,7 @@ class LeadRepository:
                 COALESCE(od."business_name", od."opportunity_title") AS business_name,
                 od."contact_person",
                 od."mpan_mpr",
+                od."service_id",
                 sm."stage_name",
                 od."start_date",
                 od."tel_number",
@@ -469,9 +599,13 @@ class LeadRepository:
             AND sm."stage_name" = 'Lost'
             ORDER BY od."created_at" DESC
         '''
-        
+        params = [tenant_id]
+        if service_id is not None:
+            query = query.replace("ORDER BY", "AND od.\"service_id\" = %s\n            ORDER BY")
+            params.append(service_id)
+
         try:
-            rows = self.db.execute_query(query, (tenant_id,))
+            rows = self.db.execute_query(query, tuple(params))
             if not rows:
                 return []
             
@@ -482,6 +616,7 @@ class LeadRepository:
                     'business_name': r.get('business_name'),
                     'contact_person': r.get('contact_person'),
                     'mpan_mpr': r.get('mpan_mpr'),
+                    'service_id': r.get('service_id'),
                     'stage_name': r.get('stage_name'),
                     'start_date': r.get('start_date'),
                     'tel_number': r.get('tel_number'),
@@ -930,9 +1065,12 @@ class LeadRepository:
                 od."service_id",
                 od."stage_id",
                 sm."stage_name",
+                od."opportunity_owner_employee_id",
+                em."employee_name" as assigned_to_name,
                 od."created_at"
             FROM "StreemLyne_MT"."Opportunity_Details" od
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
             WHERE od."tenant_id" = %s
         '''
 
@@ -952,16 +1090,16 @@ class LeadRepository:
             query += ' AND (sm."stage_name" IS NULL OR sm."stage_name" != %s)'
             params.append(filters.get('exclude_stage'))
 
-        service_id = None
-        if filters and isinstance(filters, dict) and filters.get('service'):
-            service_value = str(filters.get('service')).strip().lower()
-            if service_value == 'electricity':
-                service_id = 1
-            elif service_value == 'water':
-                service_id = 2
-
-        query += ' AND (%s IS NULL OR od."service_id" = %s)'
-        params.extend([service_id, service_id])
+        # Filter by service_id (electricity=1, water=2)
+        # Only include leads with matching service_id, exclude NULL values when filtering
+        if filters and isinstance(filters, dict) and filters.get('service_id') is not None:
+            query += ' AND od."service_id" = %s'
+            params.append(int(filters.get('service_id')))
+        
+        # Filter by assigned employee (opportunity_owner_employee_id)
+        if filters and isinstance(filters, dict) and filters.get('assigned_to') is not None:
+            query += ' AND od."opportunity_owner_employee_id" = %s'
+            params.append(int(filters.get('assigned_to')))
 
         query += ' ORDER BY od."created_at" DESC'
 
@@ -984,6 +1122,8 @@ class LeadRepository:
                     'service_id': r.get('service_id'),
                     'stage_id': r.get('stage_id'),
                     'stage_name': r.get('stage_name'),
+                    'opportunity_owner_employee_id': r.get('opportunity_owner_employee_id'),
+                    'assigned_to_name': r.get('assigned_to_name'),
                     'created_at': r.get('created_at').isoformat() if getattr(r.get('created_at'), 'isoformat', None) else (r.get('created_at') or None),
                 })
             return out
@@ -1073,3 +1213,61 @@ class LeadRepository:
         except Exception as e:
             logger.error(f"Error fetching priced renewals: {e}")
             return []
+
+    def bulk_assign_leads(self, tenant_id: int, lead_ids: List[int], employee_id: int) -> Dict[str, Any]:
+        """
+        Bulk assign leads to an employee.
+        Updates Opportunity_Details.opportunity_owner_employee_id for multiple leads.
+        
+        Args:
+            tenant_id: Tenant identifier for isolation
+            lead_ids: List of opportunity IDs to assign
+            employee_id: Employee ID to assign leads to
+        
+        Returns:
+            Dictionary with success status and updated count
+        """
+        if not lead_ids:
+            return {'success': False, 'updated': 0, 'error': 'No lead IDs provided'}
+        
+        try:
+            # Verify all leads belong to the tenant before updating
+            verify_query = '''
+                SELECT COUNT(*) as cnt FROM "StreemLyne_MT"."Opportunity_Details"
+                WHERE "tenant_id" = %s AND "opportunity_id" = ANY(%s)
+            '''
+            verify_result = self.db.execute_query(verify_query, (tenant_id, lead_ids), fetch_one=True)
+            verified_count = verify_result.get('cnt', 0) if verify_result else 0
+            
+            if verified_count != len(lead_ids):
+                logger.warning(f'bulk_assign_leads: tenant={tenant_id} requested={len(lead_ids)} but found={verified_count}')
+                return {
+                    'success': False,
+                    'updated': 0,
+                    'error': f'Some leads do not belong to tenant or do not exist'
+                }
+            
+            # Perform bulk update
+            update_query = '''
+                UPDATE "StreemLyne_MT"."Opportunity_Details"
+                SET "opportunity_owner_employee_id" = %s
+                WHERE "tenant_id" = %s AND "opportunity_id" = ANY(%s)
+            '''
+            updated = self.db.execute_update(update_query, (employee_id, tenant_id, lead_ids))
+            
+            logger.info(f'bulk_assign_leads: assigned {updated} leads to employee_id={employee_id} tenant={tenant_id}')
+            
+            return {
+                'success': True,
+                'updated': updated,
+                'employee_id': employee_id,
+                'lead_ids': lead_ids
+            }
+            
+        except Exception as e:
+            logger.exception(f'bulk_assign_leads failed tenant={tenant_id} employee={employee_id}: {e}')
+            return {
+                'success': False,
+                'updated': 0,
+                'error': str(e)
+            }
