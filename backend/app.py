@@ -5,6 +5,8 @@ import os
 import logging
 from dotenv import load_dotenv
 
+from backend.routes import calendar_routes
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -141,17 +143,17 @@ def create_app():
         auth_routes, db_routes,
         notification_routes,
         customer_routes, file_routes,
-        crm_routes, document_routes,
+        crm_routes, document_routes, calendar_routes,
     )
 
     app.register_blueprint(auth_routes.auth_bp)
     app.register_blueprint(customer_routes.energy_customer_bp)
     app.register_blueprint(db_routes.db_bp)
     app.register_blueprint(notification_routes.notification_bp)
-    # app.register_blueprint(assignment_routes.assignment_bp)
     app.register_blueprint(file_routes.file_bp)
     app.register_blueprint(crm_routes.crm_bp)
     app.register_blueprint(document_routes.document_bp)
+    app.register_blueprint(calendar_routes.calendar_bp)
     logging.info("CRM Blueprint registered successfully") 
     
     # Test CRM Supabase connection after blueprint registration
