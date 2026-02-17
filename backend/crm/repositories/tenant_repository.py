@@ -29,7 +29,7 @@ class TenantRepository:
         query = """
             SELECT *
             FROM "StreemLyne_MT"."Tenant_Master"
-            WHERE "Tenant_id" = %s
+            WHERE "tenant_id" = %s
             LIMIT 1
         """
         
@@ -104,13 +104,13 @@ class TenantRepository:
         """
         try:
             tenants = self.db.execute_query(
-                'SELECT * FROM "StreemLyne_MT"."Tenant_Master" ORDER BY "Tenant_id" LIMIT 1'
+                'SELECT * FROM "StreemLyne_MT"."Tenant_Master" ORDER BY "tenant_id" LIMIT 1'
             )
             if tenants and len(tenants) > 0:
                 return tenants[0]
             ins = (
                 'INSERT INTO "StreemLyne_MT"."Tenant_Master" '
-                '("tenant_company_name", "is_active") VALUES (%s, %s) RETURNING "Tenant_id", "tenant_company_name", "is_active"'
+                '("tenant_company_name", "is_active") VALUES (%s, %s) RETURNING "tenant_id", "tenant_company_name", "is_active"'
             )
             row = self.db.execute_insert(ins, ("Default Tenant", True), returning=True)
             if row:
