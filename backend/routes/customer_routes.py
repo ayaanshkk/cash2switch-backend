@@ -867,17 +867,54 @@ def get_stages():
 @energy_customer_bp.route('/employees', methods=['GET'])
 @token_required
 def get_employees():
-    """Get all employees for assignment"""
+    """Get all employees for assignment with their roles"""
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
-        employees = session.query(Employee_Master).filter_by(tenant_id=tenant_id).all()
         
-        result = [{
-            'employee_id': e.employee_id,
-            'employee_name': e.employee_name,
-            'email': e.email
-        } for e in employees]
+        # ✅ Debug logging
+        current_app.logger.info(f"🔍 Current user: {request.current_user}")
+        current_app.logger.info(f"🔍 Tenant ID from user: {tenant_id}")
+        current_app.logger.info(f"🔍 User employee_id: {getattr(request.current_user, 'employee_id', None)}")
+        current_app.logger.info(f"🔍 User tenant_id attr: {getattr(request.current_user, 'tenant_id', None)}")
+        
+        # ✅ JOIN with User_Master, User_Role_Mapping, and Role_Master to get roles
+        from sqlalchemy import text
+        
+        query = text('''
+            SELECT 
+                e.employee_id,
+                e.employee_name,
+                e.email,
+                e.phone,
+                e.tenant_id,
+                rm.role_name,
+                rm.role_id
+            FROM "StreemLyne_MT"."Employee_Master" e
+            LEFT JOIN "StreemLyne_MT"."User_Master" um ON e.employee_id = um.employee_id
+            LEFT JOIN "StreemLyne_MT"."User_Role_Mapping" urm ON um.user_id = urm.user_id
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON urm.role_id = rm.role_id
+            WHERE e.tenant_id = :tenant_id
+            ORDER BY e.employee_name
+        ''')
+        
+        employees = session.execute(query, {'tenant_id': tenant_id}).mappings().all()
+        
+        # ✅ Debug what we found
+        current_app.logger.info(f"✅ Found {len(employees)} employees for tenant {tenant_id}")
+        for emp in employees:
+            current_app.logger.info(f"   - {emp['employee_name']} (tenant_id: {emp['tenant_id']}, role: {emp.get('role_name')})")
+        
+        result = {
+            'data': [{
+                'employee_id': emp['employee_id'],
+                'employee_name': emp['employee_name'],
+                'email': emp['email'],
+                'phone': emp.get('phone'),
+                'role_name': emp.get('role_name'),
+                'role_id': emp.get('role_id')
+            } for emp in employees]
+        }
         
         return jsonify(result), 200
     except Exception as e:

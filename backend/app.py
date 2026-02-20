@@ -142,18 +142,18 @@ def create_app():
     from backend.routes import (
         auth_routes, db_routes,
         notification_routes,
-        customer_routes, file_routes,
-        crm_routes, document_routes, calendar_routes,
+        customer_routes,
+        crm_routes, document_routes, calendar_routes, energy_renewals_routes,
     )
 
     app.register_blueprint(auth_routes.auth_bp)
     app.register_blueprint(customer_routes.energy_customer_bp)
     app.register_blueprint(db_routes.db_bp)
     app.register_blueprint(notification_routes.notification_bp)
-    app.register_blueprint(file_routes.file_bp)
     app.register_blueprint(crm_routes.crm_bp)
     app.register_blueprint(document_routes.document_bp)
     app.register_blueprint(calendar_routes.calendar_bp)
+    app.register_blueprint(energy_renewals_routes.renewals_bp)
     logging.info("CRM Blueprint registered successfully") 
     
     # Test CRM Supabase connection after blueprint registration

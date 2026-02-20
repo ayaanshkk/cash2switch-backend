@@ -301,7 +301,7 @@ def login():
     - The tenant_id is resolved from the joined Employee_Master row (not supplied by client).
     - Returns 401 "Invalid username or password" when credentials are incorrect or the username is not found
     - If `is_active` column exists and is False → 403
-    - Returns JWT: { user_id, employee_id, tenant_id, user_name }
+    - Returns JWT: { user_id, employee_id, tenant_id, user_name, role }
     """
     session = SessionLocal()
     try:
@@ -312,6 +312,7 @@ def login():
         username = data['username'].strip()
         input_password = data['password']
 
+        # ✅ UPDATED: JOIN with User_Role_Mapping and Role_Master to get role
         sql = text('''
             SELECT
                 u.user_id,
@@ -319,9 +320,15 @@ def login():
                 u.password,
                 e.employee_id,
                 e.tenant_id,
-                e.employee_name
+                e.employee_name,
+                e.email,
+                e.phone,
+                rm.role_name,
+                rm.role_id
             FROM "StreemLyne_MT"."User_Master" u
             JOIN "StreemLyne_MT"."Employee_Master" e ON u.employee_id = e.employee_id
+            LEFT JOIN "StreemLyne_MT"."User_Role_Mapping" urm ON u.user_id = urm.user_id
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON urm.role_id = rm.role_id
             WHERE u.user_name = :username
             LIMIT 1;
         ''')
@@ -342,28 +349,34 @@ def login():
             current_app.logger.info(f"Login blocked: inactive employee_id={row.get('employee_id')}")
             return jsonify({'error': 'Account disabled'}), 403
 
+        # ✅ UPDATED: Include role in JWT payload
         payload = {
             'user_id': row.get('user_id'),
             'employee_id': row.get('employee_id'),
             'tenant_id': row.get('tenant_id'),
             'user_name': row.get('user_name'),
+            'role': row.get('role_name'),  # ✅ Add role to JWT
             'exp': datetime.utcnow() + timedelta(days=7),
             'iat': datetime.utcnow()
         }
         
-        # 🔍 TEMPORARY: Log payload before token generation
-        current_app.logger.info(f"🎫 Generating JWT for user_id={payload['user_id']}, tenant_id={payload['tenant_id']}")
+        current_app.logger.info(f"🎫 Generating JWT for user_id={payload['user_id']}, tenant_id={payload['tenant_id']}, role={payload.get('role')}")
         
         token = jwt.encode(payload, current_app.config['SECRET_KEY'], algorithm='HS256')
 
+        # ✅ UPDATED: Include role in user response
         user = {
             'id': row.get('employee_id'),
             'name': (row.get('employee_name') or row.get('user_name')),
+            'email': row.get('email'),
+            'phone': row.get('phone'),
             'username': row.get('user_name'),
+            'role': row.get('role_name'),  # ✅ Add role to response
+            'role_id': row.get('role_id'),
             'tenant_id': row.get('tenant_id')
         }
 
-        current_app.logger.info(f"✅ Tenant login successful: employee_id={row.get('employee_id')} user_name={username} tenant_id={row.get('tenant_id')}")
+        current_app.logger.info(f"✅ Tenant login successful: employee_id={row.get('employee_id')} user_name={username} tenant_id={row.get('tenant_id')} role={row.get('role_name')}")
         return jsonify({'success': True, 'token': token, 'user': user}), 200
 
     except Exception as e:
