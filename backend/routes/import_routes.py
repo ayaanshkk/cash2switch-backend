@@ -25,7 +25,9 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def get_tenant_id_from_user(user):
-    """Get tenant_id from authenticated user"""
+    """Get tenant_id from authenticated user - match customer_routes (JWT tenant_id first)"""
+    if hasattr(user, 'tenant_id') and user.tenant_id is not None:
+        return user.tenant_id
     session = SessionLocal()
     try:
         employee = session.query(Employee_Master).filter_by(employee_id=user.employee_id).first()
@@ -190,7 +192,7 @@ def parse_number(value):
         return None
 
 
-@import_bp.route('/import/energy-customers', methods=['POST', 'OPTIONS'])
+@import_bp.route('/energy-customers', methods=['POST', 'OPTIONS'])
 @token_required
 def import_energy_customers():
     """
@@ -233,9 +235,15 @@ def import_energy_customers():
             return jsonify({'error': 'Tenant not found for user'}), 400
         
         employee_id = request.current_user.employee_id
-        
-        # Get or create default service for this tenant
-        default_service_id = get_or_create_service(tenant_id, session)
+
+        # Service filter: electricity=1, water=2 (for Energy_Contract_Master and tab separation)
+        service_param = request.args.get('service')
+        import_service_id = None
+        if service_param and isinstance(service_param, str):
+            svc = service_param.strip().lower()
+            import_service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
+        if import_service_id is None:
+            import_service_id = get_or_create_service(tenant_id, session)
         
         # Read file based on extension
         filename = secure_filename(file.filename)
@@ -457,7 +465,7 @@ def import_energy_customers():
                                 contract_start_date=start_date,
                                 contract_end_date=end_date,
                                 terms_of_sale='',
-                                service_id=default_service_id,
+                                service_id=import_service_id,
                                 unit_rate=0.0,  # Default unit rate
                                 currency_id=1,
                                 document_details=None,
@@ -557,7 +565,7 @@ def import_energy_customers():
                         contract_start_date=start_date,
                         contract_end_date=end_date,
                         terms_of_sale='',
-                        service_id=default_service_id,  # Use tenant's default service
+                        service_id=import_service_id,
                         unit_rate=0.0,  # Default unit rate - required field (real type needs float)
                         currency_id=1,  # Default GBP
                         document_details=None,
@@ -604,7 +612,7 @@ def import_energy_customers():
         session.close()
 
 
-@import_bp.route('/import/template', methods=['GET'])
+@import_bp.route('/template', methods=['GET'])
 @token_required
 def download_template():
     """Download Excel template for bulk import"""

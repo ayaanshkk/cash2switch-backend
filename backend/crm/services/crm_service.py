@@ -10,6 +10,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 from backend.crm.repositories.lead_repository import LeadRepository
+from backend.crm.repositories.employee_repository import EmployeeRepository
 from backend.crm.repositories.project_repository import ProjectRepository
 from backend.crm.repositories.deal_repository import DealRepository
 from backend.crm.repositories.user_repository import UserRepository
@@ -29,6 +30,7 @@ class CRMService:
     
     def __init__(self):
         self.lead_repo = LeadRepository()
+        self.employee_repo = EmployeeRepository()
         self.project_repo = ProjectRepository()
         self.deal_repo = DealRepository()
         self.user_repo = UserRepository()
@@ -122,6 +124,17 @@ class CRMService:
             'data': updated_lead or result,
             'message': 'Lead status updated successfully'
         }
+
+    def assign_leads(self, tenant_id: int, lead_ids: List[int], employee_id: int) -> Dict[str, Any]:
+        """
+        Bulk assign leads to an employee. Admin-only.
+        """
+        return self.lead_repo.bulk_assign_leads(tenant_id, lead_ids, employee_id)
+
+    def get_employees(self, tenant_id: int) -> Dict[str, Any]:
+        """Get all employees for a tenant (for assignment dropdowns)."""
+        employees = self.employee_repo.get_all_employees(tenant_id)
+        return {'success': True, 'data': employees or [], 'count': len(employees or [])}
     
     def create_lead(self, tenant_id: int, lead_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -769,15 +782,14 @@ class CRMService:
         if total_rows == 0:
             return {'success': False, 'error': 'Empty file', 'message': 'Uploaded file contains no data rows.'}
 
-        # Determine MPAN column
+        # MPAN column optional (same as renewals: not required). If present, enforce uniqueness.
         mpan_col_candidates = [k for k in col_map.keys() if k in ('mpan_mpr', 'mpan', 'mpr')]
-        if not mpan_col_candidates:
-            return {'success': False, 'error': 'Missing column', 'message': 'MPAN_MPR column is required in the uploaded file.'}
-        mpan_key = mpan_col_candidates[0]
-
-        series_mpan = df[col_map[mpan_key]].astype(str).fillna('').str.strip()
-        mpan_counts = series_mpan[series_mpan != ''].value_counts()
-        duplicated_values = set(mpan_counts[mpan_counts > 1].index.tolist())
+        mpan_key = mpan_col_candidates[0] if mpan_col_candidates else None
+        duplicated_values = set()
+        if mpan_key:
+            series_mpan = df[col_map[mpan_key]].astype(str).fillna('').str.strip()
+            mpan_counts = series_mpan[series_mpan != ''].value_counts()
+            duplicated_values = set(mpan_counts[mpan_counts > 1].index.tolist())
 
         rows_out = []
         valid_count = 0
@@ -787,26 +799,28 @@ class CRMService:
             row_number = int(idx) + 1
             errors = []
 
-            try:
-                raw_mpan = row.get(col_map[mpan_key], None)
-                mpan_val = None if pd.isna(raw_mpan) else str(raw_mpan).strip()
-            except Exception:
-                mpan_val = None
-
-            if not mpan_val:
-                errors.append('MPAN_MPR is mandatory')
-            elif mpan_val in duplicated_values:
+            mpan_val = None
+            if mpan_key:
+                try:
+                    raw_mpan = row.get(col_map[mpan_key], None)
+                    mpan_val = None if pd.isna(raw_mpan) else str(raw_mpan).strip()
+                except Exception:
+                    mpan_val = None
+            if mpan_val and mpan_val in duplicated_values:
                 errors.append('MPAN_MPR must be unique within the uploaded file')
 
+            # Required: Business Name OR Contact Person (same as renewals requiring business name)
             bname = get_col(row, 'business_name', 'client_company_name', 'business name')
             contact = get_col(row, 'contact_person', 'client_contact_name', 'contact person')
             if not (bname or contact):
                 errors.append('Business_Name OR Contact_Person must exist')
 
+            # Required: Phone (same as renewals)
             tel = get_col(row, 'tel_number', 'phone', 'telephone', 'tel number')
             if not tel:
                 errors.append('Tel_Number must exist')
 
+            # Start_Date and End_Date mandatory; must be valid dates.
             start_raw = get_col(row, 'start_date', 'contract_start_date', 'start date')
             end_raw = get_col(row, 'end_date', 'contract_end_date', 'end date')
             if not start_raw:
@@ -854,8 +868,9 @@ class CRMService:
         - Stores MPAN_MPR directly in Opportunity_Details.mpan_mpr
         - Inserts Opportunity_Details with stage_id=Not Called, tenant_id from JWT
         - Skips rows where MPAN already exists in Opportunity_Details
-        - Partial success allowed; per-row errors returned
+        - Partial success allowed; per-row reasons logged in response
         - NO dependency on Project_Details or Client_Master
+        - Returns rejection reasons for each skipped row
         """
         if not isinstance(rows, list) or len(rows) == 0:
             return {
@@ -866,11 +881,13 @@ class CRMService:
 
         # Delegate to repository which handles DB checks/inserts per-row
         result = self.lead_repo.import_opportunities_from_import(tenant_id, rows, created_by, service_id)
+        
+        # Return detailed rejection reasons
         return {
             'success': True,
             'inserted': int(result.get('inserted', 0)),
             'skipped': int(result.get('skipped', 0)),
-            'errors': result.get('errors', [])
+            'reasons': result.get('errors', [])  # List of per-row rejection reasons
         }
 
     def get_leads_by_customer_type(self, tenant_id: int, customer_type: Optional[str] = None, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

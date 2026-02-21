@@ -165,18 +165,13 @@ class Tenant_Master(Base):
     __tablename__ = 'Tenant_Master'
     __table_args__ = {'schema': SCHEMA}
     
-    Tenant_id = Column('Tenant_id', SmallInteger, primary_key=True, autoincrement=True)
+    tenant_id = Column('tenant_id', SmallInteger, primary_key=True, autoincrement=True)
     tenant_company_name = Column(String(255))
     tenant_contact_name = Column(String(255))
     onboarding_Date = Column('onboarding_Date', Date)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime)
     updated_at = Column(DateTime)
-    
-    # Property alias for lowercase access
-    @property
-    def tenant_id(self):
-        return self.Tenant_id
 
 
 class Employee_Master(Base):

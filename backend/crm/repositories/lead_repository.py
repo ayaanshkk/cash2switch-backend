@@ -421,8 +421,13 @@ class LeadRepository:
           - stage_id = Not Called
           - tenant-scoped via Opportunity_Details.tenant_id
           - if MPAN already exists in Opportunity_Details -> skip and report
-          - partial success allowed; per-row errors returned
+          - partial success allowed; per-row reasons returned
           - NO joins to Project_Details or Client_Master
+          
+        Returns:
+          - inserted: count of successfully inserted rows
+          - skipped: count of rejected rows
+          - errors: list of {row, reason, details} for each skipped row
         """
         inserted = 0
         skipped = 0
@@ -452,18 +457,21 @@ class LeadRepository:
             row_number = raw.get('row_number') if isinstance(raw, dict) and raw.get('row_number') else (idx + 1)
             data = raw.get('data') if isinstance(raw, dict) and raw.get('data') else (raw if isinstance(raw, dict) else {})
 
-            # Normalize keys to lowercase for tolerant access
+            # Normalize keys for tolerant access (Excel often uses "Business Name", we use business_name)
+            def _norm(s):
+                if not s:
+                    return ""
+                return str(s).lower().strip().replace(" ", "_")
+
             def get_field(*names):
                 for n in names:
                     if not n:
                         continue
-                    # try exact key
                     if n in data:
                         return data.get(n)
-                    # try uppercase/lower variants
-                    low = n.lower()
+                    low = _norm(n)
                     for k in data.keys():
-                        if k.lower().strip() == low:
+                        if _norm(k) == low:
                             return data.get(k)
                 return None
 
@@ -484,30 +492,18 @@ class LeadRepository:
             # Skip row only if it has no identifying information at all
             if not mpan and not business_name and not contact_person and not email:
                 skipped += 1
-                errors.append({'row': row_number, 'error': 'Row has no identifying information (no MPAN, Business Name, Contact Person, or Email)'})
+                error_detail = {
+                    'row': row_number,
+                    'reason': 'MISSING_FIELDS',
+                    'message': 'Row has no identifying information',
+                    'details': 'Missing all of: MPAN_MPR, Business_Name, Contact_Person, Email'
+                }
+                errors.append(error_detail)
                 logger.warning('import_opportunities_from_import skipped row=%s - no identifying info', row_number)
                 continue
 
-            # Check duplicate only if MPAN is provided
-            if mpan:
-                # Enforce MPAN uniqueness: check if MPAN already exists in Opportunity_Details for this tenant
-                dup_q = '''
-                    SELECT 1 FROM "StreemLyne_MT"."Opportunity_Details" od
-                    WHERE od."mpan_mpr" = %s AND od."tenant_id" = %s AND od."service_id" = %s LIMIT 1
-                '''
-                try:
-                    exists = self.db.execute_query(dup_q, (mpan, tenant_id, service_id), fetch_one=True)
-                except Exception as e:
-                    logger.exception('import_opportunities_from_import duplicate check failed row=%s mpan=%s: %s', row_number, mpan, e)
-                    errors.append({'row': row_number, 'mpan': mpan, 'error': 'Duplicate check failed: ' + str(e)})
-                    skipped += 1
-                    continue
-
-                if exists:
-                    skipped += 1
-                    errors.append({'row': row_number, 'mpan': mpan, 'error': 'MPAN_MPR already exists in the system'})
-                    logger.info('import_opportunities_from_import skipped existing mpan=%s tenant=%s', mpan, tenant_id)
-                    continue
+            # MPAN is not unique in DB: allow importing same MPAN again (e.g. lead in Water can
+            # also be imported in Electricity). Duplicate-within-file is still enforced in preview.
 
             insert_q = '''
                 INSERT INTO "StreemLyne_MT"."Opportunity_Details"
@@ -526,11 +522,25 @@ class LeadRepository:
                     logger.info('import_opportunities_from_import inserted opportunity_id=%s mpan=%s', out.get('opportunity_id'), mpan)
                 else:
                     skipped += 1
-                    errors.append({'row': row_number, 'mpan': mpan, 'error': 'Insert returned no id'})
+                    error_detail = {
+                        'row': row_number,
+                        'mpan': mpan,
+                        'reason': 'INSERT_NO_ID',
+                        'message': 'Insert succeeded but returned no opportunity_id',
+                        'details': f'Database insert executed but no RETURNING clause result'
+                    }
+                    errors.append(error_detail)
             except Exception as e:
                 logger.exception('import_opportunities_from_import insert failed row=%s mpan=%s: %s', row_number, mpan, e)
                 skipped += 1
-                errors.append({'row': row_number, 'mpan': mpan, 'error': 'DB insert failed: ' + str(e)})
+                error_detail = {
+                    'row': row_number,
+                    'mpan': mpan,
+                    'reason': 'INSERT_FAILED',
+                    'message': 'Database insert failed',
+                    'details': str(e)
+                }
+                errors.append(error_detail)
                 # Continue with next row (partial success allowed)
                 continue
 
@@ -554,13 +564,17 @@ class LeadRepository:
             stage_result = self.db.execute_query(stage_query, (stage_id,), fetch_one=True)
             stage_name = stage_result.get('stage_name') if stage_result else None
 
+            # Allow update for: tenant_id match OR linked to client in our tenant (renewals with null tenant_id)
             query = """
                 UPDATE "StreemLyne_MT"."Opportunity_Details"
                 SET "stage_id" = %s
-                WHERE "opportunity_id" = %s AND "tenant_id" = %s
+                WHERE "opportunity_id" = %s
+                AND ("tenant_id" = %s
+                     OR ("tenant_id" IS NULL AND "client_id" IN (
+                         SELECT "client_id" FROM "StreemLyne_MT"."Client_Master" WHERE "tenant_id" = %s
+                     )))
             """
-
-            updated_count = self.db.execute_update(query, (stage_id, opportunity_id, tenant_id))
+            updated_count = self.db.execute_update(query, (stage_id, opportunity_id, tenant_id, tenant_id))
             if updated_count and updated_count > 0:
                 logger.info('Updated lead %s to stage %s (stage_name=%s) for tenant %s',
                            opportunity_id, stage_id, stage_name, tenant_id)
@@ -1051,14 +1065,15 @@ class LeadRepository:
         Sorting: latest first (created_at DESC)
         Uses ONLY Opportunity_Details table - NO Project_Details or Client_Master joins
         """
-        # Base query: use Opportunity_Details columns directly, tenant-filter by od.tenant_id
+        # Base query: use Opportunity_Details columns directly
+        # Tenant filter: od.tenant_id OR od.client_id -> Client_Master.tenant_id (for renewals with null od.tenant_id)
         query = '''
             SELECT
                 od."opportunity_id",
-                COALESCE(od."business_name", od."opportunity_title") AS business_name,
-                od."contact_person",
-                od."tel_number",
-                od."email",
+                COALESCE(od."business_name", cm."client_company_name", od."opportunity_title") AS business_name,
+                COALESCE(od."contact_person", cm."client_contact_name") AS contact_person,
+                COALESCE(od."tel_number", cm."client_phone") AS tel_number,
+                COALESCE(od."email", cm."client_email") AS email,
                 od."mpan_mpr",
                 od."start_date",
                 NULL AS end_date,
@@ -1071,10 +1086,11 @@ class LeadRepository:
             FROM "StreemLyne_MT"."Opportunity_Details" od
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
-            WHERE od."tenant_id" = %s
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
+            WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
         '''
 
-        params = [tenant_id]
+        params = [tenant_id, tenant_id]
         # support filtering by stage_id
         if filters and isinstance(filters, dict) and filters.get('stage_id'):
             query += ' AND od."stage_id" = %s'
@@ -1229,8 +1245,23 @@ class LeadRepository:
         """
         if not lead_ids:
             return {'success': False, 'updated': 0, 'error': 'No lead IDs provided'}
-        
+
         try:
+            # Validate assigned_to_id exists and belongs to tenant (prevent privilege escalation)
+            emp_check = self.db.execute_query(
+                'SELECT 1 FROM "StreemLyne_MT"."Employee_Master" WHERE "employee_id" = %s AND "tenant_id" = %s LIMIT 1',
+                (employee_id, tenant_id),
+                fetch_one=True
+            )
+            if not emp_check:
+                logger.warning('bulk_assign_leads: employee_id=%s not found for tenant_id=%s', employee_id, tenant_id)
+                return {
+                    'success': False,
+                    'updated': 0,
+                    'error': 'Employee not found',
+                    'message': 'assigned_to_id must be an existing employee in your tenant'
+                }
+
             # Verify all leads belong to the tenant before updating
             verify_query = '''
                 SELECT COUNT(*) as cnt FROM "StreemLyne_MT"."Opportunity_Details"

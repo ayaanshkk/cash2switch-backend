@@ -17,6 +17,7 @@ Multi-table system integrating:
 
 from flask import Blueprint, request, jsonify, current_app
 from .auth_helpers import token_required
+from backend.crm.utils.role_helpers import is_admin_user
 from datetime import datetime
 from sqlalchemy import and_, or_, func
 
@@ -131,6 +132,13 @@ def get_energy_customers():
         
         if not tenant_id:
             return jsonify({'error': 'Tenant not found for user'}), 400
+
+        # Service filter: electricity=1, water=2 (None = no filter)
+        _service_id = None
+        service_param = request.args.get('service')
+        if service_param and isinstance(service_param, str):
+            svc = service_param.strip().lower()
+            _service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
         
         # Query with EXCLUSION of priced customers
         query = session.query(
@@ -159,6 +167,9 @@ def get_energy_customers():
         ).outerjoin(
             Employee_Master,
             Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
+        ).outerjoin(
+            Stage_Master,
+            Opportunity_Details.stage_id == Stage_Master.stage_id
         ).filter(
             and_(
                 Client_Master.tenant_id == tenant_id,
@@ -167,7 +178,15 @@ def get_energy_customers():
                 or_(
                     Opportunity_Details.Misc_Col1 == None,
                     func.lower(Opportunity_Details.Misc_Col1) != 'priced'
-                )
+                ),
+                # ✅ EXCLUDE Lost - customers with stage_name = 'Lost' go to recycle bin
+                or_(
+                    Opportunity_Details.opportunity_id == None,
+                    Stage_Master.stage_name == None,
+                    func.lower(Stage_Master.stage_name) != 'lost'
+                ),
+                # Service filter: electricity=1, water=2 (optional)
+                *([Energy_Contract_Master.service_id == _service_id] if _service_id is not None else [])
             )
         ).order_by(
             Client_Master.created_at.desc()
@@ -413,27 +432,13 @@ def create_energy_customer():
 @token_required
 def update_energy_customer(client_id):
     """Update energy customer across multiple tables"""
-    
-def update_energy_customer(client_id):
-    """Update energy customer across multiple tables"""
-    
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
-        data = request.get_json()
-        
-        # Fetch client
-        client = session.query(Client_Master).filter_by(
-            client_id=client_id,
-            tenant_id=tenant_id
-        ).first()
-        
-        if not client:
-            tenant_id = get_tenant_id_from_user(request.current_user)
-            data = request.get_json()
+        data = request.get_json() or {}
         
         # Fetch client
         client = session.query(Client_Master).filter_by(
@@ -443,8 +448,13 @@ def update_energy_customer(client_id):
         
         if not client:
             return jsonify({'error': 'Customer not found'}), 404
-        
-        # TODO: Permission check for Staff role
+
+        # Admin-only: assignment change
+        if data and 'assigned_to_id' in data and not is_admin_user(request.current_user):
+            return jsonify({
+                'error': 'permission_denied',
+                'message': 'Only administrators can assign'
+            }), 403
         
         current_app.logger.info(f"🔄 Updating energy customer {client_id}")
         

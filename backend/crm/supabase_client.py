@@ -74,7 +74,7 @@ class SupabaseClient:
         supabase_db_url = os.getenv('SUPABASE_DB_URL')
         if supabase_db_url:
             self.connection_string = supabase_db_url.replace('postgres://', 'postgresql://')
-            print(f"✅ SupabaseClient: Using SUPABASE_DB_URL")
+            print(f"[OK] SupabaseClient: Using SUPABASE_DB_URL")
         else:
             # Priority 2: Use DATABASE_URL if provided (contains password)
             database_url = os.getenv('DATABASE_URL')
@@ -82,7 +82,7 @@ class SupabaseClient:
                 # Clean up the connection string for psycopg2
                 self.connection_string = database_url.replace('postgres://', 'postgresql://')
                 self.connection_string = self.connection_string.replace('postgresql+psycopg2://', 'postgresql://')
-                print(f"✅ SupabaseClient: Using DATABASE_URL")
+                print(f"[OK] SupabaseClient: Using DATABASE_URL")
             else:
                 # Priority 3: Try to use SUPABASE_DB_PASSWORD if set
                 db_password = os.getenv('SUPABASE_DB_PASSWORD')
@@ -94,7 +94,7 @@ class SupabaseClient:
                 
                 # Construct connection string with password
                 self.connection_string = f"postgresql://postgres.{project_id}:{db_password}@aws-0-eu-central-1.pooler.supabase.com:6543/postgres"
-                print(f"✅ SupabaseClient: Using SUPABASE_DB_PASSWORD")
+                print(f"[OK] SupabaseClient: Using SUPABASE_DB_PASSWORD")
             else:
                 raise ValueError(
                     "Supabase database password not found. Please set either:\n"
