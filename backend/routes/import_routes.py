@@ -250,13 +250,23 @@ def import_energy_customers():
         file_ext = filename.rsplit('.', 1)[1].lower()
         
         current_app.logger.info(f"📁 Processing import file: {filename}")
+        # ✅ ADD THIS: Reset file pointer to beginning
+        file.seek(0)
         
         try:
             if file_ext == 'csv':
                 df = pd.read_csv(file, encoding='utf-8-sig')  
             else:
-                df = pd.read_excel(file, engine='openpyxl')
+                try:
+                    df = pd.read_excel(file, engine='openpyxl')
+                except Exception as openpyxl_error:
+                    current_app.logger.warning(f"openpyxl failed: {openpyxl_error}, trying xlrd...")
+                    file.seek(0)  # Reset again
+                    df = pd.read_excel(file, engine='xlrd')
+            
+            current_app.logger.info(f"✅ File read successfully: {len(df)} rows, {len(df.columns)} columns")
         except Exception as e:
+            current_app.logger.error(f"❌ Failed to read file: {str(e)}")
             return jsonify({'error': f'Failed to read file: {str(e)}'}), 400
         
         # Normalize column names (lowercase, strip spaces, replace underscores with spaces)
