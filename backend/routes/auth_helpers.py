@@ -75,3 +75,33 @@ def token_required(f):
             local_session.close()
     
     return decorated
+
+def get_tenant_id_from_user(user):
+    """
+    Extract tenant_id from authenticated user object
+    
+    Args:
+        user: The authenticated user object from token_required decorator
+        
+    Returns:
+        int: The tenant_id or None if not found
+    """
+    from ..db import SessionLocal
+    from ..models import Employee_Master
+    
+    # First check if user has tenant_id directly (from JWT)
+    if hasattr(user, 'tenant_id') and user.tenant_id is not None:
+        return user.tenant_id
+    
+    # Fallback: Look up employee to get tenant_id
+    if hasattr(user, 'employee_id') and user.employee_id is not None:
+        session = SessionLocal()
+        try:
+            employee = session.query(Employee_Master).filter_by(
+                employee_id=user.employee_id
+            ).first()
+            return employee.tenant_id if employee else None
+        finally:
+            session.close()
+    
+    return None
