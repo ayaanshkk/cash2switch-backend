@@ -41,6 +41,14 @@ class CRMController:
                 filters['status'] = request.args.get('status')
             if request.args.get('assigned_to'):
                 filters['assigned_to'] = int(request.args.get('assigned_to'))
+            # Service filter: electricity=1, water=2
+            service_param = request.args.get('service')
+            if service_param and isinstance(service_param, str):
+                svc = service_param.strip().lower()
+                if svc == 'water':
+                    filters['service_id'] = 2
+                elif svc == 'electricity':
+                    filters['service_id'] = 1
             
             result = self.crm_service.get_leads(tenant_id, filters if filters else None)
             return jsonify(result), 200
@@ -252,6 +260,56 @@ class CRMController:
                 'message': str(e)
             }), 500
     
+    def assign_leads(self) -> tuple:
+        """
+        PATCH /api/crm/leads/assign
+        Bulk assign leads to an employee. Admin only.
+        Request body: { lead_ids: [...], employee_id: N } or { assigned_to_id: N }
+        """
+        try:
+            from flask import request
+            from backend.crm.utils.role_helpers import is_admin_user
+
+            user = getattr(request, 'current_user', None)
+            if not user:
+                return jsonify({'success': False, 'error': 'Authentication required'}), 401
+            if not is_admin_user(user):
+                return jsonify({
+                    'error': 'permission_denied',
+                    'message': 'Only administrators can assign'
+                }), 403
+
+            tenant_id = g.tenant_id
+            payload = request.get_json()
+            if not payload:
+                return jsonify({'success': False, 'error': 'Request body required'}), 400
+
+            lead_ids = payload.get('lead_ids')
+            employee_id = payload.get('employee_id') or payload.get('assigned_to_id')
+            if not lead_ids or not isinstance(lead_ids, list) or len(lead_ids) == 0:
+                return jsonify({'success': False, 'error': 'lead_ids must be a non-empty list'}), 400
+            if employee_id is None:
+                return jsonify({'success': False, 'error': 'employee_id or assigned_to_id required'}), 400
+            try:
+                employee_id = int(employee_id)
+            except (ValueError, TypeError):
+                return jsonify({'success': False, 'error': 'employee_id must be a number'}), 400
+
+            result = self.crm_service.assign_leads(tenant_id, lead_ids, employee_id)
+            if not result.get('success'):
+                return jsonify(result), 400
+            return jsonify({
+                'success': True,
+                'assigned_count': result.get('updated', 0),
+                'message': f"Assigned {result.get('updated', 0)} lead(s) successfully"
+            }), 200
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
+
     def delete_lead(self, opportunity_id: int) -> tuple:
         """
         DELETE /api/crm/leads/<opportunity_id>
@@ -617,6 +675,22 @@ class CRMController:
                 'error': 'Internal server error',
                 'message': str(e)
             }), 500
+
+    def get_employees(self) -> tuple:
+        """
+        GET /api/crm/employees
+        Get all employees for the current tenant (for assignment dropdowns)
+        """
+        try:
+            tenant_id = g.tenant_id
+            result = self.crm_service.get_employees(tenant_id)
+            return jsonify(result), 200
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': 'Internal server error',
+                'message': str(e)
+            }), 500
     
     # ========================================
     # SUPPORTING DATA ENDPOINTS
@@ -880,3 +954,86 @@ class CRMController:
             return jsonify(result), 200
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)}), 500
+
+def upload_document(self) -> tuple:
+    """
+    POST /api/crm/documents/upload
+    Upload a new document (admin)
+    """
+    try:
+        tenant_id = g.tenant_id
+        
+        if 'file' not in request.files:
+            return jsonify({
+                'success': False,
+                'error': 'No file provided'
+            }), 400
+        
+        file = request.files['file']
+        
+        document_data = {
+            'document_name': request.form.get('document_name', ''),
+            'document_description': request.form.get('document_description', ''),
+            'category': request.form.get('category', 'OTHER'),
+            'is_template': request.form.get('is_template', 'true').lower() == 'true'
+        }
+        
+        result = self.document_service.upload_document(
+            tenant_id, 
+            file, 
+            document_data,
+            uploaded_by_client=False
+        )
+        
+        if not result.get('success'):
+            return jsonify(result), 400
+        
+        return jsonify(result), 201
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+def client_upload_document(self, client_id: int) -> tuple:
+    """
+    POST /api/crm/clients/<client_id>/upload
+    Upload a document for a specific client (client upload)
+    """
+    try:
+        tenant_id = g.tenant_id
+        
+        if 'file' not in request.files:
+            return jsonify({
+                'success': False,
+                'error': 'No file provided'
+            }), 400
+        
+        file = request.files['file']
+        
+        document_data = {
+            'document_name': request.form.get('document_name', file.filename),
+            'document_description': request.form.get('document_description', ''),
+            'category': request.form.get('category', 'CLIENT_UPLOAD'),
+            'is_template': False
+        }
+        
+        result = self.document_service.upload_document(
+            tenant_id, 
+            file, 
+            document_data,
+            uploaded_by_client=True,
+            client_id=client_id
+        )
+        
+        if not result.get('success'):
+            return jsonify(result), 400
+        
+        return jsonify(result), 201
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500

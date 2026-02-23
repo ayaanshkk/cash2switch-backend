@@ -25,7 +25,9 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def get_tenant_id_from_user(user):
-    """Get tenant_id from authenticated user"""
+    """Get tenant_id from authenticated user - match customer_routes (JWT tenant_id first)"""
+    if hasattr(user, 'tenant_id') and user.tenant_id is not None:
+        return user.tenant_id
     session = SessionLocal()
     try:
         employee = session.query(Employee_Master).filter_by(employee_id=user.employee_id).first()
@@ -190,7 +192,7 @@ def parse_number(value):
         return None
 
 
-@import_bp.route('/import/energy-customers', methods=['POST', 'OPTIONS'])
+@import_bp.route('/energy-customers', methods=['POST', 'OPTIONS'])
 @token_required
 def import_energy_customers():
     """
@@ -233,9 +235,15 @@ def import_energy_customers():
             return jsonify({'error': 'Tenant not found for user'}), 400
         
         employee_id = request.current_user.employee_id
-        
-        # Get or create default service for this tenant
-        default_service_id = get_or_create_service(tenant_id, session)
+
+        # Service filter: electricity=1, water=2 (for Energy_Contract_Master and tab separation)
+        service_param = request.args.get('service')
+        import_service_id = None
+        if service_param and isinstance(service_param, str):
+            svc = service_param.strip().lower()
+            import_service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
+        if import_service_id is None:
+            import_service_id = get_or_create_service(tenant_id, session)
         
         # Read file based on extension
         filename = secure_filename(file.filename)
@@ -257,21 +265,48 @@ def import_energy_customers():
         current_app.logger.info(f"📊 Found {len(df)} rows in file")
         current_app.logger.info(f"📋 Columns: {list(df.columns)}")
         
-        # Column mapping (flexible to handle variations)
-        # Note: Columns are normalized to lowercase with spaces (underscores replaced)
+        # Column mapping for Cash2Switch format
         column_map = {
-            'business_name': ['business name', 'company name', 'company', 'business'],
-            'contact_person': ['contact person', 'contact', 'name'],
-            'phone': ['tel number', 'phone', 'telephone', 'tel', 'phone number'],
-            'email': ['email', 'e-mail', 'email address'],
-            'address': ['address', 'main address', 'street'],
-            'post_code': ['post code', 'postcode', 'postal code', 'zip', 'zip code'],
-            'site_address': ['site address', 'site'],
-            'mpan_mpr': ['mpan mpr', 'mpan/mpr', 'mpan', 'mpr', 'mpan number'],  # Added 'mpan mpr' for underscore format
+            'client_name': ['client name', 'business name', 'company name'],
+            'trading_name': ['trading name', 'business', 'company'],
+            'main_contact': ['main contact', 'contact person', 'contact'],
+            'position': ['position', 'role', 'title'],
+            'tel_no': ['tel no', 'phone', 'telephone', 'tel'],
+            'mobile_no': ['mobile no', 'mobile', 'cell'],
+            'email': ['email', 'e-mail'],
+            'site_name': ['site name', 'site'],
+            'month_sold': ['month sold', 'sale month'],
+            'address_line_1': ['address line 1', 'address 1', 'street'],
+            'address_line_2': ['address line 2', 'address 2'],
+            'address_line_3': ['address line 3', 'address 3'],
+            'town': ['town', 'city'],
+            'county': ['county', 'region'],
+            'postcode': ['postcode', 'post code', 'zip'],
+            'mpan_top': ['mpan top', 'mpan core'],
+            'mpan_bottom': ['mpan bottom', 'mpan llf'],
+            'data_source': ['data source', 'source'],
+            'welcome_call': ['welcome call'],
+            'payment_type': ['payment type', 'payment method'],
             'supplier': ['supplier', 'supplier name'],
-            'annual_usage': ['annual usage', 'usage', 'kwh', 'annual kwh'],
-            'start_date': ['start date', 'contract start', 'start'],
-            'end_date': ['end date', 'contract end', 'end', 'expiry date'],
+            'net_notch': ['net notch'],
+            'in_contract': ['in contract', 'contract length'],
+            'agent_sold': ['agent sold', 'sales agent', 'sold by'],
+            'start_date': ['start date', 'contract start'],
+            'contract_end': ['contract end', 'end date', 'expiry'],
+            'stand_charge': ['stand charge', 'standing charge'],
+            'rate_1': ['rate 1', 'unit rate', 'rate'],
+            'rate_2': ['rate 2'],
+            'rate_3': ['rate 3'],
+            'aggregator': ['aggregator'],
+            'annual_usage': ['annual usage', 'usage', 'kwh'],
+            'comms_paid': ['comms paid', 'commission'],
+            'company_number': ['company number', 'co number'],
+            'date_of_birth': ['date of birth', 'dob'],
+            'bank_name': ['bank name', 'bank'],
+            'ac_number': ['ac number', 'account number'],
+            'sort_code': ['sort code'],
+            'charity_ltd_company_number': ['charity/ltd company number', 'charity number'],
+            'partner_details': ['partner details', 'partner']
         }
         
         # Find actual column names (columns already normalized to lowercase with spaces)
@@ -284,16 +319,30 @@ def import_energy_customers():
         
         current_app.logger.info(f"🗺️ Mapped columns: {actual_columns}")
         
-        # Validate required fields
-        required_fields = ['business_name', 'phone']
-        missing_fields = [f for f in required_fields if f not in actual_columns]
-        
-        if missing_fields:
+        # Validate required fields - check if EITHER old format OR new format exists
+        has_business_name = 'client_name' in actual_columns or 'business_name' in actual_columns
+        has_phone = 'tel_no' in actual_columns or 'phone' in actual_columns
+
+        if not has_business_name:
             return jsonify({
-                'error': f'Missing required columns: {", ".join(missing_fields)}',
+                'error': 'Missing required column: Client Name (or Business Name)',
                 'expected_columns': list(column_map.keys()),
                 'found_columns': list(df.columns)
             }), 400
+
+        if not has_phone:
+            return jsonify({
+                'error': 'Missing required column: Tel No (or Phone)',
+                'expected_columns': list(column_map.keys()),
+                'found_columns': list(df.columns)
+            }), 400
+        
+        # Helper function to safely get string values
+        def safe_str(value):
+            """Convert value to string, handling NaN, None, and numeric types"""
+            if pd.isna(value) or value is None:
+                return ''
+            return str(value).strip()
         
         # Process rows
         success_count = 0
@@ -303,48 +352,58 @@ def import_energy_customers():
         for index, row in df.iterrows():
             try:
                 # Get values with fallbacks
-                business_name = row.get(actual_columns.get('business_name', ''), '').strip()
-                contact_person = row.get(actual_columns.get('contact_person', ''), '').strip()
-                phone = str(row.get(actual_columns.get('phone', ''), '')).strip()
-                email = row.get(actual_columns.get('email', ''), '').strip()
-                
-                # Build address from multiple fields if available
-                address_parts = []
-                for addr_field in ['house_name', 'door_number', 'street', 'town', 'locality', 'county']:
-                    col_name = actual_columns.get('address', None)
-                    if col_name is None:
-                        # Try to find specific address fields
-                        for col in df.columns:
-                            if col.lower().replace('_', ' ') == addr_field.replace('_', ' '):
-                                val = str(row.get(col, '')).strip()
-                                if val and val.lower() != 'nan':
-                                    address_parts.append(val)
-                                break
-                
-                # Fallback to single address column if available
-                if not address_parts and 'address' in actual_columns:
-                    address = row.get(actual_columns.get('address', ''), '').strip()
-                else:
-                    address = ', '.join(address_parts) if address_parts else ''
-                
-                post_code = row.get(actual_columns.get('post_code', ''), '').strip()
-                site_address = row.get(actual_columns.get('site_address', ''), '').strip()
-                mpan_mpr = str(row.get(actual_columns.get('mpan_mpr', ''), '')).strip()
-                supplier_name = row.get(actual_columns.get('supplier', ''), '').strip()
+                client_name = safe_str(row.get(actual_columns.get('client_name', ''), ''))
+                trading_name = safe_str(row.get(actual_columns.get('trading_name', ''), ''))
+                main_contact = safe_str(row.get(actual_columns.get('main_contact', ''), ''))
+                position = safe_str(row.get(actual_columns.get('position', ''), ''))
+                tel_no = safe_str(row.get(actual_columns.get('tel_no', ''), ''))
+                mobile_no = safe_str(row.get(actual_columns.get('mobile_no', ''), ''))
+                email = safe_str(row.get(actual_columns.get('email', ''), ''))
+                site_name = safe_str(row.get(actual_columns.get('site_name', ''), ''))
+
+                # Address fields
+                address_line_1 = safe_str(row.get(actual_columns.get('address_line_1', ''), ''))
+                address_line_2 = safe_str(row.get(actual_columns.get('address_line_2', ''), ''))
+                address_line_3 = safe_str(row.get(actual_columns.get('address_line_3', ''), ''))
+                town = safe_str(row.get(actual_columns.get('town', ''), ''))
+                county = safe_str(row.get(actual_columns.get('county', ''), ''))
+                postcode = safe_str(row.get(actual_columns.get('postcode', ''), ''))
+
+                # Combine address fields (filter out empty strings and 'nan')
+                address_parts = [p for p in [address_line_1, address_line_2, address_line_3, town, county] if p and p.lower() != 'nan']
+                address = ', '.join(address_parts)
+                site_address = site_name or address
+
+                # MPAN fields
+                mpan_top = safe_str(row.get(actual_columns.get('mpan_top', ''), ''))
+                mpan_bottom = safe_str(row.get(actual_columns.get('mpan_bottom', ''), ''))
+                mpan_mpr = f"{mpan_top}{mpan_bottom}" if mpan_top and mpan_bottom else (mpan_top or mpan_bottom or '')
+
+                # Contract fields
+                supplier_name = safe_str(row.get(actual_columns.get('supplier', ''), ''))
                 annual_usage = parse_number(row.get(actual_columns.get('annual_usage', '')))
                 start_date = parse_date(row.get(actual_columns.get('start_date', '')))
-                end_date = parse_date(row.get(actual_columns.get('end_date', '')))
-                
+                end_date = parse_date(row.get(actual_columns.get('contract_end', '')))
+                stand_charge = parse_number(row.get(actual_columns.get('stand_charge', '')))
+                rate_1 = parse_number(row.get(actual_columns.get('rate_1', '')))
+
+                # Use Client Name as business name, Trading Name as fallback
+                business_name = client_name or trading_name
+                contact_person = main_contact or business_name
+
+                # Use Tel No as primary, Mobile No as fallback
+                phone = tel_no or mobile_no
+
                 # Skip empty rows
                 if not business_name and not phone:
                     continue
-                
+
                 # Validate required fields
                 if not business_name:
-                    errors.append(f"Row {index + 2}: Missing business name")
+                    errors.append(f"Row {index + 2}: Missing client/business name")
                     error_count += 1
                     continue
-                
+
                 if not phone:
                     errors.append(f"Row {index + 2}: Missing phone number")
                     error_count += 1
@@ -379,8 +438,8 @@ def import_energy_customers():
                         existing_client.client_email = email
                     if address and not existing_client.address:
                         existing_client.address = address
-                    if post_code and not existing_client.post_code:
-                        existing_client.post_code = post_code
+                    if postcode and not existing_client.post_code:
+                        existing_client.post_code = postcode
                     if contact_person and not existing_client.client_contact_name:
                         existing_client.client_contact_name = contact_person
                     
@@ -457,7 +516,7 @@ def import_energy_customers():
                                 contract_start_date=start_date,
                                 contract_end_date=end_date,
                                 terms_of_sale='',
-                                service_id=default_service_id,
+                                service_id=import_service_id,
                                 unit_rate=0.0,  # Default unit rate
                                 currency_id=1,
                                 document_details=None,
@@ -493,7 +552,7 @@ def import_energy_customers():
                     client_contact_name=contact_person or business_name,
                     address=address or '',
                     country_id=None,  # Can be mapped later if needed
-                    post_code=post_code or '',
+                    post_code=postcode or '',
                     client_phone=phone,
                     client_email=email or '',
                     client_website='',
@@ -557,7 +616,7 @@ def import_energy_customers():
                         contract_start_date=start_date,
                         contract_end_date=end_date,
                         terms_of_sale='',
-                        service_id=default_service_id,  # Use tenant's default service
+                        service_id=import_service_id,
                         unit_rate=0.0,  # Default unit rate - required field (real type needs float)
                         currency_id=1,  # Default GBP
                         document_details=None,
@@ -604,58 +663,101 @@ def import_energy_customers():
         session.close()
 
 
-@import_bp.route('/import/template', methods=['GET'])
+@import_bp.route('/template', methods=['GET'])
 @token_required
 def download_template():
-    """Download Excel template for bulk import"""
+    """Download Excel template matching Cash2Switch format"""
     try:
         import io
         from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
         from flask import send_file
         
         # Create workbook
         wb = Workbook()
         ws = wb.active
-        ws.title = "Energy Customers Template"
+        ws.title = "Renewals Import Template"
         
-        # Headers
+        # Headers (matching exact Excel structure)
         headers = [
-            "Business Name",
-            "Contact Person",
-            "Tel Number",
-            "Email",
-            "Address",
-            "Post Code",
-            "Site Address",
-            "MPAN/MPR",
-            "Supplier",
-            "Annual Usage",
-            "Start Date",
-            "End Date"
+            "Client Name", "Trading Name", "Main Contact", "Position", "Tel No", "Mobile No",
+            "Email", "Site Name", "Month Sold", "", "Address Line 1", "Address Line 2",
+            "Address Line 3", "Town", "County", "Postcode", "Mpan Top", "Mpan Bottom",
+            "", "", "Data Source", "Welcome Call", "Payment Type", "Supplier", "Net Notch",
+            "In Contract", "Agent Sold", "Start Date", "Contract End", "Stand Charge",
+            "Rate 1", "Rate 2", "Rate 3", "", "", "Aggregator", "Annual Usage",
+            "Comms Paid", "Company Number", "Date of Birth", "Bank Name", "Ac Number",
+            "Sort Code", "Charity/Ltd Company Number", "Partner Details"
         ]
         
-        # Add headers
+        # Style headers
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        
         for col, header in enumerate(headers, 1):
-            ws.cell(row=1, column=col, value=header)
+            cell = ws.cell(row=1, column=col, value=header)
+            if header:  # Only style non-empty headers
+                cell.fill = header_fill
+                cell.font = header_font
         
         # Add example row
         example = [
-            "ABC Limited",
-            "John Smith",
-            "07700900000",
-            "john@abc.com",
-            "123 Main St, London",
-            "SW1A 1AA",
-            "456 Factory Rd, Manchester",
-            "1234567890123",
-            "British Gas",
-            "50000",
-            "01/01/2024",
-            "31/12/2024"
+            "ABC Limited",  # Client Name
+            "ABC Trading",  # Trading Name
+            "John Smith",   # Main Contact
+            "Director",     # Position
+            "07700900000",  # Tel No
+            "07700900001",  # Mobile No
+            "john@abc.com", # Email
+            "Main Site",    # Site Name
+            "Jan-24",       # Month Sold
+            "",             # Empty
+            "123 Main St",  # Address Line 1
+            "Unit 5",       # Address Line 2
+            "Industrial Estate",  # Address Line 3
+            "London",       # Town
+            "Greater London",  # County
+            "SW1A 1AA",     # Postcode
+            "1100012314490",  # Mpan Top
+            "04031N12",     # Mpan Bottom
+            "", "",         # Empty
+            "Renewals",     # Data Source
+            "Yes",          # Welcome Call
+            "DD",           # Payment Type
+            "British Gas",  # Supplier
+            "0.1",          # Net Notch
+            "1 Year",       # In Contract
+            "Sales Team",   # Agent Sold
+            "01/01/2024",   # Start Date
+            "31/12/2024",   # Contract End
+            "45.13",        # Stand Charge
+            "35.00",        # Rate 1
+            "26.46",        # Rate 2
+            "",             # Rate 3
+            "", "",         # Empty
+            "Online",       # Aggregator
+            "25000",        # Annual Usage
+            "£7.92",        # Comms Paid
+            "12345678",     # Company Number
+            "",             # Date of Birth
+            "Barclays",     # Bank Name
+            "12345678",     # Ac Number
+            "20-00-00",     # Sort Code
+            "",             # Charity/Ltd Company Number
+            ""              # Partner Details
         ]
         
         for col, value in enumerate(example, 1):
             ws.cell(row=2, column=col, value=value)
+        
+        # Auto-adjust column widths
+        for col in ws.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            ws.column_dimensions[column].width = min(max_length + 2, 30)
         
         # Save to bytes
         output = io.BytesIO()
@@ -666,7 +768,7 @@ def download_template():
             output,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             as_attachment=True,
-            download_name='energy_customers_template.xlsx'
+            download_name='cash2switch_renewals_template.xlsx'
         )
         
     except Exception as e:

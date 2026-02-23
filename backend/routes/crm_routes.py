@@ -165,6 +165,18 @@ def update_lead_status(opportunity_id):
     return crm_controller.update_lead_status(opportunity_id)
 
 
+@crm_bp.route('/leads/assign', methods=['PATCH'])
+@token_required
+@tenant_from_jwt
+def assign_leads():
+    """
+    PATCH /api/crm/leads/assign
+    Bulk assign leads to an employee. Admin only.
+    Request body: { lead_ids: [...], employee_id: N }
+    """
+    return crm_controller.assign_leads()
+
+
 @crm_bp.route('/leads/<int:opportunity_id>', methods=['DELETE'])
 @token_required
 @tenant_from_jwt
@@ -347,6 +359,11 @@ def import_leads():
     try:
         tenant_id = g.tenant_id
         
+        # Map service query param to service_id
+        service_param = request.args.get('service', 'electricity')
+        service_value = service_param.strip().lower() if isinstance(service_param, str) else 'electricity'
+        service_id = 2 if service_value == 'water' else 1
+        
         # Check if file is provided
         if 'file' not in request.files:
             return jsonify({
@@ -404,7 +421,7 @@ def import_leads():
         if validated_data and isinstance(validated_data, list):
             print(f"DEBUG: First row keys: {list(validated_data[0].keys()) if validated_data else 'empty'}")
         
-        confirm_result = crm_controller.crm_service.confirm_lead_import(tenant_id, validated_data, created_by)
+        confirm_result = crm_controller.crm_service.confirm_lead_import(tenant_id, validated_data, created_by, service_id)
         
         # Check if confirm returned an error (has 'success':False key)
         if 'success' in confirm_result and not confirm_result['success']:
@@ -725,6 +742,17 @@ def get_users():
         500: Internal server error
     """
     return crm_controller.get_users()
+
+
+@crm_bp.route('/employees', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_employees():
+    """
+    GET /api/crm/employees
+    Get all employees for assignment dropdowns
+    """
+    return crm_controller.get_employees()
 
 
 # ========================================

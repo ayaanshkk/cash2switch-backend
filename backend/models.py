@@ -165,18 +165,13 @@ class Tenant_Master(Base):
     __tablename__ = 'Tenant_Master'
     __table_args__ = {'schema': SCHEMA}
     
-    Tenant_id = Column('Tenant_id', SmallInteger, primary_key=True, autoincrement=True)
+    tenant_id = Column('tenant_id', SmallInteger, primary_key=True, autoincrement=True)
     tenant_company_name = Column(String(255))
     tenant_contact_name = Column(String(255))
     onboarding_Date = Column('onboarding_Date', Date)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime)
     updated_at = Column(DateTime)
-    
-    # Property alias for lowercase access
-    @property
-    def tenant_id(self):
-        return self.Tenant_id
 
 
 class Employee_Master(Base):
@@ -305,6 +300,24 @@ class Stage_Master(Base):
     stage_description = Column(String(255))
     preceding_stage_id = Column(SmallInteger)
     stage_type = Column(SmallInteger)
+
+class Role_Master(Base):
+    __tablename__ = 'Role_Master'
+    __table_args__ = {'schema': SCHEMA}
+    
+    role_id = Column(SmallInteger, primary_key=True, autoincrement=True)
+    role_name = Column(String(100))
+    role_description = Column(String(255))
+    is_system = Column(Boolean)
+    created_at = Column(DateTime)
+
+class User_Role_Mapping(Base):
+    __tablename__ = 'User_Role_Mapping'
+    __table_args__ = {'schema': SCHEMA}
+    
+    user_role_mapping_id = Column(SmallInteger, primary_key=True, autoincrement=True)
+    user_id = Column(SmallInteger)
+    role_id = Column(SmallInteger)
 
 
 class Services_Master(Base):

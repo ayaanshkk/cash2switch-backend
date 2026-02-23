@@ -15,7 +15,7 @@ calendar_bp = Blueprint('calendar', __name__, url_prefix='/api/calendar')
 @token_required
 @tenant_from_jwt
 def get_renewals_calendar():
-    """Get all renewals for calendar view - shows reminder dates (365 days before contract end)"""
+    """Get all renewals for calendar view - shows contract end dates"""
     try:
         tenant_id = g.tenant_id
         repo = TenantRepository()
@@ -23,11 +23,11 @@ def get_renewals_calendar():
         import logging
         logging.info(f"🔍 Fetching renewals for tenant_id: {tenant_id}")
         
-        # ✅ Use StreemLyne_MT schema prefix
+        # ✅ Use StreemLyne_MT schema prefix - business name on contract end date
         query = '''
             SELECT 
                 cm.client_id as id,
-                cm.client_company_name as name,
+                COALESCE(NULLIF(TRIM(cm.client_company_name), ''), cm.client_contact_name, 'Unknown') as name,
                 ecm.mpan_number as mpan,
                 sm.supplier_company_name as supplier,
                 ecm.contract_end_date,
@@ -60,21 +60,18 @@ def get_renewals_calendar():
         if renewals:
             logging.info(f"📝 First renewal: {renewals[0]}")
         
-        # Transform to calendar events
+        # Transform to calendar events (business name on contract end date)
         events = []
         for renewal in renewals:
-            if not renewal.get('name'):
-                logging.warning(f"⚠️ Skipping renewal without name: {renewal.get('id')}")
-                continue
-                
-            # ✅ Show on reminder date (365 days before contract end)
-            if renewal.get('reminder_date'):
+            business_name = renewal.get('name') or renewal.get('contact') or 'Unknown'
+            # ✅ Show on contract end date (actual renewal date)
+            if renewal.get('contract_end_date'):
                 event = {
                     'id': str(renewal['id']),
                     'customer_id': renewal['id'],
                     'type': 'renewal',
-                    'title': f"{renewal.get('name', 'Unknown')} - {renewal.get('mpan', 'N/A')}",
-                    'name': renewal.get('name'),
+                    'title': f"{business_name} - {renewal.get('mpan', 'N/A')}",
+                    'name': business_name,
                     'mpan': renewal.get('mpan'),
                     'supplier': renewal.get('supplier'),
                     'contract_start_date': str(renewal['contract_start_date']) if renewal.get('contract_start_date') else None,
@@ -88,8 +85,8 @@ def get_renewals_calendar():
                     'service_title': renewal.get('service_title'),
                     'rates': str(renewal.get('rates')) if renewal.get('rates') else None,
                     'notes': renewal.get('notes'),
-                    'display_date': str(renewal['reminder_date']),
-                    'display_type': 'reminder',
+                    'display_date': str(renewal['contract_end_date']),
+                    'display_type': 'contract_end',
                     'status': 'Active',
                 }
                 events.append(event)

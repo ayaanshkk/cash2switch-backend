@@ -4,15 +4,20 @@
 import os
 import sys
 
-# Add the current directory to the Python path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add the project root to the Python path so backend.* imports work
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 try:
-    from app import app, db
-    print("✅ Successfully imported app and db")
+    from backend.app import create_app
+    from backend.db import Base, engine
+    print("✅ Successfully imported create_app, Base, and engine")
 except ImportError as e:
     print(f"❌ Import error: {e}")
     sys.exit(1)
+
+app = create_app()
 
 def create_tables():
     """Create database tables"""
@@ -43,11 +48,21 @@ if __name__ == '__main__':
     print("🚀 Starting FAI Backend...")
     print("=" * 50)
     
-    # Create database tables
+    print("Step 1: Creating Flask app...")
+    try:
+        app = create_app()
+        print("✅ Flask app created successfully")
+    except Exception as e:
+        print(f"❌ Failed to create app: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    print("Step 2: Creating database tables...")
     if not create_tables():
         sys.exit(1)
     
-    # Test routes
+    print("Step 3: Testing routes...")
     if not test_routes():
         sys.exit(1)
     
@@ -59,6 +74,7 @@ if __name__ == '__main__':
     
     # Start the server
     try:
+        print("Step 4: Starting Flask server...")
         app.run(debug=True, host='127.0.0.1', port=5000)
     except KeyboardInterrupt:
         print("\n👋 Server stopped by user")

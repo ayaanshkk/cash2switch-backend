@@ -17,8 +17,9 @@ Multi-table system integrating:
 
 from flask import Blueprint, request, jsonify, current_app
 from .auth_helpers import token_required
+from backend.crm.utils.role_helpers import is_admin_user
 from datetime import datetime
-from sqlalchemy import and_, or_, func
+from sqlalchemy import and_, or_, func, text 
 
 from ..db import SessionLocal
 
@@ -32,7 +33,8 @@ from backend.models import (
     Opportunity_Details,
     Client_Interactions,
     Supplier_Master,
-    Stage_Master
+    Stage_Master,
+    Role_Master
 )
 
 energy_customer_bp = Blueprint('energy_customers', __name__)
@@ -113,6 +115,29 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
     
     return response
 
+def get_user_role_name(user, session):
+    """Get the role name for a user from User_Role_Mapping and Role_Master"""
+    try:
+        from backend.models import Role_Master
+        
+        # Query User_Role_Mapping to get role_id for this user
+        result = session.execute(text("""
+            SELECT rm.role_name
+            FROM "StreemLyne_MT"."User_Role_Mapping" urm
+            JOIN "StreemLyne_MT"."Role_Master" rm ON urm.role_id = rm.role_id
+            WHERE urm.user_id = :user_id
+            LIMIT 1
+        """), {'user_id': user.user_id}).fetchone()
+        
+        if result:
+            return result[0]  # Returns "Platform Admin" or "Salesperson" etc.
+        
+        return None
+        
+    except Exception as e:
+        current_app.logger.error(f"Error getting user role: {e}")
+        return None
+
 # ==========================================
 # GET ALL CUSTOMERS
 # ==========================================
@@ -120,7 +145,7 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
 @energy_customer_bp.route('/energy-clients', methods=['GET', 'OPTIONS'])
 @token_required
 def get_energy_customers():
-    """Get all energy customers EXCLUDING those with status='priced'"""
+    """Get all energy customers EXCLUDING priced/lost statuses, filtered by role"""
     
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -128,11 +153,19 @@ def get_energy_customers():
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
+        user = request.current_user
         
         if not tenant_id:
             return jsonify({'error': 'Tenant not found for user'}), 400
+
+        # Service filter: electricity=1, water=2 (None = no filter)
+        _service_id = None
+        service_param = request.args.get('service')
+        if service_param and isinstance(service_param, str):
+            svc = service_param.strip().lower()
+            _service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
         
-        # Query with EXCLUSION of priced customers
+        # Base query with joins
         query = session.query(
             Client_Master,
             Project_Details,
@@ -140,7 +173,8 @@ def get_energy_customers():
             Opportunity_Details,
             Client_Interactions,
             Supplier_Master,
-            Employee_Master
+            Employee_Master,
+            Stage_Master
         ).outerjoin(
             Project_Details, 
             Client_Master.client_id == Project_Details.client_id
@@ -159,19 +193,37 @@ def get_energy_customers():
         ).outerjoin(
             Employee_Master,
             Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
+        ).outerjoin(
+            Stage_Master,
+            Opportunity_Details.stage_id == Stage_Master.stage_id
         ).filter(
             and_(
                 Client_Master.tenant_id == tenant_id,
                 Client_Master.client_company_name != '[IMPORTED LEADS]',
-                # ✅ EXCLUDE customers where Misc_Col1 = 'priced'
+                # ✅ ISSUE 3 FIX: EXCLUDE priced, lost, lost_cot statuses
                 or_(
                     Opportunity_Details.Misc_Col1 == None,
-                    func.lower(Opportunity_Details.Misc_Col1) != 'priced'
-                )
+                    ~func.lower(Opportunity_Details.Misc_Col1).in_(['priced', 'lost', 'lost_cot', 'lost cot'])
+                ),
+                # ✅ Also exclude by stage_name (Lost stage goes to recycle bin)
+                or_(
+                    Stage_Master.stage_name == None,
+                    func.lower(Stage_Master.stage_name) != 'lost'
+                ),
+                # Service filter: electricity=1, water=2 (optional)
+                *([Energy_Contract_Master.service_id == _service_id] if _service_id is not None else [])
             )
-        ).order_by(
-            Client_Master.created_at.desc()
         )
+        
+        user_role = get_user_role_name(user, session)
+
+        if user_role != 'Platform Admin':
+            # Salesperson users only see renewals assigned to them
+            query = query.filter(
+                Opportunity_Details.opportunity_owner_employee_id == user.employee_id
+            )
+        
+        query = query.order_by(Client_Master.created_at.desc())
         
         results = query.all()
         
@@ -179,7 +231,7 @@ def get_energy_customers():
         customers = []
         seen_clients = set()
         
-        for client, project, contract, opportunity, interaction, supplier, employee in results:
+        for client, project, contract, opportunity, interaction, supplier, employee, stage in results:
             if client.client_id in seen_clients:
                 continue
             seen_clients.add(client.client_id)
@@ -187,9 +239,13 @@ def get_energy_customers():
             customer_data = build_customer_response(
                 client, project, contract, opportunity, interaction, supplier, employee
             )
+            # Add status from Misc_Col1 if available
+            if opportunity and opportunity.Misc_Col1:
+                customer_data['status'] = opportunity.Misc_Col1
+            
             customers.append(customer_data)
         
-        current_app.logger.info(f"✅ Returning {len(customers)} renewals (excluding priced)")
+        current_app.logger.info(f"✅ Returning {len(customers)} renewals for employee_id={user.employee_id} (role: {user_role})")
         
         return jsonify(customers), 200
 
@@ -198,7 +254,6 @@ def get_energy_customers():
         return jsonify({'error': 'Failed to fetch energy customers'}), 500
     finally:
         session.close()
-
 
 # ==========================================
 # GET SINGLE CUSTOMER
@@ -279,9 +334,7 @@ def get_energy_customer(client_id):
 @token_required
 def create_energy_customer():
     """Create new energy customer across multiple tables"""
-def create_energy_customer():
-    """Create new energy customer across multiple tables"""
-    
+
     session = SessionLocal()
     try:
         data = request.get_json()
@@ -413,27 +466,13 @@ def create_energy_customer():
 @token_required
 def update_energy_customer(client_id):
     """Update energy customer across multiple tables"""
-    
-def update_energy_customer(client_id):
-    """Update energy customer across multiple tables"""
-    
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
-        data = request.get_json()
-        
-        # Fetch client
-        client = session.query(Client_Master).filter_by(
-            client_id=client_id,
-            tenant_id=tenant_id
-        ).first()
-        
-        if not client:
-            tenant_id = get_tenant_id_from_user(request.current_user)
-            data = request.get_json()
+        data = request.get_json() or {}
         
         # Fetch client
         client = session.query(Client_Master).filter_by(
@@ -443,8 +482,14 @@ def update_energy_customer(client_id):
         
         if not client:
             return jsonify({'error': 'Customer not found'}), 404
-        
-        # TODO: Permission check for Staff role
+
+        # Admin-only: assignment change
+        user_role = get_user_role_name(request.current_user, session)
+        if data and 'assigned_to_id' in data and user_role != 'Platform Admin':
+            return jsonify({
+                'error': 'permission_denied',
+                'message': 'Only administrators can assign'
+            }), 403
         
         current_app.logger.info(f"🔄 Updating energy customer {client_id}")
         
@@ -524,6 +569,9 @@ def update_energy_customer(client_id):
         if opportunity:
             if 'stage_id' in data:
                 opportunity.stage_id = data['stage_id']
+            if 'status' in data:
+                # ✅ Store status in Misc_Col1 for filtering
+                opportunity.Misc_Col1 = data['status']
             if 'assigned_to_id' in data:
                 opportunity.opportunity_owner_employee_id = data['assigned_to_id']
             if 'opportunity_value' in data:
@@ -611,8 +659,6 @@ def delete_energy_customer(client_id):
     
     session = SessionLocal()
     try:
-        # TODO: Only Admin can delete - implement proper role checking
-        
         tenant_id = get_tenant_id_from_user(request.current_user)
         
         client = session.query(Client_Master).filter_by(
@@ -644,28 +690,25 @@ def delete_energy_customer(client_id):
         # 5. Delete Client_Master
         session.delete(client)
         
-        current_app.logger.info(f"🗑️ Deleting energy customer {client_id} and all related records")
-        
-        # Delete in reverse order of dependencies
-        
-        # 1. Delete Client_Interactions
-        session.query(Client_Interactions).filter_by(client_id=client_id).delete()
-        
-        # 2. Delete Energy_Contract_Master (via projects)
-        projects = session.query(Project_Details).filter_by(client_id=client_id).all()
-        for project in projects:
-            session.query(Energy_Contract_Master).filter_by(project_id=project.project_id).delete()
-        
-        # 3. Delete Opportunity_Details
-        session.query(Opportunity_Details).filter_by(client_id=client_id).delete()
-        
-        # 4. Delete Project_Details
-        session.query(Project_Details).filter_by(client_id=client_id).delete()
-        
-        # 5. Delete Client_Master
-        session.delete(client)
-        
         session.commit()
+        
+        # ✅ ISSUE 1 FIX: Check if all customers deleted, reset sequence
+        remaining_count = session.query(Client_Master).filter_by(tenant_id=tenant_id).count()
+        
+        if remaining_count == 0:
+            try:
+                # Reset PostgreSQL sequence for client_id to start from 1
+                session.execute(text("""
+                    SELECT setval(
+                        pg_get_serial_sequence('"StreemLyne_MT"."Client_Master"', 'client_id'),
+                        1,
+                        false
+                    )
+                """))
+                session.commit()
+                current_app.logger.info("✅ Reset client_id sequence to 1 (all customers deleted)")
+            except Exception as e:
+                current_app.logger.warning(f"⚠️ Could not reset sequence: {e}")
         
         current_app.logger.info(f"✅ Energy customer {client_id} deleted successfully")
         
@@ -749,6 +792,14 @@ def search_energy_customers():
 @token_required
 def get_energy_customer_stats():
     """Get customer statistics"""
+
+    user_role = get_user_role_name(user, session)
+
+    if user_role != 'Platform Admin':
+        # Salesperson users only see renewals assigned to them
+        query = query.filter(
+            Opportunity_Details.opportunity_owner_employee_id == user.employee_id
+        )
     
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -810,7 +861,6 @@ def get_energy_customer_stats():
     finally:
         session.close()
 
-
 # ==========================================
 # HELPER ENDPOINTS
 # ==========================================
@@ -867,54 +917,17 @@ def get_stages():
 @energy_customer_bp.route('/employees', methods=['GET'])
 @token_required
 def get_employees():
-    """Get all employees for assignment with their roles"""
+    """Get all employees for assignment"""
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
+        employees = session.query(Employee_Master).filter_by(tenant_id=tenant_id).all()
         
-        # ✅ Debug logging
-        current_app.logger.info(f"🔍 Current user: {request.current_user}")
-        current_app.logger.info(f"🔍 Tenant ID from user: {tenant_id}")
-        current_app.logger.info(f"🔍 User employee_id: {getattr(request.current_user, 'employee_id', None)}")
-        current_app.logger.info(f"🔍 User tenant_id attr: {getattr(request.current_user, 'tenant_id', None)}")
-        
-        # ✅ JOIN with User_Master, User_Role_Mapping, and Role_Master to get roles
-        from sqlalchemy import text
-        
-        query = text('''
-            SELECT 
-                e.employee_id,
-                e.employee_name,
-                e.email,
-                e.phone,
-                e.tenant_id,
-                rm.role_name,
-                rm.role_id
-            FROM "StreemLyne_MT"."Employee_Master" e
-            LEFT JOIN "StreemLyne_MT"."User_Master" um ON e.employee_id = um.employee_id
-            LEFT JOIN "StreemLyne_MT"."User_Role_Mapping" urm ON um.user_id = urm.user_id
-            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON urm.role_id = rm.role_id
-            WHERE e.tenant_id = :tenant_id
-            ORDER BY e.employee_name
-        ''')
-        
-        employees = session.execute(query, {'tenant_id': tenant_id}).mappings().all()
-        
-        # ✅ Debug what we found
-        current_app.logger.info(f"✅ Found {len(employees)} employees for tenant {tenant_id}")
-        for emp in employees:
-            current_app.logger.info(f"   - {emp['employee_name']} (tenant_id: {emp['tenant_id']}, role: {emp.get('role_name')})")
-        
-        result = {
-            'data': [{
-                'employee_id': emp['employee_id'],
-                'employee_name': emp['employee_name'],
-                'email': emp['email'],
-                'phone': emp.get('phone'),
-                'role_name': emp.get('role_name'),
-                'role_id': emp.get('role_id')
-            } for emp in employees]
-        }
+        result = [{
+            'employee_id': e.employee_id,
+            'employee_name': e.employee_name,
+            'email': e.email
+        } for e in employees]
         
         return jsonify(result), 200
     except Exception as e:
