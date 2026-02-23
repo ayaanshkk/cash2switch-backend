@@ -771,8 +771,9 @@ def get_roles():
     return crm_controller.get_roles()
 
 
-@crm_bp.route('/stages', methods=['GET'])
-@require_tenant
+@crm_bp.route('/stages', methods=['GET'], strict_slashes=False)
+@token_required
+@tenant_from_jwt
 def get_stages():
     """
     Get all pipeline stages

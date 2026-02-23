@@ -4,7 +4,7 @@ from flask import Blueprint, jsonify, request
 from datetime import datetime, timedelta
 from sqlalchemy import text
 from ..db import SessionLocal
-from .auth_helpers import token_required
+from .auth_helpers import token_required, get_tenant_id_from_user
 
 renewals_bp = Blueprint("renewals", __name__)
 
@@ -16,14 +16,23 @@ def get_renewals():
     Uses proper schema: Client_Master -> Project_Details -> Energy_Contract_Master
     """
     try:
+        # ✅ Get tenant_id from authenticated user
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+        
         db = SessionLocal()
         
         # Get current date and 90 days from now
         today = datetime.now().date()
         ninety_days_later = today + timedelta(days=90)
         
+        # ✅ Add employee filter if provided
+        employee_id = request.args.get('employee_id')
+        employee_filter = "AND ecm.employee_id = :employee_id" if employee_id else ""
+        
         # Query using your actual schema structure with proper joins
-        query = text("""
+        query = text(f"""
             SELECT 
                 cm.client_id,
                 cm.client_contact_name as contact_person,
@@ -32,7 +41,7 @@ def get_renewals():
                 cm.client_email as email,
                 sm.supplier_company_name as supplier_name,
                 ecm.contract_end_date as end_date,
-                pd."Misc_Col2" as annual_usage
+                pd."Misc_Col2" as annual_usage,
                 (ecm.contract_end_date - CURRENT_DATE) as days_until_expiry,
                 COALESCE(
                     (SELECT ci.notes 
@@ -52,13 +61,21 @@ def get_renewals():
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON ecm.employee_id = em.employee_id
             WHERE ecm.contract_end_date IS NOT NULL
             AND ecm.contract_end_date BETWEEN :today AND :ninety_days_later
+            AND cm.tenant_id = :tenant_id
+            {employee_filter}
             ORDER BY ecm.contract_end_date ASC
         """)
         
-        result = db.execute(query, {
+        # ✅ Pass parameters
+        params = {
             "today": today,
-            "ninety_days_later": ninety_days_later
-        })
+            "ninety_days_later": ninety_days_later,
+            "tenant_id": tenant_id
+        }
+        if employee_id:
+            params['employee_id'] = int(employee_id)
+        
+        result = db.execute(query, params)
         
         renewals = []
         for row in result:
@@ -95,28 +112,48 @@ def get_renewal_stats():
     Get renewal statistics for dashboard cards
     """
     try:
+        # ✅ Get tenant_id from authenticated user
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+        
         db = SessionLocal()
         today = datetime.now().date()
         
+        # ✅ Add employee filter if provided
+        employee_id = request.args.get('employee_id')
+        employee_filter = "AND ecm.employee_id = :employee_id" if employee_id else ""
+        
         # Renewals in different time periods with revenue calculations
-        stats_query = text("""
+        stats_query = text(f"""
             SELECT 
                 COUNT(CASE WHEN ecm.contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days' THEN 1 END) as total_renewals_30_days,
                 COUNT(CASE WHEN ecm.contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '60 days' THEN 1 END) as total_renewals_60_days,
                 COUNT(CASE WHEN ecm.contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days' THEN 1 END) as total_renewals_90_days,
                 COALESCE(SUM(CASE WHEN ecm.contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days' 
-                    THEN COALESCE(pd.Misc_Col2, 0) * COALESCE(ecm.unit_rate, 0) 
-                    ELSE 0 END), 0) as total_revenue_at_risk
+                    THEN COALESCE(pd."Misc_Col2", 0) * COALESCE(ecm.unit_rate, 0) 
+                    ELSE 0 END), 0) as total_revenue_at_risk,
+                COALESCE(SUM(CASE WHEN ecm.contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days' 
+                    THEN COALESCE(pd."Misc_Col2", 0)
+                    ELSE 0 END), 0) as total_aq
             FROM "StreemLyne_MT"."Energy_Contract_Master" ecm
             INNER JOIN "StreemLyne_MT"."Project_Details" pd ON ecm.project_id = pd.project_id
+            INNER JOIN "StreemLyne_MT"."Client_Master" cm ON pd.client_id = cm.client_id
             WHERE ecm.contract_end_date IS NOT NULL
             AND ecm.contract_end_date >= CURRENT_DATE
+            AND cm.tenant_id = :tenant_id
+            {employee_filter}
         """)
         
-        stats_result = db.execute(stats_query).first()
+        # ✅ Pass parameters
+        params = {'tenant_id': tenant_id}
+        if employee_id:
+            params['employee_id'] = int(employee_id)
         
-        # Contact status from Client_Interactions
-        contact_query = text("""
+        stats_result = db.execute(stats_query, params).first()
+        
+        # ✅ Contact status from Client_Interactions (with tenant filter)
+        contact_query = text(f"""
             SELECT 
                 COUNT(CASE WHEN latest_interaction.contact_date IS NOT NULL THEN 1 END) as contacted_count,
                 COUNT(CASE WHEN latest_interaction.contact_date IS NULL THEN 1 END) as not_contacted_count,
@@ -134,15 +171,18 @@ def get_renewal_stats():
             ) latest_interaction ON true
             WHERE ecm.contract_end_date IS NOT NULL
             AND ecm.contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days'
+            AND cm.tenant_id = :tenant_id
+            {employee_filter}
         """)
         
-        contact_result = db.execute(contact_query).first()
+        contact_result = db.execute(contact_query, params).first()
         
         stats = {
             "total_renewals_30_days": stats_result.total_renewals_30_days or 0,
             "total_renewals_60_days": stats_result.total_renewals_60_days or 0,
             "total_renewals_90_days": stats_result.total_renewals_90_days or 0,
             "total_revenue_at_risk": float(stats_result.total_revenue_at_risk or 0),
+            "total_aq": float(stats_result.total_aq or 0),
             "contacted_count": contact_result.contacted_count or 0,
             "not_contacted_count": contact_result.not_contacted_count or 0,
             "renewed_count": contact_result.renewed_count or 0,
@@ -167,24 +207,41 @@ def get_supplier_breakdown():
     Get breakdown of renewals by supplier from Supplier_Master
     """
     try:
+        # ✅ Get tenant_id from authenticated user
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+        
         db = SessionLocal()
         
-        query = text("""
+        # ✅ Add employee filter if provided
+        employee_id = request.args.get('employee_id')
+        employee_filter = "AND ecm.employee_id = :employee_id" if employee_id else ""
+        
+        query = text(f"""
             SELECT 
                 COALESCE(sm.supplier_company_name, 'Unknown') as supplier_name,
                 COUNT(*) as renewal_count,
-                COALESCE(SUM(COALESCE(pd.Misc_Col2, 0) * COALESCE(ecm.unit_rate, 0)), 0) as total_value
+                COALESCE(SUM(COALESCE(pd."Misc_Col2", 0) * COALESCE(ecm.unit_rate, 0)), 0) as total_value
             FROM "StreemLyne_MT"."Energy_Contract_Master" ecm
             INNER JOIN "StreemLyne_MT"."Project_Details" pd ON ecm.project_id = pd.project_id
+            INNER JOIN "StreemLyne_MT"."Client_Master" cm ON pd.client_id = cm.client_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
             WHERE ecm.contract_end_date IS NOT NULL
             AND ecm.contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days'
+            AND cm.tenant_id = :tenant_id
+            {employee_filter}
             GROUP BY sm.supplier_company_name
             ORDER BY total_value DESC
             LIMIT 10
         """)
         
-        result = db.execute(query)
+        # ✅ Pass parameters
+        params = {'tenant_id': tenant_id}
+        if employee_id:
+            params['employee_id'] = int(employee_id)
+        
+        result = db.execute(query, params)
         
         breakdown = []
         for row in result:
