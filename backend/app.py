@@ -144,12 +144,13 @@ def create_app():
         notification_routes,
         customer_routes, file_routes,
         crm_routes, document_routes, calendar_routes,
-        import_routes,
+        import_routes, energy_renewals_routes,
     )
 
     app.register_blueprint(auth_routes.auth_bp)
     app.register_blueprint(customer_routes.energy_customer_bp)
     app.register_blueprint(import_routes.import_bp, url_prefix='/import')
+    app.register_blueprint(energy_renewals_routes.renewals_bp)
     app.register_blueprint(db_routes.db_bp)
     app.register_blueprint(notification_routes.notification_bp)
     app.register_blueprint(file_routes.file_bp)
