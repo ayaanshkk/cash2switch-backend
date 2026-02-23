@@ -15,6 +15,8 @@ from ..models import (
 )
 from .auth_helpers import token_required
 from ..db import SessionLocal
+import tempfile
+
 
 import_bp = Blueprint('import', __name__)
 
@@ -248,23 +250,36 @@ def import_energy_customers():
         # Read file based on extension
         filename = secure_filename(file.filename)
         file_ext = filename.rsplit('.', 1)[1].lower()
-        
+
         current_app.logger.info(f"📁 Processing import file: {filename}")
-        # ✅ ADD THIS: Reset file pointer to beginning
-        file.seek(0)
-        
+
         try:
+            # ✅ Save to temporary file first (more reliable in production)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_ext}') as tmp:
+                file.save(tmp.name)
+                tmp_path = tmp.name
+            
+            current_app.logger.info(f"💾 Saved to temp file: {tmp_path}")
+            
+            # Read from temp file
             if file_ext == 'csv':
-                df = pd.read_csv(file, encoding='utf-8-sig')  
+                df = pd.read_csv(tmp_path, encoding='utf-8-sig')
             else:
+                # Try openpyxl first, fallback to xlrd for older .xls files
                 try:
-                    df = pd.read_excel(file, engine='openpyxl')
+                    df = pd.read_excel(tmp_path, engine='openpyxl')
                 except Exception as openpyxl_error:
                     current_app.logger.warning(f"openpyxl failed: {openpyxl_error}, trying xlrd...")
-                    file.seek(0)  # Reset again
-                    df = pd.read_excel(file, engine='xlrd')
+                    df = pd.read_excel(tmp_path, engine='xlrd')
+            
+            # Clean up temp file
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass  # Ignore cleanup errors
             
             current_app.logger.info(f"✅ File read successfully: {len(df)} rows, {len(df.columns)} columns")
+            
         except Exception as e:
             current_app.logger.error(f"❌ Failed to read file: {str(e)}")
             return jsonify({'error': f'Failed to read file: {str(e)}'}), 400
