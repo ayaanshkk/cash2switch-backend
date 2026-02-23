@@ -253,14 +253,16 @@ def import_energy_customers():
         
         try:
             if file_ext == 'csv':
-                df = pd.read_csv(file)
+                df = pd.read_csv(file, encoding='utf-8-sig')  
             else:
-                df = pd.read_excel(file)
+                df = pd.read_excel(file, engine='openpyxl')
         except Exception as e:
             return jsonify({'error': f'Failed to read file: {str(e)}'}), 400
         
         # Normalize column names (lowercase, strip spaces, replace underscores with spaces)
-        df.columns = df.columns.str.strip().str.lower().str.replace('_', ' ')
+        df.columns = df.columns.str.strip().str.lower().str.replace('_', ' ').str.replace(r'\s+', ' ', regex=True)
+
+        current_app.logger.info(f"📋 Normalized columns: {list(df.columns)}")
         
         current_app.logger.info(f"📊 Found {len(df)} rows in file")
         current_app.logger.info(f"📋 Columns: {list(df.columns)}")
@@ -323,18 +325,27 @@ def import_energy_customers():
         has_business_name = 'client_name' in actual_columns or 'business_name' in actual_columns
         has_phone = 'tel_no' in actual_columns or 'phone' in actual_columns
 
+        # ✅ ADD DETAILED LOGGING
+        current_app.logger.error(f"🔍 VALIDATION DEBUG:")
+        current_app.logger.error(f"   actual_columns keys: {list(actual_columns.keys())}")
+        current_app.logger.error(f"   has_business_name: {has_business_name}")
+        current_app.logger.error(f"   has_phone: {has_phone}")
+        current_app.logger.error(f"   DataFrame columns: {list(df.columns)}")
+
         if not has_business_name:
             return jsonify({
                 'error': 'Missing required column: Client Name (or Business Name)',
                 'expected_columns': list(column_map.keys()),
-                'found_columns': list(df.columns)
+                'found_columns': list(df.columns),
+                'actual_columns_mapped': actual_columns 
             }), 400
 
         if not has_phone:
             return jsonify({
                 'error': 'Missing required column: Tel No (or Phone)',
                 'expected_columns': list(column_map.keys()),
-                'found_columns': list(df.columns)
+                'found_columns': list(df.columns),
+                'actual_columns_mapped': actual_columns 
             }), 400
         
         # Helper function to safely get string values
