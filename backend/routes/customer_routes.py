@@ -242,7 +242,8 @@ def get_energy_customers():
             
             customers.append(customer_data)
         
-        current_app.logger.info(f"✅ Returning {len(customers)} renewals for employee_id={user.employee_id} (role: {user_role})")
+        current_app.logger.info(f"✅ Returning {len(customers)} renewals for employee_id={user.employee_id}")
+
         
         return jsonify(customers), 200
 
