@@ -223,11 +223,11 @@ def get_energy_customers():
         )
 
         results = query.all()
-        
+
         # Build response
         customers = []
         seen_clients = set()
-        
+
         for client, project, contract, opportunity, interaction, supplier, employee, stage in results:
             if client.client_id in seen_clients:
                 continue
@@ -241,9 +241,9 @@ def get_energy_customers():
                 customer_data['status'] = opportunity.Misc_Col1
             
             customers.append(customer_data)
-        
-        current_app.logger.info(f"✅ Returning {len(customers)} renewals for employee_id={user.employee_id} (role: {user_role})")
-        
+
+        current_app.logger.info(f"✅ Returning {len(customers)} renewals for employee_id={user.employee_id}")
+
         return jsonify(customers), 200
 
     except Exception as e:
