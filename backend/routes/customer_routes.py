@@ -214,17 +214,14 @@ def get_energy_customers():
                 *([Energy_Contract_Master.service_id == _service_id] if _service_id is not None else [])
             )
         )
-        
-        user_role = get_user_role_name(user, session)
 
-        if user_role != 'Platform Admin':
-            # Salesperson users only see renewals assigned to them
-            query = query.filter(
-                Opportunity_Details.opportunity_owner_employee_id == user.employee_id
-            )
-        
         query = query.order_by(Client_Master.created_at.desc())
-        
+
+        # ✅ ALL users only see renewals assigned to them (including Platform Admin)
+        query = query.filter(
+            Opportunity_Details.opportunity_owner_employee_id == user.employee_id
+        )
+
         results = query.all()
         
         # Build response
