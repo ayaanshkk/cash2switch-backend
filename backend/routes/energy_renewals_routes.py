@@ -29,7 +29,7 @@ def get_renewals():
         
         # ✅ Add employee filter if provided
         employee_id = request.args.get('employee_id')
-        employee_filter = "AND ecm.employee_id = :employee_id" if employee_id else ""
+        employee_filter = "AND od.opportunity_owner_employee_id = :employee_id" if employee_id else ""
         
         # Query using your actual schema structure with proper joins
         query = text(f"""
@@ -45,10 +45,10 @@ def get_renewals():
                 (ecm.contract_end_date - CURRENT_DATE) as days_until_expiry,
                 COALESCE(
                     (SELECT ci.notes 
-                     FROM "StreemLyne_MT"."Client_Interactions" ci 
-                     WHERE ci.client_id = cm.client_id 
-                     ORDER BY ci.contact_date DESC 
-                     LIMIT 1),
+                    FROM "StreemLyne_MT"."Client_Interactions" ci 
+                    WHERE ci.client_id = cm.client_id 
+                    ORDER BY ci.contact_date DESC 
+                    LIMIT 1),
                     'Pending'
                 ) as status,
                 em.employee_name as assigned_to_name,
@@ -57,8 +57,9 @@ def get_renewals():
             FROM "StreemLyne_MT"."Client_Master" cm
             INNER JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
             INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
+            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od ON cm.client_id = od.client_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
-            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON ecm.employee_id = em.employee_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
             WHERE ecm.contract_end_date IS NOT NULL
             AND ecm.contract_end_date BETWEEN :today AND :ninety_days_later
             AND cm.tenant_id = :tenant_id
@@ -122,7 +123,7 @@ def get_renewal_stats():
         
         # ✅ Add employee filter if provided
         employee_id = request.args.get('employee_id')
-        employee_filter = "AND ecm.employee_id = :employee_id" if employee_id else ""
+        employee_filter = "AND od.opportunity_owner_employee_id = :employee_id" if employee_id else ""
         
         # Renewals in different time periods with revenue calculations
         stats_query = text(f"""
@@ -139,6 +140,7 @@ def get_renewal_stats():
             FROM "StreemLyne_MT"."Energy_Contract_Master" ecm
             INNER JOIN "StreemLyne_MT"."Project_Details" pd ON ecm.project_id = pd.project_id
             INNER JOIN "StreemLyne_MT"."Client_Master" cm ON pd.client_id = cm.client_id
+            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od ON cm.client_id = od.client_id
             WHERE ecm.contract_end_date IS NOT NULL
             AND ecm.contract_end_date >= CURRENT_DATE
             AND cm.tenant_id = :tenant_id
@@ -162,6 +164,7 @@ def get_renewal_stats():
             FROM "StreemLyne_MT"."Client_Master" cm
             INNER JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
             INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
+            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od ON cm.client_id = od.client_id
             LEFT JOIN LATERAL (
                 SELECT contact_date, notes
                 FROM "StreemLyne_MT"."Client_Interactions" ci
@@ -216,7 +219,7 @@ def get_supplier_breakdown():
         
         # ✅ Add employee filter if provided
         employee_id = request.args.get('employee_id')
-        employee_filter = "AND ecm.employee_id = :employee_id" if employee_id else ""
+        employee_filter = "AND od.opportunity_owner_employee_id = :employee_id" if employee_id else ""
         
         query = text(f"""
             SELECT 
@@ -226,6 +229,7 @@ def get_supplier_breakdown():
             FROM "StreemLyne_MT"."Energy_Contract_Master" ecm
             INNER JOIN "StreemLyne_MT"."Project_Details" pd ON ecm.project_id = pd.project_id
             INNER JOIN "StreemLyne_MT"."Client_Master" cm ON pd.client_id = cm.client_id
+            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od ON cm.client_id = od.client_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
             WHERE ecm.contract_end_date IS NOT NULL
             AND ecm.contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days'
