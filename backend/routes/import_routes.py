@@ -3,21 +3,24 @@ Bulk Import Route for Energy Customers
 Handles Excel/CSV uploads and bulk insertion into database
 """
 
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify, current_app, send_file
 from werkzeug.utils import secure_filename
 import pandas as pd
 import os
 from datetime import datetime
-from sqlalchemy import and_, or_  # Add missing imports
+from sqlalchemy import and_, or_, text
+from flask_jwt_extended import jwt_required, get_jwt_identity
+import logging
+import tempfile
+
 from ..models import (
     Client_Master, Project_Details, Energy_Contract_Master,
     Opportunity_Details, Supplier_Master, Employee_Master, Services_Master
 )
 from .auth_helpers import token_required
 from ..db import SessionLocal
-import tempfile
 
-
+logger = logging.getLogger(__name__)
 import_bp = Blueprint('import', __name__)
 
 ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'csv'}
@@ -152,7 +155,7 @@ def get_or_create_service(tenant_id, session):
         return 1  # Fallback to ID 1
 
 def parse_date(date_value):
-    """Parse date from various formats"""
+    """Parse date from various formats - prioritize DD/MM/YYYY (UK format)"""
     if pd.isna(date_value) or not date_value:
         return None
     
@@ -161,16 +164,16 @@ def parse_date(date_value):
     
     date_str = str(date_value).strip()
     
-    # Try common date formats
+    # ✅ UPDATED: Prioritize UK date formats (DD/MM/YYYY)
     date_formats = [
-        '%Y-%m-%d',
-        '%d/%m/%Y',
-        '%d-%m-%Y',
-        '%m/%d/%Y',
+        '%d/%m/%Y',      
+        '%d-%m-%Y',      
+        '%d.%m.%Y',      
+        '%d %b %Y',      
+        '%d %B %Y',      
+        '%Y-%m-%d',      
+        '%m/%d/%Y',      
         '%Y/%m/%d',
-        '%d.%m.%Y',
-        '%d %b %Y',
-        '%d %B %Y',
     ]
     
     for fmt in date_formats:
@@ -198,7 +201,7 @@ def parse_number(value):
 @token_required
 def import_energy_customers():
     """
-    Bulk import energy customers from Excel/CSV file
+    Bulk import energy customers from Excel/CSV file with optional assignment
     
     Expected columns (case-insensitive):
     - Business Name (required)
@@ -238,14 +241,48 @@ def import_energy_customers():
         
         employee_id = request.current_user.employee_id
 
+        # ✅ GET ASSIGNED EMPLOYEE ID FROM FORM DATA
+        assigned_employee_id = request.form.get('assigned_employee_id', type=int)
+        
+        # ✅ If assignment provided, use that; otherwise use uploader's ID
+        opportunity_owner_id = assigned_employee_id if assigned_employee_id else employee_id
+        
+        # ✅ Get employee name for success message
+        assigned_employee_name = None
+        if assigned_employee_id:
+            assigned_employee = session.query(Employee_Master).filter_by(
+                employee_id=assigned_employee_id,
+                tenant_id=tenant_id
+            ).first()
+            if assigned_employee:
+                assigned_employee_name = assigned_employee.employee_name
+            else:
+                return jsonify({'error': f'Invalid employee ID: {assigned_employee_id}'}), 400
+
+        # ✅ LOGGING
+        print(f"\n{'='*60}")
+        print(f"📥 BULK IMPORT STARTED")
+        print(f"{'='*60}")
+        print(f"   Tenant ID: {tenant_id}")
+        print(f"   Uploaded by: Employee ID {employee_id}")
+        print(f"   Assigned to: {assigned_employee_name or 'Uploader'} (ID: {opportunity_owner_id})")
+        print(f"{'='*60}\n")
+
         # Service filter: electricity=1, water=2 (for Energy_Contract_Master and tab separation)
-        service_param = request.args.get('service')
-        import_service_id = None
-        if service_param and isinstance(service_param, str):
-            svc = service_param.strip().lower()
-            import_service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
-        if import_service_id is None:
-            import_service_id = get_or_create_service(tenant_id, session)
+        service_param = request.args.get('service', 'utilities')  # Default to 'utilities'
+        current_app.logger.info(f"📥 IMPORT SERVICE PARAMETER: {service_param}")
+
+        # Map service name to service_id
+        service_id_map = {
+            'utilities': 1,
+            'electricity': 1, 
+            'water': 2,
+            'gas': 3
+        }
+
+        import_service_id = service_id_map.get(service_param.strip().lower(), 1)  # Default to 1
+
+        current_app.logger.info(f"🔧 MAPPED SERVICE_ID: {import_service_id} (from '{service_param}')")
         
         # Read file based on extension
         filename = secure_filename(file.filename)
@@ -333,7 +370,10 @@ def import_energy_customers():
             'ac_number': ['ac number', 'account number'],
             'sort_code': ['sort code'],
             'charity_ltd_company_number': ['charity/ltd company number', 'charity number'],
-            'partner_details': ['partner details', 'partner']
+            'partner_details': ['partner details', 'partner'],
+            'house_name': ['house name'],
+            'house_number': ['house number', 'house no'],
+            'door_number': ['door number', 'door no']
         }
         
         # Find actual column names (columns already normalized to lowercase with spaces)
@@ -347,28 +387,27 @@ def import_energy_customers():
         current_app.logger.info(f"🗺️ Mapped columns: {actual_columns}")
         
         # Validate required fields - check if EITHER old format OR new format exists
-        has_business_name = 'client_name' in actual_columns or 'business_name' in actual_columns
-        has_phone = 'tel_no' in actual_columns or 'phone' in actual_columns
+        has_client_or_trading = 'client_name' in actual_columns or 'trading_name' in actual_columns
+        has_phone = 'tel_no' in actual_columns or 'mobile_no' in actual_columns
 
-        # ✅ ADD DETAILED LOGGING
-        current_app.logger.error(f"🔍 VALIDATION DEBUG:")
-        current_app.logger.error(f"   actual_columns keys: {list(actual_columns.keys())}")
-        current_app.logger.error(f"   has_business_name: {has_business_name}")
-        current_app.logger.error(f"   has_phone: {has_phone}")
-        current_app.logger.error(f"   DataFrame columns: {list(df.columns)}")
+        current_app.logger.info(f"🔍 VALIDATION CHECK:")
+        current_app.logger.info(f"   actual_columns keys: {list(actual_columns.keys())}")
+        current_app.logger.info(f"   has_client_or_trading: {has_client_or_trading}")
+        current_app.logger.info(f"   has_phone: {has_phone}")
+        current_app.logger.info(f"   DataFrame columns: {list(df.columns)}")
 
-        if not has_business_name:
+        if not has_client_or_trading:
             return jsonify({
-                'error': 'Missing required column: Client Name (or Business Name)',
-                'expected_columns': list(column_map.keys()),
+                'error': 'Missing required column: Client Name or Trading Name is required',
+                'expected_columns': ['client name', 'trading name'],
                 'found_columns': list(df.columns),
                 'actual_columns_mapped': actual_columns 
             }), 400
 
         if not has_phone:
             return jsonify({
-                'error': 'Missing required column: Tel No (or Phone)',
-                'expected_columns': list(column_map.keys()),
+                'error': 'Missing required column: Tel No or Mobile No is required',
+                'expected_columns': ['tel no', 'mobile no'],
                 'found_columns': list(df.columns),
                 'actual_columns_mapped': actual_columns 
             }), 400
@@ -423,9 +462,33 @@ def import_energy_customers():
                 stand_charge = parse_number(row.get(actual_columns.get('stand_charge', '')))
                 rate_1 = parse_number(row.get(actual_columns.get('rate_1', '')))
 
+                old_supplier_name = safe_str(row.get(actual_columns.get('old_supplier', ''), ''))
+                net_notch = parse_number(row.get(actual_columns.get('net_notch', '')))
+                rate_2 = parse_number(row.get(actual_columns.get('rate_2', '')))
+                rate_3 = parse_number(row.get(actual_columns.get('rate_3', '')))
+                comms_paid = parse_number(row.get(actual_columns.get('comms_paid', '')))
+                company_number = safe_str(row.get(actual_columns.get('company_number', ''), ''))
+                date_of_birth = parse_date(row.get(actual_columns.get('date_of_birth', '')))
+                charity_ltd_company_number = safe_str(row.get(actual_columns.get('charity_ltd_company_number', ''), ''))
+                month_sold = safe_str(row.get(actual_columns.get('month_sold', ''), ''))
+                house_name = safe_str(row.get(actual_columns.get('house_name', ''), ''))
+                house_number = safe_str(row.get(actual_columns.get('house_number', ''), ''))
+                door_number = safe_str(row.get(actual_columns.get('door_number', ''), ''))
+                term_sold = parse_number(row.get(actual_columns.get('in_contract', '')))  # "In Contract" column
+                aggregator = safe_str(row.get(actual_columns.get('aggregator', ''), ''))
+                partner_details = safe_str(row.get(actual_columns.get('partner_details', ''), ''))
+
+                # ✅ Bank details 
+                bank_name = safe_str(row.get(actual_columns.get('bank_name', ''), ''))
+                account_number = safe_str(row.get(actual_columns.get('ac_number', ''), ''))
+                sort_code = safe_str(row.get(actual_columns.get('sort_code', ''), ''))
+
+                # Find old supplier ID
+                old_supplier_id = get_or_create_supplier(old_supplier_name, session) if old_supplier_name else None
+
                 # Use Client Name as business name, Trading Name as fallback
-                business_name = client_name or trading_name
-                contact_person = main_contact or business_name
+                business_name = trading_name or client_name
+                contact_person = main_contact or client_name 
 
                 # Use Tel No as primary, Mobile No as fallback
                 phone = tel_no or mobile_no
@@ -496,7 +559,14 @@ def import_energy_customers():
                             updated_at=datetime.utcnow(),
                             address=site_address or address or '',
                             Misc_Col1=None,
-                            Misc_Col2=int(annual_usage) if annual_usage else None
+                            Misc_Col2=int(annual_usage) if annual_usage else None,
+                            site_name=site_name or None,
+                            month_sold=month_sold or None,
+                            house_name=house_name or None,
+                            house_number=house_number or None,
+                            door_number=door_number or None,  
+                            town=town or None,
+                            county=county or None,
                         )
                         session.add(project)
                         session.flush()
@@ -520,7 +590,7 @@ def import_energy_customers():
                             opportunity_title=f"Opportunity - {business_name}",
                             opportunity_description='Imported from bulk upload',
                             opportunity_date=datetime.utcnow().date(),
-                            opportunity_owner_employee_id=employee_id,
+                            opportunity_owner_employee_id=opportunity_owner_id,
                             stage_id=1,
                             opportunity_value=0,
                             currency_id=1,
@@ -529,6 +599,11 @@ def import_energy_customers():
                         )
                         session.add(opportunity)
                         session.flush()
+                    else:
+                        if assigned_employee_id:
+                            opportunity.opportunity_owner_employee_id = opportunity_owner_id
+                            current_app.logger.info(f"   🔄 Reassigned to {assigned_employee_name}")
+                    
                     
                     # Update project with opportunity_id if needed
                     if project and not project.opportunity_id:
@@ -593,7 +668,15 @@ def import_energy_customers():
                     client_email=email or '',
                     client_website='',
                     default_currency_id=1,  # Default GBP (currency_id from Currency_Master)
-                    created_at=datetime.utcnow()
+                    created_at=datetime.utcnow(),
+                    position=position or None,
+                    company_number=company_number or None,
+                    date_of_birth=date_of_birth,
+                    charity_ltd_company_number=charity_ltd_company_number or None,
+                    partner_details=partner_details or None,
+                    bank_name=bank_name or None,
+                    account_number=account_number or None,
+                    sort_code=sort_code or None,
                 )
                 session.add(new_client)
                 session.flush()
@@ -606,7 +689,7 @@ def import_energy_customers():
                     opportunity_title=f"Opportunity - {business_name}",
                     opportunity_description='Imported from bulk upload',
                     opportunity_date=datetime.utcnow().date(),
-                    opportunity_owner_employee_id=employee_id,
+                    opportunity_owner_employee_id=opportunity_owner_id,
                     stage_id=1,  # Default to first stage (from Stage_Master)
                     opportunity_value=0,  # smallint - can be updated later
                     currency_id=1,  # Default GBP
@@ -632,7 +715,11 @@ def import_energy_customers():
                         updated_at=datetime.utcnow(),
                         address=site_address or address or '',
                         Misc_Col1=None,  # Available for custom use
-                        Misc_Col2=int(annual_usage) if annual_usage else None  # Annual Usage in kWh
+                        Misc_Col2=int(annual_usage) if annual_usage else None,
+                        site_name=site_name or None,
+                        month_sold=month_sold or None,
+                        house_name=house_name or None,
+                        house_number=house_number or None
                     )
                     session.add(project)
                     session.flush()
@@ -653,12 +740,21 @@ def import_energy_customers():
                         contract_end_date=end_date,
                         terms_of_sale='',
                         service_id=import_service_id,
-                        unit_rate=0.0,  # Default unit rate - required field (real type needs float)
+                        unit_rate=rate_1 or 0.0,  # Default unit rate - required field (real type needs float)
                         currency_id=1,  # Default GBP
                         document_details=None,
                         created_at=datetime.utcnow(),
                         updated_at=datetime.utcnow(),
-                        mpan_number=mpan_mpr or ''
+                        mpan_number=mpan_mpr or '',
+                        old_supplier_id=old_supplier_id,
+                        net_notch=net_notch,
+                        term_sold=term_sold,
+                        rate_2=rate_2,
+                        rate_3=rate_3,
+                        comms_paid=comms_paid,
+                        standing_charge=stand_charge,
+                        aggregator=aggregator or None,
+                        rate_1=rate_1,  
                     )
                     session.add(contract)
                     session.flush()
@@ -688,7 +784,9 @@ def import_energy_customers():
             'total_rows': len(df),
             'successful': success_count,
             'failed': error_count,
-            'errors': errors[:50]  # Return first 50 errors
+            'errors': errors[:50],
+            'assigned_to': assigned_employee_name,
+            'assigned_employee_id': assigned_employee_id
         }), 200
         
     except Exception as e:
@@ -810,3 +908,63 @@ def download_template():
     except Exception as e:
         current_app.logger.exception(f"❌ Template download failed: {e}")
         return jsonify({'error': 'Failed to generate template'}), 500
+
+@import_bp.route('/energy-clients/reset-sequence', methods=['POST'])
+@jwt_required()
+def reset_energy_client_sequence():
+    """Reset the client_id sequence after deleting all customers"""
+    current_user = get_jwt_identity()
+    tenant_id = current_user.get('tenant_id')
+    
+    session = SessionLocal()  # ✅ Use SessionLocal instead of db.session
+    
+    try:
+        # Reset Client_Master sequence
+        session.execute(text("""
+            SELECT setval(
+                pg_get_serial_sequence('"StreemLyne_MT"."Client_Master"', 'client_id'),
+                COALESCE((SELECT MAX(client_id) FROM "StreemLyne_MT"."Client_Master" WHERE tenant_id = :tenant_id), 0),
+                true
+            )
+        """), {'tenant_id': tenant_id})
+        
+        # Reset Project_Details sequence
+        session.execute(text("""
+            SELECT setval(
+                pg_get_serial_sequence('"StreemLyne_MT"."Project_Details"', 'project_id'),
+                COALESCE((SELECT MAX(project_id) FROM "StreemLyne_MT"."Project_Details"), 0),
+                true
+            )
+        """))
+        
+        # Reset Energy_Contract_Master sequence  
+        session.execute(text("""
+            SELECT setval(
+                pg_get_serial_sequence('"StreemLyne_MT"."Energy_Contract_Master"', 'ecm_id'),
+                COALESCE((SELECT MAX(ecm_id) FROM "StreemLyne_MT"."Energy_Contract_Master"), 0),
+                true
+            )
+        """))
+        
+        # Reset Opportunity_Details sequence
+        session.execute(text("""
+            SELECT setval(
+                pg_get_serial_sequence('"StreemLyne_MT"."Opportunity_Details"', 'opportunity_id'),
+                COALESCE((SELECT MAX(opportunity_id) FROM "StreemLyne_MT"."Opportunity_Details"), 0),
+                true
+            )
+        """))
+        
+        session.commit()  # ✅ Changed from db.session.commit()
+        
+        return jsonify({
+            'message': 'All sequences reset successfully',
+            'success': True
+        }), 200
+        
+    except Exception as e:
+        session.rollback()  # ✅ Changed from db.session.rollback()
+        logger.error(f"Error resetting sequences: {str(e)}")
+        return jsonify({'error': 'Failed to reset sequences'}), 500
+    finally:
+        session.close()  # ✅ Always close the session

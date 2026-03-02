@@ -60,7 +60,7 @@ def get_tenant_id_from_user(user):
         session.close()
 
 
-def build_customer_response(client, project=None, contract=None, opportunity=None, interaction=None, supplier=None, employee=None):
+def build_customer_response(client, project=None, contract=None, opportunity=None, interaction=None, supplier=None, employee=None, old_supplier=None):
     """Build unified customer response from multiple tables"""
     response = {
         # From Client_Master
@@ -76,11 +76,32 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'website': client.client_website or '',
         'created_at': client.created_at.isoformat() if client.created_at else None,
         
+        # ✅ NEW: Client_Master fields
+        'position': getattr(client, 'position', None),
+        'company_number': getattr(client, 'company_number', None),
+        'date_of_birth': client.date_of_birth.isoformat() if hasattr(client, 'date_of_birth') and client.date_of_birth else None,
+        'charity_ltd_company_number': getattr(client, 'charity_ltd_company_number', None),
+        'partner_details': getattr(client, 'partner_details', None),
+        'home_door_number': getattr(client, 'home_door_number', None),
+        'home_street': getattr(client, 'home_street', None),
+        'home_post_code': getattr(client, 'home_post_code', None),
+        
         # From Project_Details (Site address & Annual Usage)
         'project_id': project.project_id if project else None,
         'site_address': project.address if project else client.address,
         'annual_usage': project.Misc_Col2 if project else None,
         'project_title': project.project_title if project else None,
+        
+        # ✅ NEW: Project_Details fields
+        'site_name': getattr(project, 'site_name', None) if project else None,
+        'month_sold': getattr(project, 'month_sold', None) if project else None,
+        'house_name': getattr(project, 'house_name', None) if project else None,
+        'house_number': getattr(project, 'house_number', None) if project else None,
+
+        # ✅ ADD BANK DETAILS from Client_Master:
+        'bank_name': getattr(client, 'bank_name', None),
+        'account_number': getattr(client, 'account_number', None),
+        'sort_code': getattr(client, 'sort_code', None),
         
         # From Energy_Contract_Master
         'contract_id': contract.energy_contract_master_id if contract else None,
@@ -89,12 +110,28 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'end_date': contract.contract_end_date.isoformat() if contract and contract.contract_end_date else None,
         'unit_rate': float(contract.unit_rate) if contract and contract.unit_rate else None,
         'terms_of_sale': contract.terms_of_sale if contract else None,
+
+        # ✅ ADD THESE CONTRACT FIELDS:
+        'standing_charge': float(contract.standing_charge) if contract and hasattr(contract, 'standing_charge') and contract.standing_charge else None,
+        'aggregator': getattr(contract, 'aggregator', None) if contract else None,
+        'rate_1': float(contract.rate_1) if contract and hasattr(contract, 'rate_1') and contract.rate_1 else None,
+        
+        # ✅ NEW: Energy_Contract_Master fields
+        'net_notch': float(contract.net_notch) if contract and hasattr(contract, 'net_notch') and contract.net_notch else None,
+        'term_sold': getattr(contract, 'term_sold', None) if contract else None,
+        'rate_2': float(contract.rate_2) if contract and hasattr(contract, 'rate_2') and contract.rate_2 else None,
+        'rate_3': float(contract.rate_3) if contract and hasattr(contract, 'rate_3') and contract.rate_3 else None,
+        'comms_paid': float(contract.comms_paid) if contract and hasattr(contract, 'comms_paid') and contract.comms_paid else None,
         
         # From Supplier_Master (via Energy_Contract_Master)
         'supplier_id': supplier.supplier_id if supplier else None,
         'supplier_name': supplier.supplier_company_name if supplier else '',
         'supplier_contact': supplier.supplier_contact_name if supplier else '',
         'supplier_provisions': supplier.supplier_provisions if supplier else None,
+        
+        # ✅ NEW: Old Supplier
+        'old_supplier_id': old_supplier.supplier_id if old_supplier else None,
+        'old_supplier_name': old_supplier.supplier_company_name if old_supplier else '',
         
         # From Opportunity_Details
         'opportunity_id': opportunity.opportunity_id if opportunity else None,
@@ -114,6 +151,7 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
     }
     
     return response
+
 
 def get_user_role_name(user, session):
     """Get the role name for a user from User_Role_Mapping and Role_Master"""
@@ -243,7 +281,6 @@ def get_energy_customers():
             customers.append(customer_data)
         
         current_app.logger.info(f"✅ Returning {len(customers)} renewals for employee_id={user.employee_id}")
-
         
         return jsonify(customers), 200
 
@@ -269,7 +306,7 @@ def get_energy_customer(client_id):
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
         
-        # Query with all joins
+        # Query with all joins + old supplier
         result = session.query(
             Client_Master,
             Project_Details,
@@ -304,21 +341,24 @@ def get_energy_customer(client_id):
         ).first()
         
         if not result:
-            tenant_id = get_tenant_id_from_user(request.current_user)
             return jsonify({'error': 'Customer not found'}), 404
         
         client, project, contract, opportunity, interaction, supplier, employee = result
         
-        # TODO: Permission check for Staff role
+        # ✅ Fetch old supplier if old_supplier_id exists
+        old_supplier = None
+        if contract and hasattr(contract, 'old_supplier_id') and contract.old_supplier_id:
+            old_supplier = session.query(Supplier_Master).filter_by(
+                supplier_id=contract.old_supplier_id
+            ).first()
         
         customer_data = build_customer_response(
-            client, project, contract, opportunity, interaction, supplier, employee
+            client, project, contract, opportunity, interaction, supplier, employee, old_supplier
         )
         
         return jsonify(customer_data), 200
         
     except Exception as e:
-        current_app.logger.exception(f"❌ Error fetching energy customer {client_id}: {e}")
         current_app.logger.exception(f"❌ Error fetching energy customer {client_id}: {e}")
         return jsonify({'error': 'Failed to fetch customer'}), 500
     finally:
@@ -931,5 +971,339 @@ def get_employees():
     except Exception as e:
         current_app.logger.exception(f"❌ Error fetching employees: {e}")
         return jsonify({'error': 'Failed to fetch employees'}), 500
+    finally:
+        session.close()
+
+@energy_customer_bp.route('/energy-clients/reset-sequence', methods=['POST'])
+@token_required
+def reset_client_sequence():
+    """Reset the client_id sequence to start from 1"""
+    session = SessionLocal()
+    
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+        
+        # ✅ FIX: Get user role from User_Role_Mapping
+        user_role = get_user_role_name(request.current_user, session)
+        
+        # Check if user has permission (Platform Admin or Tenant Super Admin)
+        if user_role not in ['Platform Admin', 'Tenant Super Admin']:
+            return jsonify({'error': 'Permission denied'}), 403
+        
+        # Get the maximum client_id for this tenant
+        max_id = session.query(func.max(Client_Master.client_id)).filter(
+            Client_Master.tenant_id == tenant_id
+        ).scalar()
+        
+        # If no clients exist, reset to 1
+        if max_id is None:
+            max_id = 0
+        
+        # Reset the sequence
+        session.execute(text(
+            f'ALTER SEQUENCE "StreemLyne_MT"."Client_Master_client_id_seq" RESTART WITH {max_id + 1}'
+        ))
+        session.commit()
+        
+        return jsonify({
+            'message': 'Sequence reset successfully',
+            'next_id': max_id + 1
+        })
+        
+    except Exception as e:
+        session.rollback()
+        current_app.logger.error(f"Error resetting sequence: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+@energy_customer_bp.route('/energy-clients/bulk-assign', methods=['POST'])
+@token_required
+def bulk_assign_clients():
+    """Bulk assign multiple clients to a salesperson"""
+    session = SessionLocal()
+    
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+        
+        data = request.get_json()
+        client_ids = data.get('client_ids', [])
+        employee_id = data.get('employee_id')
+        
+        if not client_ids or not employee_id:
+            return jsonify({'error': 'client_ids and employee_id are required'}), 400
+        
+        # ✅ FIX: Get user role from User_Role_Mapping
+        user_role = get_user_role_name(request.current_user, session)
+        
+        # Check permissions - only Platform Admin and Tenant Super Admin
+        if user_role not in ['Platform Admin', 'Tenant Super Admin']:
+            return jsonify({'error': 'Only administrators can bulk assign clients'}), 403
+        
+        # Verify employee exists and belongs to tenant
+        employee = session.query(Employee_Master).filter(
+            Employee_Master.employee_id == employee_id,
+            Employee_Master.tenant_id == tenant_id
+        ).first()
+        
+        if not employee:
+            return jsonify({'error': 'Employee not found'}), 404
+        
+        # Update all opportunity details for these clients
+        updated_count = 0
+        for client_id in client_ids:
+            # Update Opportunity_Details
+            opportunities = session.query(Opportunity_Details).filter(
+                Opportunity_Details.client_id == client_id
+            ).all()
+            
+            for opportunity in opportunities:
+                opportunity.opportunity_owner_employee_id = employee_id
+                updated_count += 1
+        
+        session.commit()
+        
+        return jsonify({
+            'message': f'Successfully assigned {len(client_ids)} clients to {employee.employee_name}',
+            'updated_count': updated_count,
+            'employee_name': employee.employee_name
+        })
+        
+    except Exception as e:
+        session.rollback()
+        current_app.logger.error(f"Error bulk assigning clients: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+@energy_customer_bp.route('/energy-clients/search-all', methods=['GET'])
+@token_required
+def search_all_energy_clients():
+    """
+    Search across ALL energy clients regardless of assignment
+    Used by salespeople to help customers assigned to other team members
+    """
+    session = SessionLocal()
+    
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+        
+        # Get search query
+        search_query = request.args.get('q', '').strip()
+        service = request.args.get('service', 'utilities')
+        
+        if not search_query or len(search_query) < 2:
+            return jsonify([])  # Return empty if search too short
+        
+        # Map service to service_id
+        service_id_map = {
+            'utilities': 1,
+            'electricity': 1,
+            'gas': 2,
+            'water': 3
+        }
+        service_id = service_id_map.get(service.lower(), 1)
+        
+        # Build query - search across ALL customers in tenant
+        query = session.query(
+            Client_Master.client_id,
+            Client_Master.client_company_name,
+            Client_Master.client_contact_name,
+            Client_Master.client_phone,
+            Client_Master.client_email,
+            Client_Master.address,
+            Client_Master.post_code,
+            Energy_Contract_Master.mpan_number,
+            Energy_Contract_Master.contract_end_date,
+            Energy_Contract_Master.unit_rate,
+            Supplier_Master.supplier_company_name,
+            Project_Details.Misc_Col2.label('annual_usage'),
+            Project_Details.address.label('site_address'),
+            Opportunity_Details.opportunity_owner_employee_id,
+            Employee_Master.employee_name.label('assigned_to_name'),
+            Opportunity_Details.Misc_Col1.label('status')
+        ).join(
+            Project_Details,
+            Client_Master.client_id == Project_Details.client_id
+        ).join(
+            Energy_Contract_Master,
+            Project_Details.project_id == Energy_Contract_Master.project_id
+        ).outerjoin(
+            Supplier_Master,
+            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
+        ).outerjoin(
+            Opportunity_Details,
+            Client_Master.client_id == Opportunity_Details.client_id
+        ).outerjoin(
+            Employee_Master,
+            Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
+        ).filter(
+            Client_Master.tenant_id == tenant_id,
+            Energy_Contract_Master.service_id == service_id,
+            # Exclude lost and priced
+            or_(
+                Opportunity_Details.Misc_Col1.is_(None),
+                and_(
+                    Opportunity_Details.Misc_Col1.isnot(None),
+                    ~func.lower(Opportunity_Details.Misc_Col1).in_(['lost', 'lost_cot', 'priced'])
+                )
+            ),
+            # Exclude [IMPORTED LEADS]
+            Client_Master.client_company_name != '[IMPORTED LEADS]'
+        )
+        
+        # Apply search filter - search across multiple fields
+        search_term = f"%{search_query.lower()}%"
+        query = query.filter(
+            or_(
+                func.lower(Client_Master.client_company_name).like(search_term),
+                func.lower(Client_Master.client_contact_name).like(search_term),
+                func.lower(Client_Master.client_phone).like(search_term),
+                func.lower(Client_Master.client_email).like(search_term),
+                func.lower(Energy_Contract_Master.mpan_number).like(search_term),
+                func.lower(Supplier_Master.supplier_company_name).like(search_term)
+            )
+        )
+        
+        # Limit results to prevent overwhelming response
+        results = query.limit(50).all()
+        
+        # Format results
+        customers = []
+        for r in results:
+            customers.append({
+                'id': r.client_id,
+                'client_id': r.client_id,
+                'business_name': r.client_company_name,
+                'contact_person': r.client_contact_name,
+                'phone': r.client_phone,
+                'email': r.client_email,
+                'address': r.address,
+                'site_address': r.site_address,
+                'post_code': r.post_code,
+                'mpan_mpr': r.mpan_number,
+                'supplier_name': r.supplier_company_name,
+                'annual_usage': r.annual_usage,
+                'end_date': r.contract_end_date.isoformat() if r.contract_end_date else None,
+                'unit_rate': float(r.unit_rate) if r.unit_rate else None,
+                'assigned_to_id': r.opportunity_owner_employee_id,
+                'assigned_to_name': r.assigned_to_name,
+                'status': r.status,
+                'is_assigned_to_others': True  # Flag to show it's from search
+            })
+        
+        return jsonify(customers)
+        
+    except Exception as e:
+        current_app.logger.error(f"Error searching all clients: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+@energy_customer_bp.route('/energy-clients/priced', methods=['GET', 'OPTIONS'])
+@token_required
+def get_priced_customers():
+    """Get ONLY priced customers"""
+    
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        user = request.current_user
+        
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found for user'}), 400
+
+        service_param = request.args.get('service')
+        _service_id = None
+        if service_param and isinstance(service_param, str):
+            svc = service_param.strip().lower()
+            _service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
+        
+        # Base query with joins
+        query = session.query(
+            Client_Master,
+            Project_Details,
+            Energy_Contract_Master,
+            Opportunity_Details,
+            Client_Interactions,
+            Supplier_Master,
+            Employee_Master,
+            Stage_Master
+        ).outerjoin(
+            Project_Details, 
+            Client_Master.client_id == Project_Details.client_id
+        ).outerjoin(
+            Energy_Contract_Master,
+            Project_Details.project_id == Energy_Contract_Master.project_id
+        ).outerjoin(
+            Opportunity_Details,
+            Client_Master.client_id == Opportunity_Details.client_id
+        ).outerjoin(
+            Client_Interactions,
+            Client_Master.client_id == Client_Interactions.client_id
+        ).outerjoin(
+            Supplier_Master,
+            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
+        ).outerjoin(
+            Employee_Master,
+            Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
+        ).outerjoin(
+            Stage_Master,
+            Opportunity_Details.stage_id == Stage_Master.stage_id
+        ).filter(
+            and_(
+                Client_Master.tenant_id == tenant_id,
+                Client_Master.client_company_name != '[IMPORTED LEADS]',
+                # ✅ ONLY priced status
+                func.lower(Opportunity_Details.Misc_Col1) == 'priced',
+                # Service filter
+                *([Energy_Contract_Master.service_id == _service_id] if _service_id is not None else [])
+            )
+        )
+
+        query = query.order_by(Client_Master.created_at.desc())
+
+        # Filter by assigned employee
+        query = query.filter(
+            Opportunity_Details.opportunity_owner_employee_id == user.employee_id
+        )
+
+        results = query.all()
+        
+        # Build response
+        customers = []
+        seen_clients = set()
+        
+        for client, project, contract, opportunity, interaction, supplier, employee, stage in results:
+            if client.client_id in seen_clients:
+                continue
+            seen_clients.add(client.client_id)
+            
+            customer_data = build_customer_response(
+                client, project, contract, opportunity, interaction, supplier, employee
+            )
+            if opportunity and opportunity.Misc_Col1:
+                customer_data['status'] = opportunity.Misc_Col1
+            
+            customers.append(customer_data)
+        
+        current_app.logger.info(f"✅ Returning {len(customers)} priced leads for employee_id={user.employee_id}")
+        
+        return jsonify(customers), 200
+
+    except Exception as e:
+        current_app.logger.exception(f"❌ Error fetching priced customers: {e}")
+        return jsonify({'error': 'Failed to fetch priced customers'}), 500
     finally:
         session.close()

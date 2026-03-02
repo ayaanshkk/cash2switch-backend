@@ -8,7 +8,7 @@ import secrets
 from datetime import datetime, timedelta
 from sqlalchemy import (
     Column, Integer, SmallInteger, String, Boolean, DateTime, Date, 
-    ForeignKey, Text, Float
+    ForeignKey, Text, Float, Numeric
 )
 from sqlalchemy.orm import relationship
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -197,6 +197,7 @@ class Employee_Master(Base):
 class Client_Master(Base):
     __tablename__ = 'Client_Master'
     __table_args__ = {'schema': SCHEMA}    
+    
     client_id = Column(SmallInteger, primary_key=True, autoincrement=True)
     tenant_id = Column(SmallInteger, nullable=True)
     client_company_name = Column(String(255))
@@ -209,6 +210,14 @@ class Client_Master(Base):
     client_website = Column(String(255))
     default_currency_id = Column(SmallInteger)
     created_at = Column(DateTime)
+    position = Column(String(100))
+    company_number = Column(String(50))
+    date_of_birth = Column(Date)
+    charity_ltd_company_number = Column(String(50))
+    partner_details = Column(Text)
+    bank_name = Column(String(255))
+    account_number = Column(String(50))
+    sort_code = Column(String(20))
 
 
 class Project_Details(Base):
@@ -228,6 +237,13 @@ class Project_Details(Base):
     address = Column(String(500))
     Misc_Col1 = Column(String(255))
     Misc_Col2 = Column(Integer)
+    site_name = Column(String(255))
+    month_sold = Column(String(50))
+    house_name = Column(String(255))
+    house_number = Column(String(20))
+    door_number = Column(String(20))
+    town = Column(String(100))
+    county = Column(String(100))
 
 
 class Energy_Contract_Master(Base):
@@ -248,6 +264,16 @@ class Energy_Contract_Master(Base):
     created_at = Column(DateTime)
     updated_at = Column(DateTime)
     mpan_number = Column(String(100))
+    old_supplier_id = Column(Integer, ForeignKey('StreemLyne_MT.Supplier_Master.supplier_id'))
+    net_notch = Column(Numeric(10, 2))
+    term_sold = Column(Integer)
+    rate_2 = Column(Numeric(10, 4))
+    rate_3 = Column(Numeric(10, 4))
+    comms_paid = Column(Numeric(10, 2))
+    term_sold = Column(Numeric(10, 2))
+    standing_charge = Column(Numeric(10, 2))
+    aggregator = Column(String(255))
+    rate_1 = Column(Numeric(10, 4))
 
 
 class Opportunity_Details(Base):

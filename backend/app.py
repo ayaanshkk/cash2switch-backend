@@ -35,6 +35,8 @@ from backend.db import Base, engine, SessionLocal, test_connection, init_db
 def create_app():
     app = Flask(__name__)
 
+    app.url_map.strict_slashes = False
+
     # ============================================
     # CONFIG
     # ============================================

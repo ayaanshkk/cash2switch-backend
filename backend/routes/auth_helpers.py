@@ -39,7 +39,6 @@ def token_required(f):
                 current_app.logger.info(f"✅ JWT decoded successfully. Payload keys: {list(payload.keys())}")
 
                 # Get user_id from JWT - this is the User_Master.user_id (primary key)
-                # employee_id in JWT is for Employee_Master reference, not for loading UserMaster
                 user_id = payload.get('user_id')
                 if user_id is None:
                     current_app.logger.warning("token missing user_id")
@@ -54,8 +53,12 @@ def token_required(f):
                 if not getattr(user, 'is_active', True):
                     return jsonify({'error': 'User not active'}), 401
 
-                # Attach tenant_id from JWT to user object (single source of truth)
+                # ✅ Attach tenant_id AND employee_id from JWT to user object
                 user.tenant_id = payload.get('tenant_id')
+                user.employee_id = payload.get('employee_id')  # ✅ ADD THIS LINE
+
+                # ✅ DEBUG: Log what we're attaching
+                current_app.logger.info(f"👤 User authenticated: user_id={user.user_id}, employee_id={user.employee_id}, tenant_id={user.tenant_id}")
 
                 # Attach user to request and g (for compatibility with both patterns)
                 g.user = user
@@ -73,7 +76,7 @@ def token_required(f):
             return f(*args, **kwargs)
         finally:
             local_session.close()
-    
+
     return decorated
 
 def get_tenant_id_from_user(user):
