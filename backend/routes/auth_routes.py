@@ -1001,7 +1001,7 @@ def validate_invitation():
 
 @auth_bp.route('/change-password', methods=['POST'])
 def change_password():
-    """Change user password"""
+    """Change user password by username (plain text storage per StreemLyne spec)"""
     session = SessionLocal()
     
     try:
@@ -1015,17 +1015,36 @@ def change_password():
         if len(new_password) < 6:
             return jsonify({'error': 'Password must be at least 6 characters long'}), 400
         
-        # Find user
-        user = session.query(User_Credentials).filter_by(username=username).first()
+        # ✅ Query User_Master table (not User_Credentials)
+        sql = text('''
+            SELECT user_id, user_name 
+            FROM "StreemLyne_MT"."User_Master" 
+            WHERE user_name = :username 
+            LIMIT 1
+        ''')
         
-        if not user:
+        row = session.execute(sql, {'username': username}).mappings().first()
+        
+        if not row:
             return jsonify({'error': 'User not found'}), 404
         
-        # Update password
-        user.password_hash = generate_password_hash(new_password)
+        user_id = row.get('user_id')
+        
+        # ✅ Update password (plain text as per StreemLyne spec)
+        update_sql = text('''
+            UPDATE "StreemLyne_MT"."User_Master"
+            SET password = :password
+            WHERE user_id = :user_id
+        ''')
+        
+        session.execute(update_sql, {
+            'password': new_password,
+            'user_id': user_id
+        })
+        
         session.commit()
         
-        logger.info(f"Password changed successfully for user: {username}")
+        current_app.logger.info(f"✅ Password changed successfully for user: {username}")
         
         return jsonify({
             'message': 'Password changed successfully',
@@ -1034,7 +1053,7 @@ def change_password():
         
     except Exception as e:
         session.rollback()
-        logger.error(f"Error changing password: {str(e)}")
+        current_app.logger.error(f"❌ Error changing password: {str(e)}")
         return jsonify({'error': 'Failed to change password'}), 500
         
     finally:
