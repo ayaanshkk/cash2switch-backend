@@ -64,8 +64,8 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
     """Build unified customer response from multiple tables"""
     response = {
         # From Client_Master
-        'id': client.client_id,
-        'client_id': client.client_id,
+        'id': client.tenant_client_id,
+        'client_id': client.tenant_client_id,
         'name': client.client_contact_name or '',
         'business_name': client.client_company_name or '',
         'contact_person': client.client_contact_name or '',
@@ -267,9 +267,9 @@ def get_energy_customers():
         seen_clients = set()
         
         for client, project, contract, opportunity, interaction, supplier, employee, stage in results:
-            if client.client_id in seen_clients:
+            if client.tenant_client_id in seen_clients:
                 continue
-            seen_clients.add(client.client_id)
+            seen_clients.add(client.tenant_client_id)
             
             customer_data = build_customer_response(
                 client, project, contract, opportunity, interaction, supplier, employee
@@ -417,7 +417,7 @@ def create_energy_customer():
         session.add(new_client)
         session.flush()  # Get client_id
         
-        client_id = new_client.client_id
+        client_id = new_client.tenant_client_id
         current_app.logger.info(f"✅ Created Client_Master: {client_id}")
         
         # 2. Create Project_Details (Site Address)
@@ -1286,9 +1286,9 @@ def get_priced_customers():
         seen_clients = set()
         
         for client, project, contract, opportunity, interaction, supplier, employee, stage in results:
-            if client.client_id in seen_clients:
+            if client.tenant_client_id in seen_clients:
                 continue
-            seen_clients.add(client.client_id)
+            seen_clients.add(client.tenant_client_id)
             
             customer_data = build_customer_response(
                 client, project, contract, opportunity, interaction, supplier, employee

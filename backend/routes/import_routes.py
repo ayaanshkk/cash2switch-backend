@@ -530,7 +530,7 @@ def import_energy_customers():
                 ).first()
                 
                 if existing_client:
-                    current_app.logger.info(f"📝 Duplicate found: Updating client {existing_client.client_id}")
+                    current_app.logger.info(f"📝 Duplicate found: Updating client {existing_client.tenant_client_id}")
                     
                     # Update only empty/missing fields in Client_Master
                     if email and not existing_client.client_email:
@@ -542,7 +542,7 @@ def import_energy_customers():
                     if contact_person and not existing_client.client_contact_name:
                         existing_client.client_contact_name = contact_person
                     
-                    client_id = existing_client.client_id
+                    client_id = existing_client.tenant_client_id
                     
                     # Update or create Project_Details
                     project = session.query(Project_Details).filter_by(client_id=client_id).first()
@@ -681,7 +681,7 @@ def import_energy_customers():
                 session.add(new_client)
                 session.flush()
                 
-                client_id = new_client.client_id
+                client_id = new_client.tenant_client_id
                 
                 # 2. Create Opportunity_Details FIRST (so we have opportunity_id for Project)
                 opportunity = Opportunity_Details(
