@@ -542,7 +542,7 @@ def import_energy_customers():
                     if contact_person and not existing_client.client_contact_name:
                         existing_client.client_contact_name = contact_person
                     
-                    client_id = existing_client.tenant_client_id
+                    client_id = existing_client.client_id
                     
                     # Update or create Project_Details
                     project = session.query(Project_Details).filter_by(client_id=client_id).first()
