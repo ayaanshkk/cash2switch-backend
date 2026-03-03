@@ -681,7 +681,7 @@ def import_energy_customers():
                 session.add(new_client)
                 session.flush()
                 
-                client_id = new_client.tenant_client_id
+                client_id = new_client.client_id
                 
                 # 2. Create Opportunity_Details FIRST (so we have opportunity_id for Project)
                 opportunity = Opportunity_Details(

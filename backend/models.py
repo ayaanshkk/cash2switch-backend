@@ -199,6 +199,7 @@ class Client_Master(Base):
     __table_args__ = {'schema': SCHEMA}    
     
     client_id = Column(SmallInteger, primary_key=True, autoincrement=True)
+    tenant_client_id = Column(SmallInteger, nullable=True)
     tenant_id = Column(SmallInteger, nullable=True)
     client_company_name = Column(String(255))
     client_contact_name = Column(String(255))
@@ -281,6 +282,7 @@ class Opportunity_Details(Base):
     __table_args__ = {'schema': SCHEMA}
     
     opportunity_id = Column(SmallInteger, primary_key=True, autoincrement=True)
+    tenant_opportunity_id = Column(SmallInteger, nullable=True)
     client_id = Column(SmallInteger, nullable=True)
     opportunity_title = Column(String(255))
     opportunity_description = Column(Text)
