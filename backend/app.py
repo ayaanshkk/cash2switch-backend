@@ -149,7 +149,7 @@ def create_app():
         import_routes, energy_renewals_routes,
     )
 
-    app.register_blueprint(auth_routes.auth_bp)
+    app.register_blueprint(auth_routes.auth_bp, url_prefix='/auth')
     app.register_blueprint(customer_routes.energy_customer_bp)
     app.register_blueprint(import_routes.import_bp, url_prefix='/import')
     app.register_blueprint(energy_renewals_routes.renewals_bp)
