@@ -684,44 +684,6 @@ def reset_password():
     finally:
         session.close()
 
-@auth_bp.route('/auth/change-password', methods=['POST'])
-@token_required
-def change_password():
-    """Change password for authenticated user"""
-    session = SessionLocal()
-    try:
-        data = request.get_json()
-        
-        required_fields = ['current_password', 'new_password']
-        for field in required_fields:
-            if not data.get(field):
-                return jsonify({'error': f'{field} is required'}), 400
-        
-        current_password = data['current_password']
-        new_password = data['new_password']
-        user = session.merge(g.user)
-        
-        if not user.check_password(current_password):
-            return jsonify({'error': 'Current password is incorrect'}), 400
-        
-        is_valid, message = validate_password(new_password)
-        if not is_valid:
-            return jsonify({'error': message}), 400
-        
-        user.set_password(new_password)
-        user.updated_at = datetime.utcnow()
-        
-        session.commit()
-        
-        return jsonify({'message': 'Password changed successfully'}), 200
-        
-    except Exception as e:
-        session.rollback()
-        current_app.logger.exception(f"Error changing password: {e}")
-        return jsonify({'error': str(e)}), 500
-    finally:
-        session.close()
-
 @auth_bp.route('/auth/users', methods=['GET'])
 @admin_required
 def get_users():
