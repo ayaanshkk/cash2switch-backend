@@ -1036,3 +1036,44 @@ def validate_invitation():
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
+
+@auth_bp.route('/change-password', methods=['POST'])
+def change_password():
+    """Change user password"""
+    session = SessionLocal()
+    
+    try:
+        data = request.get_json()
+        username = data.get('username')
+        new_password = data.get('new_password')
+        
+        if not username or not new_password:
+            return jsonify({'error': 'Username and new password are required'}), 400
+        
+        if len(new_password) < 6:
+            return jsonify({'error': 'Password must be at least 6 characters long'}), 400
+        
+        # Find user
+        user = session.query(User_Credentials).filter_by(username=username).first()
+        
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+        
+        # Update password
+        user.password_hash = generate_password_hash(new_password)
+        session.commit()
+        
+        logger.info(f"Password changed successfully for user: {username}")
+        
+        return jsonify({
+            'message': 'Password changed successfully',
+            'username': username
+        }), 200
+        
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error changing password: {str(e)}")
+        return jsonify({'error': 'Failed to change password'}), 500
+        
+    finally:
+        session.close()
