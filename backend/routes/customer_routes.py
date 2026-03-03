@@ -65,7 +65,8 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
     response = {
         # From Client_Master
         'id': client.tenant_client_id,
-        'client_id': client.tenant_client_id,
+        'client_id': client.client_id,
+        'tenant_client_id': client.tenant_client_id,
         'name': client.client_contact_name or '',
         'business_name': client.client_company_name or '',
         'contact_person': client.client_contact_name or '',
