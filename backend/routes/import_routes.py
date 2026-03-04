@@ -485,8 +485,110 @@ def import_energy_customers():
                         
                         client_id = existing_client.client_id
                         
-                        # Continue with project/opportunity/contract logic...
-                        # (Keep your existing logic for updates)
+                    # Update or create Project_Details
+                    project = session.query(Project_Details).filter_by(client_id=client_id).first()
+                    if not project and (site_address or annual_usage or mpan_mpr or start_date or end_date):
+                        project = Project_Details(
+                            client_id=client_id,
+                            opportunity_id=None,  # Will be set later
+                            project_title=f"Site - {business_name}",
+                            project_description='Imported site location',
+                            start_date=start_date,
+                            end_date=end_date,
+                            employee_id=employee_id,
+                            created_at=datetime.utcnow(),
+                            updated_at=datetime.utcnow(),
+                            address=site_address or address or '',
+                            Misc_Col1=None,
+                            Misc_Col2=int(annual_usage) if annual_usage else None,
+                            site_name=site_name or None,
+                            month_sold=month_sold or None,
+                            house_name=house_name or None,
+                            house_number=house_number or None,
+                            door_number=door_number or None,  
+                            town=town or None,
+                            county=county or None,
+                        )
+                        session.add(project)
+                        session.flush()
+                    elif project:
+                        # Update empty fields in existing project
+                        if site_address and not project.address:
+                            project.address = site_address
+                        if annual_usage and not project.Misc_Col2:
+                            project.Misc_Col2 = int(annual_usage)
+                        if start_date and not project.start_date:
+                            project.start_date = start_date
+                        if end_date and not project.end_date:
+                            project.end_date = end_date
+                        project.updated_at = datetime.utcnow()
+                    
+                    # Get or create Opportunity_Details
+                    opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
+                    if not opportunity:
+                        opportunity = Opportunity_Details(
+                            client_id=client_id,
+                            opportunity_title=f"Opportunity - {business_name}",
+                            opportunity_description='Imported from bulk upload',
+                            opportunity_date=datetime.utcnow().date(),
+                            opportunity_owner_employee_id=opportunity_owner_id,
+                            stage_id=1,
+                            opportunity_value=0,
+                            currency_id=1,
+                            created_at=datetime.utcnow(),
+                            Misc_Col1=None
+                        )
+                        session.add(opportunity)
+                        session.flush()
+                    else:
+                        if assigned_employee_id:
+                            opportunity.opportunity_owner_employee_id = opportunity_owner_id
+                            current_app.logger.info(f"   🔄 Reassigned to {assigned_employee_name}")
+                    
+                    
+                    # Update project with opportunity_id if needed
+                    if project and not project.opportunity_id:
+                        project.opportunity_id = opportunity.opportunity_id
+                        session.flush()
+                    
+                    # Update or create Energy_Contract_Master
+                    if project and mpan_mpr:
+                        contract = session.query(Energy_Contract_Master).filter_by(
+                            project_id=project.project_id
+                        ).first()
+                        
+                        if not contract:
+                            if supplier_name and not supplier_id:
+                                current_app.logger.warning(f"⚠️ Row {index + 2}: Supplier '{supplier_name}' not found, using default")
+                            
+                            contract = Energy_Contract_Master(
+                                project_id=project.project_id,
+                                employee_id=employee_id,
+                                supplier_id=supplier_id if supplier_id else 1,
+                                contract_start_date=start_date,
+                                contract_end_date=end_date,
+                                terms_of_sale='',
+                                service_id=import_service_id,
+                                unit_rate=0.0,  # Default unit rate
+                                currency_id=1,
+                                document_details=None,
+                                created_at=datetime.utcnow(),
+                                updated_at=datetime.utcnow(),
+                                mpan_number=mpan_mpr or ''
+                            )
+                            session.add(contract)
+                            session.flush()
+                        else:
+                            # Update empty fields in existing contract
+                            if mpan_mpr and not contract.mpan_number:
+                                contract.mpan_number = mpan_mpr
+                            if supplier_id and not contract.supplier_id:
+                                contract.supplier_id = supplier_id
+                            if start_date and not contract.contract_start_date:
+                                contract.contract_start_date = start_date
+                            if end_date and not contract.contract_end_date:
+                                contract.contract_end_date = end_date
+                            contract.updated_at = datetime.utcnow()
                         
                         success_count += 1
                         continue
