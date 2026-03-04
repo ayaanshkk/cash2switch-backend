@@ -1,3 +1,202 @@
+"""
+Bulk Import Route for Energy Customers
+Handles Excel/CSV uploads and bulk insertion into database
+"""
+
+from flask import Blueprint, request, jsonify, current_app, send_file
+from werkzeug.utils import secure_filename
+import pandas as pd
+import os
+from datetime import datetime
+from sqlalchemy import and_, or_, text
+from flask_jwt_extended import jwt_required, get_jwt_identity
+import logging
+import tempfile
+
+from ..models import (
+    Client_Master, Project_Details, Energy_Contract_Master,
+    Opportunity_Details, Supplier_Master, Employee_Master, Services_Master
+)
+from .auth_helpers import token_required
+from ..db import SessionLocal
+
+logger = logging.getLogger(__name__)
+import_bp = Blueprint('import', __name__)
+
+ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'csv'}
+UPLOAD_FOLDER = '/tmp/uploads'
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def get_tenant_id_from_user(user):
+    """Get tenant_id from authenticated user - match customer_routes (JWT tenant_id first)"""
+    if hasattr(user, 'tenant_id') and user.tenant_id is not None:
+        return user.tenant_id
+    session = SessionLocal()
+    try:
+        employee = session.query(Employee_Master).filter_by(employee_id=user.employee_id).first()
+        return employee.tenant_id if employee else None
+    finally:
+        session.close()
+
+def find_supplier_id(supplier_name, session):
+    """Find supplier ID by name (case-insensitive, fuzzy matching)"""
+    if not supplier_name or pd.isna(supplier_name):
+        return None
+    
+    supplier_name = str(supplier_name).strip()
+    
+    # Try exact match first
+    supplier = session.query(Supplier_Master).filter(
+        Supplier_Master.supplier_company_name.ilike(f'%{supplier_name}%')
+    ).first()
+    
+    if supplier:
+        return supplier.supplier_id
+    
+    # Try extracting name before parenthesis (e.g., "THRE (Corona Energy)" -> "THRE")
+    if '(' in supplier_name:
+        short_name = supplier_name.split('(')[0].strip()
+        supplier = session.query(Supplier_Master).filter(
+            Supplier_Master.supplier_company_name.ilike(f'%{short_name}%')
+        ).first()
+        if supplier:
+            return supplier.supplier_id
+    
+    # Try extracting name in parenthesis (e.g., "THRE (Corona Energy)" -> "Corona Energy")
+    if '(' in supplier_name and ')' in supplier_name:
+        paren_name = supplier_name.split('(')[1].split(')')[0].strip()
+        supplier = session.query(Supplier_Master).filter(
+            Supplier_Master.supplier_company_name.ilike(f'%{paren_name}%')
+        ).first()
+        if supplier:
+            return supplier.supplier_id
+    
+    # Try first word only (e.g., "British Gas Business" -> "British")
+    first_word = supplier_name.split()[0] if supplier_name.split() else supplier_name
+    if len(first_word) > 3:  # Only try if word is longer than 3 chars
+        supplier = session.query(Supplier_Master).filter(
+            Supplier_Master.supplier_company_name.ilike(f'{first_word}%')
+        ).first()
+        if supplier:
+            return supplier.supplier_id
+    
+    return None
+
+
+def get_or_create_supplier(supplier_name, session):
+    """Get existing supplier or create new one if doesn't exist"""
+    if not supplier_name or pd.isna(supplier_name):
+        return 1  # Return default supplier_id
+    
+    supplier_name = str(supplier_name).strip()
+    
+    # Try to find existing supplier
+    supplier_id = find_supplier_id(supplier_name, session)
+    if supplier_id:
+        return supplier_id
+    
+    # Supplier doesn't exist - create it
+    try:
+        new_supplier = Supplier_Master(
+            supplier_company_name=supplier_name,
+            supplier_contact_name='Auto-imported',
+            supplier_provisions=3,  # Default: Electricity & Gas
+            created_at=datetime.utcnow()
+        )
+        session.add(new_supplier)
+        session.flush()
+        
+        current_app.logger.info(f"✨ Created new supplier: {supplier_name} (ID: {new_supplier.supplier_id})")
+        return new_supplier.supplier_id
+    except Exception as e:
+        current_app.logger.error(f"Failed to create supplier {supplier_name}: {e}")
+        return 1  # Fallback to default
+
+
+def get_or_create_service(tenant_id, session):
+    """Get existing default service or create one if doesn't exist"""
+    # Try to find existing service for this tenant
+    service = session.query(Services_Master).filter_by(
+        tenant_id=tenant_id,
+        service_title='Default Energy Service'
+    ).first()
+    
+    if service:
+        return service.service_id
+    
+    # Try to get any service for this tenant
+    service = session.query(Services_Master).filter_by(tenant_id=tenant_id).first()
+    if service:
+        return service.service_id
+    
+    # No service exists - create default one
+    try:
+        new_service = Services_Master(
+            tenant_id=tenant_id,
+            service_title='Default Energy Service',
+            service_description='Auto-created default service for energy contracts',
+            service_rate=0.0,
+            currency_id=1,
+            supplier_id=None,
+            date_from=None,
+            date_to=None,
+            created_at=datetime.utcnow(),
+            service_code='DEFAULT'
+        )
+        session.add(new_service)
+        session.flush()
+        
+        current_app.logger.info(f"✨ Created default service for tenant {tenant_id} (ID: {new_service.service_id})")
+        return new_service.service_id
+    except Exception as e:
+        current_app.logger.error(f"Failed to create default service: {e}")
+        return 1  # Fallback to ID 1
+
+def parse_date(date_value):
+    """Parse date from various formats - prioritize DD/MM/YYYY (UK format)"""
+    if pd.isna(date_value) or not date_value:
+        return None
+    
+    if isinstance(date_value, datetime):
+        return date_value.date()
+    
+    date_str = str(date_value).strip()
+    
+    # ✅ UPDATED: Prioritize UK date formats (DD/MM/YYYY)
+    date_formats = [
+        '%d/%m/%Y',      
+        '%d-%m-%Y',      
+        '%d.%m.%Y',      
+        '%d %b %Y',      
+        '%d %B %Y',      
+        '%Y-%m-%d',      
+        '%m/%d/%Y',      
+        '%Y/%m/%d',
+    ]
+    
+    for fmt in date_formats:
+        try:
+            return datetime.strptime(date_str, fmt).date()
+        except ValueError:
+            continue
+    
+    return None
+
+def parse_number(value):
+    """Parse number from string (handles commas, etc.)"""
+    if pd.isna(value) or not value:
+        return None
+    
+    try:
+        # Remove commas and convert to float
+        cleaned = str(value).replace(',', '').strip()
+        return float(cleaned) if cleaned else None
+    except (ValueError, AttributeError):
+        return None
+
+
 @import_bp.route('/energy-customers', methods=['POST', 'OPTIONS'])
 @token_required
 def import_energy_customers():
@@ -424,3 +623,176 @@ def import_energy_customers():
         # ✅ Re-enable SQL logging
         sql_logger.setLevel(original_level)
         session.close()
+
+
+@import_bp.route('/template', methods=['GET'])
+@token_required
+def download_template():
+    """Download Excel template matching Cash2Switch format"""
+    try:
+        import io
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        from flask import send_file
+        
+        # Create workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Renewals Import Template"
+        
+        # Headers (matching exact Excel structure)
+        headers = [
+            "Client Name", "Trading Name", "Main Contact", "Position", "Tel No", "Mobile No",
+            "Email", "Site Name", "Month Sold", "", "Address Line 1", "Address Line 2",
+            "Address Line 3", "Town", "County", "Postcode", "Mpan Top", "Mpan Bottom",
+            "", "", "Data Source", "Welcome Call", "Payment Type", "Supplier", "Net Notch",
+            "In Contract", "Agent Sold", "Start Date", "Contract End", "Stand Charge",
+            "Rate 1", "Rate 2", "Rate 3", "", "", "Aggregator", "Annual Usage",
+            "Comms Paid", "Company Number", "Date of Birth", "Bank Name", "Ac Number",
+            "Sort Code", "Charity/Ltd Company Number", "Partner Details"
+        ]
+        
+        # Style headers
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            if header:  # Only style non-empty headers
+                cell.fill = header_fill
+                cell.font = header_font
+        
+        # Add example row
+        example = [
+            "ABC Limited",  # Client Name
+            "ABC Trading",  # Trading Name
+            "John Smith",   # Main Contact
+            "Director",     # Position
+            "07700900000",  # Tel No
+            "07700900001",  # Mobile No
+            "john@abc.com", # Email
+            "Main Site",    # Site Name
+            "Jan-24",       # Month Sold
+            "",             # Empty
+            "123 Main St",  # Address Line 1
+            "Unit 5",       # Address Line 2
+            "Industrial Estate",  # Address Line 3
+            "London",       # Town
+            "Greater London",  # County
+            "SW1A 1AA",     # Postcode
+            "1100012314490",  # Mpan Top
+            "04031N12",     # Mpan Bottom
+            "", "",         # Empty
+            "Renewals",     # Data Source
+            "Yes",          # Welcome Call
+            "DD",           # Payment Type
+            "British Gas",  # Supplier
+            "0.1",          # Net Notch
+            "1 Year",       # In Contract
+            "Sales Team",   # Agent Sold
+            "01/01/2024",   # Start Date
+            "31/12/2024",   # Contract End
+            "45.13",        # Stand Charge
+            "35.00",        # Rate 1
+            "26.46",        # Rate 2
+            "",             # Rate 3
+            "", "",         # Empty
+            "Online",       # Aggregator
+            "25000",        # Annual Usage
+            "£7.92",        # Comms Paid
+            "12345678",     # Company Number
+            "",             # Date of Birth
+            "Barclays",     # Bank Name
+            "12345678",     # Ac Number
+            "20-00-00",     # Sort Code
+            "",             # Charity/Ltd Company Number
+            ""              # Partner Details
+        ]
+        
+        for col, value in enumerate(example, 1):
+            ws.cell(row=2, column=col, value=value)
+        
+        # Auto-adjust column widths
+        for col in ws.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            ws.column_dimensions[column].width = min(max_length + 2, 30)
+        
+        # Save to bytes
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name='cash2switch_renewals_template.xlsx'
+        )
+        
+    except Exception as e:
+        current_app.logger.exception(f"❌ Template download failed: {e}")
+        return jsonify({'error': 'Failed to generate template'}), 500
+
+@import_bp.route('/energy-clients/reset-sequence', methods=['POST'])
+@jwt_required()
+def reset_energy_client_sequence():
+    """Reset the client_id sequence after deleting all customers"""
+    current_user = get_jwt_identity()
+    tenant_id = current_user.get('tenant_id')
+    
+    session = SessionLocal()  # ✅ Use SessionLocal instead of db.session
+    
+    try:
+        # Reset Client_Master sequence
+        session.execute(text("""
+            SELECT setval(
+                pg_get_serial_sequence('"StreemLyne_MT"."Client_Master"', 'client_id'),
+                COALESCE((SELECT MAX(client_id) FROM "StreemLyne_MT"."Client_Master" WHERE tenant_id = :tenant_id), 0),
+                true
+            )
+        """), {'tenant_id': tenant_id})
+        
+        # Reset Project_Details sequence
+        session.execute(text("""
+            SELECT setval(
+                pg_get_serial_sequence('"StreemLyne_MT"."Project_Details"', 'project_id'),
+                COALESCE((SELECT MAX(project_id) FROM "StreemLyne_MT"."Project_Details"), 0),
+                true
+            )
+        """))
+        
+        # Reset Energy_Contract_Master sequence  
+        session.execute(text("""
+            SELECT setval(
+                pg_get_serial_sequence('"StreemLyne_MT"."Energy_Contract_Master"', 'ecm_id'),
+                COALESCE((SELECT MAX(ecm_id) FROM "StreemLyne_MT"."Energy_Contract_Master"), 0),
+                true
+            )
+        """))
+        
+        # Reset Opportunity_Details sequence
+        session.execute(text("""
+            SELECT setval(
+                pg_get_serial_sequence('"StreemLyne_MT"."Opportunity_Details"', 'opportunity_id'),
+                COALESCE((SELECT MAX(opportunity_id) FROM "StreemLyne_MT"."Opportunity_Details"), 0),
+                true
+            )
+        """))
+        
+        session.commit()  # ✅ Changed from db.session.commit()
+        
+        return jsonify({
+            'message': 'All sequences reset successfully',
+            'success': True
+        }), 200
+        
+    except Exception as e:
+        session.rollback()  # ✅ Changed from db.session.rollback()
+        logger.error(f"Error resetting sequences: {str(e)}")
+        return jsonify({'error': 'Failed to reset sequences'}), 500
+    finally:
+        session.close()  # ✅ Always close the session
