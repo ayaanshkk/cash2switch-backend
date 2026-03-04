@@ -155,7 +155,7 @@ def health_check():
         'message': 'Forklift Academy Backend is running!'
     }, 200
 
-@auth_bp.route('/auth/register', methods=['POST'])
+@auth_bp.route('/register', methods=['POST'])
 def register():
     """Register a new user (handles both regular registration and invitation completion)"""
     session = SessionLocal()
@@ -293,7 +293,7 @@ def register():
     finally:
         session.close()
 
-@auth_bp.route('/auth/login', methods=['POST'])
+@auth_bp.route('/login', methods=['POST'])
 def login():
     """Tenant-resolved username login against StreemLyne_MT CRM tables.
 
@@ -386,7 +386,7 @@ def login():
         session.close()
 
 
-@auth_bp.route('/auth/signup', methods=['POST'])
+@auth_bp.route('/signup', methods=['POST'])
 def signup():
     """Create CRM user: insert into Employee_Master then User_Master and return JWT.
 
@@ -502,7 +502,7 @@ def signup():
     finally:
         session.close()
 
-@auth_bp.route('/auth/logout', methods=['POST'])
+@auth_bp.route('/logout', methods=['POST'])
 @token_required
 def logout():
     """Stateless logout: token is JWT-only so simply acknowledge the request.
@@ -516,7 +516,7 @@ def logout():
         current_app.logger.exception(f"Error during logout: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
-@auth_bp.route('/auth/me', methods=['GET'])
+@auth_bp.route('/me', methods=['GET'])
 @token_required
 def get_current_user():
     """Get current CRM user information (UserMaster-aware)"""
@@ -537,7 +537,7 @@ def get_current_user():
         current_app.logger.exception(f"Error in /auth/me: {e}")
         return jsonify({'error': 'Internal server error'}), 500
     
-@auth_bp.route('/auth/users/staff', methods=['GET'])
+@auth_bp.route('/users/staff', methods=['GET'])
 @admin_required
 def get_staff_users():
     """Get all staff users"""
@@ -556,7 +556,7 @@ def get_staff_users():
     finally:
         session.close()
 
-@auth_bp.route('/auth/refresh', methods=['POST'])
+@auth_bp.route('/refresh', methods=['POST'])
 @token_required
 def refresh_token():
     """Refresh JWT token"""
@@ -611,7 +611,7 @@ def refresh_token():
     finally:
         session.close()
 
-@auth_bp.route('/auth/forgot-password', methods=['POST'])
+@auth_bp.route('/forgot-password', methods=['POST'])
 def forgot_password():
     """Request password reset"""
     session = SessionLocal()
@@ -641,7 +641,7 @@ def forgot_password():
     finally:
         session.close()
 
-@auth_bp.route('/auth/reset-password', methods=['POST'])
+@auth_bp.route('/reset-password', methods=['POST'])
 def reset_password():
     """Reset password with token"""
     session = SessionLocal()
@@ -684,7 +684,7 @@ def reset_password():
     finally:
         session.close()
 
-@auth_bp.route('/auth/users', methods=['GET'])
+@auth_bp.route('/users', methods=['GET'])
 @admin_required
 def get_users():
     """Get all users"""
@@ -719,7 +719,7 @@ def get_user_me():
         current_app.logger.exception(f"Error fetching current user: {e}")
         return jsonify({'error': 'Failed to fetch user information'}), 500
 
-@auth_bp.route('/auth/users/<int:user_id>/toggle-status', methods=['POST'])
+@auth_bp.route('/users/<int:user_id>/toggle-status', methods=['POST'])
 @admin_required
 def toggle_user_status(user_id):
     """Toggle user active status"""
@@ -751,7 +751,7 @@ def toggle_user_status(user_id):
     finally:
         session.close()
 
-@auth_bp.route('/auth/invite-user', methods=['POST'])
+@auth_bp.route('/invite-user', methods=['POST'])
 @admin_required
 def invite_user():
     """Create an invitation for a new user"""
@@ -814,7 +814,7 @@ def invite_user():
         session.close()
 
 
-@auth_bp.route('/auth/resend-invitation/<int:user_id>', methods=['POST'])
+@auth_bp.route('/resend-invitation/<int:user_id>', methods=['POST'])
 @admin_required
 def resend_invitation(user_id):
     """Generate a new invitation token for a user"""
@@ -848,7 +848,7 @@ def resend_invitation(user_id):
         session.close()
 
 
-@auth_bp.route('/auth/users/<int:user_id>', methods=['PUT'])
+@auth_bp.route('/users/<int:user_id>', methods=['PUT'])
 @admin_required
 def update_user(user_id):
     """Update user details"""
@@ -905,7 +905,7 @@ def update_user(user_id):
         session.close()
 
 
-@auth_bp.route('/auth/users/<int:user_id>', methods=['DELETE'])
+@auth_bp.route('/users/<int:user_id>', methods=['DELETE'])
 @admin_required
 def delete_user(user_id):
     """Delete a user"""
@@ -963,7 +963,7 @@ def update_company_settings():
     finally:
         session.close()
 
-@auth_bp.route('/auth/validate-invitation', methods=['POST'])
+@auth_bp.route('/validate-invitation', methods=['POST'])
 def validate_invitation():
     """Validate an invitation token and return user info"""
     session = SessionLocal()
