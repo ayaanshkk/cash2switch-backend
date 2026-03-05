@@ -700,6 +700,7 @@ def delete_energy_customer(client_id):
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
         
+        # Find the client
         client = session.query(Client_Master).filter_by(
             client_id=client_id,
             tenant_id=tenant_id
@@ -708,35 +709,58 @@ def delete_energy_customer(client_id):
         if not client:
             return jsonify({'error': 'Customer not found'}), 404
         
-        current_app.logger.info(f"🗑️ Deleting energy customer {client_id} and all related records")
+        current_app.logger.info(f"🗑️ Deleting customer {client_id}: {client.client_company_name}")
         
-        # Delete in reverse order of dependencies
+        # ============================================
+        # CRITICAL: Delete in correct order (child → parent)
+        # ============================================
         
-        # 1. Delete Client_Interactions
-        session.query(Client_Interactions).filter_by(client_id=client_id).delete()
-        
-        # 2. Delete Energy_Contract_Master (via projects)
+        # 1. Find all projects for this client
         projects = session.query(Project_Details).filter_by(client_id=client_id).all()
-        for project in projects:
-            session.query(Energy_Contract_Master).filter_by(project_id=project.project_id).delete()
+        project_ids = [p.project_id for p in projects]
         
-        # 3. Delete Opportunity_Details
-        session.query(Opportunity_Details).filter_by(client_id=client_id).delete()
+        contracts_deleted = 0
+        if project_ids:
+            # 2. Delete Energy_Contract_Master (references project_id)
+            contracts_deleted = session.query(Energy_Contract_Master).filter(
+                Energy_Contract_Master.project_id.in_(project_ids)
+            ).delete(synchronize_session=False)
+            current_app.logger.info(f"   📋 Deleted {contracts_deleted} contracts")
         
-        # 4. Delete Project_Details
-        session.query(Project_Details).filter_by(client_id=client_id).delete()
+        # 3. Delete Client_Interactions (references client_id)
+        interactions_deleted = session.query(Client_Interactions).filter_by(
+            client_id=client_id
+        ).delete(synchronize_session=False)
+        current_app.logger.info(f"   📋 Deleted {interactions_deleted} interactions")
         
-        # 5. Delete Client_Master
+        # 4. Delete Opportunity_Details (references client_id)
+        opportunities_deleted = session.query(Opportunity_Details).filter_by(
+            client_id=client_id
+        ).delete(synchronize_session=False)
+        current_app.logger.info(f"   📋 Deleted {opportunities_deleted} opportunities")
+        
+        # 5. Delete Project_Details (references client_id and opportunity_id)
+        projects_deleted = session.query(Project_Details).filter_by(
+            client_id=client_id
+        ).delete(synchronize_session=False)
+        current_app.logger.info(f"   📋 Deleted {projects_deleted} projects")
+        
+        # 6. Finally delete Client_Master
         session.delete(client)
         
+        # Commit all deletions
         session.commit()
         
-        # ✅ ISSUE 1 FIX: Check if all customers deleted, reset sequence
+        # ============================================
+        # AUTO-RESET SEQUENCE IF ALL CUSTOMERS DELETED
+        # ============================================
         remaining_count = session.query(Client_Master).filter_by(tenant_id=tenant_id).count()
         
         if remaining_count == 0:
             try:
-                # Reset PostgreSQL sequence for client_id to start from 1
+                current_app.logger.info("🔄 All customers deleted - resetting sequences...")
+                
+                # Reset Client_Master sequence
                 session.execute(text("""
                     SELECT setval(
                         pg_get_serial_sequence('"StreemLyne_MT"."Client_Master"', 'client_id'),
@@ -744,22 +768,58 @@ def delete_energy_customer(client_id):
                         false
                     )
                 """))
+                
+                # Reset Project_Details sequence
+                session.execute(text("""
+                    SELECT setval(
+                        pg_get_serial_sequence('"StreemLyne_MT"."Project_Details"', 'project_id'),
+                        1,
+                        false
+                    )
+                """))
+                
+                # Reset Energy_Contract_Master sequence
+                session.execute(text("""
+                    SELECT setval(
+                        pg_get_serial_sequence('"StreemLyne_MT"."Energy_Contract_Master"', 'ecm_id'),
+                        1,
+                        false
+                    )
+                """))
+                
+                # Reset Opportunity_Details sequence
+                session.execute(text("""
+                    SELECT setval(
+                        pg_get_serial_sequence('"StreemLyne_MT"."Opportunity_Details"', 'opportunity_id'),
+                        1,
+                        false
+                    )
+                """))
+                
                 session.commit()
-                current_app.logger.info("✅ Reset client_id sequence to 1 (all customers deleted)")
-            except Exception as e:
-                current_app.logger.warning(f"⚠️ Could not reset sequence: {e}")
+                current_app.logger.info("✅ All sequences reset to 1")
+                
+            except Exception as seq_error:
+                current_app.logger.warning(f"⚠️ Could not reset sequences: {seq_error}")
         
-        current_app.logger.info(f"✅ Energy customer {client_id} deleted successfully")
+        current_app.logger.info(f"✅ Successfully deleted customer {client_id}")
         
         return jsonify({
             'success': True,
-            'message': 'Customer and all related records deleted successfully'
+            'message': 'Customer deleted successfully',
+            'deleted': {
+                'contracts': contracts_deleted,
+                'interactions': interactions_deleted,
+                'opportunities': opportunities_deleted,
+                'projects': projects_deleted,
+                'client': 1
+            }
         }), 200
         
     except Exception as e:
         session.rollback()
-        current_app.logger.exception(f"❌ Error deleting energy customer {client_id}: {e}")
-        return jsonify({'error': 'Failed to delete customer'}), 500
+        current_app.logger.error(f"❌ Error deleting customer {client_id}: {str(e)}")
+        return jsonify({'error': f'Failed to delete customer: {str(e)}'}), 500
     finally:
         session.close()
 
@@ -1306,5 +1366,72 @@ def get_priced_customers():
     except Exception as e:
         current_app.logger.exception(f"❌ Error fetching priced customers: {e}")
         return jsonify({'error': 'Failed to fetch priced customers'}), 500
+    finally:
+        session.close()
+
+@energy_customer_bp.route('/energy-clients/stats-by-employee', methods=['GET'])
+@token_required
+def get_stats_by_employee():
+    """Get customer count per employee for Platform Admin"""
+    session = SessionLocal()
+    
+    try:
+        # Get tenant_id
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+        
+        # Check if user is Platform Admin
+        user_role = getattr(request.current_user, 'role', None)
+        is_admin = user_role and 'admin' in user_role.lower()
+        
+        if not is_admin:
+            return jsonify({'error': 'Unauthorized - Admin only'}), 403
+        
+        # Get service filter
+        service_param = request.args.get('service', 'utilities')
+        service_id_map = {'utilities': 1, 'water': 2, 'gas': 3}
+        service_id = service_id_map.get(service_param.strip().lower(), 1)
+        
+        # Query to get count per employee
+        sql = text('''
+            SELECT 
+                em.employee_id,
+                em.employee_name,
+                COUNT(DISTINCT cm.client_id) as count
+            FROM "StreemLyne_MT"."Employee_Master" em
+            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od 
+                ON em.employee_id = od.opportunity_owner_employee_id
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm 
+                ON od.client_id = cm.client_id AND cm.tenant_id = :tenant_id
+            LEFT JOIN "StreemLyne_MT"."Project_Details" pd 
+                ON cm.client_id = pd.client_id
+            LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm 
+                ON pd.project_id = ecm.project_id AND ecm.service_id = :service_id
+            WHERE em.tenant_id = :tenant_id
+            AND em.employee_role = 'Salesperson'
+            GROUP BY em.employee_id, em.employee_name
+            ORDER BY em.employee_name ASC
+        ''')
+        
+        results = session.execute(sql, {
+            'tenant_id': tenant_id,
+            'service_id': service_id
+        }).mappings().all()
+        
+        stats = [
+            {
+                'employee_id': row['employee_id'],
+                'employee_name': row['employee_name'],
+                'count': row['count'] or 0
+            }
+            for row in results
+        ]
+        
+        return jsonify({'stats': stats}), 200
+        
+    except Exception as e:
+        current_app.logger.error(f"Error fetching employee stats: {str(e)}")
+        return jsonify({'error': str(e)}), 500
     finally:
         session.close()
