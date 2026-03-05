@@ -67,6 +67,7 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'id': client.tenant_client_id,
         'client_id': client.client_id,
         'tenant_client_id': client.tenant_client_id,
+        'display_id': client.display_id if hasattr(client, 'display_id') else None, 
         'name': client.client_contact_name or '',
         'business_name': client.client_company_name or '',
         'contact_person': client.client_contact_name or '',
@@ -197,7 +198,7 @@ def get_energy_customers():
         if not tenant_id:
             return jsonify({'error': 'Tenant not found for user'}), 400
 
-        # Service filter: electricity=1, water=2 (None = no filter)
+        # Service filter
         _service_id = None
         service_param = request.args.get('service')
         if service_param and isinstance(service_param, str):
@@ -239,24 +240,21 @@ def get_energy_customers():
             and_(
                 Client_Master.tenant_id == tenant_id,
                 Client_Master.client_company_name != '[IMPORTED LEADS]',
-                # ✅ ISSUE 3 FIX: EXCLUDE priced, lost, lost_cot statuses
                 or_(
                     Opportunity_Details.Misc_Col1 == None,
                     ~func.lower(Opportunity_Details.Misc_Col1).in_(['priced', 'lost', 'lost_cot', 'lost cot'])
                 ),
-                # ✅ Also exclude by stage_name (Lost stage goes to recycle bin)
                 or_(
                     Stage_Master.stage_name == None,
                     func.lower(Stage_Master.stage_name) != 'lost'
                 ),
-                # Service filter: electricity=1, water=2 (optional)
                 *([Energy_Contract_Master.service_id == _service_id] if _service_id is not None else [])
             )
         )
 
         query = query.order_by(Client_Master.created_at.desc())
 
-        # ✅ ALL users only see renewals assigned to them (including Platform Admin)
+        # Filter by assigned employee
         query = query.filter(
             Opportunity_Details.opportunity_owner_employee_id == user.employee_id
         )
@@ -275,7 +273,6 @@ def get_energy_customers():
             customer_data = build_customer_response(
                 client, project, contract, opportunity, interaction, supplier, employee
             )
-            # Add status from Misc_Col1 if available
             if opportunity and opportunity.Misc_Col1:
                 customer_data['status'] = opportunity.Misc_Col1
             
@@ -1369,75 +1366,69 @@ def get_priced_customers():
     finally:
         session.close()
 
-# @energy_customer_bp.route('/energy-clients/stats-by-employee', methods=['GET'])
-# @token_required
-# def get_stats_by_employee():
-#     """Get customer count per employee for Platform Admin"""
-#     session = SessionLocal()
+@energy_customer_bp.route('/energy-clients/stats-by-employee', methods=['GET'])
+@token_required
+def get_stats_by_employee():
+    """Get customer count per employee for Platform Admin"""
+    session = SessionLocal()
     
-#     try:
-#         # Get tenant_id
-#         tenant_id = get_tenant_id_from_user(request.current_user)
-#         if not tenant_id:
-#             return jsonify({'error': 'Tenant not found'}), 400
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
         
-#         # ✅ FIX: Use get_user_role_name() helper
-#         user_role = get_user_role_name(request.current_user, session)
+        user_role = get_user_role_name(request.current_user, session)
         
-#         # Check if user is Platform Admin or Tenant Super Admin
-#         if user_role not in ['Platform Admin', 'Tenant Super Admin']:
-#             return jsonify({'error': 'Unauthorized - Admin only'}), 403
+        if user_role not in ['Platform Admin', 'Tenant Super Admin']:
+            return jsonify({'error': 'Unauthorized - Admin only'}), 403
         
-#         # Get service filter
-#         service_param = request.args.get('service', 'utilities')
-#         service_id_map = {'utilities': 1, 'water': 2, 'gas': 3}
-#         service_id = service_id_map.get(service_param.strip().lower(), 1)
+        service_param = request.args.get('service', 'utilities')
+        service_id_map = {'utilities': 1, 'water': 2, 'gas': 3}
+        service_id = service_id_map.get(service_param.strip().lower(), 1)
         
-#         # Query to get count per employee
-#         sql = text('''
-#             SELECT 
-#                 em.employee_id,
-#                 em.employee_name,
-#                 COUNT(DISTINCT cm.client_id) as count
-#             FROM "StreemLyne_MT"."Employee_Master" em
-#             LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od 
-#                 ON em.employee_id = od.opportunity_owner_employee_id
-#             LEFT JOIN "StreemLyne_MT"."Client_Master" cm 
-#                 ON od.client_id = cm.client_id 
-#                 AND cm.tenant_id = :tenant_id
-#                 AND cm.client_company_name != '[IMPORTED LEADS]'
-#             LEFT JOIN "StreemLyne_MT"."Project_Details" pd 
-#                 ON cm.client_id = pd.client_id
-#             LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm 
-#                 ON pd.project_id = ecm.project_id 
-#                 AND ecm.service_id = :service_id
-#             WHERE em.tenant_id = :tenant_id
-#             AND (em.employee_role = 'Salesperson' OR em.employee_role ILIKE '%sales%')
-#             GROUP BY em.employee_id, em.employee_name
-#             HAVING COUNT(DISTINCT cm.client_id) > 0
-#             ORDER BY em.employee_name ASC
-#         ''')
+        sql = text('''
+            SELECT 
+                em.employee_id,
+                em.employee_name,
+                COUNT(DISTINCT cm.client_id) as count,
+                MAX(cm.display_id) as max_display_id  -- ✅ ADD THIS
+            FROM "StreemLyne_MT"."Employee_Master" em
+            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od 
+                ON em.employee_id = od.opportunity_owner_employee_id
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm 
+                ON od.client_id = cm.client_id 
+                AND cm.tenant_id = :tenant_id
+                AND cm.client_company_name != '[IMPORTED LEADS]'
+            LEFT JOIN "StreemLyne_MT"."Project_Details" pd 
+                ON cm.client_id = pd.client_id
+            LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm 
+                ON pd.project_id = ecm.project_id 
+                AND ecm.service_id = :service_id
+            WHERE em.tenant_id = :tenant_id
+            GROUP BY em.employee_id, em.employee_name
+            HAVING COUNT(DISTINCT cm.client_id) > 0
+            ORDER BY em.employee_name ASC
+        ''')
         
-#         results = session.execute(sql, {
-#             'tenant_id': tenant_id,
-#             'service_id': service_id
-#         }).mappings().all()
+        results = session.execute(sql, {
+            'tenant_id': tenant_id,
+            'service_id': service_id
+        }).mappings().all()
         
-#         stats = [
-#             {
-#                 'employee_id': row['employee_id'],
-#                 'employee_name': row['employee_name'],
-#                 'count': int(row['count']) if row['count'] else 0
-#             }
-#             for row in results
-#         ]
+        stats = [
+            {
+                'employee_id': row['employee_id'],
+                'employee_name': row['employee_name'],
+                'count': int(row['count']) if row['count'] else 0,
+                'max_display_id': int(row['max_display_id']) if row['max_display_id'] else 0  # ✅ ADD THIS
+            }
+            for row in results
+        ]
         
-#         current_app.logger.info(f"✅ Returning stats for {len(stats)} employees")
+        return jsonify({'stats': stats}), 200
         
-#         return jsonify({'stats': stats}), 200
-        
-#     except Exception as e:
-#         current_app.logger.error(f"Error fetching employee stats: {str(e)}")
-#         return jsonify({'error': str(e), 'stats': []}), 500
-#     finally:
-#         session.close()
+    except Exception as e:
+        current_app.logger.error(f"Error fetching employee stats: {str(e)}")
+        return jsonify({'error': str(e), 'stats': []}), 500
+    finally:
+        session.close()
