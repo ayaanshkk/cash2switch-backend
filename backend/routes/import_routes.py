@@ -202,14 +202,14 @@ def parse_number(value):
 def import_energy_customers():
     """
     Bulk import energy customers from Excel/CSV file with optional assignment
-    ⚡ OPTIMIZED: Batch processing for faster imports
+    ⚡ HANDLES UNLIMITED RECORDS: Individual commits prevent timeouts
     """
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
     session = SessionLocal()
     
-    # ✅ OPTIMIZATION 1: Disable query logging during import
+    # Disable query logging during import for performance
     import logging
     sql_logger = logging.getLogger('sqlalchemy.engine')
     original_level = sql_logger.level
@@ -368,15 +368,18 @@ def import_energy_customers():
             return str(value).strip()
         
         # ============================================
-        # ✅ OPTIMIZATION 2: PRE-LOAD SUPPLIERS (single query)
+        # PRE-LOAD SUPPLIERS (exact match only)
         # ============================================
         suppliers_dict = {}
         suppliers = session.query(Supplier_Master).all()
         for s in suppliers:
-            suppliers_dict[s.supplier_company_name.lower()] = s.supplier_id
+            # Store with exact lowercase key for matching
+            suppliers_dict[s.supplier_company_name.lower().strip()] = s.supplier_id
+        
+        current_app.logger.info(f"📊 Loaded {len(suppliers_dict)} suppliers for matching")
         
         # ============================================
-        # ✅ OPTIMIZATION 3: PRE-LOAD EXISTING MPANs ONLY
+        # PRE-LOAD EXISTING MPANs ONLY
         # ============================================
         existing_mpans = {}
         existing_contracts = session.query(Energy_Contract_Master).all()
@@ -387,355 +390,353 @@ def import_energy_customers():
         current_app.logger.info(f"📊 Loaded {len(existing_mpans)} existing MPANs for duplicate checking")
         
         # ============================================
-        # ✅ OPTIMIZATION 4: BATCH PROCESSING
+        # ✅ PROCESS EACH RECORD INDIVIDUALLY (NO BATCHING)
         # ============================================
-        BATCH_SIZE = 50
         total_rows = len(df)
         success_count = 0
         error_count = 0
+        duplicate_count = 0
         errors = []
         
-        for batch_start in range(0, total_rows, BATCH_SIZE):
-            batch_end = min(batch_start + BATCH_SIZE, total_rows)
-            batch_df = df.iloc[batch_start:batch_end]
-            
-            current_app.logger.info(f"📊 Processing batch {batch_start}-{batch_end} of {total_rows}")
-            
-            for index, row in batch_df.iterrows():
-                try:
-                    # Extract data
-                    client_name = safe_str(row.get(actual_columns.get('client_name', ''), ''))
-                    trading_name = safe_str(row.get(actual_columns.get('trading_name', ''), ''))
-                    main_contact = safe_str(row.get(actual_columns.get('main_contact', ''), ''))
-                    position = safe_str(row.get(actual_columns.get('position', ''), ''))
-                    tel_no = safe_str(row.get(actual_columns.get('tel_no', ''), ''))
-                    mobile_no = safe_str(row.get(actual_columns.get('mobile_no', ''), ''))
-                    email = safe_str(row.get(actual_columns.get('email', ''), ''))
-                    site_name = safe_str(row.get(actual_columns.get('site_name', ''), ''))
-
-                    # Address fields
-                    address_line_1 = safe_str(row.get(actual_columns.get('address_line_1', ''), ''))
-                    address_line_2 = safe_str(row.get(actual_columns.get('address_line_2', ''), ''))
-                    address_line_3 = safe_str(row.get(actual_columns.get('address_line_3', ''), ''))
-                    town = safe_str(row.get(actual_columns.get('town', ''), ''))
-                    county = safe_str(row.get(actual_columns.get('county', ''), ''))
-                    postcode = safe_str(row.get(actual_columns.get('postcode', ''), ''))
-
-                    address_parts = [p for p in [address_line_1, address_line_2, address_line_3, town, county] if p and p.lower() != 'nan']
-                    address = ', '.join(address_parts)
-                    site_address = site_name or address
-
-                    # MPAN fields
-                    mpan_top = safe_str(row.get(actual_columns.get('mpan_top', ''), ''))
-                    mpan_bottom = safe_str(row.get(actual_columns.get('mpan_bottom', ''), ''))
-                    mpan_mpr = f"{mpan_top}{mpan_bottom}" if mpan_top and mpan_bottom else (mpan_top or mpan_bottom or '')
-
-                    # Contract fields
-                    supplier_name = safe_str(row.get(actual_columns.get('supplier', ''), ''))
-                    annual_usage = parse_number(row.get(actual_columns.get('annual_usage', '')))
-                    start_date = parse_date(row.get(actual_columns.get('start_date', '')))
-                    end_date = parse_date(row.get(actual_columns.get('contract_end', '')))
-                    stand_charge = parse_number(row.get(actual_columns.get('stand_charge', '')))
-                    rate_1 = parse_number(row.get(actual_columns.get('rate_1', '')))
-                    net_notch = parse_number(row.get(actual_columns.get('net_notch', '')))
-                    rate_2 = parse_number(row.get(actual_columns.get('rate_2', '')))
-                    rate_3 = parse_number(row.get(actual_columns.get('rate_3', '')))
-                    comms_paid = parse_number(row.get(actual_columns.get('comms_paid', '')))
-                    company_number = safe_str(row.get(actual_columns.get('company_number', ''), ''))
-                    date_of_birth = parse_date(row.get(actual_columns.get('date_of_birth', '')))
-                    charity_ltd_company_number = safe_str(row.get(actual_columns.get('charity_ltd_company_number', ''), ''))
-                    month_sold = safe_str(row.get(actual_columns.get('month_sold', ''), ''))
-                    house_name = safe_str(row.get(actual_columns.get('house_name', ''), ''))
-                    house_number = safe_str(row.get(actual_columns.get('house_number', ''), ''))
-                    door_number = safe_str(row.get(actual_columns.get('door_number', ''), ''))
-                    term_sold = parse_number(row.get(actual_columns.get('in_contract', '')))
-                    aggregator = safe_str(row.get(actual_columns.get('aggregator', ''), ''))
-                    partner_details = safe_str(row.get(actual_columns.get('partner_details', ''), ''))
-                    bank_name = safe_str(row.get(actual_columns.get('bank_name', ''), ''))
-                    account_number = safe_str(row.get(actual_columns.get('ac_number', ''), ''))
-                    sort_code = safe_str(row.get(actual_columns.get('sort_code', ''), ''))
-
-                    # Use pre-loaded suppliers
-                    supplier_id = suppliers_dict.get(supplier_name.lower(), 1) if supplier_name else 1
-
-                    business_name = trading_name or client_name
-                    contact_person = main_contact or client_name
-                    phone = tel_no or mobile_no
-
-                    # Skip empty rows
-                    if not business_name and not phone:
-                        continue
-
-                    # Validate required fields
-                    if not business_name:
-                        errors.append(f"Row {index + 2}: Missing client/business name")
-                        error_count += 1
-                        continue
-
-                    if not phone:
-                        errors.append(f"Row {index + 2}: Missing phone number")
-                        error_count += 1
-                        continue
-                    
-                    # ============================================
-                    # ✅ CHECK DUPLICATES: ONLY BY MPAN NUMBER
-                    # ============================================
-                    if mpan_mpr:
-                        mpan_key = mpan_mpr.strip().lower()
-                        existing_contract = existing_mpans.get(mpan_key)
-                        
-                        if existing_contract:
-                            # ============================================
-                            # DUPLICATE MPAN - UPDATE EXISTING RECORD
-                            # ============================================
-                            current_app.logger.info(f"📝 Duplicate MPAN found: {mpan_mpr} - updating contract...")
-                            
-                            # Get the related records
-                            project = session.query(Project_Details).filter_by(
-                                project_id=existing_contract.project_id
-                            ).first()
-                            
-                            if not project:
-                                current_app.logger.warning(f"⚠️ Project not found for contract {existing_contract.energy_contract_master_id}")
-                                continue
-                            
-                            client = session.query(Client_Master).filter_by(
-                                client_id=project.client_id
-                            ).first()
-                            
-                            if not client:
-                                current_app.logger.warning(f"⚠️ Client not found for project {project.project_id}")
-                                continue
-                            
-                            # Update client basic info if provided
-                            if email and not client.client_email:
-                                client.client_email = email
-                            if address and not client.address:
-                                client.address = address
-                            if postcode and not client.post_code:
-                                client.post_code = postcode
-                            
-                            # Update project fields
-                            if site_address and not project.address:
-                                project.address = site_address
-                            if annual_usage and not project.Misc_Col2:
-                                project.Misc_Col2 = int(annual_usage)
-                            
-                            # Always update to LATEST dates if newer
-                            if start_date:
-                                if not project.start_date or start_date > project.start_date:
-                                    current_app.logger.info(f"   📅 Updating start date: {project.start_date} → {start_date}")
-                                    project.start_date = start_date
-                            
-                            if end_date:
-                                if not project.end_date or end_date > project.end_date:
-                                    current_app.logger.info(f"   📅 Updating end date: {project.end_date} → {end_date}")
-                                    project.end_date = end_date
-                            
-                            project.updated_at = datetime.utcnow()
-                            
-                            # Update contract to latest end date
-                            if end_date:
-                                if not existing_contract.contract_end_date or end_date > existing_contract.contract_end_date:
-                                    current_app.logger.info(f"   ✅ Contract end updated: {existing_contract.contract_end_date} → {end_date}")
-                                    existing_contract.contract_end_date = end_date
-                            
-                            if start_date:
-                                if not existing_contract.contract_start_date or start_date > existing_contract.contract_start_date:
-                                    existing_contract.contract_start_date = start_date
-                            
-                            # Update rates and charges if missing
-                            if rate_1 and not existing_contract.rate_1:
-                                existing_contract.rate_1 = rate_1
-                                existing_contract.unit_rate = rate_1
-                            
-                            if rate_2 and not existing_contract.rate_2:
-                                existing_contract.rate_2 = rate_2
-                            
-                            if rate_3 and not existing_contract.rate_3:
-                                existing_contract.rate_3 = rate_3
-                            
-                            if stand_charge and not existing_contract.standing_charge:
-                                existing_contract.standing_charge = stand_charge
-                            
-                            if net_notch and not existing_contract.net_notch:
-                                existing_contract.net_notch = net_notch
-                            
-                            if comms_paid and not existing_contract.comms_paid:
-                                existing_contract.comms_paid = comms_paid
-                            
-                            if aggregator and not existing_contract.aggregator:
-                                existing_contract.aggregator = aggregator
-                            
-                            if supplier_id and not existing_contract.supplier_id:
-                                existing_contract.supplier_id = supplier_id
-                            
-                            existing_contract.updated_at = datetime.utcnow()
-                            
-                            # Get or update Opportunity for assignment
-                            opportunity = session.query(Opportunity_Details).filter_by(
-                                client_id=client.client_id
-                            ).first()
-                            
-                            if not opportunity:
-                                opportunity = Opportunity_Details(
-                                    client_id=client.client_id,
-                                    opportunity_title=f"Opportunity - {client.client_company_name}",
-                                    opportunity_description='Imported from bulk upload',
-                                    opportunity_date=datetime.utcnow().date(),
-                                    opportunity_owner_employee_id=opportunity_owner_id,
-                                    stage_id=1,
-                                    opportunity_value=0,
-                                    currency_id=1,
-                                    created_at=datetime.utcnow(),
-                                    Misc_Col1=None
-                                )
-                                session.add(opportunity)
-                                session.flush()
-                            else:
-                                # Update assignment if specified
-                                if assigned_employee_id:
-                                    opportunity.opportunity_owner_employee_id = opportunity_owner_id
-                            
-                            success_count += 1
-                            current_app.logger.info(f"   ✅ Updated existing record for MPAN: {mpan_mpr}")
-                            continue  # Move to next row
-
-                    # ============================================
-                    # NO DUPLICATE - CREATE NEW CLIENT
-                    # ============================================
-                    current_app.logger.info(f"✨ Creating new client: {business_name} (MPAN: {mpan_mpr or 'none'})")
-                    
-                    new_client = Client_Master(
-                        tenant_id=tenant_id,
-                        client_company_name=business_name,
-                        client_contact_name=contact_person or business_name,
-                        address=address or '',
-                        post_code=postcode or '',
-                        client_phone=phone,
-                        client_email=email or '',
-                        client_website='',
-                        default_currency_id=1,
-                        created_at=datetime.utcnow(),
-                        position=position or None,
-                        company_number=company_number or None,
-                        date_of_birth=date_of_birth,
-                        charity_ltd_company_number=charity_ltd_company_number or None,
-                        partner_details=partner_details or None,
-                        bank_name=bank_name or None,
-                        account_number=account_number or None,
-                        sort_code=sort_code or None,
-                    )
-                    session.add(new_client)
-                    session.flush()
-                    
-                    client_id = new_client.client_id
-                    
-                    # Create Opportunity (required for visibility)
-                    opportunity = Opportunity_Details(
-                        client_id=client_id,
-                        opportunity_title=f"Opportunity - {business_name}",
-                        opportunity_description='Imported from bulk upload',
-                        opportunity_date=datetime.utcnow().date(),
-                        opportunity_owner_employee_id=opportunity_owner_id,
-                        stage_id=1,
-                        opportunity_value=0,
-                        currency_id=1,
-                        created_at=datetime.utcnow(),
-                        Misc_Col1=None
-                    )
-                    session.add(opportunity)
-                    session.flush()
-                    
-                    # Create Project
-                    project = None
-                    if site_address or annual_usage or mpan_mpr or start_date or end_date:
-                        project = Project_Details(
-                            client_id=client_id,
-                            opportunity_id=opportunity.opportunity_id,
-                            project_title=f"Site - {business_name}",
-                            project_description='Imported site location',
-                            start_date=start_date,
-                            end_date=end_date,
-                            employee_id=employee_id,
-                            created_at=datetime.utcnow(),
-                            updated_at=datetime.utcnow(),
-                            address=site_address or address or '',
-                            Misc_Col1=None,
-                            Misc_Col2=int(annual_usage) if annual_usage else None,
-                            site_name=site_name or None,
-                            month_sold=month_sold or None,
-                            house_name=house_name or None,
-                            house_number=house_number or None,
-                            door_number=door_number or None,
-                            town=town or None,
-                            county=county or None,
-                        )
-                        session.add(project)
-                        session.flush()
-                    
-                    # Create Contract
-                    if project and mpan_mpr:
-                        # Default end date if missing
-                        if not end_date:
-                            if start_date:
-                                from datetime import timedelta
-                                end_date = start_date + timedelta(days=365)
-                            else:
-                                from datetime import timedelta
-                                end_date = datetime.utcnow().date() + timedelta(days=365)
-                        
-                        current_app.logger.info(f"   ✨ Creating contract with end date: {end_date}")
-                        
-                        contract = Energy_Contract_Master(
-                            project_id=project.project_id,
-                            employee_id=employee_id,
-                            supplier_id=supplier_id or 1,
-                            contract_start_date=start_date,
-                            contract_end_date=end_date,
-                            terms_of_sale='',
-                            service_id=import_service_id,
-                            unit_rate=rate_1 or 0.0,
-                            currency_id=1,
-                            document_details=None,
-                            created_at=datetime.utcnow(),
-                            updated_at=datetime.utcnow(),
-                            mpan_number=mpan_mpr or '',
-                            net_notch=net_notch,
-                            term_sold=term_sold,
-                            rate_2=rate_2,
-                            rate_3=rate_3,
-                            comms_paid=comms_paid,
-                            standing_charge=stand_charge,
-                            aggregator=aggregator or None,
-                            rate_1=rate_1,
-                        )
-                        session.add(contract)
-                        session.flush()
-                        
-                        # Add to cache
-                        existing_mpans[mpan_mpr.strip().lower()] = contract
-                    
-                    success_count += 1
-                    
-                except Exception as row_error:
-                    error_count += 1
-                    error_msg = f"Row {index + 2}: {str(row_error)}"
-                    errors.append(error_msg)
-                    current_app.logger.error(f"❌ {error_msg}")
-                    continue
-            
-            # Commit each batch
-            session.commit()
-            current_app.logger.info(f"✅ Batch committed: {batch_end}/{total_rows} rows processed")
+        current_app.logger.info(f"📊 Starting import of {total_rows} rows (individual commits)")
         
-        current_app.logger.info(f"✅ Import complete: {success_count} success, {error_count} errors")
+        for index, row in df.iterrows():
+            try:
+                # Extract data
+                client_name = safe_str(row.get(actual_columns.get('client_name', ''), ''))
+                trading_name = safe_str(row.get(actual_columns.get('trading_name', ''), ''))
+                main_contact = safe_str(row.get(actual_columns.get('main_contact', ''), ''))
+                position = safe_str(row.get(actual_columns.get('position', ''), ''))
+                tel_no = safe_str(row.get(actual_columns.get('tel_no', ''), ''))
+                mobile_no = safe_str(row.get(actual_columns.get('mobile_no', ''), ''))
+                email = safe_str(row.get(actual_columns.get('email', ''), ''))
+                site_name = safe_str(row.get(actual_columns.get('site_name', ''), ''))
+
+                # Address fields
+                address_line_1 = safe_str(row.get(actual_columns.get('address_line_1', ''), ''))
+                address_line_2 = safe_str(row.get(actual_columns.get('address_line_2', ''), ''))
+                address_line_3 = safe_str(row.get(actual_columns.get('address_line_3', ''), ''))
+                town = safe_str(row.get(actual_columns.get('town', ''), ''))
+                county = safe_str(row.get(actual_columns.get('county', ''), ''))
+                postcode = safe_str(row.get(actual_columns.get('postcode', ''), ''))
+
+                address_parts = [p for p in [address_line_1, address_line_2, address_line_3, town, county] if p and p.lower() != 'nan']
+                address = ', '.join(address_parts)
+                site_address = site_name or address
+
+                # MPAN fields
+                mpan_top = safe_str(row.get(actual_columns.get('mpan_top', ''), ''))
+                mpan_bottom = safe_str(row.get(actual_columns.get('mpan_bottom', ''), ''))
+                mpan_mpr = f"{mpan_top}{mpan_bottom}" if mpan_top and mpan_bottom else (mpan_top or mpan_bottom or '')
+
+                # Contract fields
+                supplier_name = safe_str(row.get(actual_columns.get('supplier', ''), ''))
+                annual_usage = parse_number(row.get(actual_columns.get('annual_usage', '')))
+                start_date = parse_date(row.get(actual_columns.get('start_date', '')))
+                end_date = parse_date(row.get(actual_columns.get('contract_end', '')))
+                stand_charge = parse_number(row.get(actual_columns.get('stand_charge', '')))
+                rate_1 = parse_number(row.get(actual_columns.get('rate_1', '')))
+                net_notch = parse_number(row.get(actual_columns.get('net_notch', '')))
+                rate_2 = parse_number(row.get(actual_columns.get('rate_2', '')))
+                rate_3 = parse_number(row.get(actual_columns.get('rate_3', '')))
+                comms_paid = parse_number(row.get(actual_columns.get('comms_paid', '')))
+                company_number = safe_str(row.get(actual_columns.get('company_number', ''), ''))
+                date_of_birth = parse_date(row.get(actual_columns.get('date_of_birth', '')))
+                charity_ltd_company_number = safe_str(row.get(actual_columns.get('charity_ltd_company_number', ''), ''))
+                month_sold = safe_str(row.get(actual_columns.get('month_sold', ''), ''))
+                house_name = safe_str(row.get(actual_columns.get('house_name', ''), ''))
+                house_number = safe_str(row.get(actual_columns.get('house_number', ''), ''))
+                door_number = safe_str(row.get(actual_columns.get('door_number', ''), ''))
+                term_sold = parse_number(row.get(actual_columns.get('in_contract', '')))
+                aggregator = safe_str(row.get(actual_columns.get('aggregator', ''), ''))
+                partner_details = safe_str(row.get(actual_columns.get('partner_details', ''), ''))
+                bank_name = safe_str(row.get(actual_columns.get('bank_name', ''), ''))
+                account_number = safe_str(row.get(actual_columns.get('ac_number', ''), ''))
+                sort_code = safe_str(row.get(actual_columns.get('sort_code', ''), ''))
+
+                # ✅ EXACT MATCH ONLY for suppliers (no fuzzy matching)
+                supplier_id = None
+                if supplier_name:
+                    supplier_key = supplier_name.lower().strip()
+                    supplier_id = suppliers_dict.get(supplier_key)
+                    
+                    if not supplier_id:
+                        # Log warning but continue with default
+                        current_app.logger.warning(f"Row {index + 2}: Supplier '{supplier_name}' not found - using default")
+                        supplier_id = 1
+                else:
+                    supplier_id = 1
+
+                business_name = trading_name or client_name
+                contact_person = main_contact or client_name
+                phone = tel_no or mobile_no
+
+                # Skip empty rows
+                if not business_name and not phone:
+                    continue
+
+                # Validate required fields
+                if not business_name:
+                    errors.append(f"Row {index + 2}: Missing client/business name")
+                    error_count += 1
+                    continue
+
+                if not phone:
+                    errors.append(f"Row {index + 2}: Missing phone number")
+                    error_count += 1
+                    continue
+                
+                # ============================================
+                # CHECK DUPLICATES: ONLY BY MPAN NUMBER
+                # ============================================
+                if mpan_mpr:
+                    mpan_key = mpan_mpr.strip().lower()
+                    existing_contract = existing_mpans.get(mpan_key)
+                    
+                    if existing_contract:
+                        # DUPLICATE - UPDATE EXISTING
+                        duplicate_count += 1
+                        
+                        project = session.query(Project_Details).filter_by(
+                            project_id=existing_contract.project_id
+                        ).first()
+                        
+                        if not project:
+                            session.rollback()
+                            error_count += 1
+                            errors.append(f"Row {index + 2}: Project not found for MPAN {mpan_mpr}")
+                            continue
+                        
+                        client = session.query(Client_Master).filter_by(
+                            client_id=project.client_id
+                        ).first()
+                        
+                        if not client:
+                            session.rollback()
+                            error_count += 1
+                            errors.append(f"Row {index + 2}: Client not found for MPAN {mpan_mpr}")
+                            continue
+                        
+                        # Update fields
+                        if email and not client.client_email:
+                            client.client_email = email
+                        if address and not client.address:
+                            client.address = address
+                        if postcode and not client.post_code:
+                            client.post_code = postcode
+                        
+                        if site_address and not project.address:
+                            project.address = site_address
+                        if annual_usage and not project.Misc_Col2:
+                            project.Misc_Col2 = int(annual_usage)
+                        
+                        if start_date and (not project.start_date or start_date > project.start_date):
+                            project.start_date = start_date
+                        
+                        if end_date and (not project.end_date or end_date > project.end_date):
+                            project.end_date = end_date
+                        
+                        project.updated_at = datetime.utcnow()
+                        
+                        if end_date and (not existing_contract.contract_end_date or end_date > existing_contract.contract_end_date):
+                            existing_contract.contract_end_date = end_date
+                        
+                        if start_date and (not existing_contract.contract_start_date or start_date > existing_contract.contract_start_date):
+                            existing_contract.contract_start_date = start_date
+                        
+                        # ✅ ONLY update supplier if current is default AND new supplier found
+                        if supplier_id and supplier_id != 1 and (not existing_contract.supplier_id or existing_contract.supplier_id == 1):
+                            existing_contract.supplier_id = supplier_id
+                        
+                        if rate_1 and not existing_contract.rate_1:
+                            existing_contract.rate_1 = rate_1
+                            existing_contract.unit_rate = rate_1
+                        
+                        if rate_2 and not existing_contract.rate_2:
+                            existing_contract.rate_2 = rate_2
+                        
+                        if rate_3 and not existing_contract.rate_3:
+                            existing_contract.rate_3 = rate_3
+                        
+                        if stand_charge and not existing_contract.standing_charge:
+                            existing_contract.standing_charge = stand_charge
+                        
+                        if net_notch and not existing_contract.net_notch:
+                            existing_contract.net_notch = net_notch
+                        
+                        if comms_paid and not existing_contract.comms_paid:
+                            existing_contract.comms_paid = comms_paid
+                        
+                        if aggregator and not existing_contract.aggregator:
+                            existing_contract.aggregator = aggregator
+                        
+                        existing_contract.updated_at = datetime.utcnow()
+                        
+                        # Update Opportunity assignment
+                        opportunity = session.query(Opportunity_Details).filter_by(
+                            client_id=client.client_id
+                        ).first()
+                        
+                        if not opportunity:
+                            opportunity = Opportunity_Details(
+                                client_id=client.client_id,
+                                opportunity_title=f"Opportunity - {client.client_company_name}",
+                                opportunity_description='Imported from bulk upload',
+                                opportunity_date=datetime.utcnow().date(),
+                                opportunity_owner_employee_id=opportunity_owner_id,
+                                stage_id=1,
+                                opportunity_value=0,
+                                currency_id=1,
+                                created_at=datetime.utcnow(),
+                                Misc_Col1=None
+                            )
+                            session.add(opportunity)
+                        elif assigned_employee_id:
+                            opportunity.opportunity_owner_employee_id = opportunity_owner_id
+                        
+                        # ✅ COMMIT IMMEDIATELY
+                        session.commit()
+                        
+                        # Log progress every 100 records
+                        if (success_count + duplicate_count) % 100 == 0:
+                            current_app.logger.info(f"📊 Progress: {success_count + duplicate_count}/{total_rows}")
+                        
+                        continue
+
+                # ============================================
+                # CREATE NEW CLIENT
+                # ============================================
+                new_client = Client_Master(
+                    tenant_id=tenant_id,
+                    client_company_name=business_name,
+                    client_contact_name=contact_person or business_name,
+                    address=address or '',
+                    post_code=postcode or '',
+                    client_phone=phone,
+                    client_email=email or '',
+                    client_website='',
+                    default_currency_id=1,
+                    created_at=datetime.utcnow(),
+                    position=position or None,
+                    company_number=company_number or None,
+                    date_of_birth=date_of_birth,
+                    charity_ltd_company_number=charity_ltd_company_number or None,
+                    partner_details=partner_details or None,
+                    bank_name=bank_name or None,
+                    account_number=account_number or None,
+                    sort_code=sort_code or None,
+                )
+                session.add(new_client)
+                session.flush()
+                
+                client_id = new_client.client_id
+                
+                # Create Opportunity
+                opportunity = Opportunity_Details(
+                    client_id=client_id,
+                    opportunity_title=f"Opportunity - {business_name}",
+                    opportunity_description='Imported from bulk upload',
+                    opportunity_date=datetime.utcnow().date(),
+                    opportunity_owner_employee_id=opportunity_owner_id,
+                    stage_id=1,
+                    opportunity_value=0,
+                    currency_id=1,
+                    created_at=datetime.utcnow(),
+                    Misc_Col1=None
+                )
+                session.add(opportunity)
+                session.flush()
+                
+                # Create Project
+                project = None
+                if site_address or annual_usage or mpan_mpr or start_date or end_date:
+                    project = Project_Details(
+                        client_id=client_id,
+                        opportunity_id=opportunity.opportunity_id,
+                        project_title=f"Site - {business_name}",
+                        project_description='Imported site location',
+                        start_date=start_date,
+                        end_date=end_date,
+                        employee_id=employee_id,
+                        created_at=datetime.utcnow(),
+                        updated_at=datetime.utcnow(),
+                        address=site_address or address or '',
+                        Misc_Col1=None,
+                        Misc_Col2=int(annual_usage) if annual_usage else None,
+                        site_name=site_name or None,
+                        month_sold=month_sold or None,
+                        house_name=house_name or None,
+                        house_number=house_number or None,
+                        door_number=door_number or None,
+                        town=town or None,
+                        county=county or None,
+                    )
+                    session.add(project)
+                    session.flush()
+                
+                # Create Contract
+                if project and mpan_mpr:
+                    if not end_date:
+                        if start_date:
+                            from datetime import timedelta
+                            end_date = start_date + timedelta(days=365)
+                        else:
+                            from datetime import timedelta
+                            end_date = datetime.utcnow().date() + timedelta(days=365)
+                    
+                    contract = Energy_Contract_Master(
+                        project_id=project.project_id,
+                        employee_id=employee_id,
+                        supplier_id=supplier_id or 1,
+                        contract_start_date=start_date,
+                        contract_end_date=end_date,
+                        terms_of_sale='',
+                        service_id=import_service_id,
+                        unit_rate=rate_1 or 0.0,
+                        currency_id=1,
+                        document_details=None,
+                        created_at=datetime.utcnow(),
+                        updated_at=datetime.utcnow(),
+                        mpan_number=mpan_mpr or '',
+                        net_notch=net_notch,
+                        term_sold=term_sold,
+                        rate_2=rate_2,
+                        rate_3=rate_3,
+                        comms_paid=comms_paid,
+                        standing_charge=stand_charge,
+                        aggregator=aggregator or None,
+                        rate_1=rate_1,
+                    )
+                    session.add(contract)
+                    session.flush()
+                    
+                    # Add to cache
+                    existing_mpans[mpan_mpr.strip().lower()] = contract
+                
+                # ✅ COMMIT IMMEDIATELY AFTER EACH RECORD
+                session.commit()
+                success_count += 1
+                
+                # Log progress every 100 records
+                if success_count % 100 == 0:
+                    current_app.logger.info(f"📊 Progress: {success_count}/{total_rows} records imported")
+                
+            except Exception as row_error:
+                session.rollback()
+                error_count += 1
+                error_msg = f"Row {index + 2}: {str(row_error)}"
+                errors.append(error_msg)
+                current_app.logger.error(f"❌ {error_msg}")
+                continue
+        
+        current_app.logger.info(f"✅ Import complete: {success_count} new, {duplicate_count} updated, {error_count} errors")
         
         return jsonify({
             'success': True,
             'message': f'Import completed',
             'total_rows': len(df),
             'successful': success_count,
+            'duplicates': duplicate_count,
             'failed': error_count,
             'errors': errors[:50],
             'assigned_to': assigned_employee_name,
@@ -747,7 +748,6 @@ def import_energy_customers():
         current_app.logger.exception(f"❌ Import failed: {e}")
         return jsonify({'error': f'Import failed: {str(e)}'}), 500
     finally:
-        # Re-enable SQL logging
         sql_logger.setLevel(original_level)
         session.close()
 
