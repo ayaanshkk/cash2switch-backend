@@ -416,13 +416,13 @@ class Notification_Master(Base):
     __table_args__ = {'schema': 'StreemLyne_MT'}
     
     notification_id = Column(Integer, primary_key=True, autoincrement=True)
-    tenant_id = Column(Integer, ForeignKey('"StreemLyne_MT"."Tenant_Master".tenant_id'), nullable=False)
-    employee_id = Column(Integer, ForeignKey('"StreemLyne_MT"."Employee_Master".employee_id'), nullable=True)  # NULL for admin notifications
-    client_id = Column(Integer, ForeignKey('"StreemLyne_MT"."Client_Master".client_id'), nullable=True)
-    contract_id = Column(Integer, ForeignKey('"StreemLyne_MT"."Energy_Contract_Master".energy_contract_master_id'), nullable=True)
+    tenant_id = Column(Integer, nullable=False)
+    employee_id = Column(Integer, nullable=True)
+    client_id = Column(Integer, nullable=True)
+    contract_id = Column(Integer, nullable=True)
     
-    notification_type = Column(String(50), nullable=False)  # 'contract_expiry_30', 'contract_expiry_60', 'contract_expiry_90'
-    priority = Column(String(20), nullable=False, default='medium')  # 'urgent', 'high', 'medium', 'low'
+    notification_type = Column(String(50), nullable=False)
+    priority = Column(String(20), nullable=False, default='medium')
     message = Column(Text, nullable=False)
     
     read = Column(Boolean, default=False, nullable=False)
@@ -430,8 +430,3 @@ class Notification_Master(Base):
     
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     read_at = Column(DateTime(timezone=True), nullable=True)
-    
-    # Relationships
-    tenant = relationship("Tenant_Master", backref="notifications")
-    employee = relationship("Employee_Master", backref="notifications")
-    client = relationship("Client_Master", backref="notifications")
