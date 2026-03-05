@@ -295,7 +295,7 @@ def import_energy_customers():
         # Normalize column names
         df.columns = df.columns.str.strip().str.lower().str.replace('_', ' ').str.replace(r'\s+', ' ', regex=True)
         
-        # Column mapping (keep existing)
+        # Column mapping
         column_map = {
             'client_name': ['client name', 'business name', 'company name'],
             'trading_name': ['trading name', 'business', 'company'],
@@ -376,11 +376,15 @@ def import_energy_customers():
             suppliers_dict[s.supplier_company_name.lower()] = s.supplier_id
         
         # ============================================
-        # ✅ OPTIMIZATION 3: PRE-LOAD EXISTING CLIENTS (single query)
+        # ✅ OPTIMIZATION 3: PRE-LOAD EXISTING MPANs ONLY
         # ============================================
-        existing_clients = session.query(Client_Master).filter_by(tenant_id=tenant_id).all()
-        existing_phones = {c.client_phone: c for c in existing_clients if c.client_phone}
-        existing_names = {c.client_company_name.lower(): c for c in existing_clients if c.client_company_name}
+        existing_mpans = {}
+        existing_contracts = session.query(Energy_Contract_Master).all()
+        for contract in existing_contracts:
+            if contract.mpan_number:
+                existing_mpans[contract.mpan_number.strip().lower()] = contract
+
+        current_app.logger.info(f"📊 Loaded {len(existing_mpans)} existing MPANs for duplicate checking")
         
         # ============================================
         # ✅ OPTIMIZATION 4: BATCH PROCESSING
@@ -399,7 +403,7 @@ def import_energy_customers():
             
             for index, row in batch_df.iterrows():
                 try:
-                    # Extract data (keep existing logic)
+                    # Extract data
                     client_name = safe_str(row.get(actual_columns.get('client_name', ''), ''))
                     trading_name = safe_str(row.get(actual_columns.get('trading_name', ''), ''))
                     main_contact = safe_str(row.get(actual_columns.get('main_contact', ''), ''))
@@ -451,7 +455,7 @@ def import_energy_customers():
                     account_number = safe_str(row.get(actual_columns.get('ac_number', ''), ''))
                     sort_code = safe_str(row.get(actual_columns.get('sort_code', ''), ''))
 
-                    # ✅ OPTIMIZATION: Use pre-loaded suppliers
+                    # Use pre-loaded suppliers
                     supplier_id = suppliers_dict.get(supplier_name.lower(), 1) if supplier_name else 1
 
                     business_name = trading_name or client_name
@@ -473,59 +477,51 @@ def import_energy_customers():
                         error_count += 1
                         continue
                     
-                    # ✅ OPTIMIZATION: Check duplicates from pre-loaded data
-                    existing_client = existing_phones.get(phone) or existing_names.get(business_name.lower())
-
-                    if existing_client:
-                        # ============================================
-                        # UPDATE EXISTING CLIENT WITH LATEST DATA
-                        # ============================================
-                        current_app.logger.info(f"📝 Duplicate found for {business_name} - checking for updates...")
+                    # ============================================
+                    # ✅ CHECK DUPLICATES: ONLY BY MPAN NUMBER
+                    # ============================================
+                    if mpan_mpr:
+                        mpan_key = mpan_mpr.strip().lower()
+                        existing_contract = existing_mpans.get(mpan_key)
                         
-                        # Update client basic info if missing
-                        if email and not existing_client.client_email:
-                            existing_client.client_email = email
-                        if address and not existing_client.address:
-                            existing_client.address = address
-                        if postcode and not existing_client.post_code:
-                            existing_client.post_code = postcode
-                        
-                        client_id = existing_client.client_id
-                        
-                        # Get or create Project
-                        project = session.query(Project_Details).filter_by(client_id=client_id).first()
-                        if not project and (site_address or annual_usage or mpan_mpr or start_date or end_date):
-                            project = Project_Details(
-                                client_id=client_id,
-                                opportunity_id=None,
-                                project_title=f"Site - {business_name}",
-                                project_description='Imported site location',
-                                start_date=start_date,
-                                end_date=end_date,
-                                employee_id=employee_id,
-                                created_at=datetime.utcnow(),
-                                updated_at=datetime.utcnow(),
-                                address=site_address or address or '',
-                                Misc_Col1=None,
-                                Misc_Col2=int(annual_usage) if annual_usage else None,
-                                site_name=site_name or None,
-                                month_sold=month_sold or None,
-                                house_name=house_name or None,
-                                house_number=house_number or None,
-                                door_number=door_number or None,
-                                town=town or None,
-                                county=county or None,
-                            )
-                            session.add(project)
-                            session.flush()
-                        elif project:
+                        if existing_contract:
+                            # ============================================
+                            # DUPLICATE MPAN - UPDATE EXISTING RECORD
+                            # ============================================
+                            current_app.logger.info(f"📝 Duplicate MPAN found: {mpan_mpr} - updating contract...")
+                            
+                            # Get the related records
+                            project = session.query(Project_Details).filter_by(
+                                project_id=existing_contract.project_id
+                            ).first()
+                            
+                            if not project:
+                                current_app.logger.warning(f"⚠️ Project not found for contract {existing_contract.energy_contract_master_id}")
+                                continue
+                            
+                            client = session.query(Client_Master).filter_by(
+                                client_id=project.client_id
+                            ).first()
+                            
+                            if not client:
+                                current_app.logger.warning(f"⚠️ Client not found for project {project.project_id}")
+                                continue
+                            
+                            # Update client basic info if provided
+                            if email and not client.client_email:
+                                client.client_email = email
+                            if address and not client.address:
+                                client.address = address
+                            if postcode and not client.post_code:
+                                client.post_code = postcode
+                            
                             # Update project fields
                             if site_address and not project.address:
                                 project.address = site_address
                             if annual_usage and not project.Misc_Col2:
                                 project.Misc_Col2 = int(annual_usage)
                             
-                            # ✅ NEW: Always update to LATEST dates if newer
+                            # Always update to LATEST dates if newer
                             if start_date:
                                 if not project.start_date or start_date > project.start_date:
                                     current_app.logger.info(f"   📅 Updating start date: {project.start_date} → {start_date}")
@@ -537,265 +533,190 @@ def import_energy_customers():
                                     project.end_date = end_date
                             
                             project.updated_at = datetime.utcnow()
-                        
-                        # Get or create Opportunity
-                        opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
-                        if not opportunity:
-                            opportunity = Opportunity_Details(
-                                client_id=client_id,
-                                opportunity_title=f"Opportunity - {business_name}",
-                                opportunity_description='Imported from bulk upload',
-                                opportunity_date=datetime.utcnow().date(),
-                                opportunity_owner_employee_id=opportunity_owner_id,
-                                stage_id=1,
-                                opportunity_value=0,
-                                currency_id=1,
-                                created_at=datetime.utcnow(),
-                                Misc_Col1=None
-                            )
-                            session.add(opportunity)
-                            session.flush()
-                        else:
-                            # Update assignment if specified
-                            if assigned_employee_id:
-                                opportunity.opportunity_owner_employee_id = opportunity_owner_id
-                        
-                        # Link project to opportunity
-                        if project and not project.opportunity_id:
-                            project.opportunity_id = opportunity.opportunity_id
-                            session.flush()
-                        
-                        # ✅ NEW: SMART CONTRACT UPDATE - Keep Latest End Date
-                        if project and mpan_mpr:
-                            # Default end date if missing
-                            if not end_date:
-                                if start_date:
-                                    from datetime import timedelta
-                                    end_date = start_date + timedelta(days=365)
-                                else:
-                                    from datetime import timedelta
-                                    end_date = datetime.utcnow().date() + timedelta(days=365)
                             
-                            # Find existing contract
-                            contract = session.query(Energy_Contract_Master).filter_by(
-                                project_id=project.project_id
+                            # Update contract to latest end date
+                            if end_date:
+                                if not existing_contract.contract_end_date or end_date > existing_contract.contract_end_date:
+                                    current_app.logger.info(f"   ✅ Contract end updated: {existing_contract.contract_end_date} → {end_date}")
+                                    existing_contract.contract_end_date = end_date
+                            
+                            if start_date:
+                                if not existing_contract.contract_start_date or start_date > existing_contract.contract_start_date:
+                                    existing_contract.contract_start_date = start_date
+                            
+                            # Update rates and charges if missing
+                            if rate_1 and not existing_contract.rate_1:
+                                existing_contract.rate_1 = rate_1
+                                existing_contract.unit_rate = rate_1
+                            
+                            if rate_2 and not existing_contract.rate_2:
+                                existing_contract.rate_2 = rate_2
+                            
+                            if rate_3 and not existing_contract.rate_3:
+                                existing_contract.rate_3 = rate_3
+                            
+                            if stand_charge and not existing_contract.standing_charge:
+                                existing_contract.standing_charge = stand_charge
+                            
+                            if net_notch and not existing_contract.net_notch:
+                                existing_contract.net_notch = net_notch
+                            
+                            if comms_paid and not existing_contract.comms_paid:
+                                existing_contract.comms_paid = comms_paid
+                            
+                            if aggregator and not existing_contract.aggregator:
+                                existing_contract.aggregator = aggregator
+                            
+                            if supplier_id and not existing_contract.supplier_id:
+                                existing_contract.supplier_id = supplier_id
+                            
+                            existing_contract.updated_at = datetime.utcnow()
+                            
+                            # Get or update Opportunity for assignment
+                            opportunity = session.query(Opportunity_Details).filter_by(
+                                client_id=client.client_id
                             ).first()
                             
-                            if not contract:
-                                # No contract exists - create new one
-                                current_app.logger.info(f"   ✨ Creating new contract with end date: {end_date}")
-                                contract = Energy_Contract_Master(
-                                    project_id=project.project_id,
-                                    employee_id=employee_id,
-                                    supplier_id=supplier_id or 1,
-                                    contract_start_date=start_date,
-                                    contract_end_date=end_date,
-                                    terms_of_sale='',
-                                    service_id=import_service_id,
-                                    unit_rate=rate_1 or 0.0,
+                            if not opportunity:
+                                opportunity = Opportunity_Details(
+                                    client_id=client.client_id,
+                                    opportunity_title=f"Opportunity - {client.client_company_name}",
+                                    opportunity_description='Imported from bulk upload',
+                                    opportunity_date=datetime.utcnow().date(),
+                                    opportunity_owner_employee_id=opportunity_owner_id,
+                                    stage_id=1,
+                                    opportunity_value=0,
                                     currency_id=1,
-                                    document_details=None,
                                     created_at=datetime.utcnow(),
-                                    updated_at=datetime.utcnow(),
-                                    mpan_number=mpan_mpr or '',
-                                    net_notch=net_notch,
-                                    term_sold=term_sold,
-                                    rate_2=rate_2,
-                                    rate_3=rate_3,
-                                    comms_paid=comms_paid,
-                                    standing_charge=stand_charge,
-                                    aggregator=aggregator or None,
-                                    rate_1=rate_1,
+                                    Misc_Col1=None
                                 )
-                                session.add(contract)
+                                session.add(opportunity)
                                 session.flush()
                             else:
-                                # ✅ CONTRACT EXISTS - UPDATE TO LATEST END DATE
-                                updated = False
-                                
-                                # Update MPAN if missing
-                                if mpan_mpr and not contract.mpan_number:
-                                    contract.mpan_number = mpan_mpr
-                                    updated = True
-                                
-                                # Update supplier if missing
-                                if supplier_id and not contract.supplier_id:
-                                    contract.supplier_id = supplier_id
-                                    updated = True
-                                
-                                # ✅ CRITICAL: Always update to LATEST start date if newer
-                                if start_date:
-                                    if not contract.contract_start_date or start_date > contract.contract_start_date:
-                                        current_app.logger.info(f"   📅 Contract start updated: {contract.contract_start_date} → {start_date}")
-                                        contract.contract_start_date = start_date
-                                        updated = True
-                                
-                                # ✅ CRITICAL: Always update to LATEST end date if newer
-                                if end_date:
-                                    if not contract.contract_end_date or end_date > contract.contract_end_date:
-                                        current_app.logger.info(f"   ✅ Contract end updated: {contract.contract_end_date} → {end_date} (LATEST)")
-                                        contract.contract_end_date = end_date
-                                        updated = True
-                                    else:
-                                        current_app.logger.info(f"   ℹ️ Keeping existing end date {contract.contract_end_date} (newer than {end_date})")
-                                
-                                # ✅ NEW: Update rates and fields if missing or if this is the latest contract
-                                if end_date and contract.contract_end_date and end_date >= contract.contract_end_date:
-                                    # This is the latest contract - update all details
-                                    if rate_1 and not contract.rate_1:
-                                        contract.rate_1 = rate_1
-                                        contract.unit_rate = rate_1
-                                        updated = True
-                                    
-                                    if rate_2 and not contract.rate_2:
-                                        contract.rate_2 = rate_2
-                                        updated = True
-                                    
-                                    if rate_3 and not contract.rate_3:
-                                        contract.rate_3 = rate_3
-                                        updated = True
-                                    
-                                    if stand_charge and not contract.standing_charge:
-                                        contract.standing_charge = stand_charge
-                                        updated = True
-                                    
-                                    if net_notch and not contract.net_notch:
-                                        contract.net_notch = net_notch
-                                        updated = True
-                                    
-                                    if comms_paid and not contract.comms_paid:
-                                        contract.comms_paid = comms_paid
-                                        updated = True
-                                    
-                                    if aggregator and not contract.aggregator:
-                                        contract.aggregator = aggregator
-                                        updated = True
-                                
-                                if updated:
-                                    contract.updated_at = datetime.utcnow()
-                                    current_app.logger.info(f"   ✅ Contract updated for {business_name}")
-                        
-                        success_count += 1
-                        continue  # Move to next row
+                                # Update assignment if specified
+                                if assigned_employee_id:
+                                    opportunity.opportunity_owner_employee_id = opportunity_owner_id
+                            
+                            success_count += 1
+                            current_app.logger.info(f"   ✅ Updated existing record for MPAN: {mpan_mpr}")
+                            continue  # Move to next row
 
-                    else:
-                        # ============================================
-                        # CREATE NEW CLIENT (NOT A DUPLICATE)
-                        # ============================================
-                        current_app.logger.info(f"✨ Creating new client: {business_name}")
-                        
-                        new_client = Client_Master(
-                            tenant_id=tenant_id,
-                            client_company_name=business_name,
-                            client_contact_name=contact_person or business_name,
-                            address=address or '',
-                            post_code=postcode or '',
-                            client_phone=phone,
-                            client_email=email or '',
-                            client_website='',
-                            default_currency_id=1,
-                            created_at=datetime.utcnow(),
-                            position=position or None,
-                            company_number=company_number or None,
-                            date_of_birth=date_of_birth,
-                            charity_ltd_company_number=charity_ltd_company_number or None,
-                            partner_details=partner_details or None,
-                            bank_name=bank_name or None,
-                            account_number=account_number or None,
-                            sort_code=sort_code or None,
-                        )
-                        session.add(new_client)
-                        session.flush()
-                        
-                        # Add to cache for next iterations
-                        existing_phones[phone] = new_client
-                        existing_names[business_name.lower()] = new_client
-                        
-                        client_id = new_client.client_id
-                        
-                        # Create Opportunity
-                        opportunity = Opportunity_Details(
+                    # ============================================
+                    # NO DUPLICATE - CREATE NEW CLIENT
+                    # ============================================
+                    current_app.logger.info(f"✨ Creating new client: {business_name} (MPAN: {mpan_mpr or 'none'})")
+                    
+                    new_client = Client_Master(
+                        tenant_id=tenant_id,
+                        client_company_name=business_name,
+                        client_contact_name=contact_person or business_name,
+                        address=address or '',
+                        post_code=postcode or '',
+                        client_phone=phone,
+                        client_email=email or '',
+                        client_website='',
+                        default_currency_id=1,
+                        created_at=datetime.utcnow(),
+                        position=position or None,
+                        company_number=company_number or None,
+                        date_of_birth=date_of_birth,
+                        charity_ltd_company_number=charity_ltd_company_number or None,
+                        partner_details=partner_details or None,
+                        bank_name=bank_name or None,
+                        account_number=account_number or None,
+                        sort_code=sort_code or None,
+                    )
+                    session.add(new_client)
+                    session.flush()
+                    
+                    client_id = new_client.client_id
+                    
+                    # Create Opportunity (required for visibility)
+                    opportunity = Opportunity_Details(
+                        client_id=client_id,
+                        opportunity_title=f"Opportunity - {business_name}",
+                        opportunity_description='Imported from bulk upload',
+                        opportunity_date=datetime.utcnow().date(),
+                        opportunity_owner_employee_id=opportunity_owner_id,
+                        stage_id=1,
+                        opportunity_value=0,
+                        currency_id=1,
+                        created_at=datetime.utcnow(),
+                        Misc_Col1=None
+                    )
+                    session.add(opportunity)
+                    session.flush()
+                    
+                    # Create Project
+                    project = None
+                    if site_address or annual_usage or mpan_mpr or start_date or end_date:
+                        project = Project_Details(
                             client_id=client_id,
-                            opportunity_title=f"Opportunity - {business_name}",
-                            opportunity_description='Imported from bulk upload',
-                            opportunity_date=datetime.utcnow().date(),
-                            opportunity_owner_employee_id=opportunity_owner_id,
-                            stage_id=1,
-                            opportunity_value=0,
-                            currency_id=1,
+                            opportunity_id=opportunity.opportunity_id,
+                            project_title=f"Site - {business_name}",
+                            project_description='Imported site location',
+                            start_date=start_date,
+                            end_date=end_date,
+                            employee_id=employee_id,
                             created_at=datetime.utcnow(),
-                            Misc_Col1=None
+                            updated_at=datetime.utcnow(),
+                            address=site_address or address or '',
+                            Misc_Col1=None,
+                            Misc_Col2=int(annual_usage) if annual_usage else None,
+                            site_name=site_name or None,
+                            month_sold=month_sold or None,
+                            house_name=house_name or None,
+                            house_number=house_number or None,
+                            door_number=door_number or None,
+                            town=town or None,
+                            county=county or None,
                         )
-                        session.add(opportunity)
+                        session.add(project)
+                        session.flush()
+                    
+                    # Create Contract
+                    if project and mpan_mpr:
+                        # Default end date if missing
+                        if not end_date:
+                            if start_date:
+                                from datetime import timedelta
+                                end_date = start_date + timedelta(days=365)
+                            else:
+                                from datetime import timedelta
+                                end_date = datetime.utcnow().date() + timedelta(days=365)
+                        
+                        current_app.logger.info(f"   ✨ Creating contract with end date: {end_date}")
+                        
+                        contract = Energy_Contract_Master(
+                            project_id=project.project_id,
+                            employee_id=employee_id,
+                            supplier_id=supplier_id or 1,
+                            contract_start_date=start_date,
+                            contract_end_date=end_date,
+                            terms_of_sale='',
+                            service_id=import_service_id,
+                            unit_rate=rate_1 or 0.0,
+                            currency_id=1,
+                            document_details=None,
+                            created_at=datetime.utcnow(),
+                            updated_at=datetime.utcnow(),
+                            mpan_number=mpan_mpr or '',
+                            net_notch=net_notch,
+                            term_sold=term_sold,
+                            rate_2=rate_2,
+                            rate_3=rate_3,
+                            comms_paid=comms_paid,
+                            standing_charge=stand_charge,
+                            aggregator=aggregator or None,
+                            rate_1=rate_1,
+                        )
+                        session.add(contract)
                         session.flush()
                         
-                        # Create Project
-                        project = None
-                        if site_address or annual_usage or mpan_mpr or start_date or end_date:
-                            project = Project_Details(
-                                client_id=client_id,
-                                opportunity_id=opportunity.opportunity_id,
-                                project_title=f"Site - {business_name}",
-                                project_description='Imported site location',
-                                start_date=start_date,
-                                end_date=end_date,
-                                employee_id=employee_id,
-                                created_at=datetime.utcnow(),
-                                updated_at=datetime.utcnow(),
-                                address=site_address or address or '',
-                                Misc_Col1=None,
-                                Misc_Col2=int(annual_usage) if annual_usage else None,
-                                site_name=site_name or None,
-                                month_sold=month_sold or None,
-                                house_name=house_name or None,
-                                house_number=house_number or None,
-                                door_number=door_number or None,
-                                town=town or None,
-                                county=county or None,
-                            )
-                            session.add(project)
-                            session.flush()
-                        
-                        # Create Contract
-                        if project and mpan_mpr:
-                            # Default end date if missing
-                            if not end_date:
-                                if start_date:
-                                    from datetime import timedelta
-                                    end_date = start_date + timedelta(days=365)
-                                else:
-                                    from datetime import timedelta
-                                    end_date = datetime.utcnow().date() + timedelta(days=365)
-                            
-                            current_app.logger.info(f"   ✨ Creating contract with end date: {end_date}")
-                            
-                            contract = Energy_Contract_Master(
-                                project_id=project.project_id,
-                                employee_id=employee_id,
-                                supplier_id=supplier_id or 1,
-                                contract_start_date=start_date,
-                                contract_end_date=end_date,
-                                terms_of_sale='',
-                                service_id=import_service_id,
-                                unit_rate=rate_1 or 0.0,
-                                currency_id=1,
-                                document_details=None,
-                                created_at=datetime.utcnow(),
-                                updated_at=datetime.utcnow(),
-                                mpan_number=mpan_mpr or '',
-                                net_notch=net_notch,
-                                term_sold=term_sold,
-                                rate_2=rate_2,
-                                rate_3=rate_3,
-                                comms_paid=comms_paid,
-                                standing_charge=stand_charge,
-                                aggregator=aggregator or None,
-                                rate_1=rate_1,
-                            )
-                            session.add(contract)
-                            session.flush()
-                        
-                        success_count += 1
+                        # Add to cache
+                        existing_mpans[mpan_mpr.strip().lower()] = contract
+                    
+                    success_count += 1
                     
                 except Exception as row_error:
                     error_count += 1
@@ -804,7 +725,7 @@ def import_energy_customers():
                     current_app.logger.error(f"❌ {error_msg}")
                     continue
             
-            # ✅ COMMIT EACH BATCH (prevents timeout)
+            # Commit each batch
             session.commit()
             current_app.logger.info(f"✅ Batch committed: {batch_end}/{total_rows} rows processed")
         
@@ -826,7 +747,7 @@ def import_energy_customers():
         current_app.logger.exception(f"❌ Import failed: {e}")
         return jsonify({'error': f'Import failed: {str(e)}'}), 500
     finally:
-        # ✅ Re-enable SQL logging
+        # Re-enable SQL logging
         sql_logger.setLevel(original_level)
         session.close()
 
