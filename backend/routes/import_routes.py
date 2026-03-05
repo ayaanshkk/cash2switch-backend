@@ -677,6 +677,125 @@ def import_energy_customers():
                         
                         success_count += 1
                         continue  # Move to next row
+
+                    else:
+                        # ============================================
+                        # CREATE NEW CLIENT (NOT A DUPLICATE)
+                        # ============================================
+                        current_app.logger.info(f"✨ Creating new client: {business_name}")
+                        
+                        new_client = Client_Master(
+                            tenant_id=tenant_id,
+                            client_company_name=business_name,
+                            client_contact_name=contact_person or business_name,
+                            address=address or '',
+                            post_code=postcode or '',
+                            client_phone=phone,
+                            client_email=email or '',
+                            client_website='',
+                            default_currency_id=1,
+                            created_at=datetime.utcnow(),
+                            position=position or None,
+                            company_number=company_number or None,
+                            date_of_birth=date_of_birth,
+                            charity_ltd_company_number=charity_ltd_company_number or None,
+                            partner_details=partner_details or None,
+                            bank_name=bank_name or None,
+                            account_number=account_number or None,
+                            sort_code=sort_code or None,
+                        )
+                        session.add(new_client)
+                        session.flush()
+                        
+                        # Add to cache for next iterations
+                        existing_phones[phone] = new_client
+                        existing_names[business_name.lower()] = new_client
+                        
+                        client_id = new_client.client_id
+                        
+                        # Create Opportunity
+                        opportunity = Opportunity_Details(
+                            client_id=client_id,
+                            opportunity_title=f"Opportunity - {business_name}",
+                            opportunity_description='Imported from bulk upload',
+                            opportunity_date=datetime.utcnow().date(),
+                            opportunity_owner_employee_id=opportunity_owner_id,
+                            stage_id=1,
+                            opportunity_value=0,
+                            currency_id=1,
+                            created_at=datetime.utcnow(),
+                            Misc_Col1=None
+                        )
+                        session.add(opportunity)
+                        session.flush()
+                        
+                        # Create Project
+                        project = None
+                        if site_address or annual_usage or mpan_mpr or start_date or end_date:
+                            project = Project_Details(
+                                client_id=client_id,
+                                opportunity_id=opportunity.opportunity_id,
+                                project_title=f"Site - {business_name}",
+                                project_description='Imported site location',
+                                start_date=start_date,
+                                end_date=end_date,
+                                employee_id=employee_id,
+                                created_at=datetime.utcnow(),
+                                updated_at=datetime.utcnow(),
+                                address=site_address or address or '',
+                                Misc_Col1=None,
+                                Misc_Col2=int(annual_usage) if annual_usage else None,
+                                site_name=site_name or None,
+                                month_sold=month_sold or None,
+                                house_name=house_name or None,
+                                house_number=house_number or None,
+                                door_number=door_number or None,
+                                town=town or None,
+                                county=county or None,
+                            )
+                            session.add(project)
+                            session.flush()
+                        
+                        # Create Contract
+                        if project and mpan_mpr:
+                            # Default end date if missing
+                            if not end_date:
+                                if start_date:
+                                    from datetime import timedelta
+                                    end_date = start_date + timedelta(days=365)
+                                else:
+                                    from datetime import timedelta
+                                    end_date = datetime.utcnow().date() + timedelta(days=365)
+                            
+                            current_app.logger.info(f"   ✨ Creating contract with end date: {end_date}")
+                            
+                            contract = Energy_Contract_Master(
+                                project_id=project.project_id,
+                                employee_id=employee_id,
+                                supplier_id=supplier_id or 1,
+                                contract_start_date=start_date,
+                                contract_end_date=end_date,
+                                terms_of_sale='',
+                                service_id=import_service_id,
+                                unit_rate=rate_1 or 0.0,
+                                currency_id=1,
+                                document_details=None,
+                                created_at=datetime.utcnow(),
+                                updated_at=datetime.utcnow(),
+                                mpan_number=mpan_mpr or '',
+                                net_notch=net_notch,
+                                term_sold=term_sold,
+                                rate_2=rate_2,
+                                rate_3=rate_3,
+                                comms_paid=comms_paid,
+                                standing_charge=stand_charge,
+                                aggregator=aggregator or None,
+                                rate_1=rate_1,
+                            )
+                            session.add(contract)
+                            session.flush()
+                        
+                        success_count += 1
                     
                 except Exception as row_error:
                     error_count += 1

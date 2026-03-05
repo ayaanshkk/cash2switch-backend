@@ -410,3 +410,28 @@ class Customer(Base):
             'address': self.address,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
+
+class Notification_Master(Base):
+    __tablename__ = 'Notification_Master'
+    __table_args__ = {'schema': 'StreemLyne_MT'}
+    
+    notification_id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey('"StreemLyne_MT"."Tenant_Master".tenant_id'), nullable=False)
+    employee_id = Column(Integer, ForeignKey('"StreemLyne_MT"."Employee_Master".employee_id'), nullable=True)  # NULL for admin notifications
+    client_id = Column(Integer, ForeignKey('"StreemLyne_MT"."Client_Master".client_id'), nullable=True)
+    contract_id = Column(Integer, ForeignKey('"StreemLyne_MT"."Energy_Contract_Master".energy_contract_master_id'), nullable=True)
+    
+    notification_type = Column(String(50), nullable=False)  # 'contract_expiry_30', 'contract_expiry_60', 'contract_expiry_90'
+    priority = Column(String(20), nullable=False, default='medium')  # 'urgent', 'high', 'medium', 'low'
+    message = Column(Text, nullable=False)
+    
+    read = Column(Boolean, default=False, nullable=False)
+    dismissed = Column(Boolean, default=False, nullable=False)
+    
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    read_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Relationships
+    tenant = relationship("Tenant_Master", backref="notifications")
+    employee = relationship("Employee_Master", backref="notifications")
+    client = relationship("Client_Master", backref="notifications")
