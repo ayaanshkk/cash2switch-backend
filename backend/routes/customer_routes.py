@@ -1381,11 +1381,11 @@ def get_stats_by_employee():
         if not tenant_id:
             return jsonify({'error': 'Tenant not found'}), 400
         
-        # Check if user is Platform Admin
-        user_role = getattr(request.current_user, 'role', None)
-        is_admin = user_role and 'admin' in user_role.lower()
+        # ✅ FIX: Use get_user_role_name() helper
+        user_role = get_user_role_name(request.current_user, session)
         
-        if not is_admin:
+        # Check if user is Platform Admin or Tenant Super Admin
+        if user_role not in ['Platform Admin', 'Tenant Super Admin']:
             return jsonify({'error': 'Unauthorized - Admin only'}), 403
         
         # Get service filter
@@ -1403,14 +1403,18 @@ def get_stats_by_employee():
             LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od 
                 ON em.employee_id = od.opportunity_owner_employee_id
             LEFT JOIN "StreemLyne_MT"."Client_Master" cm 
-                ON od.client_id = cm.client_id AND cm.tenant_id = :tenant_id
+                ON od.client_id = cm.client_id 
+                AND cm.tenant_id = :tenant_id
+                AND cm.client_company_name != '[IMPORTED LEADS]'
             LEFT JOIN "StreemLyne_MT"."Project_Details" pd 
                 ON cm.client_id = pd.client_id
             LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm 
-                ON pd.project_id = ecm.project_id AND ecm.service_id = :service_id
+                ON pd.project_id = ecm.project_id 
+                AND ecm.service_id = :service_id
             WHERE em.tenant_id = :tenant_id
-            AND em.employee_role = 'Salesperson'
+            AND (em.employee_role = 'Salesperson' OR em.employee_role ILIKE '%sales%')
             GROUP BY em.employee_id, em.employee_name
+            HAVING COUNT(DISTINCT cm.client_id) > 0
             ORDER BY em.employee_name ASC
         ''')
         
@@ -1423,15 +1427,17 @@ def get_stats_by_employee():
             {
                 'employee_id': row['employee_id'],
                 'employee_name': row['employee_name'],
-                'count': row['count'] or 0
+                'count': int(row['count']) if row['count'] else 0
             }
             for row in results
         ]
+        
+        current_app.logger.info(f"✅ Returning stats for {len(stats)} employees")
         
         return jsonify({'stats': stats}), 200
         
     except Exception as e:
         current_app.logger.error(f"Error fetching employee stats: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e), 'stats': []}), 500
     finally:
         session.close()
