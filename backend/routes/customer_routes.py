@@ -1369,75 +1369,75 @@ def get_priced_customers():
     finally:
         session.close()
 
-@energy_customer_bp.route('/energy-clients/stats-by-employee', methods=['GET'])
-@token_required
-def get_stats_by_employee():
-    """Get customer count per employee for Platform Admin"""
-    session = SessionLocal()
+# @energy_customer_bp.route('/energy-clients/stats-by-employee', methods=['GET'])
+# @token_required
+# def get_stats_by_employee():
+#     """Get customer count per employee for Platform Admin"""
+#     session = SessionLocal()
     
-    try:
-        # Get tenant_id
-        tenant_id = get_tenant_id_from_user(request.current_user)
-        if not tenant_id:
-            return jsonify({'error': 'Tenant not found'}), 400
+#     try:
+#         # Get tenant_id
+#         tenant_id = get_tenant_id_from_user(request.current_user)
+#         if not tenant_id:
+#             return jsonify({'error': 'Tenant not found'}), 400
         
-        # ✅ FIX: Use get_user_role_name() helper
-        user_role = get_user_role_name(request.current_user, session)
+#         # ✅ FIX: Use get_user_role_name() helper
+#         user_role = get_user_role_name(request.current_user, session)
         
-        # Check if user is Platform Admin or Tenant Super Admin
-        if user_role not in ['Platform Admin', 'Tenant Super Admin']:
-            return jsonify({'error': 'Unauthorized - Admin only'}), 403
+#         # Check if user is Platform Admin or Tenant Super Admin
+#         if user_role not in ['Platform Admin', 'Tenant Super Admin']:
+#             return jsonify({'error': 'Unauthorized - Admin only'}), 403
         
-        # Get service filter
-        service_param = request.args.get('service', 'utilities')
-        service_id_map = {'utilities': 1, 'water': 2, 'gas': 3}
-        service_id = service_id_map.get(service_param.strip().lower(), 1)
+#         # Get service filter
+#         service_param = request.args.get('service', 'utilities')
+#         service_id_map = {'utilities': 1, 'water': 2, 'gas': 3}
+#         service_id = service_id_map.get(service_param.strip().lower(), 1)
         
-        # Query to get count per employee
-        sql = text('''
-            SELECT 
-                em.employee_id,
-                em.employee_name,
-                COUNT(DISTINCT cm.client_id) as count
-            FROM "StreemLyne_MT"."Employee_Master" em
-            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od 
-                ON em.employee_id = od.opportunity_owner_employee_id
-            LEFT JOIN "StreemLyne_MT"."Client_Master" cm 
-                ON od.client_id = cm.client_id 
-                AND cm.tenant_id = :tenant_id
-                AND cm.client_company_name != '[IMPORTED LEADS]'
-            LEFT JOIN "StreemLyne_MT"."Project_Details" pd 
-                ON cm.client_id = pd.client_id
-            LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm 
-                ON pd.project_id = ecm.project_id 
-                AND ecm.service_id = :service_id
-            WHERE em.tenant_id = :tenant_id
-            AND (em.employee_role = 'Salesperson' OR em.employee_role ILIKE '%sales%')
-            GROUP BY em.employee_id, em.employee_name
-            HAVING COUNT(DISTINCT cm.client_id) > 0
-            ORDER BY em.employee_name ASC
-        ''')
+#         # Query to get count per employee
+#         sql = text('''
+#             SELECT 
+#                 em.employee_id,
+#                 em.employee_name,
+#                 COUNT(DISTINCT cm.client_id) as count
+#             FROM "StreemLyne_MT"."Employee_Master" em
+#             LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od 
+#                 ON em.employee_id = od.opportunity_owner_employee_id
+#             LEFT JOIN "StreemLyne_MT"."Client_Master" cm 
+#                 ON od.client_id = cm.client_id 
+#                 AND cm.tenant_id = :tenant_id
+#                 AND cm.client_company_name != '[IMPORTED LEADS]'
+#             LEFT JOIN "StreemLyne_MT"."Project_Details" pd 
+#                 ON cm.client_id = pd.client_id
+#             LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm 
+#                 ON pd.project_id = ecm.project_id 
+#                 AND ecm.service_id = :service_id
+#             WHERE em.tenant_id = :tenant_id
+#             AND (em.employee_role = 'Salesperson' OR em.employee_role ILIKE '%sales%')
+#             GROUP BY em.employee_id, em.employee_name
+#             HAVING COUNT(DISTINCT cm.client_id) > 0
+#             ORDER BY em.employee_name ASC
+#         ''')
         
-        results = session.execute(sql, {
-            'tenant_id': tenant_id,
-            'service_id': service_id
-        }).mappings().all()
+#         results = session.execute(sql, {
+#             'tenant_id': tenant_id,
+#             'service_id': service_id
+#         }).mappings().all()
         
-        stats = [
-            {
-                'employee_id': row['employee_id'],
-                'employee_name': row['employee_name'],
-                'count': int(row['count']) if row['count'] else 0
-            }
-            for row in results
-        ]
+#         stats = [
+#             {
+#                 'employee_id': row['employee_id'],
+#                 'employee_name': row['employee_name'],
+#                 'count': int(row['count']) if row['count'] else 0
+#             }
+#             for row in results
+#         ]
         
-        current_app.logger.info(f"✅ Returning stats for {len(stats)} employees")
+#         current_app.logger.info(f"✅ Returning stats for {len(stats)} employees")
         
-        return jsonify({'stats': stats}), 200
+#         return jsonify({'stats': stats}), 200
         
-    except Exception as e:
-        current_app.logger.error(f"Error fetching employee stats: {str(e)}")
-        return jsonify({'error': str(e), 'stats': []}), 500
-    finally:
-        session.close()
+#     except Exception as e:
+#         current_app.logger.error(f"Error fetching employee stats: {str(e)}")
+#         return jsonify({'error': str(e), 'stats': []}), 500
+#     finally:
+#         session.close()
