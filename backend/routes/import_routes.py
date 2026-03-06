@@ -454,18 +454,41 @@ def import_energy_customers():
                 account_number = safe_str(row.get(actual_columns.get('ac_number', ''), ''))
                 sort_code = safe_str(row.get(actual_columns.get('sort_code', ''), ''))
 
-                # ✅ EXACT MATCH ONLY for suppliers (no fuzzy matching)
+                # ✅ EXACT MATCH ONLY: Use existing if exact match, otherwise create new
                 supplier_id = None
                 if supplier_name:
                     supplier_key = supplier_name.lower().strip()
+                    
+                    # Try EXACT match only (case-insensitive)
                     supplier_id = suppliers_dict.get(supplier_key)
                     
-                    if not supplier_id:
-                        # Log warning but continue with default
-                        current_app.logger.warning(f"Row {index + 2}: Supplier '{supplier_name}' not found - using default")
-                        supplier_id = 1
+                    if supplier_id:
+                        # Found exact match - use existing
+                        current_app.logger.info(f"✅ Row {index + 2}: Using existing supplier '{supplier_name}' (ID: {supplier_id})")
+                    else:
+                        # No exact match - create new supplier
+                        try:
+                            new_supplier = Supplier_Master(
+                                supplier_company_name=supplier_name,  # Use exact name from Excel
+                                supplier_contact_name='Auto-imported',
+                                supplier_provisions=3,  # Default: Electricity & Gas
+                                created_at=datetime.utcnow()
+                            )
+                            session.add(new_supplier)
+                            session.flush()
+                            
+                            supplier_id = new_supplier.supplier_id
+                            
+                            # Add to cache so subsequent rows with same supplier reuse it
+                            suppliers_dict[supplier_key] = supplier_id
+                            
+                            current_app.logger.info(f"✨ Row {index + 2}: Created new supplier '{supplier_name}' (ID: {supplier_id})")
+                            
+                        except Exception as e:
+                            current_app.logger.error(f"❌ Row {index + 2}: Failed to create supplier '{supplier_name}': {e}")
+                            supplier_id = 1  # Fallback to default
                 else:
-                    supplier_id = 1
+                    supplier_id = 1  # No supplier name provided
 
                 business_name = trading_name or client_name
                 contact_person = main_contact or client_name
