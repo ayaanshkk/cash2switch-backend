@@ -397,6 +397,7 @@ def import_energy_customers():
         error_count = 0
         duplicate_count = 0
         errors = []
+        BATCH_SIZE = 50
         
         current_app.logger.info(f"📊 Starting import of {total_rows} rows (individual commits)")
         
@@ -742,8 +743,9 @@ def import_energy_customers():
                 success_count += 1
                 
                 # Log progress every 100 records
-                if success_count % 100 == 0:
-                    current_app.logger.info(f"📊 Progress: {success_count}/{total_rows} records imported")
+                if (success_count + duplicate_count) % BATCH_SIZE == 0:
+                    session.commit()
+                    current_app.logger.info(f"📊 Batch committed: {success_count + duplicate_count}/{total_rows}")
                 
             except Exception as row_error:
                 session.rollback()
@@ -752,6 +754,14 @@ def import_energy_customers():
                 errors.append(error_msg)
                 current_app.logger.error(f"❌ {error_msg}")
                 continue
+        
+        # ✅ FINAL COMMIT - THIS MUST BE OUTSIDE THE FOR LOOP
+        try:
+            session.commit()
+            current_app.logger.info(f"📊 Final batch committed: {success_count + duplicate_count}/{total_rows}")
+        except Exception as commit_error:
+            current_app.logger.error(f"❌ Final commit error: {commit_error}")
+            session.rollback()
         
         current_app.logger.info(f"✅ Import complete: {success_count} new, {duplicate_count} updated, {error_count} errors")
         

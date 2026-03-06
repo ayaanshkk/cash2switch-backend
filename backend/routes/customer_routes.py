@@ -1457,7 +1457,7 @@ def get_stats_by_employee():
                 ON pd.project_id = ecm.project_id 
                 AND ecm.service_id = :service_id
             WHERE em.tenant_id = :tenant_id
-                AND ecm.ecm_id IS NOT NULL
+                AND ecm.energy_contract_master_id IS NOT NULL
             GROUP BY em.employee_id, em.employee_name
             HAVING COUNT(DISTINCT cm.client_id) > 0
             ORDER BY em.employee_name ASC
