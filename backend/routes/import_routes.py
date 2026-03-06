@@ -738,11 +738,9 @@ def import_energy_customers():
                     # Add to cache
                     existing_mpans[mpan_mpr.strip().lower()] = contract
                 
-                # ✅ COMMIT IMMEDIATELY AFTER EACH RECORD
-                session.commit()
                 success_count += 1
                 
-                # Log progress every 100 records
+                # COMMIT EVERY 50 RECORDS
                 if (success_count + duplicate_count) % BATCH_SIZE == 0:
                     session.commit()
                     current_app.logger.info(f"📊 Batch committed: {success_count + duplicate_count}/{total_rows}")
@@ -755,7 +753,7 @@ def import_energy_customers():
                 current_app.logger.error(f"❌ {error_msg}")
                 continue
         
-        # ✅ FINAL COMMIT - THIS MUST BE OUTSIDE THE FOR LOOP
+        # FINAL COMMIT - Same level as "for index, row"
         try:
             session.commit()
             current_app.logger.info(f"📊 Final batch committed: {success_count + duplicate_count}/{total_rows}")
