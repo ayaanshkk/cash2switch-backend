@@ -201,6 +201,8 @@ class Client_Master(Base):
     client_id = Column(SmallInteger, primary_key=True, autoincrement=True)
     tenant_client_id = Column(SmallInteger, nullable=True)
     tenant_id = Column(SmallInteger, nullable=True)
+    display_id = Column(Integer, nullable=True)
+    assigned_employee_id = Column(SmallInteger, nullable=True)
     client_company_name = Column(String(255))
     client_contact_name = Column(String(255))
     address = Column(String(500))

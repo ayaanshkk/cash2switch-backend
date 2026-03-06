@@ -631,6 +631,7 @@ def import_energy_customers():
                 # ============================================
                 new_client = Client_Master(
                     tenant_id=tenant_id,
+                    assigned_employee_id=opportunity_owner_id,
                     client_company_name=business_name,
                     client_contact_name=contact_person or business_name,
                     address=address or '',

@@ -68,6 +68,7 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'client_id': client.client_id,
         'tenant_client_id': client.tenant_client_id,
         'display_id': client.display_id if hasattr(client, 'display_id') else None, 
+        'assigned_employee_id': client.assigned_employee_id if hasattr(client, 'assigned_employee_id') else None,
         'name': client.client_contact_name or '',
         'business_name': client.client_company_name or '',
         'contact_person': client.client_contact_name or '',
@@ -398,10 +399,13 @@ def create_energy_customer():
         
         current_app.logger.info(f"🆕 Creating new energy customer for tenant {tenant_id}")
         current_app.logger.info(f"🆕 Creating new energy customer for tenant {tenant_id}")
+
+        assigned_employee_id = data.get('assigned_to_id') or request.current_user.employee_id
         
         # 1. Create Client_Master entry
         new_client = Client_Master(
             tenant_id=tenant_id,
+            assigned_employee_id=assigned_employee_id,
             client_company_name=data.get('business_name', ''),
             client_contact_name=data.get('contact_person', ''),
             address=data.get('address', ''),
@@ -613,25 +617,45 @@ def update_energy_customer(client_id):
             if 'opportunity_value' in data:
                 opportunity.opportunity_value = data['opportunity_value']
         
-        # Update Client_Interactions
-        if data.get('callback_date'):
-            interaction = session.query(Client_Interactions).filter_by(
-                client_id=client_id
-            ).order_by(Client_Interactions.created_at.desc()).first()
+        # ✅ UPDATE: Handle callback_date and interaction_notes
+        if data.get('callback_date') or data.get('interaction_notes'):
+            # Check if interaction exists
+            interaction_check = session.execute(text("""
+                SELECT interaction_id 
+                FROM "StreemLyne_MT"."Client_Interactions"
+                WHERE client_id = :client_id
+                ORDER BY created_at DESC
+                LIMIT 1
+            """), {'client_id': client_id}).fetchone()
             
-            if interaction:
-                interaction.reminder_date = data['callback_date']
-                if data.get('interaction_notes'):
-                    interaction.notes = data['interaction_notes']
+            if interaction_check:
+                # Update existing interaction
+                update_query = text("""
+                    UPDATE "StreemLyne_MT"."Client_Interactions"
+                    SET 
+                        reminder_date = :reminder_date,
+                        notes = COALESCE(:notes, notes),
+                        contact_date = CURRENT_DATE
+                    WHERE interaction_id = :interaction_id
+                """)
+                session.execute(update_query, {
+                    'reminder_date': data.get('callback_date'),
+                    'notes': data.get('interaction_notes'),
+                    'interaction_id': interaction_check[0]
+                })
             else:
-                interaction = Client_Interactions(
-                    client_id=client_id,
-                    contact_date=datetime.utcnow().date(),
-                    reminder_date=data['callback_date'],
-                    notes=data.get('interaction_notes', ''),
-                    created_at=datetime.utcnow()
-                )
-                session.add(interaction)
+                # Create new interaction with raw SQL
+                insert_query = text("""
+                    INSERT INTO "StreemLyne_MT"."Client_Interactions" 
+                    (client_id, contact_date, contact_method, notes, reminder_date, created_at)
+                    VALUES (:client_id, CURRENT_DATE, 1, :notes, :reminder_date, :created_at)
+                """)
+                session.execute(insert_query, {
+                    'client_id': client_id,
+                    'notes': data.get('interaction_notes', ''),
+                    'reminder_date': data.get('callback_date'),
+                    'created_at': datetime.utcnow()
+                })
         
         session.commit()
         
@@ -700,7 +724,7 @@ def delete_energy_customer(client_id):
         # Find the client
         client = session.query(Client_Master).filter(
             and_(
-                Client_Master.tenant_client_id == client_id,  # ✅ Changed from client_id
+                Client_Master.client_id == client_id,
                 Client_Master.tenant_id == tenant_id
             )
         ).first()
@@ -708,14 +732,23 @@ def delete_energy_customer(client_id):
         if not client:
             return jsonify({'error': 'Customer not found'}), 404
         
-        current_app.logger.info(f"🗑️ Deleting customer {client_id}: {client.client_company_name}")
+        actual_client_id = client.client_id
+        
+        current_app.logger.info(f"🗑️ Deleting customer {actual_client_id}: {client.client_company_name}")
         
         # ============================================
         # CRITICAL: Delete in correct order (child → parent)
         # ============================================
         
+        # 0. ✅ DELETE Customer_Auth FIRST (references client_id)
+        auth_deleted = session.execute(text("""
+            DELETE FROM "StreemLyne_MT"."Customer_Auth"
+            WHERE client_id = :client_id
+        """), {'client_id': actual_client_id}).rowcount
+        current_app.logger.info(f"   🔐 Deleted {auth_deleted} auth records")
+        
         # 1. Find all projects for this client
-        projects = session.query(Project_Details).filter_by(client_id=client_id).all()
+        projects = session.query(Project_Details).filter_by(client_id=actual_client_id).all()
         project_ids = [p.project_id for p in projects]
         
         contracts_deleted = 0
@@ -728,19 +761,19 @@ def delete_energy_customer(client_id):
         
         # 3. Delete Client_Interactions (references client_id)
         interactions_deleted = session.query(Client_Interactions).filter_by(
-            client_id=client_id
+            client_id=actual_client_id
         ).delete(synchronize_session=False)
         current_app.logger.info(f"   📋 Deleted {interactions_deleted} interactions")
         
         # 4. Delete Opportunity_Details (references client_id)
         opportunities_deleted = session.query(Opportunity_Details).filter_by(
-            client_id=client_id
+            client_id=actual_client_id
         ).delete(synchronize_session=False)
         current_app.logger.info(f"   📋 Deleted {opportunities_deleted} opportunities")
         
         # 5. Delete Project_Details (references client_id and opportunity_id)
         projects_deleted = session.query(Project_Details).filter_by(
-            client_id=client_id
+            client_id=actual_client_id
         ).delete(synchronize_session=False)
         current_app.logger.info(f"   📋 Deleted {projects_deleted} projects")
         
@@ -751,62 +784,82 @@ def delete_energy_customer(client_id):
         session.commit()
         
         # ============================================
-        # AUTO-RESET SEQUENCE IF ALL CUSTOMERS DELETED
+        # RESET SEQUENCES AFTER DELETION
         # ============================================
-        remaining_count = session.query(Client_Master).filter_by(tenant_id=tenant_id).count()
+        try:
+            current_app.logger.info("🔄 Resetting sequences after deletion...")
+            
+            # Get max IDs for this tenant
+            max_client_id = session.query(func.max(Client_Master.client_id)).filter(
+                Client_Master.tenant_id == tenant_id
+            ).scalar() or 0
+            
+            max_project_id = session.query(func.max(Project_Details.project_id)).join(
+                Client_Master, Project_Details.client_id == Client_Master.client_id
+            ).filter(
+                Client_Master.tenant_id == tenant_id
+            ).scalar() or 0
+            
+            max_opportunity_id = session.query(func.max(Opportunity_Details.opportunity_id)).join(
+                Client_Master, Opportunity_Details.client_id == Client_Master.client_id
+            ).filter(
+                Client_Master.tenant_id == tenant_id
+            ).scalar() or 0
+            
+            max_contract_id = session.query(func.max(Energy_Contract_Master.ecm_id)).join(
+                Project_Details, Energy_Contract_Master.project_id == Project_Details.project_id
+            ).join(
+                Client_Master, Project_Details.client_id == Client_Master.client_id
+            ).filter(
+                Client_Master.tenant_id == tenant_id
+            ).scalar() or 0
+            
+            # Reset sequences to max+1 (or 1 if no records)
+            session.execute(text(f"""
+                SELECT setval(
+                    pg_get_serial_sequence('"StreemLyne_MT"."Client_Master"', 'client_id'),
+                    {max_client_id + 1},
+                    false
+                )
+            """))
+            
+            session.execute(text(f"""
+                SELECT setval(
+                    pg_get_serial_sequence('"StreemLyne_MT"."Project_Details"', 'project_id'),
+                    {max_project_id + 1},
+                    false
+                )
+            """))
+            
+            session.execute(text(f"""
+                SELECT setval(
+                    pg_get_serial_sequence('"StreemLyne_MT"."Opportunity_Details"', 'opportunity_id'),
+                    {max_opportunity_id + 1},
+                    false
+                )
+            """))
+            
+            session.execute(text(f"""
+                SELECT setval(
+                    pg_get_serial_sequence('"StreemLyne_MT"."Energy_Contract_Master"', 'ecm_id'),
+                    {max_contract_id + 1},
+                    false
+                )
+            """))
+            
+            session.commit()
+            current_app.logger.info(f"✅ Sequences reset - next IDs: Client={max_client_id + 1}, Project={max_project_id + 1}, Opportunity={max_opportunity_id + 1}, Contract={max_contract_id + 1}")
+            
+        except Exception as seq_error:
+            current_app.logger.warning(f"⚠️ Could not reset sequences: {seq_error}")
         
-        if remaining_count == 0:
-            try:
-                current_app.logger.info("🔄 All customers deleted - resetting sequences...")
-                
-                # Reset Client_Master sequence
-                session.execute(text("""
-                    SELECT setval(
-                        pg_get_serial_sequence('"StreemLyne_MT"."Client_Master"', 'client_id'),
-                        1,
-                        false
-                    )
-                """))
-                
-                # Reset Project_Details sequence
-                session.execute(text("""
-                    SELECT setval(
-                        pg_get_serial_sequence('"StreemLyne_MT"."Project_Details"', 'project_id'),
-                        1,
-                        false
-                    )
-                """))
-                
-                # Reset Energy_Contract_Master sequence
-                session.execute(text("""
-                    SELECT setval(
-                        pg_get_serial_sequence('"StreemLyne_MT"."Energy_Contract_Master"', 'ecm_id'),
-                        1,
-                        false
-                    )
-                """))
-                
-                # Reset Opportunity_Details sequence
-                session.execute(text("""
-                    SELECT setval(
-                        pg_get_serial_sequence('"StreemLyne_MT"."Opportunity_Details"', 'opportunity_id'),
-                        1,
-                        false
-                    )
-                """))
-                
-                session.commit()
-                current_app.logger.info("✅ All sequences reset to 1")
-                
-            except Exception as seq_error:
-                current_app.logger.warning(f"⚠️ Could not reset sequences: {seq_error}")
-        
-        current_app.logger.info(f"✅ Successfully deleted customer {client_id}")
+        current_app.logger.info(f"✅ Successfully deleted customer {actual_client_id}")
         
         return jsonify({
             'success': True,
             'message': 'Customer deleted successfully',
             'deleted': {
+                'auth': auth_deleted,
                 'contracts': contracts_deleted,
                 'interactions': interactions_deleted,
                 'opportunities': opportunities_deleted,
@@ -1392,13 +1445,10 @@ def get_stats_by_employee():
             SELECT 
                 em.employee_id,
                 em.employee_name,
-                COUNT(DISTINCT cm.client_id) as count,
-                MAX(cm.display_id) as max_display_id  -- ✅ ADD THIS
+                COUNT(DISTINCT cm.client_id) as count
             FROM "StreemLyne_MT"."Employee_Master" em
-            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od 
-                ON em.employee_id = od.opportunity_owner_employee_id
             LEFT JOIN "StreemLyne_MT"."Client_Master" cm 
-                ON od.client_id = cm.client_id 
+                ON em.employee_id = cm.assigned_employee_id
                 AND cm.tenant_id = :tenant_id
                 AND cm.client_company_name != '[IMPORTED LEADS]'
             LEFT JOIN "StreemLyne_MT"."Project_Details" pd 
@@ -1407,6 +1457,7 @@ def get_stats_by_employee():
                 ON pd.project_id = ecm.project_id 
                 AND ecm.service_id = :service_id
             WHERE em.tenant_id = :tenant_id
+                AND ecm.ecm_id IS NOT NULL
             GROUP BY em.employee_id, em.employee_name
             HAVING COUNT(DISTINCT cm.client_id) > 0
             ORDER BY em.employee_name ASC
@@ -1421,8 +1472,7 @@ def get_stats_by_employee():
             {
                 'employee_id': row['employee_id'],
                 'employee_name': row['employee_name'],
-                'count': int(row['count']) if row['count'] else 0,
-                'max_display_id': int(row['max_display_id']) if row['max_display_id'] else 0  # ✅ ADD THIS
+                'count': int(row['count']) if row['count'] else 0
             }
             for row in results
         ]
