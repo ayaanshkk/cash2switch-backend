@@ -698,9 +698,11 @@ def delete_energy_customer(client_id):
         tenant_id = get_tenant_id_from_user(request.current_user)
         
         # Find the client
-        client = session.query(Client_Master).filter_by(
-            client_id=client_id,
-            tenant_id=tenant_id
+        client = session.query(Client_Master).filter(
+            and_(
+                Client_Master.tenant_client_id == client_id,  # ✅ Changed from client_id
+                Client_Master.tenant_id == tenant_id
+            )
         ).first()
         
         if not client:
