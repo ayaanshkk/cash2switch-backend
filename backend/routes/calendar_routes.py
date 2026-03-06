@@ -21,10 +21,40 @@ def get_renewals_calendar():
         repo = TenantRepository()
         
         import logging
+        from flask import request
+        from backend.routes.customer_routes import get_user_role_name
+        from backend.db import SessionLocal
+        
         logging.info(f"🔍 Fetching renewals for tenant_id: {tenant_id}")
         
-        # ✅ Query contract end dates AND callback dates
-        query = '''
+        # ✅ Get current user and check if admin
+        current_user = request.current_user
+        session = SessionLocal()
+        try:
+            user_role = get_user_role_name(current_user, session)
+            is_admin = user_role in ['Platform Admin', 'Tenant Super Admin']
+        finally:
+            session.close()
+        
+        # ✅ Get employee_id filter from query params
+        filter_employee_id = request.args.get('employee_id', type=int)
+        
+        # ✅ Build employee filter
+        if is_admin and filter_employee_id:
+            # Admin viewing specific employee's calendar
+            employee_filter = f"AND od.opportunity_owner_employee_id = {filter_employee_id}"
+            logging.info(f"📊 Admin viewing calendar for employee_id: {filter_employee_id}")
+        elif is_admin:
+            # Admin viewing all employees (no filter)
+            employee_filter = ""
+            logging.info(f"📊 Admin viewing all employees' calendars")
+        else:
+            # Salesperson only sees their own
+            employee_filter = f"AND od.opportunity_owner_employee_id = {current_user.employee_id}"
+            logging.info(f"📊 Salesperson viewing own calendar: {current_user.employee_id}")
+        
+        # ✅ Query contract end dates AND callback dates WITH EMPLOYEE FILTER
+        query = f'''
             SELECT 
                 cm.client_id,
                 COALESCE(NULLIF(TRIM(cm.client_company_name), ''), cm.client_contact_name, 'Unknown') as name,
@@ -43,7 +73,8 @@ def get_renewals_calendar():
                 ecm.unit_rate as rates,
                 ci.reminder_date as callback_date,
                 ci.notes as callback_notes,
-                od."Misc_Col1" as status
+                od."Misc_Col1" as status,
+                em.employee_name as assigned_to
             FROM "StreemLyne_MT"."Client_Master" cm
             LEFT JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
             LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
@@ -51,24 +82,23 @@ def get_renewals_calendar():
             LEFT JOIN "StreemLyne_MT"."Services_Master" srv ON ecm.service_id = srv.service_id
             LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od ON cm.client_id = od.client_id
             LEFT JOIN "StreemLyne_MT"."Client_Interactions" ci ON cm.client_id = ci.client_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
             WHERE cm.tenant_id = %s
             AND (ecm.contract_end_date IS NOT NULL OR ci.reminder_date IS NOT NULL)
+            {employee_filter}
             ORDER BY cm.client_id
         '''
         
-        logging.info(f"📊 Executing query...")
+        logging.info(f"📊 Executing query with filter: {employee_filter}")
         renewals = repo.db.execute_query(query, (tenant_id,))
         logging.info(f"✅ Found {len(renewals)} renewals")
         
-        if renewals:
-            logging.info(f"📝 First renewal: {renewals[0]}")
-        
-        # Transform to calendar events - create separate events for contract end and callbacks
+        # Transform to calendar events (same code as before)
         events = []
         for renewal in renewals:
             business_name = renewal.get('name') or renewal.get('contact') or 'Unknown'
             
-            # ✅ Add contract end date event
+            # Add contract end date event
             if renewal.get('contract_end_date'):
                 event = {
                     'id': f"contract-{renewal['client_id']}",
@@ -92,11 +122,11 @@ def get_renewals_calendar():
                     'display_date': str(renewal['contract_end_date']),
                     'display_type': 'Contract End',
                     'status': renewal.get('status') or 'Active',
+                    'assigned_to': renewal.get('assigned_to'),
                 }
                 events.append(event)
-                logging.info(f"📅 Added contract end event for {event['name']} on {event['display_date']}")
             
-            # ✅ Add callback date event
+            # Add callback date event
             if renewal.get('callback_date'):
                 event = {
                     'id': f"callback-{renewal['client_id']}",
@@ -120,9 +150,9 @@ def get_renewals_calendar():
                     'display_date': str(renewal['callback_date']),
                     'display_type': 'Callback',
                     'status': renewal.get('status') or 'Active',
+                    'assigned_to': renewal.get('assigned_to'),
                 }
                 events.append(event)
-                logging.info(f"📞 Added callback event for {event['name']} on {event['display_date']}")
         
         logging.info(f"✅ Returning {len(events)} events")
         
@@ -307,5 +337,5 @@ def get_employees():
         return jsonify({
             'success': False,
             'error': 'Failed to fetch employees',
-            'message': str(e)
+            'message': str(e)   
         }), 500
