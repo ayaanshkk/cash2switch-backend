@@ -591,9 +591,16 @@ def update_energy_customer(client_id):
         if opportunity:
             if 'stage_id' in data:
                 opportunity.stage_id = data['stage_id']
+            
             if 'status' in data:
-                # ✅ Store status in Misc_Col1 for filtering
-                opportunity.Misc_Col1 = data['status']
+                status_value = data['status']
+                if status_value is None or status_value == '' or status_value == 'null':
+                    opportunity.Misc_Col1 = None  # Clear the status
+                    print(f"✅ Clearing status for client {client_id}")
+                else:
+                    opportunity.Misc_Col1 = status_value
+                    print(f"✅ Setting status to '{status_value}' for client {client_id}")
+            
             if 'assigned_to_id' in data:
                 opportunity.opportunity_owner_employee_id = data['assigned_to_id']
             if 'opportunity_value' in data:

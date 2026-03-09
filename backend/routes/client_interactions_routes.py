@@ -1,6 +1,8 @@
 """
 Updated Callback Route - backend/routes/client_interactions_routes.py
 Handles conditional date requirements, sold status, and record deletion
+✅ FIXED: Creates NEW log entries instead of updating existing ones
+✅ ADDED: "End Date Changed" status
 MAPPED TO ACTUAL DATABASE SCHEMA
 """
 
@@ -39,6 +41,7 @@ def add_callback(client_id):
     - Invalid Number: Deletes from database
     - Meter De-energised: Deletes from database
     - Broker in Place: Requires date
+    - End Date Changed: Requires date ✅ NEW
     
     SCHEMA MAPPING:
     - interaction_type → notes (we'll prefix notes with status)
@@ -72,6 +75,7 @@ def add_callback(client_id):
             "Invalid Number": {"requires_date": False, "requires_sold": False, "deletes_record": True, "misc_col1": None},
             "Meter De-energised": {"requires_date": False, "requires_sold": False, "deletes_record": True, "misc_col1": None},
             "Broker in Place": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None},
+            "End Date Changed": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None},  # ✅ NEW
         }
         
         # Validation
@@ -171,34 +175,20 @@ def add_callback(client_id):
                 'moved_to_priced': True
             }), 200
         
-        # ✅ Create or update callback interaction (using actual schema fields)
-        if callback_date:
-            existing_interaction = session.query(Client_Interactions).filter_by(
-                client_id=client_id
-            ).order_by(Client_Interactions.created_at.desc()).first()
-            
-            # Format notes to include status (since we don't have interaction_type field)
-            formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
-            
-            if existing_interaction:
-                # Update existing (only fields that exist in schema)
-                existing_interaction.contact_date = datetime.utcnow().date()
-                existing_interaction.reminder_date = datetime.strptime(callback_date, '%Y-%m-%d').date()
-                existing_interaction.notes = formatted_notes
-                existing_interaction.next_steps = status  # Store status here
-                existing_interaction.contact_method = 1  # Default: Phone (smallint)
-            else:
-                # Create new interaction (using only fields that exist)
-                new_interaction = Client_Interactions(
-                    client_id=client_id,
-                    contact_date=datetime.utcnow().date(),
-                    contact_method=1,  # Default: 1 = Phone (required NOT NULL field)
-                    reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date(),
-                    notes=formatted_notes,
-                    next_steps=status,  # Store status here
-                    created_at=datetime.utcnow()
-                )
-                session.add(new_interaction)
+        # ✅ CRITICAL FIX: ALWAYS create a NEW interaction entry (never update)
+        # This ensures every callback is logged as a separate history entry
+        formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
+        
+        new_interaction = Client_Interactions(
+            client_id=client_id,
+            contact_date=datetime.utcnow().date(),
+            contact_method=1,  # Default: 1 = Phone (required NOT NULL field)
+            reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
+            notes=formatted_notes,
+            next_steps=status,  # Store status here
+            created_at=datetime.utcnow()
+        )
+        session.add(new_interaction)
         
         session.commit()
         
@@ -245,6 +235,7 @@ def get_interaction_history(client_id):
         else:
             query = query.filter(Client_Interactions.client_id == client_id)
         
+        # ✅ Order by newest first (descending)
         interactions = query.order_by(Client_Interactions.created_at.desc()).all()
         
         result = []
