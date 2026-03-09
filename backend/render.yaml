@@ -1,4 +1,5 @@
 services:
+  # ✅ Web Service (Flask Backend)
   - type: web
     name: cash2switch-backend
     env: python
@@ -7,3 +8,30 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: streemlyne-redis
+          property: connectionString
+
+  # ✅ NEW: Celery Worker
+  - type: worker
+    name: cash2switch-celery
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: celery -A backend.celery_app worker --loglevel=info --concurrency=2
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: streemlyne-redis
+          property: connectionString
+
+  # ✅ NEW: Redis Service
+  - type: redis
+    name: streemlyne-redis
+    plan: free
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList: []  

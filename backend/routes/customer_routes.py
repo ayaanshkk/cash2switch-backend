@@ -6,13 +6,6 @@ Multi-table system integrating:
 - Energy_Contract_Master: MPAN, Supplier, Contract dates
 - Opportunity_Details: Sales pipeline, assigned employee
 - Client_Interactions: Callback tracking
-Energy Tenant Customer Routes
-Multi-table system integrating:
-- Client_Master: Core client info
-- Project_Details: Site addresses (Misc_Col2 = Annual Usage)
-- Energy_Contract_Master: MPAN, Supplier, Contract dates
-- Opportunity_Details: Sales pipeline, assigned employee
-- Client_Interactions: Callback tracking
 """
 
 from flask import Blueprint, request, jsonify, current_app
@@ -186,7 +179,7 @@ def get_user_role_name(user, session):
 @energy_customer_bp.route('/energy-clients', methods=['GET', 'OPTIONS'])
 @token_required
 def get_energy_customers():
-    """Get all energy customers EXCLUDING priced/lost statuses, filtered by role"""
+    """Get all energy customers EXCLUDING priced/lost statuses, filtered by assigned employee"""
     
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -255,7 +248,8 @@ def get_energy_customers():
 
         query = query.order_by(Client_Master.created_at.desc())
 
-        # Filter by assigned employee
+        # ✅ CRITICAL: Filter by assigned employee for ALL users (admin and non-admin)
+        # Each user only sees their own assigned customers
         query = query.filter(
             Opportunity_Details.opportunity_owner_employee_id == user.employee_id
         )
@@ -385,19 +379,7 @@ def create_energy_customer():
             return jsonify({'error': 'Business name or contact person is required'}), 400
         if not data.get('phone'):
             return jsonify({'error': 'Phone is required'}), 400
-        data = request.get_json()
-        tenant_id = get_tenant_id_from_user(request.current_user)
         
-        if not tenant_id:
-            return jsonify({'error': 'Tenant not found'}), 400
-        
-        # Validate required fields
-        if not data.get('business_name') and not data.get('contact_person'):
-            return jsonify({'error': 'Business name or contact person is required'}), 400
-        if not data.get('phone'):
-            return jsonify({'error': 'Phone is required'}), 400
-        
-        current_app.logger.info(f"🆕 Creating new energy customer for tenant {tenant_id}")
         current_app.logger.info(f"🆕 Creating new energy customer for tenant {tenant_id}")
 
         assigned_employee_id = data.get('assigned_to_id') or request.current_user.employee_id
@@ -943,14 +925,6 @@ def search_energy_customers():
 @token_required
 def get_energy_customer_stats():
     """Get customer statistics"""
-
-    user_role = get_user_role_name(user, session)
-
-    if user_role != 'Platform Admin':
-        # Salesperson users only see renewals assigned to them
-        query = query.filter(
-            Opportunity_Details.opportunity_owner_employee_id == user.employee_id
-        )
     
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -958,6 +932,7 @@ def get_energy_customer_stats():
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
+        user = request.current_user
         
         # Total customers
         total = session.query(Client_Master).filter_by(tenant_id=tenant_id).count()
@@ -989,12 +964,6 @@ def get_energy_customer_stats():
         ).filter(
             Client_Master.tenant_id == tenant_id
         ).scalar() or 0
-        # Total annual usage
-        total_usage = session.query(func.sum(Project_Details.Misc_Col2)).join(
-            Client_Master
-        ).filter(
-            Client_Master.tenant_id == tenant_id
-        ).scalar() or 0
         
         stats = {
             'total': total,
@@ -1006,7 +975,6 @@ def get_energy_customer_stats():
         return jsonify(stats), 200
         
     except Exception as e:
-        current_app.logger.exception(f"❌ Error fetching energy customer stats: {e}")
         current_app.logger.exception(f"❌ Error fetching energy customer stats: {e}")
         return jsonify({'error': 'Failed to fetch statistics'}), 500
     finally:
@@ -1150,7 +1118,6 @@ def bulk_assign_clients():
         if not client_ids or not employee_id:
             return jsonify({'error': 'client_ids and employee_id are required'}), 400
         
-        # ✅ FIX: Get user role from User_Role_Mapping
         user_role = get_user_role_name(request.current_user, session)
         
         # Check permissions - only Platform Admin and Tenant Super Admin
@@ -1166,19 +1133,30 @@ def bulk_assign_clients():
         if not employee:
             return jsonify({'error': 'Employee not found'}), 404
         
-        # Update all opportunity details for these clients
+        # ✅ FIX: Update BOTH tables
         updated_count = 0
         for client_id in client_ids:
-            # Update Opportunity_Details
+            # ✅ 1. Update Client_Master.assigned_employee_id
+            client = session.query(Client_Master).filter(
+                Client_Master.client_id == client_id,
+                Client_Master.tenant_id == tenant_id
+            ).first()
+            
+            if client:
+                client.assigned_employee_id = employee_id
+                updated_count += 1
+            
+            # ✅ 2. Update Opportunity_Details
             opportunities = session.query(Opportunity_Details).filter(
                 Opportunity_Details.client_id == client_id
             ).all()
             
             for opportunity in opportunities:
                 opportunity.opportunity_owner_employee_id = employee_id
-                updated_count += 1
         
         session.commit()
+        
+        current_app.logger.info(f"✅ Bulk assigned {len(client_ids)} clients to {employee.employee_name} (ID: {employee_id})")
         
         return jsonify({
             'message': f'Successfully assigned {len(client_ids)} clients to {employee.employee_name}',

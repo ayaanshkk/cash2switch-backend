@@ -3,36 +3,50 @@
 Calendar Routes
 API endpoints for contract calendar view
 """
-from flask import Blueprint, g, jsonify
+from flask import Blueprint, g, jsonify, request
 from backend.routes.auth_helpers import token_required
 from backend.routes.crm_routes import tenant_from_jwt
 from backend.crm.repositories.tenant_repository import TenantRepository
+import logging
 
 calendar_bp = Blueprint('calendar', __name__, url_prefix='/api/calendar')
 
+# ✅ Add CORS support for all calendar routes
+@calendar_bp.after_request
+def after_request(response):
+    """Add CORS headers to all responses"""
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Tenant-ID')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
 
-@calendar_bp.route('/renewals', methods=['GET'])
+
+@calendar_bp.route('/renewals', methods=['GET', 'OPTIONS'])
 @token_required
 @tenant_from_jwt
 def get_renewals_calendar():
     """Get all renewals for calendar view - shows contract end dates AND callback dates"""
+    
+    # ✅ Handle OPTIONS preflight request
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
     try:
         tenant_id = g.tenant_id
         repo = TenantRepository()
-        
-        import logging
-        from flask import request
-        from backend.routes.customer_routes import get_user_role_name
-        from backend.db import SessionLocal
         
         logging.info(f"🔍 Fetching renewals for tenant_id: {tenant_id}")
         
         # ✅ Get current user and check if admin
         current_user = request.current_user
+        from backend.db import SessionLocal
+        from backend.routes.customer_routes import get_user_role_name
+        
         session = SessionLocal()
         try:
             user_role = get_user_role_name(current_user, session)
             is_admin = user_role in ['Platform Admin', 'Tenant Super Admin']
+            logging.info(f"👤 User role: {user_role}, is_admin: {is_admin}")
         finally:
             session.close()
         
@@ -84,6 +98,7 @@ def get_renewals_calendar():
             LEFT JOIN "StreemLyne_MT"."Client_Interactions" ci ON cm.client_id = ci.client_id
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
             WHERE cm.tenant_id = %s
+            AND cm.client_company_name != '[IMPORTED LEADS]'
             AND (ecm.contract_end_date IS NOT NULL OR ci.reminder_date IS NOT NULL)
             {employee_filter}
             ORDER BY cm.client_id
@@ -93,7 +108,7 @@ def get_renewals_calendar():
         renewals = repo.db.execute_query(query, (tenant_id,))
         logging.info(f"✅ Found {len(renewals)} renewals")
         
-        # Transform to calendar events (same code as before)
+        # Transform to calendar events
         events = []
         for renewal in renewals:
             business_name = renewal.get('name') or renewal.get('contact') or 'Unknown'
@@ -163,19 +178,23 @@ def get_renewals_calendar():
         }), 200
         
     except Exception as e:
-        import logging
-        logging.exception("Error fetching renewals calendar")
+        logging.exception("❌ Error fetching renewals calendar")
         return jsonify({
             'success': False,
             'error': 'Failed to fetch calendar',
             'message': str(e)
         }), 500
 
-@calendar_bp.route('/contracts', methods=['GET'])
+
+@calendar_bp.route('/contracts', methods=['GET', 'OPTIONS'])
 @token_required
 @tenant_from_jwt
 def get_contract_schedule():
     """Get all energy contracts for calendar view"""
+    
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
     try:
         tenant_id = g.tenant_id
         repo = TenantRepository()
@@ -218,32 +237,27 @@ def get_contract_schedule():
         # Transform to calendar events
         events = []
         for contract in contracts:
-            if not contract.get('client_name'):
+            if not contract.get('name'):
                 continue
                 
             events.append({
-                'id': str(contract['id']),
+                'id': str(contract['client_id']),
                 'type': 'contract',
-                'title': f"{contract['client_name']} - {contract.get('supplier_name', 'Unknown')}",
+                'title': f"{contract['name']} - {contract.get('supplier', 'Unknown')}",
                 'client_id': contract.get('client_id'),
-                'client_name': contract.get('client_name'),
-                'client_contact': contract.get('client_contact_name'),
-                'client_phone': contract.get('client_phone'),
-                'client_email': contract.get('client_email'),
-                'start_date': str(contract['start_date']) if contract.get('start_date') else None,
-                'end_date': str(contract['end_date']) if contract.get('end_date') else None,
-                'employee_id': contract.get('employee_id'),
-                'assigned_to': contract.get('assigned_to'),
-                'supplier_name': contract.get('supplier_name'),
-                'supplier_id': contract.get('supplier_id'),
+                'client_name': contract.get('name'),
+                'client_contact': contract.get('contact'),
+                'client_phone': contract.get('phone'),
+                'client_email': contract.get('email'),
+                'start_date': str(contract['contract_start_date']) if contract.get('contract_start_date') else None,
+                'end_date': str(contract['contract_end_date']) if contract.get('contract_end_date') else None,
+                'supplier_name': contract.get('supplier'),
                 'service_title': contract.get('service_title'),
-                'mpan_number': contract.get('mpan_number'),
-                'unit_rate': float(contract['unit_rate']) if contract.get('unit_rate') else None,
-                'currency_code': contract.get('currency_code'),
-                'terms_of_sale': contract.get('terms_of_sale'),
-                'notes': contract.get('terms_of_sale'),
+                'mpan_number': contract.get('mpan'),
+                'unit_rate': float(contract['rates']) if contract.get('rates') else None,
+                'terms_of_sale': contract.get('contract_notes'),
+                'notes': contract.get('contract_notes'),
                 'status': 'Active',
-                'created_at': str(contract['created_at']) if contract.get('created_at') else None,
             })
         
         return jsonify({
@@ -253,8 +267,7 @@ def get_contract_schedule():
         }), 200
         
     except Exception as e:
-        import logging
-        logging.exception("Error fetching contract calendar")
+        logging.exception("❌ Error fetching contract calendar")
         return jsonify({
             'success': False,
             'error': 'Failed to fetch calendar',
@@ -262,11 +275,15 @@ def get_contract_schedule():
         }), 500
 
 
-@calendar_bp.route('/clients', methods=['GET'])
+@calendar_bp.route('/clients', methods=['GET', 'OPTIONS'])
 @token_required
 @tenant_from_jwt
 def get_clients():
     """Get all clients for dropdown"""
+    
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
     try:
         tenant_id = g.tenant_id
         repo = TenantRepository()
@@ -293,8 +310,7 @@ def get_clients():
         }), 200
         
     except Exception as e:
-        import logging
-        logging.exception("Error fetching clients")
+        logging.exception("❌ Error fetching clients")
         return jsonify({
             'success': False,
             'error': 'Failed to fetch clients',
@@ -302,11 +318,15 @@ def get_clients():
         }), 500
 
 
-@calendar_bp.route('/employees', methods=['GET'])
+@calendar_bp.route('/employees', methods=['GET', 'OPTIONS'])
 @token_required
 @tenant_from_jwt
 def get_employees():
     """Get all employees for assignment"""
+    
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
     try:
         tenant_id = g.tenant_id
         repo = TenantRepository()
@@ -332,8 +352,7 @@ def get_employees():
         }), 200
         
     except Exception as e:
-        import logging
-        logging.exception("Error fetching employees")
+        logging.exception("❌ Error fetching employees")
         return jsonify({
             'success': False,
             'error': 'Failed to fetch employees',
