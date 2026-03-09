@@ -159,7 +159,7 @@ def create_app():
     app.register_blueprint(crm_routes.crm_bp)
     app.register_blueprint(document_routes.document_bp)
     app.register_blueprint(calendar_routes.calendar_bp)
-    app.register_blueprint(bulk_import_optimized.bulk_import_bp, url_prefix='/api')
+    # app.register_blueprint(bulk_import_optimized.bulk_import_bp, url_prefix='/api')
     # app.register_blueprint(async_bulk_routes.async_bulk_bp, url_prefix='/api')
     logging.info("CRM Blueprint registered successfully") 
     
