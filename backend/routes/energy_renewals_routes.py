@@ -141,7 +141,7 @@ def get_renewal_stats():
         days_30 = today + timedelta(days=30)
         days_60 = today + timedelta(days=60)
         days_90 = today + timedelta(days=90)
-        days_120 = today + timedelta(days=120)
+        days_180 = today + timedelta(days=180)
         
         # ✅ BASE QUERY - Get ALL records, not paginated
         base_query = session.query(
@@ -178,6 +178,7 @@ def get_renewal_stats():
         total_renewals_30_60_days = 0
         total_renewals_61_90_days = 0
         total_renewals_90_plus_days = 0
+        expired_contracts = 0  # ✅ NEW
         total_revenue_at_risk = 0
         total_aq = 0
         contacted_count = 0
@@ -199,12 +200,14 @@ def get_renewal_stats():
             # Calculate days until renewal
             days_until_renewal = (end_date - today).days
             
-            # Count by period
-            if 30 <= days_until_renewal <= 60:
+            # ✅ Count by period (including expired)
+            if days_until_renewal < 0:
+                expired_contracts += 1
+            elif 30 <= days_until_renewal <= 60:
                 total_renewals_30_60_days += 1
             elif 61 <= days_until_renewal <= 90:
                 total_renewals_61_90_days += 1
-            elif days_until_renewal > 90:
+            elif 91 <= days_until_renewal <= 180:
                 total_renewals_90_plus_days += 1
             
             # ✅ Revenue at risk calculation
@@ -233,6 +236,7 @@ def get_renewal_stats():
             'total_renewals_30_60_days': total_renewals_30_60_days,
             'total_renewals_61_90_days': total_renewals_61_90_days,
             'total_renewals_90_plus_days': total_renewals_90_plus_days,
+            'expired_contracts': expired_contracts,  # ✅ NEW
             'total_revenue_at_risk': total_revenue_at_risk,
             'total_aq': total_aq,
             'contacted_count': contacted_count,
@@ -244,7 +248,8 @@ def get_renewal_stats():
         print(f"\n✅ RETURNING STATS:")
         print(f"   30-60 days: {total_renewals_30_60_days}")
         print(f"   61-90 days: {total_renewals_61_90_days}")
-        print(f"   90+ days: {total_renewals_90_plus_days}")
+        print(f"   91-180 days: {total_renewals_90_plus_days}")
+        print(f"   Expired: {expired_contracts}")
         print(f"   Total AQ: {total_aq}")
         print(f"{'='*60}\n")
         
@@ -348,82 +353,132 @@ def get_supplier_breakdown():
         session.close()
 
 
-@renewals_bp.route("/energy-renewals/test", methods=["GET"])
-def test_renewals_endpoint():
+@renewals_bp.route('/energy-renewals/period-breakdown', methods=['GET'])
+@token_required
+def get_period_breakdown():
     """
-    Test endpoint to verify database connection and schema
-    No authentication required for testing
+    Get detailed breakdown of renewals by period
+    ✅ FIX: Shows ALL salespeople's customers (no employee filter unless explicitly salesperson role)
     """
+    session = SessionLocal()
+    
     try:
-        db = SessionLocal()
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
         
-        # Test query with proper joins
-        test_query = text("""
-            SELECT 
-                COUNT(DISTINCT cm.client_id) as total_clients,
-                COUNT(DISTINCT ecm.energy_contract_master_id) as total_contracts,
-                COUNT(CASE WHEN ecm.contract_end_date IS NOT NULL THEN 1 END) as contracts_with_end_date,
-                COUNT(CASE WHEN ecm.contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days' THEN 1 END) as renewals_due_90_days,
-                COUNT(CASE WHEN ecm.contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days' THEN 1 END) as renewals_due_30_days
-            FROM "StreemLyne_MT"."Client_Master" cm
-            LEFT JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
-            LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
-        """)
+        # Required period filter
+        period = request.args.get('period')  # '30-60', '61-90', '91-180', 'expired'
         
-        result = db.execute(test_query).first()
+        from datetime import datetime, timedelta
+        today = datetime.utcnow().date()
         
-        # Sample data query
-        sample_query = text("""
-            SELECT 
-                cm.client_company_name,
-                ecm.contract_end_date,
-                sm.supplier_company_name,
-                (ecm.contract_end_date - CURRENT_DATE) as days_until_expiry
-            FROM "StreemLyne_MT"."Client_Master" cm
-            INNER JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
-            INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
-            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
-            WHERE ecm.contract_end_date IS NOT NULL
-            AND ecm.contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days'
-            ORDER BY ecm.contract_end_date
-            LIMIT 5
-        """)
+        # ✅ Calculate date range based on period
+        if period == 'expired':
+            # Get all expired contracts
+            start_date = today - timedelta(days=365 * 5)  # Go back 5 years
+            end_date = today - timedelta(days=1)  # Up to yesterday
+        elif period == '30-60':
+            start_days = 30
+            end_days = 60
+            start_date = today + timedelta(days=start_days)
+            end_date = today + timedelta(days=end_days)
+        elif period == '61-90':
+            start_days = 61
+            end_days = 90
+            start_date = today + timedelta(days=start_days)
+            end_date = today + timedelta(days=end_days)
+        elif period == '91-180':
+            start_days = 91
+            end_days = 180
+            start_date = today + timedelta(days=start_days)
+            end_date = today + timedelta(days=end_days)
+        else:
+            return jsonify({'error': 'Invalid period parameter'}), 400
         
-        sample_result = db.execute(sample_query)
-        sample_data = []
-        for row in sample_result:
-            sample_data.append({
-                "company": row.client_company_name,
-                "end_date": row.contract_end_date.isoformat() if row.contract_end_date else None,
-                "supplier": row.supplier_company_name,
-                "days_until_expiry": row.days_until_expiry
+        # ✅ Query for detailed breakdown - NO EMPLOYEE FILTER (show all salespeople's customers)
+        query = session.query(
+            Client_Master.client_id,
+            Client_Master.client_company_name,
+            Client_Master.client_contact_name,
+            Client_Master.client_phone,
+            Client_Master.client_email,
+            Supplier_Master.supplier_company_name,
+            Energy_Contract_Master.contract_end_date,
+            Energy_Contract_Master.mpan_number,
+            Project_Details.Misc_Col2.label('annual_usage'),
+            Energy_Contract_Master.unit_rate,
+            Employee_Master.employee_name,
+            Opportunity_Details.Misc_Col1.label('status')
+        ).join(
+            Project_Details,
+            Client_Master.client_id == Project_Details.client_id
+        ).join(
+            Energy_Contract_Master,
+            Project_Details.project_id == Energy_Contract_Master.project_id
+        ).outerjoin(
+            Supplier_Master,
+            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
+        ).outerjoin(
+            Opportunity_Details,
+            Client_Master.client_id == Opportunity_Details.client_id
+        ).outerjoin(
+            Employee_Master,
+            Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
+        ).filter(
+            Client_Master.tenant_id == tenant_id,
+            Energy_Contract_Master.contract_end_date.between(start_date, end_date)
+        )
+        
+        # ✅ NO EMPLOYEE FILTER - Show all customers regardless of assignment
+        
+        # Order by end date
+        results = query.order_by(Energy_Contract_Master.contract_end_date).all()
+        
+        breakdown = []
+        for r in results:
+            # Calculate revenue
+            revenue = 0
+            if r.unit_rate and r.annual_usage:
+                revenue = (r.unit_rate * r.annual_usage) / 100
+            
+            # Calculate days until expiry
+            days_until_expiry = (r.contract_end_date - today).days if r.contract_end_date else 0
+            
+            breakdown.append({
+                'client_id': r.client_id,
+                'business_name': r.client_company_name,
+                'contact_person': r.client_contact_name,
+                'phone': r.client_phone,
+                'email': r.client_email,
+                'supplier_name': r.supplier_company_name,
+                'contract_end_date': r.contract_end_date.isoformat() if r.contract_end_date else None,
+                'days_until_expiry': days_until_expiry,
+                'mpan_number': r.mpan_number,
+                'annual_usage': r.annual_usage,
+                'estimated_revenue': round(revenue, 2),
+                'assigned_to': r.employee_name or 'Unassigned',  # ✅ Show assigned salesperson
+                'status': r.status or 'Pending'
             })
         
-        response = {
-            "status": "success",
-            "schema": "StreemLyne_MT",
-            "total_clients": result.total_clients,
-            "total_contracts": result.total_contracts,
-            "contracts_with_end_date": result.contracts_with_end_date,
-            "renewals_due_90_days": result.renewals_due_90_days,
-            "renewals_due_30_days": result.renewals_due_30_days,
-            "sample_renewals": sample_data,
-            "message": "Database connection successful! Schema verified."
-        }
-        
-        print(f"✅ Test endpoint result: {response}")
-        db.close()
-        return jsonify(response), 200
+        return jsonify({
+            'period': period,
+            'start_date': start_date.isoformat(),
+            'end_date': end_date.isoformat(),
+            'total_count': len(breakdown),
+            'total_revenue': sum(item['estimated_revenue'] for item in breakdown),
+            'renewals': breakdown
+        })
         
     except Exception as e:
-        print(f"❌ Test endpoint error: {str(e)}")
+        session.rollback()
+        print(f"Error getting period breakdown: {e}")
         import traceback
         traceback.print_exc()
-        return jsonify({
-            "status": "error",
-            "error": str(e),
-            "message": "Database connection failed. Check schema structure."
-        }), 500
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
 
 @renewals_bp.route('/energy-renewals/salesperson-performance', methods=['GET'])
 @token_required
@@ -596,128 +651,6 @@ def get_salesperson_performance():
         session.close()
 
 
-@renewals_bp.route('/energy-renewals/period-breakdown', methods=['GET'])
-@token_required
-def get_period_breakdown():
-    """Get detailed breakdown of renewals by period"""
-    session = SessionLocal()
-    
-    try:
-        tenant_id = get_tenant_id_from_user(request.current_user)
-        if not tenant_id:
-            return jsonify({'error': 'Tenant not found'}), 400
-        
-        # Required period filter
-        period = request.args.get('period')  # '30-60', '61-90', '91-180', '181+'
-        employee_id = request.args.get('employee_id', type=int)
-        
-        from datetime import datetime, timedelta
-        today = datetime.utcnow().date()
-        
-        # Calculate date range based on period
-        if period == '30-60':
-            start_days = 30
-            end_days = 60
-        elif period == '61-90':
-            start_days = 61
-            end_days = 90
-        elif period == '91-180':
-            start_days = 91
-            end_days = 180
-        elif period == '181+':
-            start_days = 181
-            end_days = 365  # Cap at 1 year
-        else:
-            return jsonify({'error': 'Invalid period parameter'}), 400
-        
-        start_date = today + timedelta(days=start_days)
-        end_date = today + timedelta(days=end_days)
-        
-        # Query for detailed breakdown
-        query = session.query(
-            Client_Master.client_id,
-            Client_Master.client_company_name,
-            Client_Master.client_contact_name,
-            Client_Master.client_phone,
-            Client_Master.client_email,
-            Supplier_Master.supplier_company_name,
-            Energy_Contract_Master.contract_end_date,
-            Energy_Contract_Master.mpan_number,
-            Project_Details.Misc_Col2.label('annual_usage'),
-            Energy_Contract_Master.unit_rate,
-            Employee_Master.employee_name,
-            Opportunity_Details.Misc_Col1.label('status')
-        ).join(
-            Project_Details,
-            Client_Master.client_id == Project_Details.client_id
-        ).join(
-            Energy_Contract_Master,
-            Project_Details.project_id == Energy_Contract_Master.project_id
-        ).outerjoin(
-            Supplier_Master,
-            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
-        ).outerjoin(
-            Opportunity_Details,
-            Client_Master.client_id == Opportunity_Details.client_id
-        ).outerjoin(
-            Employee_Master,
-            Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
-        ).filter(
-            Client_Master.tenant_id == tenant_id,
-            Energy_Contract_Master.contract_end_date.between(start_date, end_date)
-        )
-        
-        # Apply employee filter if provided
-        if employee_id:
-            query = query.filter(
-                Opportunity_Details.opportunity_owner_employee_id == employee_id
-            )
-        
-        # Order by end date
-        results = query.order_by(Energy_Contract_Master.contract_end_date).all()
-        
-        breakdown = []
-        for r in results:
-            # Calculate revenue
-            revenue = 0
-            if r.unit_rate and r.annual_usage:
-                revenue = (r.unit_rate * r.annual_usage) / 100
-            
-            # Calculate days until expiry
-            days_until_expiry = (r.contract_end_date - today).days if r.contract_end_date else 0
-            
-            breakdown.append({
-                'client_id': r.client_id,
-                'business_name': r.client_company_name,
-                'contact_person': r.client_contact_name,
-                'phone': r.client_phone,
-                'email': r.client_email,
-                'supplier_name': r.supplier_company_name,
-                'contract_end_date': r.contract_end_date.isoformat() if r.contract_end_date else None,
-                'days_until_expiry': days_until_expiry,
-                'mpan_number': r.mpan_number,
-                'annual_usage': r.annual_usage,
-                'estimated_revenue': round(revenue, 2),
-                'assigned_to': r.employee_name,
-                'status': r.status or 'Pending'
-            })
-        
-        return jsonify({
-            'period': period,
-            'start_date': start_date.isoformat(),
-            'end_date': end_date.isoformat(),
-            'total_count': len(breakdown),
-            'total_revenue': sum(item['estimated_revenue'] for item in breakdown),
-            'renewals': breakdown
-        })
-        
-    except Exception as e:
-        session.rollback()
-        print(f"Error getting period breakdown: {e}")
-        return jsonify({'error': str(e)}), 500
-    finally:
-        session.close()
-
 @renewals_bp.route('/energy-renewals/aq-breakdown', methods=['GET'])
 @token_required
 def get_aq_breakdown():
@@ -826,3 +759,81 @@ def get_aq_breakdown():
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
+
+
+@renewals_bp.route("/energy-renewals/test", methods=["GET"])
+def test_renewals_endpoint():
+    """
+    Test endpoint to verify database connection and schema
+    No authentication required for testing
+    """
+    try:
+        db = SessionLocal()
+        
+        # Test query with proper joins
+        test_query = text("""
+            SELECT 
+                COUNT(DISTINCT cm.client_id) as total_clients,
+                COUNT(DISTINCT ecm.energy_contract_master_id) as total_contracts,
+                COUNT(CASE WHEN ecm.contract_end_date IS NOT NULL THEN 1 END) as contracts_with_end_date,
+                COUNT(CASE WHEN ecm.contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days' THEN 1 END) as renewals_due_90_days,
+                COUNT(CASE WHEN ecm.contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '30 days' THEN 1 END) as renewals_due_30_days
+            FROM "StreemLyne_MT"."Client_Master" cm
+            LEFT JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
+            LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
+        """)
+        
+        result = db.execute(test_query).first()
+        
+        # Sample data query
+        sample_query = text("""
+            SELECT 
+                cm.client_company_name,
+                ecm.contract_end_date,
+                sm.supplier_company_name,
+                (ecm.contract_end_date - CURRENT_DATE) as days_until_expiry
+            FROM "StreemLyne_MT"."Client_Master" cm
+            INNER JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
+            INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
+            WHERE ecm.contract_end_date IS NOT NULL
+            AND ecm.contract_end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days'
+            ORDER BY ecm.contract_end_date
+            LIMIT 5
+        """)
+        
+        sample_result = db.execute(sample_query)
+        sample_data = []
+        for row in sample_result:
+            sample_data.append({
+                "company": row.client_company_name,
+                "end_date": row.contract_end_date.isoformat() if row.contract_end_date else None,
+                "supplier": row.supplier_company_name,
+                "days_until_expiry": row.days_until_expiry
+            })
+        
+        response = {
+            "status": "success",
+            "schema": "StreemLyne_MT",
+            "total_clients": result.total_clients,
+            "total_contracts": result.total_contracts,
+            "contracts_with_end_date": result.contracts_with_end_date,
+            "renewals_due_90_days": result.renewals_due_90_days,
+            "renewals_due_30_days": result.renewals_due_30_days,
+            "sample_renewals": sample_data,
+            "message": "Database connection successful! Schema verified."
+        }
+        
+        print(f"✅ Test endpoint result: {response}")
+        db.close()
+        return jsonify(response), 200
+        
+    except Exception as e:
+        print(f"❌ Test endpoint error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "message": "Database connection failed. Check schema structure."
+        }), 500

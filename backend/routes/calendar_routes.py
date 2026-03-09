@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Calendar Routes
-API endpoints for contract calendar view
+Calendar Routes - FIXED VERSION with Customer Details Sync
+Syncs with renewals page AND customer details page (callbacks)
 """
 from flask import Blueprint, g, jsonify, request
 from backend.routes.auth_helpers import token_required
@@ -57,18 +57,21 @@ def get_renewals_calendar():
         if is_admin and filter_employee_id:
             # Admin viewing specific employee's calendar
             employee_filter = f"AND od.opportunity_owner_employee_id = {filter_employee_id}"
+            callback_employee_filter = f"AND od2.opportunity_owner_employee_id = {filter_employee_id}"
             logging.info(f"📊 Admin viewing calendar for employee_id: {filter_employee_id}")
         elif is_admin:
             # Admin viewing all employees (no filter)
             employee_filter = ""
+            callback_employee_filter = ""
             logging.info(f"📊 Admin viewing all employees' calendars")
         else:
             # Salesperson only sees their own
             employee_filter = f"AND od.opportunity_owner_employee_id = {current_user.employee_id}"
+            callback_employee_filter = f"AND od2.opportunity_owner_employee_id = {current_user.employee_id}"
             logging.info(f"📊 Salesperson viewing own calendar: {current_user.employee_id}")
         
-        # ✅ Query contract end dates AND callback dates WITH EMPLOYEE FILTER
-        query = f'''
+        # ✅ PART 1: Get contract end dates
+        contract_query = f'''
             SELECT 
                 cm.client_id,
                 COALESCE(NULLIF(TRIM(cm.client_company_name), ''), cm.client_contact_name, 'Unknown') as name,
@@ -85,91 +88,142 @@ def get_renewals_calendar():
                 ecm.terms_of_sale as contract_notes,
                 srv.service_title,
                 ecm.unit_rate as rates,
-                ci.reminder_date as callback_date,
-                ci.notes as callback_notes,
                 od."Misc_Col1" as status,
-                em.employee_name as assigned_to
+                em.employee_name as assigned_to,
+                'contract_end' as event_type
             FROM "StreemLyne_MT"."Client_Master" cm
+            INNER JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
+            INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
+            LEFT JOIN "StreemLyne_MT"."Services_Master" srv ON ecm.service_id = srv.service_id
+            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od ON cm.client_id = od.client_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
+            WHERE cm.tenant_id = %s
+            AND cm.client_company_name != '[IMPORTED LEADS]'
+            AND ecm.contract_end_date IS NOT NULL
+            AND (od."Misc_Col1" IS NULL OR LOWER(od."Misc_Col1") NOT IN ('priced', 'lost'))
+            {employee_filter}
+        '''
+        
+        # ✅ PART 2: Get callback dates (from Client_Interactions)
+        # Using a subquery to get the LATEST callback for each client
+        callback_query = f'''
+            SELECT 
+                cm.client_id,
+                COALESCE(NULLIF(TRIM(cm.client_company_name), ''), cm.client_contact_name, 'Unknown') as name,
+                ecm.mpan_number as mpan,
+                sm.supplier_company_name as supplier,
+                ecm.contract_end_date,
+                ecm.contract_start_date,
+                ci.reminder_date as callback_date,
+                cm.address,
+                cm.post_code as postcode,
+                cm.client_contact_name as contact,
+                cm.client_email as email,
+                cm.client_phone as phone,
+                ci.notes as callback_notes,
+                srv.service_title,
+                ecm.unit_rate as rates,
+                od2."Misc_Col1" as status,
+                em2.employee_name as assigned_to,
+                'callback' as event_type
+            FROM "StreemLyne_MT"."Client_Interactions" ci
+            INNER JOIN "StreemLyne_MT"."Client_Master" cm ON ci.client_id = cm.client_id
             LEFT JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
             LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
             LEFT JOIN "StreemLyne_MT"."Services_Master" srv ON ecm.service_id = srv.service_id
-            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od ON cm.client_id = od.client_id
-            LEFT JOIN "StreemLyne_MT"."Client_Interactions" ci ON cm.client_id = ci.client_id
-            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
+            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od2 ON cm.client_id = od2.client_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em2 ON od2.opportunity_owner_employee_id = em2.employee_id
             WHERE cm.tenant_id = %s
             AND cm.client_company_name != '[IMPORTED LEADS]'
-            AND (ecm.contract_end_date IS NOT NULL OR ci.reminder_date IS NOT NULL)
-            {employee_filter}
-            ORDER BY cm.client_id
+            AND ci.reminder_date IS NOT NULL
+            AND ci.reminder_date >= CURRENT_DATE
+            AND (od2."Misc_Col1" IS NULL OR LOWER(od2."Misc_Col1") NOT IN ('priced', 'lost'))
+            {callback_employee_filter}
+            ORDER BY cm.client_id, ci.reminder_date DESC
         '''
         
-        logging.info(f"📊 Executing query with filter: {employee_filter}")
-        renewals = repo.db.execute_query(query, (tenant_id,))
-        logging.info(f"✅ Found {len(renewals)} renewals")
+        logging.info(f"📊 Executing contract query with filter: {employee_filter}")
+        contracts = repo.db.execute_query(contract_query, (tenant_id,))
+        logging.info(f"✅ Found {len(contracts)} contract renewals")
+        
+        logging.info(f"📊 Executing callback query with filter: {callback_employee_filter}")
+        callbacks = repo.db.execute_query(callback_query, (tenant_id,))
+        logging.info(f"✅ Found {len(callbacks)} callbacks")
         
         # Transform to calendar events
         events = []
-        for renewal in renewals:
+        
+        # Add contract end date events
+        for renewal in contracts:
             business_name = renewal.get('name') or renewal.get('contact') or 'Unknown'
             
-            # Add contract end date event
-            if renewal.get('contract_end_date'):
-                event = {
-                    'id': f"contract-{renewal['client_id']}",
-                    'customer_id': renewal['client_id'],
-                    'type': 'contract_end',
-                    'title': f"{business_name} - Contract End",
-                    'name': business_name,
-                    'mpan': renewal.get('mpan'),
-                    'supplier': renewal.get('supplier'),
-                    'contract_start_date': str(renewal['contract_start_date']) if renewal.get('contract_start_date') else None,
-                    'contract_end_date': str(renewal['contract_end_date']) if renewal.get('contract_end_date') else None,
-                    'reminder_date': str(renewal['reminder_date']) if renewal.get('reminder_date') else None,
-                    'address': renewal.get('address'),
-                    'postcode': renewal.get('postcode'),
-                    'contact': renewal.get('contact'),
-                    'email': renewal.get('email'),
-                    'phone': renewal.get('phone'),
-                    'service_title': renewal.get('service_title'),
-                    'rates': str(renewal.get('rates')) if renewal.get('rates') else None,
-                    'notes': renewal.get('contract_notes'),
-                    'display_date': str(renewal['contract_end_date']),
-                    'display_type': 'Contract End',
-                    'status': renewal.get('status') or 'Active',
-                    'assigned_to': renewal.get('assigned_to'),
-                }
-                events.append(event)
-            
-            # Add callback date event
-            if renewal.get('callback_date'):
-                event = {
-                    'id': f"callback-{renewal['client_id']}",
-                    'customer_id': renewal['client_id'],
-                    'type': 'callback',
-                    'title': f"{business_name} - Callback",
-                    'name': business_name,
-                    'mpan': renewal.get('mpan'),
-                    'supplier': renewal.get('supplier'),
-                    'contract_start_date': str(renewal['contract_start_date']) if renewal.get('contract_start_date') else None,
-                    'contract_end_date': str(renewal['contract_end_date']) if renewal.get('contract_end_date') else None,
-                    'reminder_date': str(renewal['callback_date']) if renewal.get('callback_date') else None,
-                    'address': renewal.get('address'),
-                    'postcode': renewal.get('postcode'),
-                    'contact': renewal.get('contact'),
-                    'email': renewal.get('email'),
-                    'phone': renewal.get('phone'),
-                    'service_title': renewal.get('service_title'),
-                    'rates': str(renewal.get('rates')) if renewal.get('rates') else None,
-                    'notes': renewal.get('callback_notes'),
-                    'display_date': str(renewal['callback_date']),
-                    'display_type': 'Callback',
-                    'status': renewal.get('status') or 'Active',
-                    'assigned_to': renewal.get('assigned_to'),
-                }
-                events.append(event)
+            event = {
+                'id': f"contract-{renewal['client_id']}",
+                'customer_id': renewal['client_id'],
+                'type': 'contract_end',
+                'title': f"{business_name} - Contract End",
+                'name': business_name,
+                'mpan': renewal.get('mpan'),
+                'supplier': renewal.get('supplier'),
+                'contract_start_date': str(renewal['contract_start_date']) if renewal.get('contract_start_date') else None,
+                'contract_end_date': str(renewal['contract_end_date']) if renewal.get('contract_end_date') else None,
+                'reminder_date': str(renewal['reminder_date']) if renewal.get('reminder_date') else None,
+                'address': renewal.get('address'),
+                'postcode': renewal.get('postcode'),
+                'contact': renewal.get('contact'),
+                'email': renewal.get('email'),
+                'phone': renewal.get('phone'),
+                'service_title': renewal.get('service_title'),
+                'rates': str(renewal.get('rates')) if renewal.get('rates') else None,
+                'notes': renewal.get('contract_notes'),
+                'display_date': str(renewal['contract_end_date']),
+                'display_type': 'Contract End',
+                'status': renewal.get('status') or 'Active',
+                'assigned_to': renewal.get('assigned_to'),
+            }
+            events.append(event)
         
-        logging.info(f"✅ Returning {len(events)} events")
+        # Add callback events (deduplicate by client_id - keep only latest)
+        seen_clients = set()
+        for callback in callbacks:
+            client_id = callback['client_id']
+            
+            # Skip if we've already added a callback for this client
+            if client_id in seen_clients:
+                continue
+            seen_clients.add(client_id)
+            
+            business_name = callback.get('name') or callback.get('contact') or 'Unknown'
+            
+            event = {
+                'id': f"callback-{client_id}",
+                'customer_id': client_id,
+                'type': 'callback',
+                'title': f"{business_name} - Callback",
+                'name': business_name,
+                'mpan': callback.get('mpan'),
+                'supplier': callback.get('supplier'),
+                'contract_start_date': str(callback['contract_start_date']) if callback.get('contract_start_date') else None,
+                'contract_end_date': str(callback['contract_end_date']) if callback.get('contract_end_date') else None,
+                'reminder_date': str(callback['callback_date']) if callback.get('callback_date') else None,
+                'address': callback.get('address'),
+                'postcode': callback.get('postcode'),
+                'contact': callback.get('contact'),
+                'email': callback.get('email'),
+                'phone': callback.get('phone'),
+                'service_title': callback.get('service_title'),
+                'rates': str(callback.get('rates')) if callback.get('rates') else None,
+                'notes': callback.get('callback_notes'),
+                'display_date': str(callback['callback_date']),
+                'display_type': 'Callback',
+                'status': callback.get('status') or 'Active',
+                'assigned_to': callback.get('assigned_to'),
+            }
+            events.append(event)
+        
+        logging.info(f"✅ Returning {len(events)} total events ({len(contracts)} contracts + {len(seen_clients)} callbacks)")
         
         return jsonify({
             'success': True,
@@ -199,7 +253,7 @@ def get_contract_schedule():
         tenant_id = g.tenant_id
         repo = TenantRepository()
         
-        # ✅ Query with correct schema (StreemLyne_MT) and exact table names from your schema
+        # ✅ Query with status filter to exclude priced/lost
         query = '''
             SELECT 
                 cm.client_id,
@@ -229,6 +283,7 @@ def get_contract_schedule():
             LEFT JOIN "StreemLyne_MT"."Client_Interactions" ci ON cm.client_id = ci.client_id
             WHERE cm.tenant_id = %s
             AND (ecm.contract_end_date IS NOT NULL OR ci.reminder_date IS NOT NULL)
+            AND (od."Misc_Col1" IS NULL OR LOWER(od."Misc_Col1") NOT IN ('priced', 'lost'))
             ORDER BY cm.client_id
         '''
         
