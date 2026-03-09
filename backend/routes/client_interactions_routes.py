@@ -1,9 +1,8 @@
 """
 Updated Callback Route - backend/routes/client_interactions_routes.py
-Handles conditional date requirements, sold status, and record deletion
+✅ ADDED: Delete individual interaction endpoint
 ✅ FIXED: Creates NEW log entries instead of updating existing ones
 ✅ ADDED: "End Date Changed" status
-MAPPED TO ACTUAL DATABASE SCHEMA
 """
 
 from flask import Blueprint, request, jsonify, current_app
@@ -30,24 +29,7 @@ def get_tenant_id_from_user(user):
 @token_required
 def add_callback(client_id):
     """
-    Add callback with conditional logic:
-    - Callback: Requires date (simple reminder)
-    - Called: Requires date
-    - Not Answered: Requires date
-    - Priced: Asks "Sold?" - if yes, requires date; if no, moves to priced page
-    - Lost: Requires date
-    - Lost COT: Deletes from database
-    - Already Renewed: Requires date
-    - Invalid Number: Deletes from database
-    - Meter De-energised: Deletes from database
-    - Broker in Place: Requires date
-    - End Date Changed: Requires date ✅ NEW
-    
-    SCHEMA MAPPING:
-    - interaction_type → notes (we'll prefix notes with status)
-    - employee_id → stored in notes or ignored
-    - contact_date → contact_date (already exists)
-    - reminder_date → reminder_date (already exists)
+    Add callback with conditional logic
     """
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -63,7 +45,7 @@ def add_callback(client_id):
         notes = data.get('notes', '')
         is_sold = data.get('is_sold')
         
-        # ✅ Status configurations (matches frontend)
+        # ✅ Status configurations
         status_config = {
             "Callback": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None},
             "Called": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None},
@@ -75,7 +57,7 @@ def add_callback(client_id):
             "Invalid Number": {"requires_date": False, "requires_sold": False, "deletes_record": True, "misc_col1": None},
             "Meter De-energised": {"requires_date": False, "requires_sold": False, "deletes_record": True, "misc_col1": None},
             "Broker in Place": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None},
-            "End Date Changed": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None},  # ✅ NEW
+            "End Date Changed": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None},
         }
         
         # Validation
@@ -87,7 +69,7 @@ def add_callback(client_id):
         
         config = status_config[status]
         
-        # ✅ Check if date is required
+        # Check if date is required
         date_required = False
         if config["requires_sold"]:
             if is_sold is None:
@@ -99,7 +81,7 @@ def add_callback(client_id):
         if date_required and not callback_date:
             return jsonify({'error': 'Callback date is required for this status'}), 400
         
-        # ✅ Handle deletion statuses
+        # Handle deletion statuses
         if config["deletes_record"]:
             client_query = session.query(Client_Master).filter(Client_Master.client_id == client_id)
             if tenant_id:
@@ -110,12 +92,10 @@ def add_callback(client_id):
             if not client:
                 return jsonify({'error': 'Customer not found'}), 404
             
-            # Delete all related records in correct order (respecting foreign keys)
             try:
-                # 1. Client Interactions (no foreign key dependencies)
+                # Delete all related records
                 session.query(Client_Interactions).filter_by(client_id=client_id).delete(synchronize_session=False)
                 
-                # 2. Energy Contracts (depends on projects)
                 projects = session.query(Project_Details).filter_by(client_id=client_id).all()
                 project_ids = [p.project_id for p in projects]
                 if project_ids:
@@ -123,27 +103,20 @@ def add_callback(client_id):
                         Energy_Contract_Master.project_id.in_(project_ids)
                     ).delete(synchronize_session=False)
                 
-                # 3. Invoices and Invoice Details
                 from backend.models import Invoice_Master, Invoice_Details
                 invoice_ids = [inv.invoice_id for inv in session.query(Invoice_Master).filter_by(client_id=client_id).all()]
                 if invoice_ids:
                     session.query(Invoice_Details).filter(Invoice_Details.invoice_id.in_(invoice_ids)).delete(synchronize_session=False)
                 session.query(Invoice_Master).filter_by(client_id=client_id).delete(synchronize_session=False)
                 
-                # 4. Proposals and Proposal Details
                 from backend.models import Proposal_Master, Proposal_Details
                 proposal_ids = [prop.proposal_id for prop in session.query(Proposal_Master).filter_by(client_id=client_id).all()]
                 if proposal_ids:
                     session.query(Proposal_Details).filter(Proposal_Details.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
                 session.query(Proposal_Master).filter_by(client_id=client_id).delete(synchronize_session=False)
                 
-                # 5. Projects
                 session.query(Project_Details).filter_by(client_id=client_id).delete(synchronize_session=False)
-                
-                # 6. Opportunities
                 session.query(Opportunity_Details).filter_by(client_id=client_id).delete(synchronize_session=False)
-                
-                # 7. Finally, delete the client
                 session.delete(client)
                 
                 session.commit()
@@ -159,14 +132,12 @@ def add_callback(client_id):
                 current_app.logger.exception(f"❌ Error deleting record: {delete_error}")
                 return jsonify({'error': f'Failed to delete record: {str(delete_error)}'}), 500
         
-        # ✅ Find the client's opportunity to update Misc_Col1 (if exists)
+        # Update Misc_Col1 based on status
         opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
-        
-        # ✅ Update Misc_Col1 based on status (only if opportunity exists)
         if opportunity and config["misc_col1"]:
             opportunity.Misc_Col1 = config["misc_col1"]
         
-        # ✅ For "Priced" status with "No" - don't set callback date
+        # For "Priced" status with "No" - don't set callback date
         if status == "Priced" and not is_sold:
             session.commit()
             return jsonify({
@@ -175,17 +146,16 @@ def add_callback(client_id):
                 'moved_to_priced': True
             }), 200
         
-        # ✅ CRITICAL FIX: ALWAYS create a NEW interaction entry (never update)
-        # This ensures every callback is logged as a separate history entry
+        # ✅ CRITICAL: ALWAYS create a NEW interaction entry (never update)
         formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
         
         new_interaction = Client_Interactions(
             client_id=client_id,
             contact_date=datetime.utcnow().date(),
-            contact_method=1,  # Default: 1 = Phone (required NOT NULL field)
+            contact_method=1,
             reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
             notes=formatted_notes,
-            next_steps=status,  # Store status here
+            next_steps=status,
             created_at=datetime.utcnow()
         )
         session.add(new_interaction)
@@ -210,16 +180,12 @@ def add_callback(client_id):
 @client_interaction_bp.route('/energy-clients/<int:client_id>/history', methods=['GET'])
 @token_required
 def get_interaction_history(client_id):
-    """
-    Get all interactions for a client
-    MAPPED TO ACTUAL SCHEMA
-    """
+    """Get all interactions for a client"""
     session = SessionLocal()
     
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
         
-        # Build query with optional tenant filtering
         query = session.query(Client_Interactions)
         
         if tenant_id:
@@ -235,18 +201,17 @@ def get_interaction_history(client_id):
         else:
             query = query.filter(Client_Interactions.client_id == client_id)
         
-        # ✅ Order by newest first (descending)
         interactions = query.order_by(Client_Interactions.created_at.desc()).all()
         
         result = []
         for interaction in interactions:
             result.append({
                 'interaction_id': interaction.interaction_id,
-                'interaction_type': interaction.next_steps or 'Unknown',  # Use next_steps as status
+                'interaction_type': interaction.next_steps or 'Unknown',
                 'contact_date': interaction.contact_date.isoformat() if interaction.contact_date else None,
                 'reminder_date': interaction.reminder_date.isoformat() if interaction.reminder_date else None,
                 'notes': interaction.notes,
-                'employee_id': None,  # Not available in schema
+                'employee_id': None,
                 'created_at': interaction.created_at.isoformat() if interaction.created_at else None
             })
         
@@ -254,6 +219,58 @@ def get_interaction_history(client_id):
         
     except Exception as e:
         current_app.logger.exception(f"❌ Error fetching interaction history: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+# ✅ NEW: Delete individual interaction
+@client_interaction_bp.route('/energy-clients/<int:client_id>/history/<int:interaction_id>', methods=['DELETE', 'OPTIONS'])
+@token_required
+def delete_interaction(client_id, interaction_id):
+    """
+    Delete a specific interaction from history
+    Admin or owner can delete their own interactions
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    session = SessionLocal()
+    
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        
+        # Build query with tenant filtering
+        query = session.query(Client_Interactions).filter(
+            Client_Interactions.interaction_id == interaction_id,
+            Client_Interactions.client_id == client_id
+        )
+        
+        if tenant_id:
+            query = query.join(
+                Client_Master,
+                Client_Interactions.client_id == Client_Master.client_id
+            ).filter(Client_Master.tenant_id == tenant_id)
+        
+        interaction = query.first()
+        
+        if not interaction:
+            return jsonify({'error': 'Interaction not found'}), 404
+        
+        # Delete the interaction
+        session.delete(interaction)
+        session.commit()
+        
+        current_app.logger.info(f"✅ Deleted interaction {interaction_id} for client {client_id}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Interaction deleted successfully'
+        }), 200
+        
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"❌ Error deleting interaction: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
