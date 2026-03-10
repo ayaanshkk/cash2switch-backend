@@ -567,11 +567,13 @@ def update_energy_customer(client_id):
                     contract.contract_start_date = data['start_date']
                 if 'end_date' in data:
                     contract.contract_end_date = data['end_date']
-                if 'unit_rate' in data:
+                # ✅ FIX: Only update unit_rate if it's actually provided AND not None
+                if 'unit_rate' in data and data['unit_rate'] is not None:
                     contract.unit_rate = data['unit_rate']
                 if 'terms_of_sale' in data:
                     contract.terms_of_sale = data['terms_of_sale']
                 contract.updated_at = datetime.utcnow()
+                
             elif data.get('mpan_mpr') or data.get('supplier_id'):
                 # Create contract if it doesn't exist
                 contract = Energy_Contract_Master(

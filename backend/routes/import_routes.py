@@ -518,9 +518,26 @@ def import_energy_customers():
                     existing_contract = existing_mpans.get(mpan_key)
                     
                     if existing_contract:
-                        # DUPLICATE - UPDATE EXISTING
+                        # DUPLICATE FOUND
                         duplicate_count += 1
                         
+                        # ✅ NEW LOGIC: Determine if new record is more recent
+                        new_end_date = end_date
+                        existing_end_date = existing_contract.contract_end_date
+                        
+                        # Skip if new record has no end date
+                        if not new_end_date:
+                            current_app.logger.info(f"⏭️ Row {index + 2}: Skipping - no end date in new record for MPAN {mpan_mpr}")
+                            continue
+                        
+                        # ✅ COMPARE END DATES: Only update if new end date is NEWER
+                        if existing_end_date and new_end_date <= existing_end_date:
+                            current_app.logger.info(f"⏭️ Row {index + 2}: Skipping - existing end date {existing_end_date} is same or newer than {new_end_date}")
+                            continue
+                        
+                        current_app.logger.info(f"🔄 Row {index + 2}: Updating MPAN {mpan_mpr} - new end date {new_end_date} is newer than {existing_end_date}")
+                        
+                        # ✅ FETCH RELATED RECORDS
                         project = session.query(Project_Details).filter_by(
                             project_id=existing_contract.project_id
                         ).first()
@@ -541,62 +558,57 @@ def import_energy_customers():
                             errors.append(f"Row {index + 2}: Client not found for MPAN {mpan_mpr}")
                             continue
                         
-                        # Update fields
-                        if email and not client.client_email:
-                            client.client_email = email
-                        if address and not client.address:
-                            client.address = address
-                        if postcode and not client.post_code:
-                            client.post_code = postcode
+                        # ✅ NEW: COMPLETELY REPLACE ALL FIELDS (not just empty ones)
                         
-                        if site_address and not project.address:
-                            project.address = site_address
-                        if annual_usage and not project.Misc_Col2:
-                            project.Misc_Col2 = int(annual_usage)
+                        # Update Client_Master - REPLACE ALL FIELDS
+                        client.client_company_name = business_name or client.client_company_name
+                        client.client_contact_name = contact_person or client.client_contact_name
+                        client.client_phone = phone or client.client_phone
+                        client.client_email = email or client.client_email
+                        client.address = address or client.address
+                        client.post_code = postcode or client.post_code
+                        client.position = position or None
+                        client.company_number = company_number or None
+                        client.date_of_birth = date_of_birth
+                        client.charity_ltd_company_number = charity_ltd_company_number or None
+                        client.partner_details = partner_details or None
+                        client.bank_name = bank_name or None
+                        client.account_number = account_number or None
+                        client.sort_code = sort_code or None
                         
-                        if start_date and (not project.start_date or start_date > project.start_date):
-                            project.start_date = start_date
-                        
-                        if end_date and (not project.end_date or end_date > project.end_date):
-                            project.end_date = end_date
-                        
+                        # Update Project_Details - REPLACE ALL FIELDS
+                        project.address = site_address or address or project.address
+                        project.Misc_Col2 = int(annual_usage) if annual_usage else project.Misc_Col2
+                        project.start_date = start_date or project.start_date
+                        project.end_date = end_date or project.end_date
+                        project.site_name = site_name or None
+                        project.month_sold = month_sold or None
+                        project.house_name = house_name or None
+                        project.house_number = house_number or None
                         project.updated_at = datetime.utcnow()
                         
-                        if end_date and (not existing_contract.contract_end_date or end_date > existing_contract.contract_end_date):
-                            existing_contract.contract_end_date = end_date
+                        # Update Energy_Contract_Master - REPLACE ALL FIELDS (including supplier!)
+                        existing_contract.contract_end_date = end_date
+                        existing_contract.contract_start_date = start_date or existing_contract.contract_start_date
                         
-                        if start_date and (not existing_contract.contract_start_date or start_date > existing_contract.contract_start_date):
-                            existing_contract.contract_start_date = start_date
-                        
-                        # ✅ ONLY update supplier if current is default AND new supplier found
-                        if supplier_id and supplier_id != 1 and (not existing_contract.supplier_id or existing_contract.supplier_id == 1):
+                        # ✅ CRITICAL: Always update supplier if provided (don't skip if current is not default)
+                        if supplier_id:
                             existing_contract.supplier_id = supplier_id
+                            current_app.logger.info(f"   ✅ Updated supplier to ID {supplier_id}")
                         
-                        if rate_1 and not existing_contract.rate_1:
-                            existing_contract.rate_1 = rate_1
-                            existing_contract.unit_rate = rate_1
-                        
-                        if rate_2 and not existing_contract.rate_2:
-                            existing_contract.rate_2 = rate_2
-                        
-                        if rate_3 and not existing_contract.rate_3:
-                            existing_contract.rate_3 = rate_3
-                        
-                        if stand_charge and not existing_contract.standing_charge:
-                            existing_contract.standing_charge = stand_charge
-                        
-                        if net_notch and not existing_contract.net_notch:
-                            existing_contract.net_notch = net_notch
-                        
-                        if comms_paid and not existing_contract.comms_paid:
-                            existing_contract.comms_paid = comms_paid
-                        
-                        if aggregator and not existing_contract.aggregator:
-                            existing_contract.aggregator = aggregator
-                        
+                        # Update all contract fields
+                        existing_contract.unit_rate = rate_1 or existing_contract.unit_rate
+                        existing_contract.rate_1 = rate_1 or existing_contract.rate_1
+                        existing_contract.rate_2 = rate_2 or existing_contract.rate_2
+                        existing_contract.rate_3 = rate_3 or existing_contract.rate_3
+                        existing_contract.standing_charge = stand_charge or existing_contract.standing_charge
+                        existing_contract.net_notch = net_notch or existing_contract.net_notch
+                        existing_contract.comms_paid = comms_paid or existing_contract.comms_paid
+                        existing_contract.aggregator = aggregator or existing_contract.aggregator
+                        existing_contract.term_sold = term_sold or existing_contract.term_sold
                         existing_contract.updated_at = datetime.utcnow()
                         
-                        # Update Opportunity assignment
+                        # Update Opportunity assignment (if provided)
                         opportunity = session.query(Opportunity_Details).filter_by(
                             client_id=client.client_id
                         ).first()
@@ -620,6 +632,8 @@ def import_energy_customers():
                         
                         # ✅ COMMIT IMMEDIATELY
                         session.commit()
+                        
+                        current_app.logger.info(f"✅ Row {index + 2}: Updated MPAN {mpan_mpr} with latest data")
                         
                         # Log progress every 100 records
                         if (success_count + duplicate_count) % 100 == 0:

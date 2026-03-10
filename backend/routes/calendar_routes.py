@@ -20,58 +20,52 @@ def after_request(response):
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     return response
 
-
 @calendar_bp.route('/renewals', methods=['GET', 'OPTIONS'])
 @token_required
 @tenant_from_jwt
 def get_renewals_calendar():
-    """Get all renewals for calendar view - shows contract end dates AND callback dates"""
+    """Get all renewals for calendar view - FIXED VERSION"""
     
-    # ✅ Handle OPTIONS preflight request
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
+    from backend.db import SessionLocal
+    from sqlalchemy import text
+    
+    session = SessionLocal()
+    
     try:
         tenant_id = g.tenant_id
-        repo = TenantRepository()
         
         logging.info(f"🔍 Fetching renewals for tenant_id: {tenant_id}")
         
-        # ✅ Get current user and check if admin
+        # Get current user and check if admin
         current_user = request.current_user
-        from backend.db import SessionLocal
         from backend.routes.customer_routes import get_user_role_name
         
-        session = SessionLocal()
-        try:
-            user_role = get_user_role_name(current_user, session)
-            is_admin = user_role in ['Platform Admin', 'Tenant Super Admin']
-            logging.info(f"👤 User role: {user_role}, is_admin: {is_admin}")
-        finally:
-            session.close()
+        user_role = get_user_role_name(current_user, session)
+        is_admin = user_role in ['Platform Admin', 'Tenant Super Admin']
+        logging.info(f"👤 User role: {user_role}, is_admin: {is_admin}")
         
-        # ✅ Get employee_id filter from query params
+        # Get employee_id filter from query params
         filter_employee_id = request.args.get('employee_id', type=int)
         
-        # ✅ Build employee filter
+        # Build employee filter
         if is_admin and filter_employee_id:
-            # Admin viewing specific employee's calendar
             employee_filter = f"AND od.opportunity_owner_employee_id = {filter_employee_id}"
             callback_employee_filter = f"AND od2.opportunity_owner_employee_id = {filter_employee_id}"
             logging.info(f"📊 Admin viewing calendar for employee_id: {filter_employee_id}")
         elif is_admin:
-            # Admin viewing all employees (no filter)
             employee_filter = ""
             callback_employee_filter = ""
             logging.info(f"📊 Admin viewing all employees' calendars")
         else:
-            # Salesperson only sees their own
             employee_filter = f"AND od.opportunity_owner_employee_id = {current_user.employee_id}"
             callback_employee_filter = f"AND od2.opportunity_owner_employee_id = {current_user.employee_id}"
             logging.info(f"📊 Salesperson viewing own calendar: {current_user.employee_id}")
         
-        # ✅ PART 1: Get contract end dates
-        contract_query = f'''
+        # PART 1: Get contract end dates
+        contract_query = text(f'''
             SELECT 
                 cm.client_id,
                 COALESCE(NULLIF(TRIM(cm.client_company_name), ''), cm.client_contact_name, 'Unknown') as name,
@@ -98,16 +92,15 @@ def get_renewals_calendar():
             LEFT JOIN "StreemLyne_MT"."Services_Master" srv ON ecm.service_id = srv.service_id
             LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od ON cm.client_id = od.client_id
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
-            WHERE cm.tenant_id = %s
+            WHERE cm.tenant_id = :tenant_id
             AND cm.client_company_name != '[IMPORTED LEADS]'
             AND ecm.contract_end_date IS NOT NULL
             AND (od."Misc_Col1" IS NULL OR LOWER(od."Misc_Col1") NOT IN ('priced', 'lost'))
             {employee_filter}
-        '''
+        ''')
         
-        # ✅ PART 2: Get callback dates (from Client_Interactions)
-        # Using a subquery to get the LATEST callback for each client
-        callback_query = f'''
+        # PART 2: Get callback dates
+        callback_query = text(f'''
             SELECT 
                 cm.client_id,
                 COALESCE(NULLIF(TRIM(cm.client_company_name), ''), cm.client_contact_name, 'Unknown') as name,
@@ -135,21 +128,23 @@ def get_renewals_calendar():
             LEFT JOIN "StreemLyne_MT"."Services_Master" srv ON ecm.service_id = srv.service_id
             LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od2 ON cm.client_id = od2.client_id
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em2 ON od2.opportunity_owner_employee_id = em2.employee_id
-            WHERE cm.tenant_id = %s
+            WHERE cm.tenant_id = :tenant_id
             AND cm.client_company_name != '[IMPORTED LEADS]'
             AND ci.reminder_date IS NOT NULL
             AND ci.reminder_date >= CURRENT_DATE
             AND (od2."Misc_Col1" IS NULL OR LOWER(od2."Misc_Col1") NOT IN ('priced', 'lost'))
             {callback_employee_filter}
             ORDER BY cm.client_id, ci.reminder_date DESC
-        '''
+        ''')
         
-        logging.info(f"📊 Executing contract query with filter: {employee_filter}")
-        contracts = repo.db.execute_query(contract_query, (tenant_id,))
+        logging.info(f"📊 Executing contract query")
+        contract_result = session.execute(contract_query, {'tenant_id': tenant_id})
+        contracts = [dict(row._mapping) for row in contract_result]
         logging.info(f"✅ Found {len(contracts)} contract renewals")
         
-        logging.info(f"📊 Executing callback query with filter: {callback_employee_filter}")
-        callbacks = repo.db.execute_query(callback_query, (tenant_id,))
+        logging.info(f"📊 Executing callback query")
+        callback_result = session.execute(callback_query, {'tenant_id': tenant_id})
+        callbacks = [dict(row._mapping) for row in callback_result]
         logging.info(f"✅ Found {len(callbacks)} callbacks")
         
         # Transform to calendar events
@@ -185,12 +180,11 @@ def get_renewals_calendar():
             }
             events.append(event)
         
-        # Add callback events (deduplicate by client_id - keep only latest)
+        # Add callback events (deduplicate by client_id)
         seen_clients = set()
         for callback in callbacks:
             client_id = callback['client_id']
             
-            # Skip if we've already added a callback for this client
             if client_id in seen_clients:
                 continue
             seen_clients.add(client_id)
@@ -238,6 +232,8 @@ def get_renewals_calendar():
             'error': 'Failed to fetch calendar',
             'message': str(e)
         }), 500
+    finally:
+        session.close()
 
 
 @calendar_bp.route('/contracts', methods=['GET', 'OPTIONS'])
@@ -377,16 +373,22 @@ def get_clients():
 @token_required
 @tenant_from_jwt
 def get_employees():
-    """Get all employees for assignment"""
+    """Get all employees for assignment - FIXED VERSION"""
     
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     
+    from backend.db import SessionLocal
+    from sqlalchemy import text
+    
+    session = SessionLocal()
+    
     try:
         tenant_id = g.tenant_id
-        repo = TenantRepository()
         
-        query = '''
+        logging.info(f"📊 Fetching employees for tenant_id: {tenant_id}")
+        
+        query = text('''
             SELECT 
                 employee_id as id,
                 employee_name as full_name,
@@ -394,12 +396,16 @@ def get_employees():
                 phone,
                 dm.designation_description as role
             FROM "StreemLyne_MT"."Employee_Master" em
-            LEFT JOIN "StreemLyne_MT"."Designation_Master" dm ON em.employee_designation_id = dm.designation_id
-            WHERE em.tenant_id = %s
+            LEFT JOIN "StreemLyne_MT"."Designation_Master" dm 
+                ON em.employee_designation_id = dm.designation_id
+            WHERE em.tenant_id = :tenant_id
             ORDER BY employee_name
-        '''
+        ''')
         
-        employees = repo.db.execute_query(query, (tenant_id,))
+        result = session.execute(query, {'tenant_id': tenant_id})
+        employees = [dict(row._mapping) for row in result]
+        
+        logging.info(f"✅ Found {len(employees)} employees for tenant_id {tenant_id}")
         
         return jsonify({
             'success': True,
@@ -413,3 +419,5 @@ def get_employees():
             'error': 'Failed to fetch employees',
             'message': str(e)   
         }), 500
+    finally:
+        session.close()
