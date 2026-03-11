@@ -1,8 +1,6 @@
 """
 Updated Callback Route - backend/routes/client_interactions_routes.py
-✅ ADDED: Delete individual interaction endpoint
-✅ FIXED: Creates NEW log entries instead of updating existing ones
-✅ ADDED: "End Date Changed" status
+✅ BOTH "Lost" and "Lost COT" now move to recycle bin with soft delete
 """
 
 from flask import Blueprint, request, jsonify, current_app
@@ -30,6 +28,8 @@ def get_tenant_id_from_user(user):
 def add_callback(client_id):
     """
     Add callback with conditional logic
+    ✅ NEW: Soft delete for Lost, Lost COT, Invalid Number, Meter De-energised
+    ✅ NEW: Notes field is REQUIRED for Lost and Lost COT statuses
     """
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -47,17 +47,17 @@ def add_callback(client_id):
         
         # ✅ Status configurations
         status_config = {
-            "Callback": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None},
-            "Called": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None},
-            "Not Answered": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None},
-            "Priced": {"requires_date": False, "requires_sold": True, "deletes_record": False, "misc_col1": "priced"},
-            "Lost": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": "lost"},
-            "Lost COT": {"requires_date": False, "requires_sold": False, "deletes_record": True, "misc_col1": None},
-            "Already Renewed": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": "renewed"},
-            "Invalid Number": {"requires_date": False, "requires_sold": False, "deletes_record": True, "misc_col1": None},
-            "Meter De-energised": {"requires_date": False, "requires_sold": False, "deletes_record": True, "misc_col1": None},
-            "Broker in Place": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None},
-            "End Date Changed": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None},
+            "Callback": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None, "requires_notes": False},
+            "Called": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None, "requires_notes": False},
+            "Not Answered": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None, "requires_notes": False},
+            "Priced": {"requires_date": False, "requires_sold": True, "deletes_record": False, "misc_col1": "priced", "requires_notes": False},
+            "Lost": {"requires_date": True, "requires_sold": False, "deletes_record": True, "misc_col1": "lost", "requires_notes": True},  # ✅ CHANGED: deletes_record to TRUE
+            "Lost COT": {"requires_date": False, "requires_sold": False, "deletes_record": True, "misc_col1": None, "requires_notes": True},
+            "Already Renewed": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": "renewed", "requires_notes": False},
+            "Invalid Number": {"requires_date": False, "requires_sold": False, "deletes_record": True, "misc_col1": None, "requires_notes": False},
+            "Meter De-energised": {"requires_date": False, "requires_sold": False, "deletes_record": True, "misc_col1": None, "requires_notes": False},
+            "Broker in Place": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None, "requires_notes": False},
+            "End Date Changed": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None, "requires_notes": False},
         }
         
         # Validation
@@ -68,6 +68,10 @@ def add_callback(client_id):
             return jsonify({'error': 'Invalid status'}), 400
         
         config = status_config[status]
+        
+        # ✅ NEW: Validate notes for Lost/Lost COT
+        if config["requires_notes"] and not notes.strip():
+            return jsonify({'error': 'Please enter the reason why it was lost'}), 400
         
         # Check if date is required
         date_required = False
@@ -81,7 +85,7 @@ def add_callback(client_id):
         if date_required and not callback_date:
             return jsonify({'error': 'Callback date is required for this status'}), 400
         
-        # Handle deletion statuses
+        # ✅ Handle deletion statuses with SOFT DELETE
         if config["deletes_record"]:
             client_query = session.query(Client_Master).filter(Client_Master.client_id == client_id)
             if tenant_id:
@@ -93,44 +97,45 @@ def add_callback(client_id):
                 return jsonify({'error': 'Customer not found'}), 404
             
             try:
-                # Delete all related records
-                session.query(Client_Interactions).filter_by(client_id=client_id).delete(synchronize_session=False)
+                # ✅ SOFT DELETE: Mark as deleted instead of removing from database
+                client.is_deleted = True
+                client.deleted_at = datetime.utcnow()
+                client.deleted_reason = status
                 
-                projects = session.query(Project_Details).filter_by(client_id=client_id).all()
-                project_ids = [p.project_id for p in projects]
-                if project_ids:
-                    session.query(Energy_Contract_Master).filter(
-                        Energy_Contract_Master.project_id.in_(project_ids)
-                    ).delete(synchronize_session=False)
+                # Update Opportunity status to track the reason
+                opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
+                if opportunity:
+                    opportunity.Misc_Col1 = status.lower().replace(' ', '_')
                 
-                from backend.models import Invoice_Master, Invoice_Details
-                invoice_ids = [inv.invoice_id for inv in session.query(Invoice_Master).filter_by(client_id=client_id).all()]
-                if invoice_ids:
-                    session.query(Invoice_Details).filter(Invoice_Details.invoice_id.in_(invoice_ids)).delete(synchronize_session=False)
-                session.query(Invoice_Master).filter_by(client_id=client_id).delete(synchronize_session=False)
-                
-                from backend.models import Proposal_Master, Proposal_Details
-                proposal_ids = [prop.proposal_id for prop in session.query(Proposal_Master).filter_by(client_id=client_id).all()]
-                if proposal_ids:
-                    session.query(Proposal_Details).filter(Proposal_Details.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
-                session.query(Proposal_Master).filter_by(client_id=client_id).delete(synchronize_session=False)
-                
-                session.query(Project_Details).filter_by(client_id=client_id).delete(synchronize_session=False)
-                session.query(Opportunity_Details).filter_by(client_id=client_id).delete(synchronize_session=False)
-                session.delete(client)
+                # ✅ Create interaction with notes (will be visible in history)
+                # Include callback_date in the interaction if provided
+                formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
+                new_interaction = Client_Interactions(
+                    client_id=client_id,
+                    contact_date=datetime.utcnow().date(),
+                    contact_method=1,
+                    reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,  # ✅ Store callback date if provided
+                    notes=formatted_notes,
+                    next_steps=status,
+                    created_at=datetime.utcnow()
+                )
+                session.add(new_interaction)
                 
                 session.commit()
                 
+                current_app.logger.info(f"✅ Moved client {client_id} to recycle bin ({status})")
+                
                 return jsonify({
                     'success': True,
-                    'message': f'Record removed from database ({status})',
-                    'deleted': True
+                    'message': f'Moved to recycle bin ({status})',
+                    'deleted': False,
+                    'moved_to_recycle_bin': True
                 }), 200
                 
             except Exception as delete_error:
                 session.rollback()
-                current_app.logger.exception(f"❌ Error deleting record: {delete_error}")
-                return jsonify({'error': f'Failed to delete record: {str(delete_error)}'}), 500
+                current_app.logger.exception(f"❌ Error moving to recycle bin: {delete_error}")
+                return jsonify({'error': f'Failed to move to recycle bin: {str(delete_error)}'}), 500
         
         # Update Misc_Col1 based on status
         opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
@@ -224,7 +229,6 @@ def get_interaction_history(client_id):
         session.close()
 
 
-# ✅ NEW: Delete individual interaction
 @client_interaction_bp.route('/energy-clients/<int:client_id>/history/<int:interaction_id>', methods=['DELETE', 'OPTIONS'])
 @token_required
 def delete_interaction(client_id, interaction_id):

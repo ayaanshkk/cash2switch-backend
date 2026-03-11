@@ -33,7 +33,7 @@ class UserRepository:
                 rm."role_name",
                 rm."role_code"
             FROM "StreemLyne_MT"."User_Master" um
-            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON rm."Role_id" = rm."Role_id"
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON rm."role_id" = em."role_id"
             WHERE um."Tenant_id" = %s
         """
         
@@ -65,7 +65,7 @@ class UserRepository:
                 rm."role_name",
                 rm."role_code"
             FROM "StreemLyne_MT"."User_Master" um
-            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON rm."Role_id" = rm."Role_id"
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON rm."role_id" = em."role_id"
             WHERE um."Tenant_id" = %s
             AND um."User_id" = %s
             LIMIT 1
@@ -94,7 +94,7 @@ class UserRepository:
                 rm."role_name",
                 rm."role_code"
             FROM "StreemLyne_MT"."User_Master" um
-            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON um."Role_id" = rm."Role_id"
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON rm."role_id" = em."role_id"
             WHERE um."Tenant_id" = %s
             AND um."Role_id" = %s
             AND um."is_active" = TRUE

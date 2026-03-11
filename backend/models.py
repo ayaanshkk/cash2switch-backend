@@ -221,6 +221,9 @@ class Client_Master(Base):
     bank_name = Column(String(255))
     account_number = Column(String(50))
     sort_code = Column(String(20))
+    is_deleted = Column(Boolean, default=False, nullable=False)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+    deleted_reason = Column(String(100), nullable=True)
 
 
 class Project_Details(Base):

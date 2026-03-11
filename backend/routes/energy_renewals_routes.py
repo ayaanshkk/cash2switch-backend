@@ -114,7 +114,7 @@ def get_renewals():
 @renewals_bp.route('/energy-renewals/stats', methods=['GET'])
 @token_required
 def get_renewal_stats():
-    """Get renewal statistics - FULL DATASET (not paginated)"""
+    """Get renewal statistics - FILTERED BY EMPLOYEE"""
     session = SessionLocal()
     
     try:
@@ -125,7 +125,7 @@ def get_renewal_stats():
         # ✅ Optional employee filter for salespeople
         employee_id = request.args.get('employee_id', type=int)
         
-        # ✅ ADD DEBUG LOGGING
+        # ✅ DEBUG LOGGING
         print(f"\n{'='*60}")
         print(f"📊 STATS ENDPOINT CALLED")
         print(f"{'='*60}")
@@ -143,7 +143,7 @@ def get_renewal_stats():
         days_90 = today + timedelta(days=90)
         days_180 = today + timedelta(days=180)
         
-        # ✅ BASE QUERY - Get ALL records, not paginated
+        # ✅ CRITICAL FIX: Build base query BEFORE filtering
         base_query = session.query(
             Client_Master,
             Project_Details,
@@ -160,7 +160,7 @@ def get_renewal_stats():
             Energy_Contract_Master.contract_end_date.isnot(None)
         )
         
-        # ✅ Apply employee filter if provided
+        # ✅ CRITICAL FIX: Apply employee filter BEFORE calling .all()
         if employee_id:
             print(f"🔍 Applying filter: opportunity_owner_employee_id = {employee_id}")
             base_query = base_query.filter(
@@ -169,16 +169,16 @@ def get_renewal_stats():
         else:
             print(f"🌍 NO FILTER - Returning ALL company data")
         
-        # ✅ Get ALL results (no pagination)
+        # ✅ NOW get all results AFTER filter is applied
         all_results = base_query.all()
         
         print(f"📦 Query returned {len(all_results)} total records")
         
-        # ✅ Calculate statistics from ALL records
+        # ✅ Calculate statistics from filtered records
         total_renewals_30_60_days = 0
         total_renewals_61_90_days = 0
         total_renewals_90_plus_days = 0
-        expired_contracts = 0  # ✅ NEW
+        expired_contracts = 0
         total_revenue_at_risk = 0
         total_aq = 0
         contacted_count = 0
@@ -236,7 +236,7 @@ def get_renewal_stats():
             'total_renewals_30_60_days': total_renewals_30_60_days,
             'total_renewals_61_90_days': total_renewals_61_90_days,
             'total_renewals_90_plus_days': total_renewals_90_plus_days,
-            'expired_contracts': expired_contracts,  # ✅ NEW
+            'expired_contracts': expired_contracts,
             'total_revenue_at_risk': total_revenue_at_risk,
             'total_aq': total_aq,
             'contacted_count': contacted_count,
@@ -251,6 +251,7 @@ def get_renewal_stats():
         print(f"   91-180 days: {total_renewals_90_plus_days}")
         print(f"   Expired: {expired_contracts}")
         print(f"   Total AQ: {total_aq}")
+        print(f"   Revenue: £{total_revenue_at_risk:,.2f}")
         print(f"{'='*60}\n")
         
         return jsonify(result)
@@ -267,7 +268,7 @@ def get_renewal_stats():
 @renewals_bp.route('/energy-renewals/supplier-breakdown', methods=['GET'])
 @token_required
 def get_supplier_breakdown():
-    """Get supplier breakdown - FULL DATASET (not paginated)"""
+    """Get supplier breakdown - FILTERED BY EMPLOYEE"""
     session = SessionLocal()
     
     try:
@@ -278,7 +279,7 @@ def get_supplier_breakdown():
         # ✅ Optional employee filter
         employee_id = request.args.get('employee_id', type=int)
         
-        # ✅ Query ALL suppliers with aggregated data
+        # ✅ Query suppliers with aggregated data
         query = session.query(
             Supplier_Master.supplier_company_name,
             func.count(Energy_Contract_Master.energy_contract_master_id).label('renewal_count'),
@@ -303,17 +304,17 @@ def get_supplier_breakdown():
         ).join(
             Client_Master,
             Project_Details.client_id == Client_Master.client_id
+        ).join(
+            Opportunity_Details,
+            Client_Master.client_id == Opportunity_Details.client_id
         ).filter(
             Client_Master.tenant_id == tenant_id,
             Energy_Contract_Master.contract_end_date.isnot(None)
         )
         
-        # ✅ Apply employee filter if provided
+        # ✅ CRITICAL FIX: Apply employee filter
         if employee_id:
-            query = query.join(
-                Opportunity_Details,
-                Client_Master.client_id == Opportunity_Details.client_id
-            ).filter(
+            query = query.filter(
                 Opportunity_Details.opportunity_owner_employee_id == employee_id
             )
         
@@ -344,6 +345,8 @@ def get_supplier_breakdown():
             for r in results
         ]
         
+        print(f"✅ Supplier breakdown: {len(supplier_breakdown)} suppliers (employee_id={employee_id})")
+        
         return jsonify(supplier_breakdown)
         
     except Exception as e:
@@ -358,7 +361,7 @@ def get_supplier_breakdown():
 def get_period_breakdown():
     """
     Get detailed breakdown of renewals by period
-    ✅ FIX: Shows ALL salespeople's customers (no employee filter unless explicitly salesperson role)
+    ✅ FILTERED BY EMPLOYEE for salespeople
     """
     session = SessionLocal()
     
@@ -370,14 +373,16 @@ def get_period_breakdown():
         # Required period filter
         period = request.args.get('period')  # '30-60', '61-90', '91-180', 'expired'
         
+        # ✅ Optional employee filter
+        employee_id = request.args.get('employee_id', type=int)
+        
         from datetime import datetime, timedelta
         today = datetime.utcnow().date()
         
         # ✅ Calculate date range based on period
         if period == 'expired':
-            # Get all expired contracts
-            start_date = today - timedelta(days=365 * 5)  # Go back 5 years
-            end_date = today - timedelta(days=1)  # Up to yesterday
+            start_date = today - timedelta(days=365 * 5)
+            end_date = today - timedelta(days=1)
         elif period == '30-60':
             start_days = 30
             end_days = 60
@@ -396,7 +401,7 @@ def get_period_breakdown():
         else:
             return jsonify({'error': 'Invalid period parameter'}), 400
         
-        # ✅ Query for detailed breakdown - NO EMPLOYEE FILTER (show all salespeople's customers)
+        # ✅ Query for detailed breakdown
         query = session.query(
             Client_Master.client_id,
             Client_Master.client_company_name,
@@ -419,7 +424,7 @@ def get_period_breakdown():
         ).outerjoin(
             Supplier_Master,
             Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
-        ).outerjoin(
+        ).join(
             Opportunity_Details,
             Client_Master.client_id == Opportunity_Details.client_id
         ).outerjoin(
@@ -430,7 +435,12 @@ def get_period_breakdown():
             Energy_Contract_Master.contract_end_date.between(start_date, end_date)
         )
         
-        # ✅ NO EMPLOYEE FILTER - Show all customers regardless of assignment
+        # ✅ CRITICAL FIX: Apply employee filter for salespeople
+        if employee_id:
+            print(f"🔍 Period breakdown filtered by employee_id={employee_id}")
+            query = query.filter(
+                Opportunity_Details.opportunity_owner_employee_id == employee_id
+            )
         
         # Order by end date
         results = query.order_by(Energy_Contract_Master.contract_end_date).all()
@@ -457,9 +467,11 @@ def get_period_breakdown():
                 'mpan_number': r.mpan_number,
                 'annual_usage': r.annual_usage,
                 'estimated_revenue': round(revenue, 2),
-                'assigned_to': r.employee_name or 'Unassigned',  # ✅ Show assigned salesperson
+                'assigned_to': r.employee_name or 'Unassigned',
                 'status': r.status or 'Pending'
             })
+        
+        print(f"✅ Period breakdown: {len(breakdown)} renewals (employee_id={employee_id})")
         
         return jsonify({
             'period': period,
@@ -483,7 +495,7 @@ def get_period_breakdown():
 @renewals_bp.route('/energy-renewals/salesperson-performance', methods=['GET'])
 @token_required
 def get_salesperson_performance():
-    """Get detailed performance metrics with customer contact breakdown"""
+    """Get detailed performance metrics - FILTERED BY EMPLOYEE"""
     session = SessionLocal()
     
     try:
@@ -506,7 +518,7 @@ def get_salesperson_performance():
             start_date = today - timedelta(days=30)
             period_label = "This Month"
         
-        # Query for salesperson performance with customer details
+        # Query for salesperson performance
         query = session.query(
             Employee_Master.employee_id,
             Employee_Master.employee_name,
@@ -546,7 +558,7 @@ def get_salesperson_performance():
             Employee_Master.tenant_id == tenant_id
         )
         
-        # Apply employee filter if provided (for salesperson view)
+        # ✅ CRITICAL FIX: Apply employee filter
         if employee_id:
             query = query.filter(Employee_Master.employee_id == employee_id)
         
@@ -573,7 +585,7 @@ def get_salesperson_performance():
                     'customers_contacted': []
                 }
             
-            # Calculate revenue for this contact
+            # Calculate revenue
             revenue = 0
             if r.unit_rate and r.annual_usage:
                 revenue = (r.unit_rate * r.annual_usage) / 100
@@ -607,7 +619,7 @@ def get_salesperson_performance():
                     'estimated_revenue': round(revenue, 2)
                 })
         
-        # Calculate conversion rates and format output
+        # Calculate conversion rates
         performance_data = []
         for emp_data in performance_by_employee.values():
             conversion_rate = round(
@@ -630,8 +642,10 @@ def get_salesperson_performance():
                 )
             })
         
-        # Sort by total value touched (descending)
+        # Sort by total value touched
         performance_data.sort(key=lambda x: x['total_value_touched'], reverse=True)
+        
+        print(f"✅ Performance data: {len(performance_data)} employees (employee_id={employee_id})")
         
         return jsonify({
             'period': period,
@@ -654,7 +668,7 @@ def get_salesperson_performance():
 @renewals_bp.route('/energy-renewals/aq-breakdown', methods=['GET'])
 @token_required
 def get_aq_breakdown():
-    """Get AQ breakdown by salesperson - shows ALL salespeople in tenant"""
+    """Get AQ breakdown - FILTERED BY EMPLOYEE for salespeople"""
     session = SessionLocal()
     
     try:
@@ -662,14 +676,17 @@ def get_aq_breakdown():
         if not tenant_id:
             return jsonify({'error': 'Tenant not found'}), 400
         
+        # ✅ Optional employee filter
+        employee_id = request.args.get('employee_id', type=int)
+        
         print(f"\n{'='*60}")
-        print(f"📊 AQ BREAKDOWN - SHOWING ALL SALESPEOPLE")
+        print(f"📊 AQ BREAKDOWN")
         print(f"{'='*60}")
         print(f"   Tenant ID: {tenant_id}")
-        print(f"   Requested by: {request.current_user.email if hasattr(request.current_user, 'email') else 'Unknown'}")
+        print(f"   Employee Filter: {employee_id if employee_id else 'NONE (ALL SALESPEOPLE)'}")
         print(f"{'='*60}\n")
         
-        # Query AQ grouped by salesperson - NO EMPLOYEE FILTER
+        # Query AQ grouped by salesperson
         query = session.query(
             Employee_Master.employee_id,
             Employee_Master.employee_name,
@@ -703,20 +720,28 @@ def get_aq_breakdown():
             Client_Master.tenant_id == tenant_id,
             Energy_Contract_Master.contract_end_date.isnot(None),
             Project_Details.Misc_Col2.isnot(None),
-            Employee_Master.tenant_id == tenant_id  # ✅ Only filter by tenant, not by employee
-        ).group_by(
+            Employee_Master.tenant_id == tenant_id
+        )
+        
+        # ✅ CRITICAL FIX: Apply employee filter for salespeople
+        if employee_id:
+            query = query.filter(Employee_Master.employee_id == employee_id)
+        
+        query = query.group_by(
             Employee_Master.employee_id,
             Employee_Master.employee_name
         ).order_by(
             func.sum(Project_Details.Misc_Col2).desc()
-        ).all()
+        )
+        
+        results = query.all()
         
         breakdown = []
         total_aq = 0
         total_revenue = 0
         total_customers = 0
         
-        for r in query:
+        for r in results:
             aq = float(r.total_aq or 0)
             revenue = float(r.total_revenue or 0)
             customers = r.customer_count or 0
@@ -734,13 +759,10 @@ def get_aq_breakdown():
                 'average_aq_per_customer': round(aq / customers, 2) if customers > 0 else 0
             })
         
-        print(f"✅ BREAKDOWN RESULTS:")
-        print(f"   Total Salespeople: {len(breakdown)}")
+        print(f"✅ AQ BREAKDOWN RESULTS:")
+        print(f"   Employees: {len(breakdown)}")
         print(f"   Total AQ: {total_aq:,.0f} kWh")
         print(f"   Total Revenue: £{total_revenue:,.2f}")
-        print(f"   Total Customers: {total_customers}")
-        for b in breakdown:
-            print(f"   - {b['employee_name']}: {b['total_aq']:,.0f} kWh ({b['customer_count']} customers)")
         print(f"{'='*60}\n")
         
         return jsonify({
@@ -763,14 +785,10 @@ def get_aq_breakdown():
 
 @renewals_bp.route("/energy-renewals/test", methods=["GET"])
 def test_renewals_endpoint():
-    """
-    Test endpoint to verify database connection and schema
-    No authentication required for testing
-    """
+    """Test endpoint - no auth required"""
     try:
         db = SessionLocal()
         
-        # Test query with proper joins
         test_query = text("""
             SELECT 
                 COUNT(DISTINCT cm.client_id) as total_clients,
@@ -785,7 +803,6 @@ def test_renewals_endpoint():
         
         result = db.execute(test_query).first()
         
-        # Sample data query
         sample_query = text("""
             SELECT 
                 cm.client_company_name,

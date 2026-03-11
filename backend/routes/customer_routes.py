@@ -234,6 +234,7 @@ def get_energy_customers():
             and_(
                 Client_Master.tenant_id == tenant_id,
                 Client_Master.client_company_name != '[IMPORTED LEADS]',
+                Client_Master.is_deleted == False,
                 or_(
                     Opportunity_Details.Misc_Col1 == None,
                     ~func.lower(Opportunity_Details.Misc_Col1).in_(['priced', 'lost', 'lost_cot', 'lost cot'])
@@ -1469,5 +1470,266 @@ def get_stats_by_employee():
     except Exception as e:
         current_app.logger.error(f"Error fetching employee stats: {str(e)}")
         return jsonify({'error': str(e), 'stats': []}), 500
+    finally:
+        session.close()
+
+# ==========================================
+# RECYCLE BIN ENDPOINTS
+# ==========================================
+
+@energy_customer_bp.route('/energy-clients/recycle-bin', methods=['GET', 'OPTIONS'])
+@token_required
+def get_recycle_bin():
+    """
+    Get all soft-deleted customers from recycle bin
+    Shows only deleted records (is_deleted = TRUE)
+    """
+    
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        user = request.current_user
+        
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found for user'}), 400
+
+        # Service filter
+        service_param = request.args.get('service', 'utilities')
+        service_id_map = {'utilities': 1, 'water': 2, 'gas': 3}
+        service_id = service_id_map.get(service_param.strip().lower(), 1)
+        
+        # Base query - ONLY get deleted records
+        query = session.query(
+            Client_Master,
+            Project_Details,
+            Energy_Contract_Master,
+            Opportunity_Details,
+            Supplier_Master,
+            Employee_Master
+        ).outerjoin(
+            Project_Details, 
+            Client_Master.client_id == Project_Details.client_id
+        ).outerjoin(
+            Energy_Contract_Master,
+            Project_Details.project_id == Energy_Contract_Master.project_id
+        ).outerjoin(
+            Opportunity_Details,
+            Client_Master.client_id == Opportunity_Details.client_id
+        ).outerjoin(
+            Supplier_Master,
+            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
+        ).outerjoin(
+            Employee_Master,
+            Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
+        ).filter(
+            and_(
+                Client_Master.tenant_id == tenant_id,
+                Client_Master.is_deleted == True,  # ✅ Only deleted records
+                *([Energy_Contract_Master.service_id == service_id] if service_id is not None else [])
+            )
+        )
+
+        # Sort by most recently deleted first
+        query = query.order_by(Client_Master.deleted_at.desc())
+
+        # Filter by employee (each user sees their own deleted records)
+        query = query.filter(
+            Opportunity_Details.opportunity_owner_employee_id == user.employee_id
+        )
+
+        results = query.all()
+        
+        # Build response
+        customers = []
+        seen_clients = set()
+        
+        for client, project, contract, opportunity, supplier, employee in results:
+            if client.client_id in seen_clients:
+                continue
+            seen_clients.add(client.client_id)
+            
+            customer_data = build_customer_response(
+                client, project, contract, opportunity, None, supplier, employee
+            )
+            
+            # ✅ Add deletion metadata
+            customer_data['is_deleted'] = True
+            customer_data['deleted_at'] = client.deleted_at.isoformat() if client.deleted_at else None
+            customer_data['deleted_reason'] = client.deleted_reason
+            
+            customers.append(customer_data)
+        
+        current_app.logger.info(f"✅ Returning {len(customers)} deleted records for employee_id={user.employee_id}")
+        
+        return jsonify(customers), 200
+
+    except Exception as e:
+        current_app.logger.exception(f"❌ Error fetching recycle bin: {e}")
+        return jsonify({'error': 'Failed to fetch recycle bin'}), 500
+    finally:
+        session.close()
+
+
+@energy_customer_bp.route('/energy-clients/<int:client_id>/restore', methods=['POST', 'OPTIONS'])
+@token_required
+def restore_customer(client_id):
+    """
+    Restore a customer from recycle bin
+    Sets is_deleted = FALSE and clears deletion metadata
+    """
+    
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        
+        # Find the deleted client
+        client = session.query(Client_Master).filter_by(
+            client_id=client_id,
+            tenant_id=tenant_id,
+            is_deleted=True  # Must be in recycle bin
+        ).first()
+        
+        if not client:
+            return jsonify({'error': 'Customer not found in recycle bin'}), 404
+        
+        # Restore the customer
+        client.is_deleted = False
+        client.deleted_at = None
+        client.deleted_reason = None
+        
+        # Clear Opportunity status
+        opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
+        if opportunity and opportunity.Misc_Col1:
+            # Clear the deletion status (lost_cot, invalid_number, meter_de-energised)
+            if opportunity.Misc_Col1.lower() in ['lost_cot', 'invalid_number', 'meter_de-energised']:
+                opportunity.Misc_Col1 = None
+        
+        session.commit()
+        
+        current_app.logger.info(f"✅ Restored customer {client_id} from recycle bin")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Customer restored successfully'
+        }), 200
+        
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"❌ Error restoring customer: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@energy_customer_bp.route('/energy-clients/<int:client_id>/permanent-delete', methods=['DELETE', 'OPTIONS'])
+@token_required
+def permanent_delete_customer(client_id):
+    """
+    Permanently delete a customer from recycle bin
+    This is a HARD DELETE - removes from database completely
+    Can only delete records that are already in recycle bin (is_deleted = TRUE)
+    """
+    
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        
+        # Find the client - MUST be in recycle bin
+        client = session.query(Client_Master).filter_by(
+            client_id=client_id,
+            tenant_id=tenant_id,
+            is_deleted=True  # ✅ Only allow permanent delete from recycle bin
+        ).first()
+        
+        if not client:
+            return jsonify({'error': 'Customer not found in recycle bin'}), 404
+        
+        current_app.logger.info(f"🗑️ Permanently deleting customer {client_id}: {client.client_company_name}")
+        
+        # ============================================
+        # HARD DELETE: Delete in correct order (child → parent)
+        # ============================================
+        
+        # 1. Find all projects for this client
+        projects = session.query(Project_Details).filter_by(client_id=client_id).all()
+        project_ids = [p.project_id for p in projects]
+        
+        contracts_deleted = 0
+        if project_ids:
+            # 2. Delete Energy_Contract_Master (references project_id)
+            contracts_deleted = session.query(Energy_Contract_Master).filter(
+                Energy_Contract_Master.project_id.in_(project_ids)
+            ).delete(synchronize_session=False)
+            current_app.logger.info(f"   📋 Deleted {contracts_deleted} contracts")
+        
+        # 3. Delete Client_Interactions (references client_id)
+        interactions_deleted = session.query(Client_Interactions).filter_by(
+            client_id=client_id
+        ).delete(synchronize_session=False)
+        current_app.logger.info(f"   📋 Deleted {interactions_deleted} interactions")
+        
+        # 4. Delete Invoice_Details and Invoice_Master
+        invoice_ids = [inv.invoice_id for inv in session.query(Invoice_Master).filter_by(client_id=client_id).all()]
+        invoices_deleted = 0
+        if invoice_ids:
+            session.query(Invoice_Details).filter(Invoice_Details.invoice_id.in_(invoice_ids)).delete(synchronize_session=False)
+            invoices_deleted = session.query(Invoice_Master).filter_by(client_id=client_id).delete(synchronize_session=False)
+            current_app.logger.info(f"   📋 Deleted {invoices_deleted} invoices")
+        
+        # 5. Delete Proposal_Details and Proposal_Master
+        proposal_ids = [prop.proposal_id for prop in session.query(Proposal_Master).filter_by(client_id=client_id).all()]
+        proposals_deleted = 0
+        if proposal_ids:
+            session.query(Proposal_Details).filter(Proposal_Details.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+            proposals_deleted = session.query(Proposal_Master).filter_by(client_id=client_id).delete(synchronize_session=False)
+            current_app.logger.info(f"   📋 Deleted {proposals_deleted} proposals")
+        
+        # 6. Delete Opportunity_Details (references client_id)
+        opportunities_deleted = session.query(Opportunity_Details).filter_by(
+            client_id=client_id
+        ).delete(synchronize_session=False)
+        current_app.logger.info(f"   📋 Deleted {opportunities_deleted} opportunities")
+        
+        # 7. Delete Project_Details (references client_id and opportunity_id)
+        projects_deleted = session.query(Project_Details).filter_by(
+            client_id=client_id
+        ).delete(synchronize_session=False)
+        current_app.logger.info(f"   📋 Deleted {projects_deleted} projects")
+        
+        # 8. Finally delete Client_Master
+        session.delete(client)
+        
+        # Commit all deletions
+        session.commit()
+        
+        current_app.logger.info(f"✅ Permanently deleted customer {client_id} from recycle bin")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Customer permanently deleted',
+            'deleted': {
+                'contracts': contracts_deleted,
+                'interactions': interactions_deleted,
+                'invoices': invoices_deleted,
+                'proposals': proposals_deleted,
+                'opportunities': opportunities_deleted,
+                'projects': projects_deleted,
+                'client': 1
+            }
+        }), 200
+        
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"❌ Error permanently deleting customer: {e}")
+        return jsonify({'error': str(e)}), 500
     finally:
         session.close()
