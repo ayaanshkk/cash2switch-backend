@@ -105,7 +105,7 @@ def add_callback(client_id):
                 # Update Opportunity status to track the reason
                 opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
                 if opportunity:
-                    opportunity.Misc_Col1 = status.lower().replace(' ', '_')
+                    opportunity.Misc_Col1 = status
                 
                 # ✅ Create interaction with notes (will be visible in history)
                 # Include callback_date in the interaction if provided
@@ -139,8 +139,8 @@ def add_callback(client_id):
         
         # Update Misc_Col1 based on status
         opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
-        if opportunity and config["misc_col1"]:
-            opportunity.Misc_Col1 = config["misc_col1"]
+        if opportunity:
+            opportunity.Misc_Col1 = status
         
         # For "Priced" status with "No" - don't set callback date
         if status == "Priced" and not is_sold:

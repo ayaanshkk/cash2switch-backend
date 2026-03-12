@@ -53,7 +53,7 @@ def get_tenant_id_from_user(user):
         session.close()
 
 
-def build_customer_response(client, project=None, contract=None, opportunity=None, interaction=None, supplier=None, employee=None, old_supplier=None):
+def build_customer_response(client, project=None, contract=None, opportunity=None, interaction=None, supplier=None, employee=None, old_supplier=None, stage=None):
     """Build unified customer response from multiple tables"""
     response = {
         # From Client_Master
@@ -118,6 +118,10 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'rate_2': float(contract.rate_2) if contract and hasattr(contract, 'rate_2') and contract.rate_2 else None,
         'rate_3': float(contract.rate_3) if contract and hasattr(contract, 'rate_3') and contract.rate_3 else None,
         'comms_paid': float(contract.comms_paid) if contract and hasattr(contract, 'comms_paid') and contract.comms_paid else None,
+
+        'mpan_top': contract.mpan_number if contract else None,
+        'mpan_bottom': contract.mpan_bottom if contract else None,
+        'mpan_mpr': contract.mpan_number if contract else None,
         
         # From Supplier_Master (via Energy_Contract_Master)
         'supplier_id': supplier.supplier_id if supplier else None,
@@ -181,13 +185,24 @@ def get_user_role_name(user, session):
 def get_energy_customers():
     """Get all energy customers EXCLUDING priced/lost statuses, filtered by assigned employee"""
     
+    print("\n" + "="*80)
+    print("🚀 GET /energy-clients CALLED - CODE IS RUNNING")
+    print("="*80 + "\n")
+    
     if request.method == 'OPTIONS':
+        print("⚠️ OPTIONS request - returning early")
         return jsonify({}), 200
+    
+    print("✅ Past OPTIONS check")
     
     session = SessionLocal()
     try:
+        print("✅ Session created")
+        
         tenant_id = get_tenant_id_from_user(request.current_user)
         user = request.current_user
+        
+        print(f"✅ Tenant ID: {tenant_id}, Employee ID: {user.employee_id}")
         
         if not tenant_id:
             return jsonify({'error': 'Tenant not found for user'}), 400
@@ -198,6 +213,8 @@ def get_energy_customers():
         if service_param and isinstance(service_param, str):
             svc = service_param.strip().lower()
             _service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
+        
+        print(f"✅ Service ID: {_service_id}")
         
         # Base query with joins
         query = session.query(
@@ -235,6 +252,7 @@ def get_energy_customers():
                 Client_Master.tenant_id == tenant_id,
                 Client_Master.client_company_name != '[IMPORTED LEADS]',
                 Client_Master.is_deleted == False,
+                Client_Master.is_archived == False,
                 or_(
                     Opportunity_Details.Misc_Col1 == None,
                     ~func.lower(Opportunity_Details.Misc_Col1).in_(['priced', 'lost', 'lost_cot', 'lost cot'])
@@ -255,31 +273,49 @@ def get_energy_customers():
             Opportunity_Details.opportunity_owner_employee_id == user.employee_id
         )
 
+        print("✅ About to execute query")
+        
         results = query.all()
+        
+        print(f"🔍 QUERY RETURNED {len(results)} TOTAL RESULTS")
         
         # Build response
         customers = []
         seen_clients = set()
-        
+
         for client, project, contract, opportunity, interaction, supplier, employee, stage in results:
             if client.tenant_client_id in seen_clients:
                 continue
             seen_clients.add(client.tenant_client_id)
             
+            print(f"🔍 Processing customer tenant_client_id={client.tenant_client_id}, client_id={client.client_id}")
+            
             customer_data = build_customer_response(
-                client, project, contract, opportunity, interaction, supplier, employee
+                client, project, contract, opportunity, interaction, supplier, employee, None, stage
             )
+
+            print(f"   - opportunity exists: {opportunity is not None}")
+            if opportunity:
+                print(f"   - opportunity.Misc_Col1: '{opportunity.Misc_Col1}'")
+                print(f"   - opportunity.stage_id: {opportunity.stage_id}")
+            print(f"   - customer_data['status'] BEFORE override: {customer_data['status']}")
+
             if opportunity and opportunity.Misc_Col1:
                 customer_data['status'] = opportunity.Misc_Col1
-            
+                print(f"   - customer_data['status'] AFTER override: '{customer_data['status']}'")
+            else:
+                print(f"   - ⚠️ NO OVERRIDE - opportunity.Misc_Col1 is NULL or opportunity is None")
+
             customers.append(customer_data)
         
-        current_app.logger.info(f"✅ Returning {len(customers)} renewals for employee_id={user.employee_id}")
+        print(f"✅ Returning {len(customers)} renewals for employee_id={user.employee_id}")
         
         return jsonify(customers), 200
 
     except Exception as e:
-        current_app.logger.exception(f"❌ Error fetching energy customers: {e}")
+        print(f"❌ EXCEPTION: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': 'Failed to fetch energy customers'}), 500
     finally:
         session.close()
@@ -346,9 +382,17 @@ def get_energy_customer(client_id):
                 supplier_id=contract.old_supplier_id
             ).first()
         
+        stage = None
+        if opportunity and opportunity.stage_id:
+            stage = session.query(Stage_Master).filter_by(stage_id=opportunity.stage_id).first()
+
         customer_data = build_customer_response(
-            client, project, contract, opportunity, interaction, supplier, employee, old_supplier
+            client, project, contract, opportunity, interaction, supplier, employee, old_supplier, stage
         )
+
+        # ✅ Prioritize Misc_Col1 if it exists
+        if opportunity and opportunity.Misc_Col1:
+            customer_data['status'] = opportunity.Misc_Col1
         
         return jsonify(customer_data), 200
         
@@ -465,7 +509,7 @@ def create_energy_customer():
         
         # Build response (no opportunity parameter since we don't create it)
         response_data = build_customer_response(
-            new_client, project, contract, None, None, None, None
+            new_client, project, contract, None, None, None, None, None, None
         )
         
         return jsonify({
@@ -508,11 +552,13 @@ def update_energy_customer(client_id):
 
         # Admin-only: assignment change
         user_role = get_user_role_name(request.current_user, session)
-        if data and 'assigned_to_id' in data and user_role != 'Platform Admin':
-            return jsonify({
-                'error': 'permission_denied',
-                'message': 'Only administrators can assign'
-            }), 403
+        if data and 'assigned_to_id' in data:
+            # Only Platform Admin can change assignments
+            if user_role not in ['Platform Admin', 'Tenant Super Admin']:
+                return jsonify({
+                    'error': 'permission_denied',
+                    'message': 'Only administrators can change customer assignments'
+                }), 403
         
         current_app.logger.info(f"🔄 Updating energy customer {client_id}")
         
@@ -597,12 +643,10 @@ def update_energy_customer(client_id):
             
             if 'status' in data:
                 status_value = data['status']
-                if status_value is None or status_value == '' or status_value == 'null':
-                    opportunity.Misc_Col1 = None  # Clear the status
-                    print(f"✅ Clearing status for client {client_id}")
+                if status_value in ['None', 'null', '', None]:
+                    opportunity.Misc_Col1 = None
                 else:
                     opportunity.Misc_Col1 = status_value
-                    print(f"✅ Setting status to '{status_value}' for client {client_id}")
             
             if 'assigned_to_id' in data:
                 opportunity.opportunity_owner_employee_id = data['assigned_to_id']
@@ -659,7 +703,8 @@ def update_energy_customer(client_id):
             Opportunity_Details,
             Client_Interactions,
             Supplier_Master,
-            Employee_Master
+            Employee_Master,
+            Stage_Master
         ).outerjoin(
             Project_Details, Client_Master.client_id == Project_Details.client_id
         ).outerjoin(
@@ -672,18 +717,23 @@ def update_energy_customer(client_id):
             Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
         ).outerjoin(
             Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
+        ).outerjoin(
+            Stage_Master, Opportunity_Details.stage_id == Stage_Master.stage_id
         ).filter(
             Client_Master.client_id == client_id
         ).first()
         
-        client, project, contract, opportunity, interaction, supplier, employee = updated_result
+        client, project, contract, opportunity, interaction, supplier, employee, stage = updated_result 
         
         response_data = build_customer_response(
-            client, project, contract, opportunity, interaction, supplier, employee
+            client, project, contract, opportunity, interaction, supplier, employee, None, stage 
         )
         
+        if opportunity and opportunity.Misc_Col1:
+            response_data['status'] = opportunity.Misc_Col1
+
         current_app.logger.info(f"✅ Energy customer {client_id} updated")
-        
+
         return jsonify({
             'success': True,
             'message': 'Customer updated successfully',
@@ -1392,7 +1442,7 @@ def get_priced_customers():
             seen_clients.add(client.tenant_client_id)
             
             customer_data = build_customer_response(
-                client, project, contract, opportunity, interaction, supplier, employee
+                client, project, contract, opportunity, interaction, supplier, employee, None, stage
             )
             if opportunity and opportunity.Misc_Col1:
                 customer_data['status'] = opportunity.Misc_Col1
@@ -1551,9 +1601,17 @@ def get_recycle_bin():
                 continue
             seen_clients.add(client.client_id)
             
+            stage = None
+            if opportunity and opportunity.stage_id:
+                stage = session.query(Stage_Master).filter_by(stage_id=opportunity.stage_id).first()
+
             customer_data = build_customer_response(
-                client, project, contract, opportunity, None, supplier, employee
+                client, project, contract, opportunity, None, supplier, employee, None, stage
             )
+
+            # ✅ Prioritize Misc_Col1
+            if opportunity and opportunity.Misc_Col1:
+                customer_data['status'] = opportunity.Misc_Col1
             
             # ✅ Add deletion metadata
             customer_data['is_deleted'] = True
@@ -1730,6 +1788,156 @@ def permanent_delete_customer(client_id):
     except Exception as e:
         session.rollback()
         current_app.logger.exception(f"❌ Error permanently deleting customer: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+@energy_customer_bp.route('/energy-clients/archives', methods=['GET', 'OPTIONS'])
+@token_required
+def get_archived_customers():
+    """
+    Get all archived customers
+    Shows historical records that have been superseded by newer contracts
+    """
+    
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        user = request.current_user
+        
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found for user'}), 400
+
+        # Service filter
+        service_param = request.args.get('service', 'utilities')
+        service_id_map = {'utilities': 1, 'water': 2, 'gas': 3}
+        service_id = service_id_map.get(service_param.strip().lower(), 1)
+        
+        # Base query - ONLY get archived records
+        query = session.query(
+            Client_Master,
+            Project_Details,
+            Energy_Contract_Master,
+            Opportunity_Details,
+            Supplier_Master,
+            Employee_Master
+        ).outerjoin(
+            Project_Details, 
+            Client_Master.client_id == Project_Details.client_id
+        ).outerjoin(
+            Energy_Contract_Master,
+            Project_Details.project_id == Energy_Contract_Master.project_id
+        ).outerjoin(
+            Opportunity_Details,
+            Client_Master.client_id == Opportunity_Details.client_id
+        ).outerjoin(
+            Supplier_Master,
+            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
+        ).outerjoin(
+            Employee_Master,
+            Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
+        ).filter(
+            and_(
+                Client_Master.tenant_id == tenant_id,
+                Client_Master.is_archived == True,  # ✅ Only archived records
+                *([Energy_Contract_Master.service_id == service_id] if service_id is not None else [])
+            )
+        )
+
+        # Sort by most recently archived first
+        query = query.order_by(Client_Master.archived_at.desc())
+
+        # Filter by employee (each user sees their own archived records)
+        query = query.filter(
+            Opportunity_Details.opportunity_owner_employee_id == user.employee_id
+        )
+
+        results = query.all()
+        
+        # Build response
+        customers = []
+        seen_clients = set()
+        
+        for client, project, contract, opportunity, supplier, employee in results:
+            if client.client_id in seen_clients:
+                continue
+            seen_clients.add(client.client_id)
+            
+            stage = None
+            if opportunity and opportunity.stage_id:
+                stage = session.query(Stage_Master).filter_by(stage_id=opportunity.stage_id).first()
+
+            customer_data = build_customer_response(
+                client, project, contract, opportunity, None, supplier, employee, None, stage
+            )
+
+            # ✅ Prioritize Misc_Col1
+            if opportunity and opportunity.Misc_Col1:
+                customer_data['status'] = opportunity.Misc_Col1
+            
+            # ✅ Add archive metadata
+            customer_data['is_archived'] = True
+            customer_data['archived_at'] = client.archived_at.isoformat() if client.archived_at else None
+            customer_data['archived_reason'] = client.archived_reason
+            
+            customers.append(customer_data)
+        
+        current_app.logger.info(f"✅ Returning {len(customers)} archived records for employee_id={user.employee_id}")
+        
+        return jsonify(customers), 200
+
+    except Exception as e:
+        current_app.logger.exception(f"❌ Error fetching archives: {e}")
+        return jsonify({'error': 'Failed to fetch archives'}), 500
+    finally:
+        session.close()
+
+
+@energy_customer_bp.route('/energy-clients/<int:client_id>/unarchive', methods=['POST', 'OPTIONS'])
+@token_required
+def unarchive_customer(client_id):
+    """
+    Restore a customer from archives
+    Sets is_archived = FALSE and clears archive metadata
+    """
+    
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        
+        # Find the archived client
+        client = session.query(Client_Master).filter_by(
+            client_id=client_id,
+            tenant_id=tenant_id,
+            is_archived=True  # Must be in archives
+        ).first()
+        
+        if not client:
+            return jsonify({'error': 'Customer not found in archives'}), 404
+        
+        # Restore the customer
+        client.is_archived = False
+        client.archived_at = None
+        client.archived_reason = None
+        
+        session.commit()
+        
+        current_app.logger.info(f"✅ Restored customer {client_id} from archives")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Customer restored from archives successfully'
+        }), 200
+        
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"❌ Error restoring customer from archives: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()

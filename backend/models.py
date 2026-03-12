@@ -224,7 +224,9 @@ class Client_Master(Base):
     is_deleted = Column(Boolean, default=False, nullable=False)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
     deleted_reason = Column(String(100), nullable=True)
-
+    is_archived = Column(Boolean, default=False)
+    archived_at = Column(DateTime)
+    archived_reason = Column(String(255))
 
 class Project_Details(Base):
     __tablename__ = 'Project_Details'
@@ -270,6 +272,7 @@ class Energy_Contract_Master(Base):
     created_at = Column(DateTime)
     updated_at = Column(DateTime)
     mpan_number = Column(String(100))
+    mpan_bottom = Column(String(100))
     old_supplier_id = Column(Integer, ForeignKey('StreemLyne_MT.Supplier_Master.supplier_id'))
     net_notch = Column(Numeric(10, 2))
     term_sold = Column(Integer)
