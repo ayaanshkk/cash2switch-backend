@@ -30,6 +30,7 @@ def add_callback(client_id):
     Add callback with conditional logic
     ✅ NEW: Soft delete for Lost, Lost COT, Invalid Number, Meter De-energised
     ✅ NEW: Notes field is REQUIRED for Lost and Lost COT statuses
+    ✅ NEW: Update end date for "End Date Changed" status
     """
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -44,6 +45,11 @@ def add_callback(client_id):
         callback_date = data.get('callback_date')
         notes = data.get('notes', '')
         is_sold = data.get('is_sold')
+        new_end_date_str = data.get('new_end_date')
+        
+        print(f"📥 Received callback request for client {client_id}")
+        print(f"📥 Status: {status}")
+        print(f"📥 New end date: {new_end_date_str}")
         
         # ✅ Status configurations
         status_config = {
@@ -51,7 +57,7 @@ def add_callback(client_id):
             "Called": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None, "requires_notes": False},
             "Not Answered": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None, "requires_notes": False},
             "Priced": {"requires_date": False, "requires_sold": True, "deletes_record": False, "misc_col1": "priced", "requires_notes": False},
-            "Lost": {"requires_date": True, "requires_sold": False, "deletes_record": True, "misc_col1": "lost", "requires_notes": True},  # ✅ CHANGED: deletes_record to TRUE
+            "Lost": {"requires_date": True, "requires_sold": False, "deletes_record": True, "misc_col1": "lost", "requires_notes": True},
             "Lost COT": {"requires_date": False, "requires_sold": False, "deletes_record": True, "misc_col1": None, "requires_notes": True},
             "Already Renewed": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": "renewed", "requires_notes": False},
             "Invalid Number": {"requires_date": False, "requires_sold": False, "deletes_record": True, "misc_col1": None, "requires_notes": False},
@@ -69,7 +75,7 @@ def add_callback(client_id):
         
         config = status_config[status]
         
-        # ✅ NEW: Validate notes for Lost/Lost COT
+        # ✅ Validate notes for Lost/Lost COT
         if config["requires_notes"] and not notes.strip():
             return jsonify({'error': 'Please enter the reason why it was lost'}), 400
         
@@ -108,13 +114,12 @@ def add_callback(client_id):
                     opportunity.Misc_Col1 = status
                 
                 # ✅ Create interaction with notes (will be visible in history)
-                # Include callback_date in the interaction if provided
                 formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
                 new_interaction = Client_Interactions(
                     client_id=client_id,
                     contact_date=datetime.utcnow().date(),
                     contact_method=1,
-                    reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,  # ✅ Store callback date if provided
+                    reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
                     notes=formatted_notes,
                     next_steps=status,
                     created_at=datetime.utcnow()
@@ -123,7 +128,7 @@ def add_callback(client_id):
                 
                 session.commit()
                 
-                current_app.logger.info(f"✅ Moved client {client_id} to recycle bin ({status})")
+                print(f"✅ Moved client {client_id} to recycle bin ({status})")
                 
                 return jsonify({
                     'success': True,
@@ -134,8 +139,43 @@ def add_callback(client_id):
                 
             except Exception as delete_error:
                 session.rollback()
-                current_app.logger.exception(f"❌ Error moving to recycle bin: {delete_error}")
+                print(f"❌ Error moving to recycle bin: {delete_error}")
                 return jsonify({'error': f'Failed to move to recycle bin: {str(delete_error)}'}), 500
+        
+        # ✅ Handle End Date Changed - DO THIS FIRST before updating Misc_Col1
+        if status == "End Date Changed" and new_end_date_str:
+            try:
+                new_end_date = datetime.strptime(new_end_date_str, '%Y-%m-%d').date()
+                
+                print(f"🔍 Updating end date for client {client_id}")
+                print(f"📅 New end date: {new_end_date}")
+                
+                # Find the contract
+                contract = session.query(Energy_Contract_Master).join(
+                    Project_Details
+                ).join(
+                    Client_Master
+                ).filter(
+                    Client_Master.client_id == client_id
+                ).first()
+                
+                if contract:
+                    old_end_date = contract.contract_end_date
+                    contract.contract_end_date = new_end_date
+                    contract.updated_at = datetime.utcnow()
+                    session.flush()  # ✅ Force write to DB immediately
+                    print(f"✅ Updated contract end date from {old_end_date} to {new_end_date}")
+                    
+                    # ✅ CRITICAL: Verify the update worked
+                    session.refresh(contract)
+                    print(f"🔍 Verified contract end date is now: {contract.contract_end_date}")
+                else:
+                    print(f"❌ No contract found for client {client_id}")
+                    
+            except Exception as e:
+                session.rollback()
+                print(f"❌ Failed to update end date: {e}")
+                return jsonify({'error': f'Failed to update end date: {str(e)}'}), 500
         
         # Update Misc_Col1 based on status
         opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
@@ -167,6 +207,8 @@ def add_callback(client_id):
         
         session.commit()
         
+        print(f"✅ Callback saved successfully for client {client_id}, status: {status}")
+        
         return jsonify({
             'success': True,
             'message': 'Callback saved successfully',
@@ -176,7 +218,7 @@ def add_callback(client_id):
         
     except Exception as e:
         session.rollback()
-        current_app.logger.exception(f"❌ Error saving callback: {e}")
+        print(f"❌ Error saving callback: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
