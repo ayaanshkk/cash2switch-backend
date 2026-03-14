@@ -6,7 +6,7 @@ Updated Callback Route - backend/routes/client_interactions_routes.py
 from flask import Blueprint, request, jsonify, current_app
 from datetime import datetime, timedelta
 from sqlalchemy import and_, text
-from backend.models import Client_Interactions, Client_Master, Opportunity_Details, Energy_Contract_Master, Project_Details
+from backend.models import Client_Interactions, Client_Master, Opportunity_Details, Energy_Contract_Master, Project_Details, Supplier_Master
 from backend.db import SessionLocal
 from backend.routes.auth_routes import token_required
 
@@ -46,6 +46,8 @@ def add_callback(client_id):
         notes = data.get('notes', '')
         is_sold = data.get('is_sold')
         new_end_date_str = data.get('new_end_date')
+        new_supplier = data.get('new_supplier')
+        new_address = data.get('new_address')  
         
         print(f"📥 Received callback request for client {client_id}")
         print(f"📥 Status: {status}")
@@ -141,20 +143,124 @@ def add_callback(client_id):
                 session.rollback()
                 print(f"❌ Error moving to recycle bin: {delete_error}")
                 return jsonify({'error': f'Failed to move to recycle bin: {str(delete_error)}'}), 500
+
+        if status == "Already Renewed":
+            try:
+                client = session.query(Client_Master).filter(Client_Master.client_id == client_id).first()
+                
+                if not client:
+                    print(f"❌ No client found for client {client_id}")
+                    return jsonify({'error': 'Client not found'}), 404
+                
+                changes_made = []
+                
+                # ✅ Get the contract first (we'll need it for both end date and supplier updates)
+                contract = session.query(Energy_Contract_Master).select_from(Client_Master).join(
+                    Project_Details,
+                    Client_Master.client_id == Project_Details.client_id
+                ).join(
+                    Energy_Contract_Master,
+                    Project_Details.project_id == Energy_Contract_Master.project_id
+                ).filter(
+                    Client_Master.client_id == client_id
+                ).first()
+                
+                if not contract:
+                    print(f"❌ No contract found for client {client_id}")
+                    return jsonify({'error': 'Contract not found'}), 404
+                
+                # ✅ Update contract end date if provided
+                if new_end_date_str:
+                    new_end_date = datetime.strptime(new_end_date_str, '%Y-%m-%d').date()
+                    old_end_date = contract.contract_end_date
+                    contract.contract_end_date = new_end_date
+                    contract.updated_at = datetime.utcnow()
+                    session.flush()
+                    print(f"✅ Updated contract end date from {old_end_date} to {new_end_date}")
+                    
+                    # ✅ Track changes
+                    old_date_formatted = old_end_date.strftime('%d/%m/%Y') if old_end_date else 'None'
+                    new_date_formatted = new_end_date.strftime('%d/%m/%Y')
+                    changes_made.append(f"End date: {old_date_formatted} → {new_date_formatted}")
+                
+                # ✅ Update supplier if provided (supplier is on the contract, not the client)
+                if new_supplier and new_supplier.strip():
+                    print(f"🔍 Attempting to update supplier to: {new_supplier}")
+                    
+                    # Find or create supplier
+                    supplier = session.query(Supplier_Master).filter(
+                        Supplier_Master.supplier_company_name.ilike(new_supplier.strip())
+                    ).first()
+                    
+                    if not supplier:
+                        # Create new supplier if doesn't exist
+                        supplier = Supplier_Master(
+                            supplier_company_name=new_supplier.strip(),
+                            supplier_contact_name=new_supplier.strip(),
+                            supplier_provisions=0,
+                            created_at=datetime.utcnow()
+                        )
+                        session.add(supplier)
+                        session.flush()
+                        print(f"✅ Created new supplier: {new_supplier}")
+                    
+                    # Get old supplier name for tracking
+                    old_supplier = None
+                    if contract.supplier_id:
+                        old_supplier = session.query(Supplier_Master).filter(
+                            Supplier_Master.supplier_id == contract.supplier_id
+                        ).first()
+                    
+                    old_supplier_name = old_supplier.supplier_company_name if old_supplier else 'None'
+                    
+                    # ✅ Update the CONTRACT's supplier (not the client's)
+                    contract.supplier_id = supplier.supplier_id
+                    contract.updated_at = datetime.utcnow()
+                    session.flush()
+                    print(f"✅ Updated supplier from {old_supplier_name} to: {new_supplier}")
+                    changes_made.append(f"Supplier: {old_supplier_name} → {new_supplier}")
+                
+                # ✅ Update address if provided (address IS on the client)
+                if new_address and new_address.strip():
+                    old_address = client.address or 'N/A'
+                    client.address = new_address.strip()
+                    print(f"✅ Updated address")
+                    changes_made.append(f"Address updated")
+                
+                session.flush()
+                
+                # ✅ Add changes summary to notes
+                if changes_made:
+                    changes_summary = " | ".join(changes_made)
+                    if notes.strip():
+                        notes = f"{notes.strip()} | {changes_summary}"
+                    else:
+                        notes = f"{changes_summary}"
+                
+                print(f"✅ Already Renewed - Changes: {changes_made}")
+                
+            except Exception as e:
+                session.rollback()
+                print(f"❌ Failed to update Already Renewed info: {e}")
+                import traceback
+                traceback.print_exc()
+                return jsonify({'error': f'Failed to update information: {str(e)}'}), 500
         
         # ✅ Handle End Date Changed - DO THIS FIRST before updating Misc_Col1
-        if status == "End Date Changed" and new_end_date_str:
+        elif status == "End Date Changed" and new_end_date_str:
             try:
                 new_end_date = datetime.strptime(new_end_date_str, '%Y-%m-%d').date()
                 
                 print(f"🔍 Updating end date for client {client_id}")
                 print(f"📅 New end date: {new_end_date}")
                 
-                # Find the contract
-                contract = session.query(Energy_Contract_Master).join(
-                    Project_Details
+                # ✅ FIX: Use explicit join conditions with select_from
+                contract = session.query(Energy_Contract_Master).select_from(Client_Master).join(
+                    Project_Details,
+                    Client_Master.client_id == Project_Details.client_id
                 ).join(
-                    Client_Master
+                    Energy_Contract_Master,
+                    Project_Details.project_id == Energy_Contract_Master.project_id
                 ).filter(
                     Client_Master.client_id == client_id
                 ).first()
@@ -169,12 +275,24 @@ def add_callback(client_id):
                     # ✅ CRITICAL: Verify the update worked
                     session.refresh(contract)
                     print(f"🔍 Verified contract end date is now: {contract.contract_end_date}")
+                    
+                    # ✅ ADD THIS: Format the old and new dates for the interaction notes
+                    old_date_formatted = old_end_date.strftime('%d/%m/%Y') if old_end_date else 'None'
+                    new_date_formatted = new_end_date.strftime('%d/%m/%Y')
+                    
+                    # ✅ UPDATE: Store the date change info in notes
+                    notes = f"Old end date: {old_date_formatted} → New end date: {new_date_formatted}"
+                    if data.get('notes', '').strip():
+                        notes = f"{data.get('notes').strip()} | {notes}"
+                        
                 else:
                     print(f"❌ No contract found for client {client_id}")
                     
             except Exception as e:
                 session.rollback()
                 print(f"❌ Failed to update end date: {e}")
+                import traceback
+                traceback.print_exc()
                 return jsonify({'error': f'Failed to update end date: {str(e)}'}), 500
         
         # Update Misc_Col1 based on status
