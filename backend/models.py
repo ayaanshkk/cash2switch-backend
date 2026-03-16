@@ -227,6 +227,7 @@ class Client_Master(Base):
     is_archived = Column(Boolean, default=False)
     archived_at = Column(DateTime)
     archived_reason = Column(String(255))
+    display_order = Column(Integer, nullable=True)
 
 class Project_Details(Base):
     __tablename__ = 'Project_Details'

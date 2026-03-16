@@ -279,6 +279,46 @@ def get_energy_customers():
         
         print(f"🔍 QUERY RETURNED {len(results)} TOTAL RESULTS")
         
+        # ✅ NEW: Fetch assignment notes for all customers
+        client_ids = list(set([client.client_id for client, _, _, _, _, _, _, _ in results]))
+        assignment_notes_map = {}
+        
+        if client_ids:
+            print(f"📝 Fetching assignment notes for {len(client_ids)} clients")
+            
+            # Get latest assignment note for each client
+            assignment_notes_query = text("""
+                SELECT DISTINCT ON (client_id)
+                    client_id,
+                    notes
+                FROM "StreemLyne_MT"."Client_Interactions"
+                WHERE client_id = ANY(:client_ids)
+                AND next_steps = 'Assignment'
+                ORDER BY client_id, created_at DESC
+            """)
+            
+            try:
+                assignment_notes_result = session.execute(
+                    assignment_notes_query,
+                    {'client_ids': client_ids}
+                )
+                
+                # Extract just the note part (after "Assigned to [Name] - ")
+                for row in assignment_notes_result:
+                    if row.notes:
+                        # Remove the "Assigned to [Name] - " prefix
+                        note_parts = row.notes.split(' - ', 1)
+                        if len(note_parts) > 1:
+                            assignment_notes_map[row.client_id] = note_parts[1]
+                        else:
+                            assignment_notes_map[row.client_id] = row.notes
+                
+                print(f"✅ Loaded {len(assignment_notes_map)} assignment notes")
+                
+            except Exception as notes_error:
+                print(f"⚠️ Error loading assignment notes: {notes_error}")
+                # Continue without notes if there's an error
+        
         # Build response
         customers = []
         seen_clients = set()
@@ -306,6 +346,9 @@ def get_energy_customers():
             else:
                 print(f"   - ⚠️ NO OVERRIDE - opportunity.Misc_Col1 is NULL or opportunity is None")
 
+            # ✅ NEW: Add assignment notes to customer data
+            customer_data['assignment_notes'] = assignment_notes_map.get(client.client_id)
+            
             customers.append(customer_data)
         
         print(f"✅ Returning {len(customers)} renewals for employee_id={user.employee_id}")
@@ -426,8 +469,24 @@ def create_energy_customer():
             return jsonify({'error': 'Phone is required'}), 400
         
         current_app.logger.info(f"🆕 Creating new energy customer for tenant {tenant_id}")
+        current_app.logger.info(f"📝 Received data: {data}")  # ✅ Debug log
 
         assigned_employee_id = data.get('assigned_to_id') or request.current_user.employee_id
+
+        # ✅ Map service string to service_id
+        service_string = data.get('service', 'utilities')
+        service_id = 1 if service_string == 'utilities' else 2
+        
+        # ✅ Auto-archive logic
+        should_archive, archive_reason = auto_archive_older_contracts(
+            session=session,
+            tenant_id=tenant_id,
+            business_name=data.get('business_name', ''),
+            mpan_top=data.get('mpan_top', ''),  # ✅ Use mpan_top
+            mpan_bottom=data.get('mpan_bottom', ''),
+            new_end_date=data.get('end_date'),
+            service_id=service_id
+        )
         
         # 1. Create Client_Master entry
         new_client = Client_Master(
@@ -440,62 +499,82 @@ def create_energy_customer():
             client_phone=data.get('phone'),
             client_email=data.get('email', ''),
             client_website=data.get('website', ''),
-            default_currency_id=data.get('currency_id', 1),  # Default GBP
+            default_currency_id=data.get('currency_id', 1),
+            is_archived=should_archive,
+            archived_at=datetime.utcnow() if should_archive else None,
+            archived_reason=archive_reason,
             created_at=datetime.utcnow()
         )
         session.add(new_client)
-        session.flush()  # Get client_id
+        session.flush()
         
         client_id = new_client.client_id
         current_app.logger.info(f"✅ Created Client_Master: {client_id}")
         
-        # 2. Create Project_Details (Site Address)
-        project = None
-        if data.get('site_address') or data.get('annual_usage'):
-            project = Project_Details(
-                client_id=client_id,
-                project_title=f"Site - {data.get('business_name', 'Unknown')}",
-                project_description='Primary site location',
-                address=data.get('site_address', data.get('address', '')),
-                Misc_Col2=data.get('annual_usage'),  # Annual Usage in kWh
-                employee_id=request.current_user.employee_id,
-                start_date=data.get('start_date'),
-                created_at=datetime.utcnow()
-            )
-            session.add(project)
-            session.flush()
-            current_app.logger.info(f"✅ Created Project_Details: {project.project_id}")
+        # 2. Get default stage for opportunity
+        default_stage_query = session.query(Stage_Master).order_by(Stage_Master.stage_id).first()
+        default_stage_id = default_stage_query.stage_id if default_stage_query else 1
         
-        # 3. Create Energy_Contract_Master
-        contract = None
-        if project and (data.get('mpan_mpr') or data.get('supplier_id')):
-            contract = Energy_Contract_Master(
-                project_id=project.project_id,
-                employee_id=request.current_user.employee_id,
-                supplier_id=data.get('supplier_id'),
-                mpan_number=data.get('mpan_mpr', ''),
-                contract_start_date=data.get('start_date'),
-                contract_end_date=data.get('end_date'),
-                unit_rate=data.get('unit_rate'),
-                currency_id=data.get('currency_id', 1),
-                service_id=data.get('service_id'),  # Energy supplier rate
-                terms_of_sale=data.get('terms_of_sale', ''),
-                created_at=datetime.utcnow()
-            )
-            session.add(contract)
-            session.flush()
-            current_app.logger.info(f"✅ Created Energy_Contract_Master: {contract.energy_contract_master_id}")
+        # 3. Create Opportunity_Details
+        opportunity = Opportunity_Details(
+            client_id=client_id,
+            opportunity_title=f"Energy Renewal - {data.get('business_name', 'Unknown')}",
+            opportunity_description=f"Energy contract renewal for {data.get('business_name', 'Unknown')}",
+            opportunity_owner_employee_id=assigned_employee_id,
+            stage_id=default_stage_id,
+            created_at=datetime.utcnow()
+        )
+        session.add(opportunity)
+        session.flush()
+        current_app.logger.info(f"✅ Created Opportunity_Details: {opportunity.opportunity_id}")
         
-        # 4. ✅ REMOVED: Opportunity_Details creation (was creating duplicate leads)
-        # Renewals page (Client_Master) is now separate from Leads page (Opportunity_Details)
+        # ✅ 4. ALWAYS create Project_Details (not conditional)
+        project = Project_Details(
+            client_id=client_id,
+            opportunity_id=opportunity.opportunity_id,
+            project_title=f"Site - {data.get('business_name', 'Unknown')}",
+            project_description='Primary site location',
+            address=data.get('site_address') or data.get('address', ''),
+            Misc_Col2=data.get('annual_usage'),  # Annual Usage in kWh
+            employee_id=request.current_user.employee_id,
+            start_date=data.get('start_date'),
+            created_at=datetime.utcnow()
+        )
+        session.add(project)
+        session.flush()
+        current_app.logger.info(f"✅ Created Project_Details: {project.project_id}")
         
-        # 5. Create Client_Interactions (if callback date provided)
+        # ✅ 5. ALWAYS create Energy_Contract_Master (not conditional)
+        mpan_top = data.get('mpan_top', '').strip()
+        mpan_bottom = data.get('mpan_bottom', '').strip()
+        
+        current_app.logger.info(f"📋 MPAN fields - Top: '{mpan_top}', Bottom: '{mpan_bottom}'")
+        
+        contract = Energy_Contract_Master(
+            project_id=project.project_id,
+            employee_id=request.current_user.employee_id,
+            supplier_id=data.get('supplier_id'),
+            mpan_number=mpan_top,  # ✅ Store MPAN top as main number
+            mpan_bottom=mpan_bottom,  # ✅ Store MPAN bottom separately
+            contract_start_date=data.get('start_date'),
+            contract_end_date=data.get('end_date'),
+            unit_rate=data.get('unit_rate'),
+            currency_id=data.get('currency_id', 1),
+            service_id=service_id,  # ✅ Use mapped service_id
+            terms_of_sale=data.get('terms_of_sale', ''),
+            created_at=datetime.utcnow()
+        )
+        session.add(contract)
+        session.flush()
+        current_app.logger.info(f"✅ Created Energy_Contract_Master: {contract.energy_contract_master_id}")
+        
+        # 6. Create Client_Interactions (if callback date provided)
         if data.get('callback_date'):
             interaction = Client_Interactions(
                 client_id=client_id,
                 contact_date=datetime.utcnow().date(),
-                contact_method=1,  # Phone by default
-                notes=data.get('interaction_notes', 'Initial contact'),
+                contact_method=1,
+                notes=data.get('notes', 'Initial contact'),
                 reminder_date=data.get('callback_date'),
                 created_at=datetime.utcnow()
             )
@@ -507,9 +586,9 @@ def create_energy_customer():
         # Fetch complete customer data
         session.refresh(new_client)
         
-        # Build response (no opportunity parameter since we don't create it)
+        # Build response with opportunity
         response_data = build_customer_response(
-            new_client, project, contract, None, None, None, None, None, None
+            new_client, project, contract, opportunity, None, None, None, None, None
         )
         
         return jsonify({
@@ -524,7 +603,7 @@ def create_energy_customer():
         return jsonify({'error': f'Failed to create customer: {str(e)}'}), 500
     finally:
         session.close()
-
+        
 # ==========================================
 # UPDATE CUSTOMER
 # ==========================================
@@ -551,14 +630,14 @@ def update_energy_customer(client_id):
             return jsonify({'error': 'Customer not found'}), 404
 
         # Admin-only: assignment change
-        user_role = get_user_role_name(request.current_user, session)
-        if data and 'assigned_to_id' in data:
-            # Only Platform Admin can change assignments
-            if user_role not in ['Platform Admin', 'Tenant Super Admin']:
-                return jsonify({
-                    'error': 'permission_denied',
-                    'message': 'Only administrators can change customer assignments'
-                }), 403
+        # user_role = get_user_role_name(request.current_user, session)
+        # if data and 'assigned_to_id' in data:
+        #     # Only Platform Admin can change assignments
+        #     if user_role not in ['Platform Admin', 'Tenant Super Admin']:
+        #         return jsonify({
+        #             'error': 'permission_denied',
+        #             'message': 'Only administrators can change customer assignments'
+        #         }), 403
         
         current_app.logger.info(f"🔄 Updating energy customer {client_id}")
         
@@ -635,6 +714,11 @@ def update_energy_customer(client_id):
                 )
                 session.add(contract)
         
+        # ✅ Track assignment changes for interaction logging
+        old_assigned_to = None
+        new_assigned_to = None
+        assignment_notes = data.get('assignment_notes')
+        
         # Update Opportunity_Details
         opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
         if opportunity:
@@ -648,12 +732,46 @@ def update_energy_customer(client_id):
                 else:
                     opportunity.Misc_Col1 = status_value
             
+            # ✅ Handle assignment with notes
             if 'assigned_to_id' in data:
-                opportunity.opportunity_owner_employee_id = data['assigned_to_id']
+                old_assigned_to = opportunity.opportunity_owner_employee_id
+                new_assigned_to = data['assigned_to_id']
+                opportunity.opportunity_owner_employee_id = new_assigned_to
+                
+                current_app.logger.info(f"✅ Updated assignment from {old_assigned_to} to {new_assigned_to}")
+            
             if 'opportunity_value' in data:
                 opportunity.opportunity_value = data['opportunity_value']
         
-        # ✅ UPDATE: Handle callback_date and interaction_notes
+        # ✅ Create interaction for assignment change with notes
+        if old_assigned_to != new_assigned_to and 'assigned_to_id' in data:
+            # Get employee name
+            if new_assigned_to:
+                employee = session.query(Employee_Master).filter_by(
+                    employee_id=new_assigned_to
+                ).first()
+                employee_name = employee.employee_name if employee else "Unknown"
+            else:
+                employee_name = "Unassigned"
+            
+            # Build interaction notes
+            interaction_notes = f"Assigned to {employee_name}"
+            if assignment_notes:
+                interaction_notes += f" - {assignment_notes}"
+            
+            # Create interaction
+            assignment_interaction = Client_Interactions(
+                client_id=client_id,
+                contact_date=datetime.utcnow().date(),
+                contact_method=1,  # Internal note
+                notes=interaction_notes,
+                next_steps="Assignment",
+                created_at=datetime.utcnow()
+            )
+            session.add(assignment_interaction)
+            current_app.logger.info(f"✅ Created assignment interaction: {interaction_notes}")
+        
+        # ✅ Handle callback_date and interaction_notes (separate from assignment)
         if data.get('callback_date') or data.get('interaction_notes'):
             # Check if interaction exists
             interaction_check = session.execute(text("""
@@ -776,6 +894,9 @@ def delete_energy_customer(client_id):
         
         actual_client_id = client.client_id
         
+        # ✅ Get employee_id BEFORE deletion for display_order recalculation
+        assigned_employee_id = client.assigned_employee_id
+        
         current_app.logger.info(f"🗑️ Deleting customer {actual_client_id}: {client.client_company_name}")
         
         # ============================================
@@ -823,6 +944,12 @@ def delete_energy_customer(client_id):
         session.delete(client)
         
         # Commit all deletions
+        session.flush()
+        
+        # ✅ Recalculate display_order for the employee who lost this record
+        if assigned_employee_id:
+            recalculate_display_order(session, tenant_id, assigned_employee_id)
+        
         session.commit()
         
         # ============================================
@@ -896,6 +1023,7 @@ def delete_energy_customer(client_id):
             current_app.logger.warning(f"⚠️ Could not reset sequences: {seq_error}")
         
         current_app.logger.info(f"✅ Successfully deleted customer {actual_client_id}")
+        current_app.logger.info(f"✅ Recalculated display_order for employee_id={assigned_employee_id}")
         
         return jsonify({
             'success': True,
@@ -924,7 +1052,7 @@ def delete_energy_customer(client_id):
 @energy_customer_bp.route('/energy-clients/search', methods=['GET', 'OPTIONS'])
 @token_required
 def search_energy_customers():
-    """Search energy customers"""
+    """Search energy customers - returns ALL results regardless of assignment"""
 
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -937,34 +1065,90 @@ def search_energy_customers():
         if not query_param:
             return jsonify([]), 200
         
-        # Search across multiple fields
+        # ✅ COMPLETE QUERY: Search across ALL customers with full data
         results = session.query(
             Client_Master,
             Project_Details,
             Energy_Contract_Master,
-            Supplier_Master
+            Opportunity_Details,
+            Client_Interactions,
+            Supplier_Master,
+            Employee_Master,
+            Stage_Master
         ).outerjoin(
-            Project_Details, Client_Master.client_id == Project_Details.client_id
+            Project_Details,
+            Client_Master.client_id == Project_Details.client_id
         ).outerjoin(
-            Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
+            Energy_Contract_Master,
+            Project_Details.project_id == Energy_Contract_Master.project_id
         ).outerjoin(
-            Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
+            Opportunity_Details,
+            Client_Master.client_id == Opportunity_Details.client_id
+        ).outerjoin(
+            Client_Interactions,
+            Client_Master.client_id == Client_Interactions.client_id
+        ).outerjoin(
+            Supplier_Master,
+            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
+        ).outerjoin(
+            Employee_Master,
+            Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
+        ).outerjoin(
+            Stage_Master,
+            Opportunity_Details.stage_id == Stage_Master.stage_id
         ).filter(
             and_(
                 Client_Master.tenant_id == tenant_id,
+                Client_Master.is_deleted == False,
                 or_(
                     Client_Master.client_company_name.ilike(f'%{query_param}%'),
                     Client_Master.client_contact_name.ilike(f'%{query_param}%'),
                     Client_Master.client_phone.ilike(f'%{query_param}%'),
                     Client_Master.client_email.ilike(f'%{query_param}%'),
-                    Energy_Contract_Master.mpan_number.ilike(f'%{query_param}%')
+                    Client_Master.post_code.ilike(f'%{query_param}%'),
+                    Energy_Contract_Master.mpan_number.ilike(f'%{query_param}%'),
+                    Energy_Contract_Master.mpan_bottom.ilike(f'%{query_param}%'),
+                    Project_Details.site_name.ilike(f'%{query_param}%'),
+                    Supplier_Master.supplier_company_name.ilike(f'%{query_param}%')
                 )
             )
-        ).limit(20).all()
+        ).order_by(Client_Master.client_id.desc()).limit(50).all()
         
+        # ✅ Build complete response
         customers = []
-        for client, project, contract, supplier in results:
-            customer_data = build_customer_response(client, project, contract, None, None, supplier, None)
+        seen_clients = set()
+        
+        for client, project, contract, opportunity, interaction, supplier, employee, stage in results:
+            if client.client_id in seen_clients:
+                continue
+            seen_clients.add(client.client_id)
+            
+            # ✅ Fetch old supplier if exists
+            old_supplier = None
+            if contract and hasattr(contract, 'old_supplier_id') and contract.old_supplier_id:
+                old_supplier = session.query(Supplier_Master).filter_by(
+                    supplier_id=contract.old_supplier_id
+                ).first()
+            
+            # ✅ Use build_customer_response for consistency
+            customer_data = build_customer_response(
+                client, project, contract, opportunity, interaction, supplier, employee, old_supplier, stage
+            )
+            
+            # ✅ Ensure these fields are explicitly set (redundant but safe)
+            if contract:
+                customer_data['mpan_top'] = contract.mpan_number or ''
+                customer_data['mpan_bottom'] = contract.mpan_bottom or ''
+                customer_data['start_date'] = contract.contract_start_date.isoformat() if contract.contract_start_date else None
+                customer_data['end_date'] = contract.contract_end_date.isoformat() if contract.contract_end_date else None
+            
+            if client:
+                customer_data['phone'] = client.client_phone or ''
+            
+            # ✅ Prioritize Misc_Col1 if it exists
+            if opportunity and opportunity.Misc_Col1:
+                customer_data['status'] = opportunity.Misc_Col1
+            
             customers.append(customer_data)
         
         current_app.logger.info(f"🔍 Search for '{query_param}' returned {len(customers)} results")
@@ -1160,10 +1344,14 @@ def reset_client_sequence():
     finally:
         session.close()
 
-@energy_customer_bp.route('/energy-clients/bulk-assign', methods=['POST'])
+@energy_customer_bp.route('/energy-clients/bulk-assign', methods=['POST', 'OPTIONS'])
 @token_required
 def bulk_assign_clients():
     """Bulk assign multiple clients to a salesperson"""
+    
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
     session = SessionLocal()
     
     try:
@@ -1174,15 +1362,10 @@ def bulk_assign_clients():
         data = request.get_json()
         client_ids = data.get('client_ids', [])
         employee_id = data.get('employee_id')
+        assignment_notes = data.get('assignment_notes')
         
         if not client_ids or not employee_id:
             return jsonify({'error': 'client_ids and employee_id are required'}), 400
-        
-        user_role = get_user_role_name(request.current_user, session)
-        
-        # Check permissions - only Platform Admin and Tenant Super Admin
-        if user_role not in ['Platform Admin', 'Tenant Super Admin']:
-            return jsonify({'error': 'Only administrators can bulk assign clients'}), 403
         
         # Verify employee exists and belongs to tenant
         employee = session.query(Employee_Master).filter(
@@ -1193,36 +1376,72 @@ def bulk_assign_clients():
         if not employee:
             return jsonify({'error': 'Employee not found'}), 404
         
-        # ✅ FIX: Update BOTH tables
+        # ✅ Track old employee IDs for display_order recalculation
+        old_employee_ids = set()
+        
+        # ✅ Update BOTH tables + create interactions
         updated_count = 0
         for client_id in client_ids:
-            # ✅ 1. Update Client_Master.assigned_employee_id
+            # 1. Update Client_Master.assigned_employee_id
             client = session.query(Client_Master).filter(
                 Client_Master.client_id == client_id,
                 Client_Master.tenant_id == tenant_id
             ).first()
             
             if client:
+                # ✅ Track the old employee ID
+                if client.assigned_employee_id:
+                    old_employee_ids.add(client.assigned_employee_id)
+                
                 client.assigned_employee_id = employee_id
                 updated_count += 1
             
-            # ✅ 2. Update Opportunity_Details
+            # 2. Update Opportunity_Details
             opportunities = session.query(Opportunity_Details).filter(
                 Opportunity_Details.client_id == client_id
             ).all()
             
             for opportunity in opportunities:
                 opportunity.opportunity_owner_employee_id = employee_id
+            
+            # ✅ 3. Create interaction for assignment with notes
+            interaction_notes = f"Assigned to {employee.employee_name}"
+            if assignment_notes:
+                interaction_notes += f" - {assignment_notes}"
+            
+            assignment_interaction = Client_Interactions(
+                client_id=client_id,
+                contact_date=datetime.utcnow().date(),
+                contact_method=1,  # Internal note
+                notes=interaction_notes,
+                next_steps="Assignment",
+                created_at=datetime.utcnow()
+            )
+            session.add(assignment_interaction)
         
+        # ✅ Commit the changes first
+        session.commit()
+        
+        # ✅ Recalculate display_order for all affected employees
+        # Recalculate for the old employees (records were removed from their list)
+        for old_emp_id in old_employee_ids:
+            recalculate_display_order(session, tenant_id, old_emp_id)
+        
+        # Recalculate for the new employee (records were added to their list)
+        recalculate_display_order(session, tenant_id, employee_id)
+        
+        # ✅ Commit the display_order changes
         session.commit()
         
         current_app.logger.info(f"✅ Bulk assigned {len(client_ids)} clients to {employee.employee_name} (ID: {employee_id})")
+        current_app.logger.info(f"✅ Recalculated display_order for {len(old_employee_ids) + 1} employees")
         
         return jsonify({
+            'success': True,
             'message': f'Successfully assigned {len(client_ids)} clients to {employee.employee_name}',
             'updated_count': updated_count,
             'employee_name': employee.employee_name
-        })
+        }), 200
         
     except Exception as e:
         session.rollback()
@@ -1231,131 +1450,159 @@ def bulk_assign_clients():
     finally:
         session.close()
 
-@energy_customer_bp.route('/energy-clients/search-all', methods=['GET'])
+@energy_customer_bp.route('/energy-clients/search-all', methods=['GET', 'OPTIONS'])
 @token_required
-def search_all_energy_clients():
+def search_all_energy_customers():
     """
-    Search across ALL energy clients regardless of assignment
-    Used by salespeople to help customers assigned to other team members
+    Search energy customers across ALL tenants (for cross-tenant search)
+    Returns COMPLETE data including MPAN, phone, dates, etc.
     """
-    session = SessionLocal()
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
     
+    session = SessionLocal()
     try:
-        tenant_id = get_tenant_id_from_user(request.current_user)
-        if not tenant_id:
-            return jsonify({'error': 'Tenant not found'}), 400
+        query_param = request.args.get('q', '').strip()
+        service_param = request.args.get('service', 'utilities').strip().lower()
         
-        # Get search query
-        search_query = request.args.get('q', '').strip()
-        service = request.args.get('service', 'utilities')
+        if not query_param:
+            return jsonify([]), 200
         
-        if not search_query or len(search_query) < 2:
-            return jsonify([])  # Return empty if search too short
-        
-        # Map service to service_id
+        # ✅ Map service to service_id
         service_id_map = {
             'utilities': 1,
             'electricity': 1,
-            'gas': 2,
-            'water': 3
+            'water': 2,
+            'gas': 3
         }
-        service_id = service_id_map.get(service.lower(), 1)
+        service_id = service_id_map.get(service_param, 1)
         
-        # Build query - search across ALL customers in tenant
-        query = session.query(
-            Client_Master.client_id,
-            Client_Master.client_company_name,
-            Client_Master.client_contact_name,
-            Client_Master.client_phone,
-            Client_Master.client_email,
-            Client_Master.address,
-            Client_Master.post_code,
-            Energy_Contract_Master.mpan_number,
-            Energy_Contract_Master.contract_end_date,
-            Energy_Contract_Master.unit_rate,
-            Supplier_Master.supplier_company_name,
-            Project_Details.Misc_Col2.label('annual_usage'),
-            Project_Details.address.label('site_address'),
-            Opportunity_Details.opportunity_owner_employee_id,
-            Employee_Master.employee_name.label('assigned_to_name'),
-            Opportunity_Details.Misc_Col1.label('status')
-        ).join(
+        current_app.logger.info(f"🔍 Cross-tenant search for '{query_param}' (service: {service_param})")
+        
+        # ✅ CROSS-TENANT SEARCH: No tenant filter, but filter by service
+        results = session.query(
+            Client_Master,
+            Project_Details,
+            Energy_Contract_Master,
+            Opportunity_Details,
+            Client_Interactions,
+            Supplier_Master,
+            Employee_Master,
+            Stage_Master
+        ).outerjoin(
             Project_Details,
             Client_Master.client_id == Project_Details.client_id
-        ).join(
+        ).outerjoin(
             Energy_Contract_Master,
             Project_Details.project_id == Energy_Contract_Master.project_id
-        ).outerjoin(
-            Supplier_Master,
-            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
         ).outerjoin(
             Opportunity_Details,
             Client_Master.client_id == Opportunity_Details.client_id
         ).outerjoin(
+            Client_Interactions,
+            Client_Master.client_id == Client_Interactions.client_id
+        ).outerjoin(
+            Supplier_Master,
+            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
+        ).outerjoin(
             Employee_Master,
-            Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id
+            Client_Master.assigned_employee_id == Employee_Master.employee_id
+        ).outerjoin(
+            Stage_Master,
+            Opportunity_Details.stage_id == Stage_Master.stage_id
         ).filter(
-            Client_Master.tenant_id == tenant_id,
-            Energy_Contract_Master.service_id == service_id,
-            # Exclude lost and priced
-            or_(
-                Opportunity_Details.Misc_Col1.is_(None),
-                and_(
-                    Opportunity_Details.Misc_Col1.isnot(None),
-                    ~func.lower(Opportunity_Details.Misc_Col1).in_(['lost', 'lost_cot', 'priced'])
+            and_(
+                Client_Master.is_deleted == False,
+                or_(
+                    Energy_Contract_Master.service_id == service_id,
+                    Energy_Contract_Master.service_id == None  # Include records without contracts
+                ),
+                or_(
+                    Client_Master.client_company_name.ilike(f'%{query_param}%'),
+                    Client_Master.client_contact_name.ilike(f'%{query_param}%'),
+                    Client_Master.client_phone.ilike(f'%{query_param}%'),
+                    Client_Master.client_email.ilike(f'%{query_param}%'),
+                    Client_Master.post_code.ilike(f'%{query_param}%'),
+                    Energy_Contract_Master.mpan_number.ilike(f'%{query_param}%'),
+                    Energy_Contract_Master.mpan_bottom.ilike(f'%{query_param}%'),
+                    Project_Details.site_name.ilike(f'%{query_param}%'),
+                    Supplier_Master.supplier_company_name.ilike(f'%{query_param}%')
                 )
-            ),
-            # Exclude [IMPORTED LEADS]
-            Client_Master.client_company_name != '[IMPORTED LEADS]'
-        )
-        
-        # Apply search filter - search across multiple fields
-        search_term = f"%{search_query.lower()}%"
-        query = query.filter(
-            or_(
-                func.lower(Client_Master.client_company_name).like(search_term),
-                func.lower(Client_Master.client_contact_name).like(search_term),
-                func.lower(Client_Master.client_phone).like(search_term),
-                func.lower(Client_Master.client_email).like(search_term),
-                func.lower(Energy_Contract_Master.mpan_number).like(search_term),
-                func.lower(Supplier_Master.supplier_company_name).like(search_term)
             )
-        )
+        ).order_by(Client_Master.client_id.desc()).limit(50).all()
         
-        # Limit results to prevent overwhelming response
-        results = query.limit(50).all()
-        
-        # Format results
+        # ✅ Build complete response with ALL fields
         customers = []
-        for r in results:
-            customers.append({
-                'id': r.client_id,
-                'client_id': r.client_id,
-                'business_name': r.client_company_name,
-                'contact_person': r.client_contact_name,
-                'phone': r.client_phone,
-                'email': r.client_email,
-                'address': r.address,
-                'site_address': r.site_address,
-                'post_code': r.post_code,
-                'mpan_mpr': r.mpan_number,
-                'supplier_name': r.supplier_company_name,
-                'annual_usage': r.annual_usage,
-                'end_date': r.contract_end_date.isoformat() if r.contract_end_date else None,
-                'unit_rate': float(r.unit_rate) if r.unit_rate else None,
-                'assigned_to_id': r.opportunity_owner_employee_id,
-                'assigned_to_name': r.assigned_to_name,
-                'status': r.status,
-                'is_assigned_to_others': True  # Flag to show it's from search
-            })
+        seen_clients = set()
         
-        return jsonify(customers)
+        for client, project, contract, opportunity, interaction, supplier, employee, stage in results:
+            if client.client_id in seen_clients:
+                continue
+            seen_clients.add(client.client_id)
+            
+            # ✅ Fetch old supplier if exists
+            old_supplier = None
+            if contract and hasattr(contract, 'old_supplier_id') and contract.old_supplier_id:
+                old_supplier = session.query(Supplier_Master).filter_by(
+                    supplier_id=contract.old_supplier_id
+                ).first()
+            
+            # ✅ Build COMPLETE customer response - EVERY field must be included
+            customer_data = {
+                'id': client.client_id,
+                'client_id': client.client_id,
+                'display_id': client.tenant_client_id if hasattr(client, 'tenant_client_id') else None,
+                'display_order': client.display_order,
+                'name': client.client_contact_name or '',
+                'business_name': client.client_company_name or '',
+                'contact_person': client.client_contact_name or '',
+                'phone': client.client_phone or '',  # ✅ CRITICAL
+                'email': client.client_email or '',
+                'address': client.address or '',
+                'site_address': project.address if project else '',
+                
+                # ✅ Energy specific fields - MUST include ALL of these
+                'mpan_mpr': contract.mpan_number if contract else '',
+                'mpan_top': contract.mpan_number if contract else '',  # ✅ CRITICAL
+                'mpan_bottom': contract.mpan_bottom if contract else '',  # ✅ CRITICAL
+                'supplier_id': contract.supplier_id if contract else None,
+                'supplier_name': supplier.supplier_company_name if supplier else '',
+                'annual_usage': project.Misc_Col2 if project and hasattr(project, 'Misc_Col2') else None,
+                'start_date': contract.contract_start_date.isoformat() if contract and contract.contract_start_date else None,  # ✅ CRITICAL
+                'end_date': contract.contract_end_date.isoformat() if contract and contract.contract_end_date else None,
+                'unit_rate': float(contract.unit_rate) if contract and contract.unit_rate else None,
+                
+                # Pipeline fields
+                'status': opportunity.Misc_Col1 if opportunity and opportunity.Misc_Col1 else (stage.stage_name if stage else None),
+                'stage_id': opportunity.stage_id if opportunity else None,
+                'opportunity_id': opportunity.opportunity_id if opportunity else None,
+                
+                # ✅ Assignment - show who owns the record
+                'assigned_to_id': client.assigned_employee_id,
+                'assigned_to_name': employee.employee_name if employee else None,
+                'assignment_notes': client.assignment_notes if hasattr(client, 'assignment_notes') else None,
+                
+                'created_at': client.created_at.isoformat() if client.created_at else None,
+                
+                # ✅ Archive status
+                'is_archived': client.is_archived if hasattr(client, 'is_archived') else False,
+                
+                # ✅ Additional fields
+                'position': client.position if hasattr(client, 'position') else None,
+                'company_number': client.company_number if hasattr(client, 'company_number') else None,
+                'site_name': project.site_name if project and hasattr(project, 'site_name') else None,
+                'old_supplier_name': old_supplier.supplier_company_name if old_supplier else None,
+            }
+            
+            customers.append(customer_data)
+        
+        current_app.logger.info(f"🔍 Cross-tenant search for '{query_param}' returned {len(customers)} results")
+        
+        return jsonify(customers), 200
         
     except Exception as e:
-        current_app.logger.error(f"Error searching all clients: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        current_app.logger.exception(f"❌ Error in cross-tenant search: {e}")
+        return jsonify({'error': 'Failed to search customers'}), 500
     finally:
         session.close()
 
@@ -1380,6 +1627,12 @@ def get_priced_customers():
         if service_param and isinstance(service_param, str):
             svc = service_param.strip().lower()
             _service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
+        
+        # ✅ Get salesperson filter (optional, admin only)
+        salesperson_param = request.args.get('salesperson')
+        
+        # ✅ DEBUG LOG
+        current_app.logger.info(f"🔍 Priced request - salesperson_param: {salesperson_param}")
         
         # Base query with joins
         query = session.query(
@@ -1423,14 +1676,37 @@ def get_priced_customers():
             )
         )
 
+        # ✅ CRITICAL FIX: Apply employee filter based on role BEFORE order_by
+        user_role = get_user_role_name(user, session)
+        is_admin = user_role in ['Platform Admin', 'Tenant Super Admin']
+        
+        if is_admin:
+            # ✅ Admin: Optional filter by salesperson
+            if salesperson_param and salesperson_param != "All":
+                try:
+                    salesperson_id = int(salesperson_param)
+                    query = query.filter(
+                        Opportunity_Details.opportunity_owner_employee_id == salesperson_id
+                    )
+                    current_app.logger.info(f"✅ Admin filtering priced by salesperson_id={salesperson_id}")
+                except ValueError:
+                    current_app.logger.warning(f"⚠️ Invalid salesperson_id: {salesperson_param}")
+            else:
+                current_app.logger.info(f"ℹ️ Admin viewing all priced leads (no filter)")
+        else:
+            # ✅ Salesperson: Only see their own priced leads
+            query = query.filter(
+                Opportunity_Details.opportunity_owner_employee_id == user.employee_id
+            )
+            current_app.logger.info(f"ℹ️ Salesperson viewing own priced leads (employee_id={user.employee_id})")
+
+        # ✅ Sort AFTER applying filters
         query = query.order_by(Client_Master.created_at.desc())
 
-        # Filter by assigned employee
-        query = query.filter(
-            Opportunity_Details.opportunity_owner_employee_id == user.employee_id
-        )
-
         results = query.all()
+        
+        # ✅ DEBUG LOG
+        current_app.logger.info(f"📊 Query returned {len(results)} priced leads")
         
         # Build response
         customers = []
@@ -1449,7 +1725,7 @@ def get_priced_customers():
             
             customers.append(customer_data)
         
-        current_app.logger.info(f"✅ Returning {len(customers)} priced leads for employee_id={user.employee_id}")
+        current_app.logger.info(f"✅ Returning {len(customers)} priced leads (admin={is_admin}, filter={salesperson_param or 'none'})")
         
         return jsonify(customers), 200
 
@@ -1470,10 +1746,10 @@ def get_stats_by_employee():
         if not tenant_id:
             return jsonify({'error': 'Tenant not found'}), 400
         
-        user_role = get_user_role_name(request.current_user, session)
+        # user_role = get_user_role_name(request.current_user, session)
         
-        if user_role not in ['Platform Admin', 'Tenant Super Admin']:
-            return jsonify({'error': 'Unauthorized - Admin only'}), 403
+        # if user_role not in ['Platform Admin', 'Tenant Super Admin']:
+        #     return jsonify({'error': 'Unauthorized - Admin only'}), 403
         
         service_param = request.args.get('service', 'utilities')
         service_id_map = {'utilities': 1, 'water': 2, 'gas': 3}
@@ -1636,7 +1912,7 @@ def get_recycle_bin():
 def restore_customer(client_id):
     """
     Restore a customer from recycle bin
-    Sets is_deleted = FALSE and clears deletion metadata
+    Sets is_deleted = FALSE, clears deletion metadata, and recalculates display_order
     """
     
     if request.method == 'OPTIONS':
@@ -1656,6 +1932,9 @@ def restore_customer(client_id):
         if not client:
             return jsonify({'error': 'Customer not found in recycle bin'}), 404
         
+        # Get employee_id for display_order recalculation
+        assigned_employee_id = client.assigned_employee_id
+        
         # Restore the customer
         client.is_deleted = False
         client.deleted_at = None
@@ -1668,9 +1947,17 @@ def restore_customer(client_id):
             if opportunity.Misc_Col1.lower() in ['lost_cot', 'invalid_number', 'meter_de-energised']:
                 opportunity.Misc_Col1 = None
         
+        # Commit the restore change
+        session.flush()
+        
+        # ✅ Recalculate display_order for the employee who gained this record
+        if assigned_employee_id:
+            recalculate_display_order(session, tenant_id, assigned_employee_id)
+        
         session.commit()
         
         current_app.logger.info(f"✅ Restored customer {client_id} from recycle bin")
+        current_app.logger.info(f"✅ Recalculated display_order for employee_id={assigned_employee_id}")
         
         return jsonify({
             'success': True,
@@ -1816,6 +2103,12 @@ def get_archived_customers():
         service_id_map = {'utilities': 1, 'water': 2, 'gas': 3}
         service_id = service_id_map.get(service_param.strip().lower(), 1)
         
+        # ✅ Get salesperson filter (optional, admin only)
+        salesperson_param = request.args.get('salesperson')
+        
+        # ✅ DEBUG LOG
+        current_app.logger.info(f"🔍 Archives request - salesperson_param: {salesperson_param}")
+        
         # Base query - ONLY get archived records
         query = session.query(
             Client_Master,
@@ -1847,15 +2140,37 @@ def get_archived_customers():
             )
         )
 
-        # Sort by most recently archived first
-        query = query.order_by(Client_Master.archived_at.desc())
+        # ✅ CRITICAL FIX: Apply employee filter BEFORE order_by
+        user_role = get_user_role_name(user, session)
+        is_admin = user_role in ['Platform Admin', 'Tenant Super Admin']
+        
+        if is_admin:
+            # ✅ Admin: Optional filter by salesperson
+            if salesperson_param and salesperson_param != "All":
+                try:
+                    salesperson_id = int(salesperson_param)
+                    query = query.filter(
+                        Opportunity_Details.opportunity_owner_employee_id == salesperson_id
+                    )
+                    current_app.logger.info(f"✅ Admin filtering archives by salesperson_id={salesperson_id}")
+                except ValueError:
+                    current_app.logger.warning(f"⚠️ Invalid salesperson_id: {salesperson_param}")
+            else:
+                current_app.logger.info(f"ℹ️ Admin viewing all archived records (no filter)")
+        else:
+            # ✅ Salesperson: Only see their own archived records
+            query = query.filter(
+                Opportunity_Details.opportunity_owner_employee_id == user.employee_id
+            )
+            current_app.logger.info(f"ℹ️ Salesperson viewing own archives (employee_id={user.employee_id})")
 
-        # Filter by employee (each user sees their own archived records)
-        query = query.filter(
-            Opportunity_Details.opportunity_owner_employee_id == user.employee_id
-        )
+        # ✅ Sort AFTER applying filters
+        query = query.order_by(Energy_Contract_Master.contract_end_date.desc())
 
         results = query.all()
+        
+        # ✅ DEBUG LOG
+        current_app.logger.info(f"📊 Query returned {len(results)} archived records")
         
         # Build response
         customers = []
@@ -1885,7 +2200,7 @@ def get_archived_customers():
             
             customers.append(customer_data)
         
-        current_app.logger.info(f"✅ Returning {len(customers)} archived records for employee_id={user.employee_id}")
+        current_app.logger.info(f"✅ Returning {len(customers)} archived records (admin={is_admin}, filter={salesperson_param or 'none'})")
         
         return jsonify(customers), 200
 
@@ -1895,13 +2210,73 @@ def get_archived_customers():
     finally:
         session.close()
 
+@energy_customer_bp.route('/energy-clients/<int:client_id>/archive', methods=['POST', 'OPTIONS'])
+@token_required
+def archive_customer(client_id):
+    """
+    Archive a customer record
+    Sets is_archived = TRUE and recalculates display_order
+    """
+    
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        
+        # Find the client
+        client = session.query(Client_Master).filter_by(
+            client_id=client_id,
+            tenant_id=tenant_id,
+            is_archived=False  # Must not already be archived
+        ).first()
+        
+        if not client:
+            return jsonify({'error': 'Customer not found'}), 404
+        
+        # ✅ Get employee_id BEFORE archiving (for display_order recalculation)
+        assigned_employee_id = client.assigned_employee_id
+        
+        # Archive the customer
+        client.is_archived = True
+        client.archived_at = datetime.utcnow()
+        
+        # Get reason from request body if provided
+        data = request.get_json() or {}
+        client.archived_reason = data.get('reason', 'Manually archived')
+        
+        # Commit the archive change
+        session.flush()
+        
+        # ✅ Recalculate display_order for the employee who lost this record
+        if assigned_employee_id:
+            recalculate_display_order(session, tenant_id, assigned_employee_id)
+        
+        session.commit()
+        
+        current_app.logger.info(f"✅ Archived customer {client_id}")
+        current_app.logger.info(f"✅ Recalculated display_order for employee_id={assigned_employee_id}")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Customer archived successfully'
+        }), 200
+        
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"❌ Error archiving customer: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
 
 @energy_customer_bp.route('/energy-clients/<int:client_id>/unarchive', methods=['POST', 'OPTIONS'])
 @token_required
 def unarchive_customer(client_id):
     """
     Restore a customer from archives
-    Sets is_archived = FALSE and clears archive metadata
+    Sets is_archived = FALSE, clears archive metadata, and recalculates display_order
     """
     
     if request.method == 'OPTIONS':
@@ -1921,14 +2296,25 @@ def unarchive_customer(client_id):
         if not client:
             return jsonify({'error': 'Customer not found in archives'}), 404
         
+        # ✅ Get employee_id for display_order recalculation
+        assigned_employee_id = client.assigned_employee_id
+        
         # Restore the customer
         client.is_archived = False
         client.archived_at = None
         client.archived_reason = None
         
+        # Commit the unarchive change
+        session.flush()
+        
+        # ✅ Recalculate display_order for the employee who gained this record
+        if assigned_employee_id:
+            recalculate_display_order(session, tenant_id, assigned_employee_id)
+        
         session.commit()
         
         current_app.logger.info(f"✅ Restored customer {client_id} from archives")
+        current_app.logger.info(f"✅ Recalculated display_order for employee_id={assigned_employee_id}")
         
         return jsonify({
             'success': True,
@@ -1941,3 +2327,142 @@ def unarchive_customer(client_id):
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
+
+
+def auto_archive_older_contracts(session, tenant_id, business_name, mpan_top, mpan_bottom, new_end_date, service_id, new_client_id=None):
+    """
+    Automatically archive older contracts when a newer one is created
+    Returns: (should_archive_new, reason)
+    """
+    if not new_end_date:
+        return False, None
+    
+    # Find existing records for this customer (by MPAN or business name)
+    existing_query = session.query(
+        Client_Master,
+        Project_Details,
+        Energy_Contract_Master
+    ).join(
+        Project_Details,
+        Client_Master.client_id == Project_Details.client_id
+    ).join(
+        Energy_Contract_Master,
+        Project_Details.project_id == Energy_Contract_Master.project_id
+    ).filter(
+        Client_Master.tenant_id == tenant_id,
+        Energy_Contract_Master.service_id == service_id,
+        Client_Master.is_deleted == False  # Don't consider deleted records
+    )
+    
+    # Exclude the new client if it already exists (for updates)
+    if new_client_id:
+        existing_query = existing_query.filter(Client_Master.client_id != new_client_id)
+    
+    # Match by MPAN or business name
+    if mpan_top or mpan_bottom:
+        existing_query = existing_query.filter(
+            or_(
+                Energy_Contract_Master.mpan_number == mpan_top,
+                Energy_Contract_Master.mpan_bottom == mpan_bottom
+            )
+        )
+    elif business_name:
+        existing_query = existing_query.filter(
+            Client_Master.client_company_name == business_name
+        )
+    else:
+        return False, None
+    
+    existing_records = existing_query.all()
+    
+    if not existing_records:
+        return False, None
+    
+    # Convert new_end_date to date object if it's a string
+    if isinstance(new_end_date, str):
+        try:
+            new_end_date = datetime.fromisoformat(new_end_date.replace('Z', '+00:00')).date()
+        except:
+            return False, None
+    
+    # Find the latest end date among existing records
+    latest_end_date = None
+    latest_client = None
+    
+    for client, project, contract in existing_records:
+        if contract.contract_end_date:
+            if latest_end_date is None or contract.contract_end_date > latest_end_date:
+                latest_end_date = contract.contract_end_date
+                latest_client = client
+    
+    if not latest_end_date:
+        return False, None
+    
+    # If this NEW record's end date is OLDER than the latest existing, archive the NEW one
+    if new_end_date < latest_end_date:
+        current_app.logger.info(
+            f"📦 Auto-archiving NEW record: {business_name} - "
+            f"End date {new_end_date} is older than existing {latest_end_date}"
+        )
+        return True, f"Older contract - superseded by existing contract ending {latest_end_date}"
+    
+    # If this NEW record's end date is NEWER than existing, archive the OLD ones
+    elif new_end_date > latest_end_date:
+        archived_count = 0
+        # ✅ Track employee IDs for display_order recalculation
+        affected_employee_ids = set()
+        
+        for client, project, contract in existing_records:
+            if not client.is_archived and contract.contract_end_date and contract.contract_end_date < new_end_date:
+                # ✅ Track the employee ID before archiving
+                if client.assigned_employee_id:
+                    affected_employee_ids.add(client.assigned_employee_id)
+                
+                client.is_archived = True
+                client.archived_at = datetime.utcnow()
+                client.archived_reason = f"Superseded by newer contract ending {new_end_date}"
+                archived_count += 1
+                current_app.logger.info(
+                    f"📦 Auto-archiving OLD record: {business_name} (ID: {client.client_id}) - "
+                    f"Old end date {contract.contract_end_date} < New end date {new_end_date}"
+                )
+        
+        if archived_count > 0:
+            current_app.logger.info(f"✅ Archived {archived_count} older contract(s)")
+            
+            # ✅ Recalculate display_order for all affected employees
+            session.flush()
+            for employee_id in affected_employee_ids:
+                recalculate_display_order(session, tenant_id, employee_id)
+                current_app.logger.info(f"✅ Recalculated display_order for employee_id={employee_id} after auto-archive")
+    
+    return False, None
+
+def recalculate_display_order(session, tenant_id, employee_id=None):
+    """
+    Recalculate display_order for all active (non-archived, non-deleted) records
+    If employee_id is provided, only recalculate for that employee's records
+    Otherwise, recalculate for all records in the tenant
+    """
+    from sqlalchemy import and_
+    
+    query = session.query(Client_Master).filter(
+        and_(
+            Client_Master.tenant_id == tenant_id,
+            Client_Master.is_deleted == False,
+            Client_Master.is_archived == False
+        )
+    )
+    
+    if employee_id:
+        query = query.filter(Client_Master.assigned_employee_id == employee_id)
+    
+    # Order by created_at (oldest first)
+    clients = query.order_by(Client_Master.created_at.asc()).all()
+    
+    # Assign sequential display_order
+    for idx, client in enumerate(clients, start=1):
+        client.display_order = idx
+    
+    session.flush()
+    current_app.logger.info(f"✅ Recalculated display_order for {len(clients)} clients (tenant={tenant_id}, employee={employee_id})")

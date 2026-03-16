@@ -428,13 +428,44 @@ def import_energy_customers():
         print(f"📊 Loaded {len(suppliers_dict)} suppliers for matching")
         
         # PRE-LOAD EXISTING MPANs
-        existing_mpans = {}
-        existing_contracts = session.query(Energy_Contract_Master).all()
-        for contract in existing_contracts:
-            if contract.mpan_number:
-                existing_mpans[contract.mpan_number.strip().lower()] = contract
+        existing_mpans = {}  
+        existing_contracts_query = session.query(
+            Energy_Contract_Master,
+            Client_Master.tenant_id,
+            Client_Master.assigned_employee_id,
+            Employee_Master.employee_name,
+            Client_Master.client_company_name,
+            Client_Master.is_archived
+        ).join(
+            Project_Details, Energy_Contract_Master.project_id == Project_Details.project_id
+        ).join(
+            Client_Master, Project_Details.client_id == Client_Master.client_id
+        ).outerjoin(
+            Employee_Master, Client_Master.assigned_employee_id == Employee_Master.employee_id
+        ).all()
 
-        print(f"📊 Loaded {len(existing_mpans)} existing MPANs for duplicate checking")
+        for contract, contract_tenant_id, assigned_emp_id, emp_name, company_name, is_archived in existing_contracts_query:
+            if contract.mpan_number:
+                mpan_key = contract.mpan_number.strip().lower()
+                
+                # ✅ CRITICAL FIX: Store as LIST to handle multiple tenants with same MPAN
+                if mpan_key not in existing_mpans:
+                    existing_mpans[mpan_key] = []
+                
+                existing_mpans[mpan_key].append({
+                    'contract': contract,
+                    'tenant_id': contract_tenant_id,
+                    'assigned_to_id': assigned_emp_id,
+                    'assigned_to_name': emp_name or 'Unassigned',
+                    'company_name': company_name,
+                    'is_archived': is_archived
+                })
+
+        print(f"📊 Loaded {sum(len(v) for v in existing_mpans.values())} total contracts across {len(existing_mpans)} unique MPANs for cross-tenant duplicate checking")
+
+        # Track duplicate info for final report
+        duplicate_details = []
+        cross_tenant_duplicates = []
         
         # PROCESS EACH RECORD
         total_rows = len(df)
@@ -556,344 +587,266 @@ def import_energy_customers():
                 if not business_name and not phone and not email and not mpan_top and not contact_person:
                     continue
                 
-                # CHECK DUPLICATES WITH ARCHIVING
+                # ✅ CHECK DUPLICATES WITH ARCHIVING
                 if mpan_top:
                     mpan_key = mpan_top.strip().lower()
-                    existing_contract = existing_mpans.get(mpan_key)
+                    existing_records = existing_mpans.get(mpan_key)  # ✅ Changed from existing_contract to existing_records
                     
-                    if existing_contract:
+                    if existing_records:  # ✅ This is now a LIST
                         duplicate_count += 1
                         
-                        project = session.query(Project_Details).filter_by(
-                            project_id=existing_contract.project_id
-                        ).first()
+                        # ✅ Check if ANY of the existing records belong to a different tenant
+                        cross_tenant_record = None
+                        same_tenant_record = None
                         
-                        if not project:
-                            session.rollback()
-                            error_count += 1
-                            errors.append(f"Row {index + 2}: Project not found for MPAN {mpan_top}")
+                        for record in existing_records:  # ✅ NOW we iterate through the list
+                            if record['tenant_id'] != tenant_id:
+                                # Found a cross-tenant duplicate - PRIORITY 1
+                                cross_tenant_record = record
+                                break  # Stop at first cross-tenant match
+                            else:
+                                # Found a same-tenant duplicate
+                                same_tenant_record = record
+                        
+                        # ✅ PRIORITY 1: Cross-tenant duplicates are ALWAYS skipped
+                        if cross_tenant_record:
+                            cross_tenant_duplicates.append({
+                                'row': index + 2,
+                                'mpan': mpan_top,
+                                'new_company': business_name,
+                                'existing_company': cross_tenant_record['company_name'],
+                                'existing_tenant_id': cross_tenant_record['tenant_id'],
+                                'assigned_to': cross_tenant_record['assigned_to_name'],
+                                'is_archived': cross_tenant_record['is_archived']
+                            })
+                            
+                            print(f"⚠️ Row {index + 2}: CROSS-TENANT DUPLICATE FOUND!")
+                            print(f"   MPAN: {mpan_top}")
+                            print(f"   Your tenant: {tenant_id} | Existing tenant: {cross_tenant_record['tenant_id']}")
+                            print(f"   Assigned to: {cross_tenant_record['assigned_to_name']}")
+                            print(f"   ⏭️ Skipping import for this record")
                             continue
                         
-                        client = session.query(Client_Master).filter_by(
-                            client_id=project.client_id
-                        ).first()
-                        
-                        if not client:
-                            session.rollback()
-                            error_count += 1
-                            errors.append(f"Row {index + 2}: Client not found for MPAN {mpan_top}")
-                            continue
-                        
-                        new_end_date = end_date
-                        existing_end_date = existing_contract.contract_end_date
-                        
-                        if not new_end_date:
-                            print(f"⏭️ Row {index + 2}: Skipping - no end date in new record for MPAN {mpan_top}")
-                            continue
-                        
-                        if existing_end_date and new_end_date < existing_end_date:
-                            print(f"⏭️ Row {index + 2}: Skipping - new end date {new_end_date} is older than existing {existing_end_date}")
-                            continue
-                        
-                        if existing_end_date and new_end_date == existing_end_date:
-                            print(f"🔄 Row {index + 2}: Updating existing record (same end date {new_end_date}) for MPAN {mpan_top}")
+                        # ✅ PRIORITY 2: Same-tenant duplicate handling (if no cross-tenant found)
+                        if same_tenant_record:
+                            existing_contract = same_tenant_record['contract']
+                            existing_assigned_to = same_tenant_record['assigned_to_name']
+                            is_archived = same_tenant_record['is_archived']
                             
-                            # Update existing record
-                            client.client_company_name = business_name or client.client_company_name
-                            client.client_contact_name = contact_person or client.client_contact_name
-                            client.client_phone = phone or client.client_phone
-                            client.client_email = email or client.client_email
-                            client.address = address or client.address
-                            client.post_code = postcode or client.post_code
-                            client.position = position or client.position
-                            client.company_number = company_number or client.company_number
-                            client.date_of_birth = date_of_birth or client.date_of_birth
-                            client.charity_ltd_company_number = charity_ltd_company_number or client.charity_ltd_company_number
-                            client.partner_details = partner_details or client.partner_details
-                            client.bank_name = bank_name or client.bank_name
-                            client.account_number = account_number or client.account_number
-                            client.sort_code = sort_code or client.sort_code
+                            # ✅ Get existing end date early
+                            existing_end_date = existing_contract.contract_end_date
+                            new_end_date = end_date
                             
-                            project.address = site_address or address or project.address
-                            project.Misc_Col2 = int(annual_usage) if annual_usage else project.Misc_Col2
-                            project.start_date = start_date or project.start_date
-                            project.end_date = end_date or project.end_date
-                            project.site_name = site_name or project.site_name
-                            project.month_sold = month_sold or project.month_sold
-                            project.house_name = house_name or project.house_name
-                            project.house_number = house_number or project.house_number
-                            project.door_number = door_number or project.door_number
-                            project.town = town or project.town
-                            project.county = county or project.county
-                            project.updated_at = datetime.utcnow()
-                            
-                            existing_contract.contract_start_date = start_date or existing_contract.contract_start_date
-                            if supplier_id:
-                                existing_contract.supplier_id = supplier_id
-                            if old_supplier_id:
-                                existing_contract.old_supplier_id = old_supplier_id
-                            existing_contract.unit_rate = rate_1 or existing_contract.unit_rate
-                            existing_contract.rate_1 = rate_1 or existing_contract.rate_1
-                            existing_contract.rate_2 = rate_2 or existing_contract.rate_2
-                            existing_contract.rate_3 = rate_3 or existing_contract.rate_3
-                            existing_contract.standing_charge = stand_charge or existing_contract.standing_charge
-                            existing_contract.net_notch = net_notch or existing_contract.net_notch
-                            existing_contract.comms_paid = comms_paid or existing_contract.comms_paid
-                            existing_contract.aggregator = aggregator or existing_contract.aggregator
-                            existing_contract.term_sold = term_sold or existing_contract.term_sold
-                            existing_contract.mpan_bottom = mpan_bottom or existing_contract.mpan_bottom
-                            existing_contract.updated_at = datetime.utcnow()
-                            
-                            opportunity = session.query(Opportunity_Details).filter_by(
-                                client_id=client.client_id
+                            project = session.query(Project_Details).filter_by(
+                                project_id=existing_contract.project_id
                             ).first()
                             
-                            if not opportunity:
-                                opportunity = Opportunity_Details(
-                                    client_id=client.client_id,
-                                    opportunity_title=f"Opportunity - {client.client_company_name}",
-                                    opportunity_description='Imported from bulk upload',
-                                    opportunity_date=datetime.utcnow().date(),
-                                    opportunity_owner_employee_id=opportunity_owner_id,
-                                    stage_id=1,
-                                    opportunity_value=0,
-                                    currency_id=1,
-                                    created_at=datetime.utcnow(),
-                                    Misc_Col1=None
-                                )
-                                session.add(opportunity)
-                            elif assigned_employee_id:
-                                opportunity.opportunity_owner_employee_id = opportunity_owner_id
-                            
-                            session.commit()
-                            print(f"✅ Row {index + 2}: Updated existing record for MPAN {mpan_top}")
-                            
-                            if (success_count + duplicate_count) % 100 == 0:
-                                print(f"📊 Progress: {success_count + duplicate_count}/{total_rows}")
-                            
-                            continue
-                        
-                        # New is NEWER - Archive old snapshot, update existing
-                        if new_end_date > existing_end_date:
-                            print(f"\n\n🔥 ARCHIVING TRIGGERED for MPAN {mpan_top}! 🔥\n\n")
-                            print(f"\n{'='*60}")
-                            print(f"📦 ARCHIVING LOGIC TRIGGERED")
-                            print(f"   Row: {index + 2}")
-                            print(f"   MPAN: {mpan_top}")
-                            print(f"   Existing end date: {existing_end_date}")
-                            print(f"   New end date: {new_end_date}")
-                            print(f"   Existing client_id: {client.client_id}")
-                            print(f"   Existing project_id: {project.project_id}")
-                            print(f"   Existing contract_id: {existing_contract.energy_contract_master_id}")
-                            print(f"{'='*60}\n")
-                            
-                            try:
-                                # CREATE ARCHIVED SNAPSHOT
-                                archived_client = Client_Master(
-                                    tenant_id=client.tenant_id,
-                                    assigned_employee_id=client.assigned_employee_id,
-                                    client_company_name=client.client_company_name,
-                                    client_contact_name=client.client_contact_name,
-                                    address=client.address,
-                                    post_code=client.post_code,
-                                    client_phone=client.client_phone,
-                                    client_email=client.client_email,
-                                    client_website=client.client_website,
-                                    default_currency_id=client.default_currency_id,
-                                    position=client.position,
-                                    company_number=client.company_number,
-                                    date_of_birth=client.date_of_birth,
-                                    charity_ltd_company_number=client.charity_ltd_company_number,
-                                    partner_details=client.partner_details,
-                                    bank_name=client.bank_name,
-                                    account_number=client.account_number,
-                                    sort_code=client.sort_code,
-                                    created_at=client.created_at,
-                                    is_archived=True,
-                                    archived_at=datetime.utcnow(),
-                                    archived_reason=f"Historical record (ended {existing_end_date}) - superseded by contract ending {new_end_date}"
-                                )
-                                session.add(archived_client)
-                                session.flush()
-                                
-                                archived_client_id = archived_client.client_id
-                                print(f"✅ Created archived client (ID: {archived_client_id})")
-                                
-                                # Clone Project
-                                opportunity = session.query(Opportunity_Details).filter_by(
-                                    client_id=client.client_id
-                                ).first()
-
-                                archived_opportunity = None
-                                if opportunity:
-                                    archived_opportunity = Opportunity_Details(
-                                        client_id=archived_client_id,
-                                        opportunity_title=opportunity.opportunity_title,
-                                        opportunity_description=opportunity.opportunity_description,
-                                        opportunity_date=opportunity.opportunity_date,
-                                        opportunity_owner_employee_id=opportunity.opportunity_owner_employee_id,
-                                        stage_id=opportunity.stage_id,
-                                        opportunity_value=opportunity.opportunity_value,
-                                        currency_id=opportunity.currency_id,
-                                        Misc_Col1=opportunity.Misc_Col1,
-                                        created_at=opportunity.created_at
-                                    )
-                                    session.add(archived_opportunity)
-                                    session.flush()
-                                    print(f"✅ Created archived opportunity (ID: {archived_opportunity.opportunity_id})")
-
-                                # Clone Project (with opportunity_id now available)
-                                archived_project = Project_Details(
-                                    client_id=archived_client_id,
-                                    opportunity_id=archived_opportunity.opportunity_id if archived_opportunity else None,  # ✅ SET THIS
-                                    project_title=project.project_title,
-                                    project_description=project.project_description,
-                                    address=project.address,
-                                    Misc_Col2=project.Misc_Col2,
-                                    site_name=project.site_name,
-                                    month_sold=project.month_sold,
-                                    house_name=project.house_name,
-                                    house_number=project.house_number,
-                                    door_number=project.door_number,
-                                    town=project.town,
-                                    county=project.county,
-                                    start_date=project.start_date,
-                                    end_date=project.end_date,
-                                    employee_id=project.employee_id,
-                                    created_at=project.created_at,
-                                    updated_at=datetime.utcnow()
-                                )
-                                session.add(archived_project)
-                                session.flush()
-                                print(f"✅ Created archived project (ID: {archived_project.project_id})")
-                                
-                                # Clone Contract
-                                archived_contract = Energy_Contract_Master(
-                                    project_id=archived_project.project_id,
-                                    employee_id=existing_contract.employee_id,
-                                    supplier_id=existing_contract.supplier_id,
-                                    old_supplier_id=existing_contract.old_supplier_id,
-                                    mpan_number=existing_contract.mpan_number,
-                                    mpan_bottom=existing_contract.mpan_bottom,
-                                    contract_start_date=existing_contract.contract_start_date,
-                                    contract_end_date=existing_contract.contract_end_date,
-                                    unit_rate=existing_contract.unit_rate,
-                                    rate_1=existing_contract.rate_1,
-                                    rate_2=existing_contract.rate_2,
-                                    rate_3=existing_contract.rate_3,
-                                    standing_charge=existing_contract.standing_charge,
-                                    net_notch=existing_contract.net_notch,
-                                    comms_paid=existing_contract.comms_paid,
-                                    aggregator=existing_contract.aggregator,
-                                    term_sold=existing_contract.term_sold,
-                                    service_id=existing_contract.service_id,
-                                    currency_id=existing_contract.currency_id,
-                                    terms_of_sale=existing_contract.terms_of_sale,
-                                    created_at=existing_contract.created_at,
-                                    updated_at=datetime.utcnow()
-                                )
-                                session.add(archived_contract)
-                                session.flush()
-                                print(f"✅ Created archived contract (ID: {archived_contract.energy_contract_master_id})")
-                                
-                                # Clone Opportunity
-                                opportunity = session.query(Opportunity_Details).filter_by(
-                                    client_id=client.client_id
-                                ).first()
-                                
-                                if opportunity:
-                                    archived_opportunity = Opportunity_Details(
-                                        client_id=archived_client_id,
-                                        opportunity_title=opportunity.opportunity_title,
-                                        opportunity_description=opportunity.opportunity_description,
-                                        opportunity_date=opportunity.opportunity_date,
-                                        opportunity_owner_employee_id=opportunity.opportunity_owner_employee_id,
-                                        stage_id=opportunity.stage_id,
-                                        opportunity_value=opportunity.opportunity_value,
-                                        currency_id=opportunity.currency_id,
-                                        Misc_Col1=opportunity.Misc_Col1,
-                                        created_at=opportunity.created_at
-                                    )
-                                    session.add(archived_opportunity)
-                                    session.flush()
-                                    archived_project.opportunity_id = archived_opportunity.opportunity_id
-                                    print(f"✅ Created archived opportunity (ID: {archived_opportunity.opportunity_id})")
-                                
-                                print(f"📦 Archive snapshot complete")
-                                
-                                # UPDATE EXISTING WITH NEW DATA
-                                print(f"🔄 Now updating existing client {client.client_id} with new data...")
-                                
-                                client.client_company_name = business_name or client.client_company_name
-                                client.client_contact_name = contact_person or client.client_contact_name
-                                client.client_phone = phone or client.client_phone
-                                client.client_email = email or client.client_email
-                                client.address = address or client.address
-                                client.post_code = postcode or client.post_code
-                                client.position = position
-                                client.company_number = company_number
-                                client.date_of_birth = date_of_birth
-                                client.charity_ltd_company_number = charity_ltd_company_number
-                                client.partner_details = partner_details
-                                client.bank_name = bank_name
-                                client.account_number = account_number
-                                client.sort_code = sort_code
-                                
-                                project.address = site_address or address or project.address
-                                project.Misc_Col2 = int(annual_usage) if annual_usage else project.Misc_Col2
-                                project.start_date = start_date or project.start_date
-                                project.end_date = end_date
-                                project.site_name = site_name
-                                project.month_sold = month_sold
-                                project.house_name = house_name
-                                project.house_number = house_number
-                                project.door_number = door_number
-                                project.town = town
-                                project.county = county
-                                project.updated_at = datetime.utcnow()
-                                
-                                if supplier_id:
-                                    existing_contract.supplier_id = supplier_id
-                                if old_supplier_id:
-                                    existing_contract.old_supplier_id = old_supplier_id
-                                existing_contract.contract_start_date = start_date or existing_contract.contract_start_date
-                                existing_contract.contract_end_date = end_date
-                                existing_contract.unit_rate = rate_1 or existing_contract.unit_rate
-                                existing_contract.rate_1 = rate_1 or existing_contract.rate_1
-                                existing_contract.rate_2 = rate_2 or existing_contract.rate_2
-                                existing_contract.rate_3 = rate_3 or existing_contract.rate_3
-                                existing_contract.standing_charge = stand_charge or existing_contract.standing_charge
-                                existing_contract.net_notch = net_notch or existing_contract.net_notch
-                                existing_contract.comms_paid = comms_paid or existing_contract.comms_paid
-                                existing_contract.aggregator = aggregator or existing_contract.aggregator
-                                existing_contract.term_sold = term_sold or existing_contract.term_sold
-                                existing_contract.mpan_bottom = mpan_bottom or existing_contract.mpan_bottom
-                                existing_contract.updated_at = datetime.utcnow()
-                                
-                                if opportunity and assigned_employee_id:
-                                    opportunity.opportunity_owner_employee_id = opportunity_owner_id
-                                
-                                session.commit()
-                                
-                                print(f"✅ ARCHIVE + UPDATE COMPLETE")
-                                print(f"   Archived client ID: {archived_client_id} (is_archived=True)")
-                                print(f"   Updated client ID: {client.client_id} (is_archived=False)")
-                                print(f"   New end date: {end_date}")
-                                print(f"{'='*60}\n")
-                                
-                                if (success_count + duplicate_count) % 100 == 0:
-                                    print(f"📊 Progress: {success_count + duplicate_count}/{total_rows}")
-                                
-                                continue
-                                
-                            except Exception as archive_error:
+                            if not project:
                                 session.rollback()
-                                print(f"❌ ARCHIVE FAILED for row {index + 2}: {archive_error}")
-                                import traceback
-                                traceback.print_exc()
                                 error_count += 1
-                                errors.append(f"Row {index + 2}: Archive failed - {str(archive_error)}")
+                                errors.append(f"Row {index + 2}: Project not found for MPAN {mpan_top}")
                                 continue
+                            
+                            client = session.query(Client_Master).filter_by(
+                                client_id=project.client_id
+                            ).first()
+                            
+                            if not client:
+                                session.rollback()
+                                error_count += 1
+                                errors.append(f"Row {index + 2}: Client not found for MPAN {mpan_top}")
+                                continue
+                            
+                            # ✅ Determine the action for tracking
+                            if existing_end_date and new_end_date and existing_end_date == new_end_date:
+                                action = 'Exact duplicate - skipped'
+                            elif existing_end_date and new_end_date and new_end_date < existing_end_date:
+                                action = 'Older record - created as archived'
+                            elif existing_end_date and new_end_date and new_end_date > existing_end_date:
+                                action = 'Newer record - archived existing'
+                            else:
+                                action = 'Updated existing record'
+                            
+                            # Track same-tenant duplicate
+                            duplicate_details.append({
+                                'row': index + 2,
+                                'mpan': mpan_top,
+                                'company': business_name,
+                                'assigned_to': existing_assigned_to,
+                                'action': action
+                            })
+                            
+                            # ✅ Skip if already archived
+                            if is_archived:
+                                print(f"⏭️ Row {index + 2}: Skipping - existing record already archived for MPAN {mpan_top}")
+                                continue
+                            
+                            if not new_end_date:
+                                print(f"⏭️ Row {index + 2}: Skipping - no end date in new record for MPAN {mpan_top}")
+                                continue
+                            
+                            # ✅ If new record is OLDER, create it as ARCHIVED
+                            if existing_end_date and new_end_date < existing_end_date:
+                                print(f"⏭️ Row {index + 2}: Older record detected - creating as archived for MPAN {mpan_top}")
+                                
+                                try:
+                                    # Create the older record as ARCHIVED
+                                    archived_client = Client_Master(
+                                        tenant_id=tenant_id,
+                                        assigned_employee_id=opportunity_owner_id,
+                                        client_company_name=business_name or '',
+                                        client_contact_name=contact_person or '',
+                                        address=address or '',
+                                        post_code=postcode or '',
+                                        client_phone=phone or '',
+                                        client_email=email or '',
+                                        client_website='',
+                                        default_currency_id=1,
+                                        created_at=datetime.utcnow(),
+                                        position=position or None,
+                                        company_number=company_number or None,
+                                        date_of_birth=date_of_birth,
+                                        charity_ltd_company_number=charity_ltd_company_number or None,
+                                        partner_details=partner_details or None,
+                                        bank_name=bank_name or None,
+                                        account_number=account_number or None,
+                                        sort_code=sort_code or None,
+                                        is_archived=True,
+                                        archived_at=datetime.utcnow(),
+                                        archived_reason=f"Historical record (ended {new_end_date}) - superseded by existing contract ending {existing_end_date}"
+                                    )
+                                    session.add(archived_client)
+                                    session.flush()
+                                    
+                                    archived_client_id = archived_client.client_id
+                                    
+                                    # Create archived opportunity
+                                    archived_opportunity = Opportunity_Details(
+                                        client_id=archived_client_id,
+                                        opportunity_title=business_name or '',
+                                        opportunity_description='Imported from bulk upload',
+                                        opportunity_date=datetime.utcnow().date(),
+                                        opportunity_owner_employee_id=opportunity_owner_id,
+                                        stage_id=1,
+                                        opportunity_value=0,
+                                        currency_id=1,
+                                        created_at=datetime.utcnow(),
+                                        Misc_Col1=None
+                                    )
+                                    session.add(archived_opportunity)
+                                    session.flush()
+                                    
+                                    # Create archived project
+                                    archived_project = Project_Details(
+                                        client_id=archived_client_id,
+                                        opportunity_id=archived_opportunity.opportunity_id,
+                                        project_title=business_name or '',
+                                        project_description='Imported site location',
+                                        start_date=start_date if start_date else datetime.utcnow().date(),
+                                        end_date=end_date,
+                                        employee_id=employee_id,
+                                        created_at=datetime.utcnow(),
+                                        updated_at=datetime.utcnow(),
+                                        address=site_address or address or '',
+                                        Misc_Col1=None,
+                                        Misc_Col2=int(annual_usage) if annual_usage else None,
+                                        site_name=site_name or None,
+                                        month_sold=month_sold or None,
+                                        house_name=house_name or None,
+                                        house_number=house_number or None,
+                                        door_number=door_number or None,
+                                        town=town or None,
+                                        county=county or None,
+                                    )
+                                    session.add(archived_project)
+                                    session.flush()
+                                    
+                                    # Create archived contract
+                                    archived_contract = Energy_Contract_Master(
+                                        project_id=archived_project.project_id,
+                                        employee_id=employee_id,
+                                        supplier_id=supplier_id or 1,
+                                        old_supplier_id=old_supplier_id,
+                                        contract_start_date=start_date or datetime.utcnow().date(),
+                                        contract_end_date=end_date,
+                                        terms_of_sale='',
+                                        service_id=import_service_id,
+                                        unit_rate=rate_1 or 0.0,
+                                        currency_id=1,
+                                        document_details=None,
+                                        created_at=datetime.utcnow(),
+                                        updated_at=datetime.utcnow(),
+                                        mpan_number=mpan_top or '',
+                                        mpan_bottom=mpan_bottom or '',
+                                        net_notch=net_notch,
+                                        term_sold=term_sold,
+                                        rate_2=rate_2,
+                                        rate_3=rate_3,
+                                        comms_paid=comms_paid,
+                                        standing_charge=stand_charge,
+                                        aggregator=aggregator or None,
+                                        rate_1=rate_1,
+                                    )
+                                    session.add(archived_contract)
+                                    session.flush()
+                                    
+                                    # ✅ ADD TO existing_mpans so subsequent imports can find this archived record
+                                    if mpan_key not in existing_mpans:
+                                        existing_mpans[mpan_key] = []
+                                    
+                                    existing_mpans[mpan_key].append({
+                                        'contract': archived_contract,
+                                        'tenant_id': tenant_id,
+                                        'assigned_to_id': opportunity_owner_id,
+                                        'assigned_to_name': assigned_employee_name or 'Unassigned',
+                                        'company_name': business_name,
+                                        'is_archived': True  # This is an archived record
+                                    })
+                                    
+                                    session.commit()
+                                    success_count += 1
+                                    print(f"✅ OLDER RECORD CREATED AS ARCHIVED")
+                                    continue
+                                    
+                                except Exception as archive_error:
+                                    session.rollback()
+                                    print(f"❌ ARCHIVE CREATION FAILED for row {index + 2}: {archive_error}")
+                                    import traceback
+                                    traceback.print_exc()
+                                    error_count += 1
+                                    errors.append(f"Row {index + 2}: Archive creation failed - {str(archive_error)}")
+                                    continue
+                            
+                            # ✅ Skip exact duplicates (same MPAN + same end date)
+                            if existing_end_date and new_end_date == existing_end_date:
+                                print(f"⏭️ Row {index + 2}: Skipping - exact duplicate (same MPAN and end date)")
+                                continue
+                            
+                            # ✅ If new record is newer, archive existing
+                            if existing_end_date and new_end_date > existing_end_date:
+                                print(f"🔄 Row {index + 2}: New record is newer - archiving existing record for MPAN {mpan_top}")
+                                
+                                try:
+                                    client.is_archived = True
+                                    client.archived_at = datetime.utcnow()
+                                    client.archived_reason = f"Superseded by newer contract (ending {new_end_date})"
+                                    session.flush()
+                                    print(f"✅ Archived existing client ID {client.client_id}")
+                                    
+                                    # ✅ UPDATE the existing_mpans entry to reflect archived status
+                                    for record in existing_mpans[mpan_key]:
+                                        if record['contract'].energy_contract_master_id == existing_contract.energy_contract_master_id:
+                                            record['is_archived'] = True
+                                            break
+                                    
+                                except Exception as archive_error:
+                                    session.rollback()
+                                    print(f"❌ Failed to archive existing record: {archive_error}")
+                                    error_count += 1
+                                    errors.append(f"Row {index + 2}: Failed to archive existing - {str(archive_error)}")
+                                    continue
+
+                                print(f"✅ Proceeding to create newer replacement record for MPAN {mpan_top}")
 
                 # CREATE NEW CLIENT
                 new_client = Client_Master(
@@ -916,6 +869,7 @@ def import_energy_customers():
                     bank_name=bank_name or None,
                     account_number=account_number or None,
                     sort_code=sort_code or None,
+                    is_archived=False,
                 )
                 session.add(new_client)
                 session.flush()
@@ -1005,11 +959,25 @@ def import_energy_customers():
                     )
                     session.add(contract)
                     session.flush()
-                    
+
+                    # ✅ FIX: Add new contract to existing_mpans as a LIST item
                     if mpan_top:
-                        existing_mpans[mpan_top.strip().lower()] = contract
-                
-                success_count += 1
+                        mpan_key = mpan_top.strip().lower()
+                        
+                        # ✅ Store as LIST to match the pre-load structure
+                        if mpan_key not in existing_mpans:
+                            existing_mpans[mpan_key] = []
+                        
+                        existing_mpans[mpan_key].append({
+                            'contract': contract,
+                            'tenant_id': tenant_id,
+                            'assigned_to_id': opportunity_owner_id,
+                            'assigned_to_name': assigned_employee_name or 'Unassigned',
+                            'company_name': business_name,
+                            'is_archived': False  # Newly created records are not archived
+                        })
+                                        
+                    success_count += 1
                 
                 if (success_count + duplicate_count) % BATCH_SIZE == 0:
                     session.commit()
@@ -1033,14 +1001,46 @@ def import_energy_customers():
         
         print(f"✅ Import complete: {success_count} new, {duplicate_count} updated, {error_count} errors")
         
+        print(f"✅ Import complete: {success_count} new, {duplicate_count} duplicates, {error_count} errors")
+
+        # ✅ BUILD DETAILED DUPLICATE REPORT
+        duplicate_report = []
+        if duplicate_details:
+            duplicate_report.append("\n📋 SAME-TENANT DUPLICATES:")
+            for dup in duplicate_details:
+                duplicate_report.append(
+                    f"  Row {dup['row']}: {dup['company']} (MPAN: {dup['mpan']}) - "
+                    f"Assigned to: {dup['assigned_to']} - {dup['action']}"
+                )
+
+        if cross_tenant_duplicates:
+            duplicate_report.append("\n⚠️ CROSS-TENANT DUPLICATES (SKIPPED):")
+            for dup in cross_tenant_duplicates:
+                archived_status = " [ARCHIVED]" if dup['is_archived'] else ""
+                duplicate_report.append(
+                    f"  Row {dup['row']}: {dup['new_company']} (MPAN: {dup['mpan']}) - "
+                    f"Already exists in another account{archived_status} - "
+                    f"Assigned to: {dup['assigned_to']}"
+                )
+
+        # ✅ ADD DEBUG PRINT TO SEE WHAT'S IN THE LISTS
+        print(f"\n🔍 DUPLICATE REPORT DEBUG:")
+        print(f"   duplicate_details count: {len(duplicate_details)}")
+        print(f"   cross_tenant_duplicates count: {len(cross_tenant_duplicates)}")
+        print(f"   duplicate_report lines: {len(duplicate_report)}")
+        print(f"   duplicate_report content: {duplicate_report}")
+
         return jsonify({
             'success': True,
             'message': f'Import completed',
             'total_rows': len(df),
             'successful': success_count,
             'duplicates': duplicate_count,
+            'same_tenant_duplicates': len(duplicate_details),
+            'cross_tenant_duplicates': len(cross_tenant_duplicates),
             'failed': error_count,
             'errors': errors[:50],
+            'duplicate_report': duplicate_report,  # ✅ Make sure this line exists!
             'assigned_to': assigned_employee_name,
             'assigned_employee_id': assigned_employee_id
         }), 200

@@ -109,6 +109,7 @@ def get_renewals_calendar():
                 ecm.contract_end_date,
                 ecm.contract_start_date,
                 ci.reminder_date as callback_date,
+                ci.next_steps as interaction_status,
                 cm.address,
                 cm.post_code as postcode,
                 cm.client_contact_name as contact,
@@ -190,12 +191,14 @@ def get_renewals_calendar():
             seen_clients.add(client_id)
             
             business_name = callback.get('name') or callback.get('contact') or 'Unknown'
-            
+
+            interaction_status = callback.get('interaction_status') or 'Callback'
+                        
             event = {
                 'id': f"callback-{client_id}",
                 'customer_id': client_id,
                 'type': 'callback',
-                'title': f"{business_name} - Callback",
+                'title': f"{business_name} - {interaction_status}",
                 'name': business_name,
                 'mpan': callback.get('mpan'),
                 'supplier': callback.get('supplier'),
@@ -211,7 +214,7 @@ def get_renewals_calendar():
                 'rates': str(callback.get('rates')) if callback.get('rates') else None,
                 'notes': callback.get('callback_notes'),
                 'display_date': str(callback['callback_date']),
-                'display_type': 'Callback',
+                'display_type': interaction_status,
                 'status': callback.get('status') or 'Active',
                 'assigned_to': callback.get('assigned_to'),
             }
