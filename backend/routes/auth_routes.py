@@ -366,12 +366,13 @@ def login():
 
         # ✅ UPDATED: Include role in user response
         user = {
+            'employee_id': row.get('employee_id'),
             'id': row.get('employee_id'),
             'name': (row.get('employee_name') or row.get('user_name')),
             'email': row.get('email'),
             'phone': row.get('phone'),
             'username': row.get('user_name'),
-            'role': row.get('role_name'),  # ✅ Add role to response
+            'role': row.get('role_name'),  
             'role_id': row.get('role_id'),
             'tenant_id': row.get('tenant_id')
         }

@@ -854,3 +854,147 @@ def test_renewals_endpoint():
             "error": str(e),
             "message": "Database connection failed. Check schema structure."
         }), 500
+
+@renewals_bp.route('/energy-renewals/performance', methods=['GET'])
+@token_required
+def get_renewal_performance():
+    """
+    Get renewal performance metrics
+    
+    Two modes:
+    1. Dashboard (optional employee_id): Can show ALL data for admin or filtered for salesperson
+    2. Renewals page (no employee_id): Uses current logged-in user automatically
+    
+    Query params:
+    - employee_id (optional): If provided, filter by this employee. If not provided, return ALL.
+    - use_current_user (optional): If 'true', ignore employee_id and use current user from JWT
+    """
+    session = SessionLocal()
+    
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+        
+        # ✅ Check if we should use current user (for renewals page)
+        use_current_user = request.args.get('use_current_user', 'false').lower() == 'true'
+        
+        if use_current_user:
+            # ✅ RENEWALS PAGE MODE: Always use current logged-in user
+            current_user = request.current_user
+            
+            # Extract employee_id from the user object
+            if hasattr(current_user, 'id'):
+                employee_id = current_user.id
+            elif hasattr(current_user, 'employee_id'):
+                employee_id = current_user.employee_id
+            else:
+                return jsonify({'error': 'User employee_id not found'}), 400
+            
+            print(f"\n{'='*60}")
+            print(f"📊 PERFORMANCE (RENEWALS PAGE - PERSONAL)")
+            print(f"{'='*60}")
+            print(f"   Mode: use_current_user=true")
+            print(f"   Current User Employee ID: {employee_id}")
+            print(f"   Showing: ONLY THIS USER'S PERFORMANCE")
+            print(f"{'='*60}\n")
+        else:
+            # ✅ DASHBOARD MODE: Optional employee filter
+            employee_id = request.args.get('employee_id', type=int)
+            
+            print(f"\n{'='*60}")
+            print(f"📊 PERFORMANCE (DASHBOARD)")
+            print(f"{'='*60}")
+            print(f"   Mode: Dashboard (optional filter)")
+            print(f"   Tenant ID: {tenant_id}")
+            print(f"   Employee Filter: {employee_id if employee_id else 'NONE (ALL DATA)'}")
+            print(f"   Showing: {'FILTERED DATA' if employee_id else 'ALL COMPANY DATA'}")
+            print(f"{'='*60}\n")
+        
+        # ✅ Build base query
+        base_query = session.query(
+            Client_Master,
+            Project_Details,
+            Energy_Contract_Master,
+            Opportunity_Details
+        ).join(
+            Project_Details, Client_Master.client_id == Project_Details.client_id
+        ).join(
+            Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
+        ).join(
+            Opportunity_Details, Client_Master.client_id == Opportunity_Details.client_id
+        ).filter(
+            Client_Master.tenant_id == tenant_id,
+            Energy_Contract_Master.contract_end_date.isnot(None)
+        )
+        
+        # ✅ Apply employee filter if provided (or if using current user)
+        if employee_id:
+            print(f"🔍 Filtering by employee_id={employee_id}")
+            base_query = base_query.filter(
+                Opportunity_Details.opportunity_owner_employee_id == employee_id
+            )
+        else:
+            print(f"🌍 NO FILTER - Returning ALL company data")
+        
+        # ✅ Get all results
+        all_results = base_query.all()
+        
+        print(f"📦 Query returned {len(all_results)} total records")
+        
+        # ✅ Calculate statistics
+        renewed_count = 0
+        contacted_count = 0
+        not_contacted_count = 0
+        lost_count = 0
+        
+        for client, project, contract, opportunity in all_results:
+            status = opportunity.Misc_Col1
+            
+            if status:
+                status_lower = status.lower()
+                if status_lower in ['priced', 'renewed']:
+                    renewed_count += 1
+                elif status_lower in ['called', 'callback', 'contacted']:
+                    contacted_count += 1
+                elif status_lower in ['lost', 'lost cot']:
+                    lost_count += 1
+                elif status_lower in ['not answered', 'not contacted']:
+                    not_contacted_count += 1
+                else:
+                    not_contacted_count += 1
+            else:
+                not_contacted_count += 1
+        
+        # ✅ Calculate success rate
+        total_attempts = renewed_count + lost_count + contacted_count + not_contacted_count
+        success_rate = round((renewed_count / total_attempts * 100), 1) if total_attempts > 0 else 0
+        
+        result = {
+            'renewed_count': renewed_count,
+            'contacted_count': contacted_count,
+            'not_contacted_count': not_contacted_count,
+            'lost_count': lost_count,
+            'success_rate': success_rate,
+            'total_customers': len(all_results),
+            'employee_id': employee_id if employee_id else None  # Return for verification
+        }
+        
+        print(f"\n✅ PERFORMANCE STATS:")
+        print(f"   Employee ID: {employee_id if employee_id else 'ALL'}")
+        print(f"   Renewed: {renewed_count}")
+        print(f"   In Progress: {contacted_count}")
+        print(f"   Not Contacted: {not_contacted_count}")
+        print(f"   Lost: {lost_count}")
+        print(f"   Success Rate: {success_rate}%")
+        print(f"{'='*60}\n")
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        current_app.logger.error(f"Error getting performance stats: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
