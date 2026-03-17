@@ -221,6 +221,10 @@ class Client_Master(Base):
     bank_name = Column(String(255))
     account_number = Column(String(50))
     sort_code = Column(String(20))
+    home_door_number = Column(String(20))
+    home_street = Column(String(255))
+    partner_dob = Column(Date)
+    credit_score = Column(Integer)
     is_deleted = Column(Boolean, default=False, nullable=False)
     deleted_at = Column(DateTime(timezone=True), nullable=True)
     deleted_reason = Column(String(100), nullable=True)
@@ -228,6 +232,7 @@ class Client_Master(Base):
     archived_at = Column(DateTime)
     archived_reason = Column(String(255))
     display_order = Column(Integer, nullable=True)
+
 
 class Project_Details(Base):
     __tablename__ = 'Project_Details'
@@ -284,6 +289,7 @@ class Energy_Contract_Master(Base):
     standing_charge = Column(Numeric(10, 2))
     aggregator = Column(String(255))
     rate_1 = Column(Numeric(10, 4))
+    payment_type = Column(String(50))
 
 
 class Opportunity_Details(Base):

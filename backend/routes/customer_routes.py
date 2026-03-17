@@ -55,6 +55,18 @@ def get_tenant_id_from_user(user):
 
 def build_customer_response(client, project=None, contract=None, opportunity=None, interaction=None, supplier=None, employee=None, old_supplier=None, stage=None):
     """Build unified customer response from multiple tables"""
+    
+    # Helper function to safely convert dates to ISO format
+    def safe_date_to_iso(date_value):
+        """Convert date to ISO string, handling both date objects and strings"""
+        if date_value is None:
+            return None
+        if isinstance(date_value, str):
+            return date_value  # Already a string
+        if hasattr(date_value, 'isoformat'):
+            return date_value.isoformat()  # datetime/date object
+        return str(date_value)  # Fallback
+    
     response = {
         # From Client_Master
         'id': client.tenant_client_id,
@@ -70,12 +82,12 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'address': client.address or '',
         'post_code': client.post_code or '',
         'website': client.client_website or '',
-        'created_at': client.created_at.isoformat() if client.created_at else None,
+        'created_at': safe_date_to_iso(client.created_at),
         
         # ✅ NEW: Client_Master fields
         'position': getattr(client, 'position', None),
         'company_number': getattr(client, 'company_number', None),
-        'date_of_birth': client.date_of_birth.isoformat() if hasattr(client, 'date_of_birth') and client.date_of_birth else None,
+        'date_of_birth': safe_date_to_iso(getattr(client, 'date_of_birth', None)),
         'charity_ltd_company_number': getattr(client, 'charity_ltd_company_number', None),
         'partner_details': getattr(client, 'partner_details', None),
         'home_door_number': getattr(client, 'home_door_number', None),
@@ -99,11 +111,11 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'account_number': getattr(client, 'account_number', None),
         'sort_code': getattr(client, 'sort_code', None),
         
-        # From Energy_Contract_Master
+        # From Energy_Contract_Master - ✅ FIX: Use safe_date_to_iso
         'contract_id': contract.energy_contract_master_id if contract else None,
         'mpan_mpr': contract.mpan_number if contract else '',
-        'start_date': contract.contract_start_date.isoformat() if contract and contract.contract_start_date else None,
-        'end_date': contract.contract_end_date.isoformat() if contract and contract.contract_end_date else None,
+        'start_date': safe_date_to_iso(contract.contract_start_date if contract else None),
+        'end_date': safe_date_to_iso(contract.contract_end_date if contract else None),
         'unit_rate': float(contract.unit_rate) if contract and contract.unit_rate else None,
         'terms_of_sale': contract.terms_of_sale if contract else None,
 
@@ -111,6 +123,7 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'standing_charge': float(contract.standing_charge) if contract and hasattr(contract, 'standing_charge') and contract.standing_charge else None,
         'aggregator': getattr(contract, 'aggregator', None) if contract else None,
         'rate_1': float(contract.rate_1) if contract and hasattr(contract, 'rate_1') and contract.rate_1 else None,
+        'payment_type': getattr(contract, 'payment_type', None) if contract else None,  
         
         # ✅ NEW: Energy_Contract_Master fields
         'net_notch': float(contract.net_notch) if contract and hasattr(contract, 'net_notch') and contract.net_notch else None,
@@ -144,9 +157,9 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'assigned_to_id': employee.employee_id if employee else None,
         'assigned_to_name': employee.employee_name if employee else '',
         
-        # From Client_Interactions
-        'callback_date': interaction.reminder_date.isoformat() if interaction and interaction.reminder_date else None,
-        'last_contact_date': interaction.contact_date.isoformat() if interaction and interaction.contact_date else None,
+        # From Client_Interactions - ✅ FIX: Use safe_date_to_iso
+        'callback_date': safe_date_to_iso(interaction.reminder_date if interaction else None),
+        'last_contact_date': safe_date_to_iso(interaction.contact_date if interaction else None),
         'interaction_notes': interaction.notes if interaction else None,
     }
     
@@ -664,6 +677,20 @@ def update_energy_customer(client_id):
                 project.address = data['site_address']
             if 'annual_usage' in data:
                 project.Misc_Col2 = data['annual_usage']
+            if 'site_name' in data:
+                project.site_name = data['site_name']
+            if 'month_sold' in data:
+                project.month_sold = data['month_sold']
+            if 'house_name' in data:
+                project.house_name = data['house_name']
+            if 'house_number' in data:
+                project.house_number = data['house_number']
+            if 'door_number' in data:
+                project.door_number = data['door_number']
+            if 'town' in data:
+                project.town = data['town']
+            if 'county' in data:
+                project.county = data['county']
             project.updated_at = datetime.utcnow()
         elif data.get('site_address') or data.get('annual_usage'):
             # Create project if it doesn't exist
@@ -689,15 +716,28 @@ def update_energy_customer(client_id):
                     contract.mpan_number = data['mpan_mpr']
                 if 'supplier_id' in data:
                     contract.supplier_id = data['supplier_id']
-                if 'start_date' in data:
-                    contract.contract_start_date = data['start_date']
-                if 'end_date' in data:
-                    contract.contract_end_date = data['end_date']
+                if 'start_date' in data and data['start_date']:
+                    # Convert string to date object if needed
+                    if isinstance(data['start_date'], str):
+                        contract.contract_start_date = datetime.fromisoformat(data['start_date'].replace('Z', '')).date()
+                    else:
+                        contract.contract_start_date = data['start_date']
+
+                if 'end_date' in data and data['end_date']:
+                    # Convert string to date object if needed
+                    if isinstance(data['end_date'], str):
+                        contract.contract_end_date = datetime.fromisoformat(data['end_date'].replace('Z', '')).date()
+                    else:
+                        contract.contract_end_date = data['end_date']
                 # ✅ FIX: Only update unit_rate if it's actually provided AND not None
                 if 'unit_rate' in data and data['unit_rate'] is not None:
                     contract.unit_rate = data['unit_rate']
                 if 'terms_of_sale' in data:
                     contract.terms_of_sale = data['terms_of_sale']
+                
+                if 'payment_type' in data:
+                    contract.payment_type = data['payment_type']
+                
                 contract.updated_at = datetime.utcnow()
                 
             elif data.get('mpan_mpr') or data.get('supplier_id'):
@@ -1944,8 +1984,8 @@ def restore_customer(client_id):
         opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
         if opportunity and opportunity.Misc_Col1:
             # Clear the deletion status (lost_cot, invalid_number, meter_de-energised)
-            if opportunity.Misc_Col1.lower() in ['lost_cot', 'invalid_number', 'meter_de-energised']:
-                opportunity.Misc_Col1 = None
+            # if opportunity.Misc_Col1.lower() in ['lost_cot', 'invalid_number', 'meter_de-energised']:
+            opportunity.Misc_Col1 = None
         
         # Commit the restore change
         session.flush()

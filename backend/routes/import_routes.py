@@ -356,6 +356,7 @@ def import_energy_customers():
         
         # Column mapping
         column_map = {
+            # Contact Information
             'client_name': ['client name', 'business name', 'company name'],
             'trading_name': ['trading name', 'business', 'company'],
             'main_contact': ['main contact', 'contact person', 'contact'],
@@ -363,24 +364,47 @@ def import_energy_customers():
             'tel_no': ['tel no', 'phone', 'telephone', 'tel'],
             'mobile_no': ['mobile no', 'mobile', 'cell'],
             'email': ['email', 'e-mail'],
+            
+            # Site/Property Information
             'site_name': ['site name', 'site'],
             'month_sold': ['month sold', 'sale month'],
             'house_name': ['house name'],
             'house_number': ['house number', 'house no'],
-            'address_line_1': ['address line 1', 'address 1', 'street'],  
+            'door_number': ['door number'],
+            
+            # Address Fields
+            'address_line_1': ['address line 1', 'address 1', 'street'],
             'address_line_2': ['address line 2', 'address 2'],
             'address_line_3': ['address line 3', 'address 3'],
             'town': ['town', 'city'],
             'county': ['county', 'region'],
-            'postcode': ['postcode', 'post code', 'zip'],
+            
+            # ✅ CORRECTED: Both postcode fields map to same column
+            'postcode': ['postcode', 'post code', 'zip', 'home post code', 'home postcode'],
+            
+            # Home Address (separate from trading address)
+            'home_door_number': ['home door number', 'home door no'],
+            'home_street': ['home street'],
+            # ❌ REMOVED: 'home_post_code' - using postcode instead
+            
+            # MPAN/Meter Information
             'mpan_top': ['mpan top', 'mpan core'],
             'mpan_bottom': ['mpan bottom', 'mpan llf'],
-            'old_supplier': ['old supplier'],  
+            'data_source': ['data source'],
+            
+            # Supplier Information
+            'old_supplier': ['old supplier'],
             'supplier': ['supplier', 'supplier name'],
+            
+            # Contract Details
+            'payment_type': ['payment type'],
             'net_notch': ['net notch'],
-            'term_sold': ['term sold', 'in contract', 'contract length'],  
+            'term_sold': ['term sold', 'in contract', 'contract length'],
+            'agent_sold': ['agent sold'],
             'start_date': ['start date', 'contract start'],
             'contract_end': ['contract end', 'end date', 'expiry'],
+            
+            # Charges
             'stand_charge': ['stand charge', 'standing charge'],
             'rate_1': ['rate 1', 'unit rate', 'rate'],
             'rate_2': ['rate 2'],
@@ -388,16 +412,25 @@ def import_energy_customers():
             'aggregator': ['aggregator'],
             'annual_usage': ['annual usage', 'usage', 'kwh'],
             'comms_paid': ['comms paid', 'commission'],
+            
+            # Company/Trading Information
+            'trading_type': ['trading type'],
             'company_number': ['company number', 'co number'],
             'date_of_birth': ['date of birth', 'dob'],
+            'charity_ltd_company_number': ['charity/ltd company number', 'charity number'],
+            
+            # Banking Information
             'bank_name': ['bank name', 'bank'],
             'ac_number': ['ac number', 'account number'],
             'sort_code': ['sort code'],
-            'charity_ltd_company_number': ['charity/ltd company number', 'charity number'],
+            
+            # Partner Information
             'partner_details': ['partner details', 'partner'],
-            'door_number': ['door number', 'door no'],
-            'payment_type': ['payment type'],  
-            'trading_type': ['trading type'],  
+            'partner_dob': ['partner date of birth', 'partner dob'],
+            
+            # Customer Verification
+            'credit_score': ['credit score'],
+            'password': ['password'],
         }
         
         actual_columns = {}
@@ -531,6 +564,13 @@ def import_energy_customers():
                 bank_name = safe_str(row.get(actual_columns.get('bank_name', ''), ''))
                 account_number = safe_str(row.get(actual_columns.get('ac_number', ''), ''))
                 sort_code = safe_str(row.get(actual_columns.get('sort_code', ''), ''))
+                home_door_number = safe_str(row.get(actual_columns.get('home_door_number', ''), ''))
+                home_street = safe_str(row.get(actual_columns.get('home_street', ''), ''))
+                partner_dob = parse_date(row.get(actual_columns.get('partner_dob', '')))
+                credit_score = parse_number(row.get(actual_columns.get('credit_score', '')))
+                data_source = safe_str(row.get(actual_columns.get('data_source', ''), ''))
+                agent_sold = safe_str(row.get(actual_columns.get('agent_sold', ''), ''))
+
 
                 # Get or create supplier
                 supplier_id = None
@@ -712,8 +752,12 @@ def import_energy_customers():
                                         account_number=account_number or None,
                                         sort_code=sort_code or None,
                                         is_archived=True,
+                                        home_door_number=home_door_number or None,
+                                        home_street=home_street or None,
                                         archived_at=datetime.utcnow(),
-                                        archived_reason=f"Historical record (ended {new_end_date}) - superseded by existing contract ending {existing_end_date}"
+                                        archived_reason=f"Historical record (ended {new_end_date}) - superseded by existing contract ending {existing_end_date}",
+                                        partner_dob=partner_dob,
+                                        credit_score=credit_score,
                                     )
                                     session.add(archived_client)
                                     session.flush()
@@ -849,148 +893,242 @@ def import_energy_customers():
                                 print(f"✅ Proceeding to create newer replacement record for MPAN {mpan_top}")
 
                 # CREATE NEW CLIENT
-                new_client = Client_Master(
-                    tenant_id=tenant_id,
-                    assigned_employee_id=opportunity_owner_id,
-                    client_company_name=business_name or '',  
-                    client_contact_name=contact_person or '',  
-                    address=address or '',
-                    post_code=postcode or '',
-                    client_phone=phone or '',
-                    client_email=email or '',
-                    client_website='',
-                    default_currency_id=1,
-                    created_at=datetime.utcnow(),
-                    position=position or None,
-                    company_number=company_number or None,
-                    date_of_birth=date_of_birth,
-                    charity_ltd_company_number=charity_ltd_company_number or None,
-                    partner_details=partner_details or None,
-                    bank_name=bank_name or None,
-                    account_number=account_number or None,
-                    sort_code=sort_code or None,
-                    is_archived=False,
-                )
-                session.add(new_client)
-                session.flush()
-                
-                client_id = new_client.client_id
-                
-                # Create Opportunity
-                opportunity = Opportunity_Details(
-                    client_id=client_id,
-                    opportunity_title=business_name or '',
-                    opportunity_description='Imported from bulk upload',
-                    opportunity_date=datetime.utcnow().date(),
-                    opportunity_owner_employee_id=opportunity_owner_id,
-                    stage_id=1,
-                    opportunity_value=0,
-                    currency_id=1,
-                    created_at=datetime.utcnow(),
-                    Misc_Col1=None
-                )
-                session.add(opportunity)
-                session.flush()
-                
-                # Create Project
-                project = None
-                if site_address or annual_usage or mpan_top or start_date or end_date:
-                    project_start_date = start_date if start_date else datetime.utcnow().date()
-                    project_end_date = end_date if end_date else None
-                    project = Project_Details(
-                        client_id=client_id,
-                        opportunity_id=opportunity.opportunity_id,
-                        project_title=business_name or '',
-                        project_description='Imported site location',
-                        start_date=project_start_date,
-                        end_date=project_end_date,
-                        employee_id=employee_id,
-                        created_at=datetime.utcnow(),
-                        updated_at=datetime.utcnow(),
-                        address=site_address or address or '',
-                        Misc_Col1=None,
-                        Misc_Col2=int(annual_usage) if annual_usage else None,
-                        site_name=site_name or None,
-                        month_sold=month_sold or None,
-                        house_name=house_name or None,
-                        house_number=house_number or None,
-                        door_number=door_number or None,
-                        town=town or None,
-                        county=county or None,
-                    )
-                    session.add(project)
-                    session.flush()
-                
-                # Create Contract
-                if project and mpan_top:
-                    from datetime import timedelta
+                try:
+                    # ✅ PRE-CHECK: Look for existing customer by email/phone (before database insert)
+                    existing_customer = None
                     
-                    contract_start_date = start_date if start_date else datetime.utcnow().date()
-                    
-                    if end_date:
-                        contract_end_date = end_date
-                    else:
-                        contract_end_date = contract_start_date + timedelta(days=365)
-                    
-                    contract = Energy_Contract_Master(
-                        project_id=project.project_id,
-                        employee_id=employee_id,
-                        supplier_id=supplier_id or 1,
-                        old_supplier_id=old_supplier_id,
-                        contract_start_date=contract_start_date,
-                        contract_end_date=contract_end_date,
-                        terms_of_sale='',
-                        service_id=import_service_id,
-                        unit_rate=rate_1 or 0.0,
-                        currency_id=1,
-                        document_details=None,
-                        created_at=datetime.utcnow(),
-                        updated_at=datetime.utcnow(),
-                        mpan_number=mpan_top or '',
-                        mpan_bottom=mpan_bottom or '',
-                        net_notch=net_notch,
-                        term_sold=term_sold,
-                        rate_2=rate_2,
-                        rate_3=rate_3,
-                        comms_paid=comms_paid,
-                        standing_charge=stand_charge,
-                        aggregator=aggregator or None,
-                        rate_1=rate_1,
-                    )
-                    session.add(contract)
-                    session.flush()
+                    if email or phone:
+                        existing_customer = session.query(Client_Master).filter(
+                            Client_Master.tenant_id == tenant_id,
+                            or_(
+                                and_(
+                                    Client_Master.client_email == email,
+                                    Client_Master.client_email != '',
+                                    Client_Master.client_email.isnot(None)
+                                ) if email else False,
+                                and_(
+                                    Client_Master.client_phone == phone,
+                                    Client_Master.client_phone != '',
+                                    Client_Master.client_phone.isnot(None)
+                                ) if phone else False,
+                                and_(
+                                    Client_Master.client_contact_name == contact_person,
+                                    Client_Master.client_phone == phone,
+                                    Client_Master.client_contact_name != '',
+                                    Client_Master.client_phone != ''
+                                ) if contact_person and phone else False
+                            ),
+                            Client_Master.is_deleted == False,
+                            Client_Master.is_archived == False
+                        ).first()
 
-                    # ✅ FIX: Add new contract to existing_mpans as a LIST item
-                    if mpan_top:
-                        mpan_key = mpan_top.strip().lower()
+                    if existing_customer:
+                        error_msg = f"Customer '{contact_person}'"
+                        if business_name:
+                            error_msg += f" from '{business_name}'"
+                        if email:
+                            error_msg += f" (Email: {email})"
+                        error_msg += " already exists in your account"
                         
-                        # ✅ Store as LIST to match the pre-load structure
-                        if mpan_key not in existing_mpans:
-                            existing_mpans[mpan_key] = []
+                        errors.append(error_msg)
+                        error_count += 1
+                        print(f"⏭️ Row {index + 2}: {error_msg}")
+                        continue
+
+                    new_client = Client_Master(
+                        tenant_id=tenant_id,
+                        assigned_employee_id=opportunity_owner_id,
+                        client_company_name=business_name or '',  
+                        client_contact_name=contact_person or '',  
+                        address=address or '',
+                        post_code=postcode or '',
+                        home_door_number=home_door_number or None,
+                        home_street=home_street or None,
+                        client_phone=phone or '',
+                        client_email=email or '',
+                        client_website='',
+                        default_currency_id=1,
+                        created_at=datetime.utcnow(),
+                        position=position or None,
+                        company_number=company_number or None,
+                        date_of_birth=date_of_birth,
+                        charity_ltd_company_number=charity_ltd_company_number or None,
+                        partner_details=partner_details or None,
+                        bank_name=bank_name or None,
+                        account_number=account_number or None,
+                        sort_code=sort_code or None,
+                        partner_dob=partner_dob,
+                        credit_score=credit_score,
+                        is_archived=False,
+                    )
+                    session.add(new_client)
+                    session.flush()
+                    
+                    client_id = new_client.client_id
+                    
+                    # Create Opportunity
+                    opportunity = Opportunity_Details(
+                        client_id=client_id,
+                        opportunity_title=business_name or '',
+                        opportunity_description='Imported from bulk upload',
+                        opportunity_date=datetime.utcnow().date(),
+                        opportunity_owner_employee_id=opportunity_owner_id,
+                        stage_id=1,
+                        opportunity_value=0,
+                        currency_id=1,
+                        created_at=datetime.utcnow(),
+                        Misc_Col1=None
+                    )
+                    session.add(opportunity)
+                    session.flush()
+                    
+                    # Create Project
+                    project = None
+                    if site_address or annual_usage or mpan_top or start_date or end_date:
+                        project_start_date = start_date if start_date else datetime.utcnow().date()
+                        project_end_date = end_date if end_date else None
+                        project = Project_Details(
+                            client_id=client_id,
+                            opportunity_id=opportunity.opportunity_id,
+                            project_title=business_name or '',
+                            project_description='Imported site location',
+                            start_date=project_start_date,
+                            end_date=project_end_date,
+                            employee_id=employee_id,
+                            created_at=datetime.utcnow(),
+                            updated_at=datetime.utcnow(),
+                            address=site_address or address or '',
+                            Misc_Col1=None,
+                            Misc_Col2=int(annual_usage) if annual_usage else None,
+                            site_name=site_name or None,
+                            month_sold=month_sold or None,
+                            house_name=house_name or None,
+                            house_number=house_number or None,
+                            door_number=door_number or None,
+                            town=town or None,
+                            county=county or None,
+                        )
+                        session.add(project)
+                        session.flush()
+                    
+                    # Create Contract
+                    if project and mpan_top:
+                        from datetime import timedelta
                         
-                        existing_mpans[mpan_key].append({
-                            'contract': contract,
-                            'tenant_id': tenant_id,
-                            'assigned_to_id': opportunity_owner_id,
-                            'assigned_to_name': assigned_employee_name or 'Unassigned',
-                            'company_name': business_name,
-                            'is_archived': False  # Newly created records are not archived
-                        })
-                                        
-                    success_count += 1
+                        contract_start_date = start_date if start_date else datetime.utcnow().date()
+                        
+                        if end_date:
+                            contract_end_date = end_date
+                        else:
+                            contract_end_date = contract_start_date + timedelta(days=365)
+                        
+                        contract = Energy_Contract_Master(
+                            project_id=project.project_id,
+                            employee_id=employee_id,
+                            supplier_id=supplier_id or 1,
+                            old_supplier_id=old_supplier_id,
+                            contract_start_date=contract_start_date,
+                            contract_end_date=contract_end_date,
+                            terms_of_sale='',
+                            service_id=import_service_id,
+                            unit_rate=rate_1 or 0.0,
+                            currency_id=1,
+                            document_details=None,
+                            created_at=datetime.utcnow(),
+                            updated_at=datetime.utcnow(),
+                            mpan_number=mpan_top or '',
+                            mpan_bottom=mpan_bottom or '',
+                            net_notch=net_notch,
+                            rate_2=rate_2,
+                            rate_3=rate_3,
+                            comms_paid=comms_paid,
+                            standing_charge=stand_charge,
+                            aggregator=aggregator or None,
+                            rate_1=rate_1,
+                            payment_type=payment_type or None,
+                        )
+                        session.add(contract)
+                        session.flush()
+
+                        # ✅ Add new contract to existing_mpans as a LIST item
+                        if mpan_top:
+                            mpan_key = mpan_top.strip().lower()
+                            
+                            if mpan_key not in existing_mpans:
+                                existing_mpans[mpan_key] = []
+                            
+                            existing_mpans[mpan_key].append({
+                                'contract': contract,
+                                'tenant_id': tenant_id,
+                                'assigned_to_id': opportunity_owner_id,
+                                'assigned_to_name': assigned_employee_name or 'Unassigned',
+                                'company_name': business_name,
+                                'is_archived': False
+                            })
+                                            
+                        success_count += 1
+                    
+                    if (success_count + duplicate_count) % BATCH_SIZE == 0:
+                        session.commit()
+                        print(f"📊 Batch committed: {success_count + duplicate_count}/{total_rows}")
                 
-                if (success_count + duplicate_count) % BATCH_SIZE == 0:
-                    session.commit()
-                    print(f"📊 Batch committed: {success_count + duplicate_count}/{total_rows}")
+                # ✅ IMPROVED ERROR HANDLING - No more raw SQL errors!
+                except Exception as client_error:
+                    session.rollback()
+                    error_count += 1
+                    
+                    error_str = str(client_error)
+                    
+                    # Handle duplicate key violations
+                    if "UniqueViolation" in error_str or "duplicate key" in error_str:
+                        error_msg = f"Customer '{contact_person}'"
+                        if business_name:
+                            error_msg += f" from '{business_name}'"
+                        error_msg += " already exists (duplicate record)"
+                        
+                        errors.append(error_msg)
+                        print(f"⚠️ Row {index + 2}: {error_msg}")
+                    
+                    # Handle integrity errors (missing required fields)
+                    elif "IntegrityError" in error_str or "violates not-null constraint" in error_str:
+                        errors.append(f"Missing required field - check your data")
+                        print(f"⚠️ Row {index + 2}: Data validation error")
+                    
+                    # Handle foreign key errors
+                    elif "ForeignKeyViolation" in error_str or "foreign key constraint" in error_str:
+                        errors.append(f"Invalid reference (supplier, employee, etc.)")
+                        print(f"⚠️ Row {index + 2}: Foreign key error")
+                    
+                    # Generic error - show simplified message
+                    else:
+                        error_lines = error_str.split('\n')
+                        error_msg = error_lines[0] if error_lines else error_str
+                        if len(error_msg) > 150:
+                            error_msg = error_msg[:150] + "..."
+                        
+                        errors.append(error_msg)
+                        print(f"❌ Row {index + 2}: {error_msg}")
+                    
+                    continue
                 
             except Exception as row_error:
                 session.rollback()
                 error_count += 1
-                error_msg = f"Row {index + 2}: {str(row_error)}"
+                
+                error_str = str(row_error)
+                
+                if "UniqueViolation" in error_str or "duplicate key" in error_str:
+                    error_msg = f"Duplicate customer detected"
+                elif "IntegrityError" in error_str:
+                    error_msg = f"Data validation error"
+                else:
+                    error_lines = error_str.split('\n')
+                    error_msg = error_lines[0][:150] if error_lines else error_str[:150]
+                
                 errors.append(error_msg)
-                print(f"❌ {error_msg}")
+                print(f"❌ Row {index + 2}: {error_msg}")
                 continue
-        
+                        
         # FINAL COMMIT
         try:
             session.commit()

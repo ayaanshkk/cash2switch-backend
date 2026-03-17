@@ -17,11 +17,11 @@ renewals_bp = Blueprint("renewals", __name__)
 @token_required
 def get_renewals():
     """
-    Get all clients with energy contracts expiring in the next 90 days
-    Uses proper schema: Client_Master -> Project_Details -> Energy_Contract_Master
+    Get all clients with energy contracts
+    - Normal mode: Expiring in next 90 days
+    - use_current_user mode: ALL contracts (no date filter)
     """
     try:
-        # ✅ Get tenant_id from authenticated user
         tenant_id = get_tenant_id_from_user(request.current_user)
         if not tenant_id:
             return jsonify({'error': 'Tenant not found'}), 400
@@ -32,9 +32,33 @@ def get_renewals():
         today = datetime.now().date()
         ninety_days_later = today + timedelta(days=90)
         
-        # ✅ Add employee filter if provided
-        employee_id = request.args.get('employee_id')
+        # Check if we should use current user
+        use_current_user = request.args.get('use_current_user', 'false').lower() == 'true'
+        
+        if use_current_user:
+            # Use current logged-in user's employee_id from JWT
+            current_user = request.current_user
+            
+            if hasattr(current_user, 'id'):
+                employee_id = current_user.id
+            elif hasattr(current_user, 'employee_id'):
+                employee_id = current_user.employee_id
+            else:
+                employee_id = None
+            
+            print(f"🔍 Using current user's employee_id: {employee_id}")
+        else:
+            # Use optional employee_id parameter (original behavior)
+            employee_id = request.args.get('employee_id')
+            print(f"🔍 Using employee_id parameter: {employee_id}")
+        
         employee_filter = "AND od.opportunity_owner_employee_id = :employee_id" if employee_id else ""
+        
+        # ✅ CRITICAL FIX: Only filter by date if NOT using current user
+        if use_current_user:
+            date_filter = "AND ecm.contract_end_date IS NOT NULL"  # No 90-day limit
+        else:
+            date_filter = "AND ecm.contract_end_date BETWEEN :today AND :ninety_days_later"
         
         # Query using your actual schema structure with proper joins
         query = text(f"""
@@ -48,14 +72,7 @@ def get_renewals():
                 ecm.contract_end_date as end_date,
                 pd."Misc_Col2" as annual_usage,
                 (ecm.contract_end_date - CURRENT_DATE) as days_until_expiry,
-                COALESCE(
-                    (SELECT ci.notes 
-                    FROM "StreemLyne_MT"."Client_Interactions" ci 
-                    WHERE ci.client_id = cm.client_id 
-                    ORDER BY ci.contact_date DESC 
-                    LIMIT 1),
-                    'Pending'
-                ) as status,
+                od."Misc_Col1" as status,
                 em.employee_name as assigned_to_name,
                 ecm.unit_rate,
                 ecm.mpan_number
@@ -65,19 +82,20 @@ def get_renewals():
             LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od ON cm.client_id = od.client_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
-            WHERE ecm.contract_end_date IS NOT NULL
-            AND ecm.contract_end_date BETWEEN :today AND :ninety_days_later
-            AND cm.tenant_id = :tenant_id
+            WHERE cm.tenant_id = :tenant_id
+            {date_filter}
             {employee_filter}
             ORDER BY ecm.contract_end_date ASC
         """)
         
-        # ✅ Pass parameters
-        params = {
-            "today": today,
-            "ninety_days_later": ninety_days_later,
-            "tenant_id": tenant_id
-        }
+        # Pass parameters
+        params = {"tenant_id": tenant_id}
+        
+        # ✅ Only add date params if not using current user
+        if not use_current_user:
+            params["today"] = today
+            params["ninety_days_later"] = ninety_days_later
+        
         if employee_id:
             params['employee_id'] = int(employee_id)
         
@@ -101,7 +119,7 @@ def get_renewals():
             })
         
         db.close()
-        print(f"✅ Found {len(renewals)} renewals due in next 90 days")
+        print(f"✅ Found {len(renewals)} renewals (use_current_user={use_current_user}, employee_id={employee_id})")
         return jsonify(renewals), 200
         
     except Exception as e:
@@ -109,7 +127,6 @@ def get_renewals():
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
 
 @renewals_bp.route('/energy-renewals/stats', methods=['GET'])
 @token_required
