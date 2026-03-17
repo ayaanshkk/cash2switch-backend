@@ -273,3 +273,4 @@ xlrd>=2.0.1
 celery==5.3.4
 redis==5.0.1
 vercel-storage==0.3.0
+vercel-blob
