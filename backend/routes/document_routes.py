@@ -11,7 +11,7 @@ from backend.routes.crm_routes import tenant_from_jwt
 from backend.crm.controllers.document_controller import DocumentController
 from backend.db import SessionLocal
 from backend.models import Client_Master
-from vercel_storage import blob
+import vercel_blob as blob
 
 # Create blueprint
 document_bp = Blueprint('documents', __name__, url_prefix='/api/crm/documents')
