@@ -964,14 +964,22 @@ def get_renewal_performance():
         contacted_count = 0
         not_contacted_count = 0
         lost_count = 0
+        renewed_directly_count = 0
+        end_date_changed_count = 0
+        priced_count = 0
         
         for client, project, contract, opportunity in all_results:
             status = opportunity.Misc_Col1
             
             if status:
                 status_lower = status.lower()
-                # ✅ FIX: Count 'Already Renewed' and 'End Date Changed' as renewed
-                if status_lower in ['priced', 'renewed', 'already renewed', 'end date changed']:
+                if status_lower == 'renewed directly':
+                    renewed_directly_count += 1
+                elif status_lower == 'end date changed':
+                    end_date_changed_count += 1
+                elif status_lower == 'priced':
+                    priced_count += 1
+                elif status_lower in ['renewed', 'already renewed']:
                     renewed_count += 1
                 elif status_lower in ['called', 'callback', 'contacted']:
                     contacted_count += 1
@@ -995,12 +1003,18 @@ def get_renewal_performance():
             'lost_count': lost_count,
             'success_rate': success_rate,
             'total_customers': len(all_results),
-            'employee_id': employee_id if employee_id else None  # Return for verification
+            'employee_id': employee_id if employee_id else None,
+            'renewed_directly_count': renewed_directly_count,
+            'end_date_changed_count': end_date_changed_count,
+            'priced_count': priced_count,
         }
         
         print(f"\n✅ PERFORMANCE STATS:")
         print(f"   Employee ID: {employee_id if employee_id else 'ALL'}")
-        print(f"   Renewed: {renewed_count}")
+        print(f"   Renewed (Already Renewed): {renewed_count}")
+        print(f"   Renewed Directly: {renewed_directly_count}")
+        print(f"   End Date Changed: {end_date_changed_count}")
+        print(f"   Priced: {priced_count}")
         print(f"   In Progress: {contacted_count}")
         print(f"   Not Contacted: {not_contacted_count}")
         print(f"   Lost: {lost_count}")

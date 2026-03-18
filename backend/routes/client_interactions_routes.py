@@ -47,7 +47,8 @@ def add_callback(client_id):
         is_sold = data.get('is_sold')
         new_end_date_str = data.get('new_end_date')
         new_supplier = data.get('new_supplier')
-        new_address = data.get('new_address')  
+        new_address = data.get('new_address')
+        renewed_by = data.get('renewed_by')  
         
         print(f"📥 Received callback request for client {client_id}")
         print(f"📥 Status: {status}")
@@ -240,7 +241,30 @@ def add_callback(client_id):
                         notes = f"{notes.strip()} | {changes_summary}"
                     else:
                         notes = f"{changes_summary}"
-                
+
+                if renewed_by == 'customer':
+                    # Customer renewed themselves → count as "Renewed Directly"
+                    opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
+                    if opportunity:
+                        opportunity.Misc_Col1 = 'Renewed Directly'
+                    renewed_by_label = "[Renewed by Customer]"
+                    notes = f"{renewed_by_label} {notes}".strip() if notes else renewed_by_label
+                    print(f"✅ Renewed by customer → setting Misc_Col1 to 'Renewed Directly'")
+                elif renewed_by == 'agent':
+                    # Agent renewed → keep as "Already Renewed"
+                    opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
+                    if opportunity:
+                        opportunity.Misc_Col1 = 'Already Renewed'
+                    renewed_by_label = "[Renewed by Agent]"
+                    notes = f"{renewed_by_label} {notes}".strip() if notes else renewed_by_label
+                    print(f"✅ Renewed by agent → setting Misc_Col1 to 'Already Renewed'")
+                else:
+                    # Fallback: no renewed_by sent, default to Already Renewed
+                    opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
+                    if opportunity:
+                        opportunity.Misc_Col1 = 'Already Renewed'
+                    print(f"⚠️ No renewed_by provided, defaulting to 'Already Renewed'")
+
                 print(f"✅ Already Renewed - Changes: {changes_made}")
                 
             except Exception as e:
@@ -300,9 +324,10 @@ def add_callback(client_id):
                 return jsonify({'error': f'Failed to update end date: {str(e)}'}), 500
         
         # Update Misc_Col1 based on status
-        opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
-        if opportunity:
-            opportunity.Misc_Col1 = status
+        if status != "Already Renewed":
+            opportunity = session.query(Opportunity_Details).filter_by(client_id=client_id).first()
+            if opportunity:
+                opportunity.Misc_Col1 = status
         
         # For "Priced" status with "No" - don't set callback date
         if status == "Priced" and not is_sold:
