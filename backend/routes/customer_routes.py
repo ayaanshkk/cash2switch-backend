@@ -143,7 +143,8 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'supplier_provisions': supplier.supplier_provisions if supplier else None,
         
         # ✅ NEW: Old Supplier
-        'old_supplier_id': old_supplier.supplier_id if old_supplier else None,
+        'old_supplier_id': (old_supplier.supplier_id if old_supplier else 
+                    (contract.old_supplier_id if contract and hasattr(contract, 'old_supplier_id') else None)),
         'old_supplier_name': old_supplier.supplier_company_name if old_supplier else '',
         
         # From Opportunity_Details
@@ -430,14 +431,14 @@ def get_energy_customer(client_id):
             return jsonify({'error': 'Customer not found'}), 404
         
         client, project, contract, opportunity, interaction, supplier, employee = result
-        
+
         # ✅ Fetch old supplier if old_supplier_id exists
         old_supplier = None
         if contract and hasattr(contract, 'old_supplier_id') and contract.old_supplier_id:
             old_supplier = session.query(Supplier_Master).filter_by(
                 supplier_id=contract.old_supplier_id
             ).first()
-        
+
         stage = None
         if opportunity and opportunity.stage_id:
             stage = session.query(Stage_Master).filter_by(stage_id=opportunity.stage_id).first()
@@ -716,6 +717,9 @@ def update_energy_customer(client_id):
                     contract.mpan_number = data['mpan_mpr']
                 if 'supplier_id' in data:
                     contract.supplier_id = data['supplier_id']
+                if 'old_supplier_id' in data:
+                    val = data['old_supplier_id']
+                    contract.old_supplier_id = None if (val is None or val == 0) else val
                 if 'start_date' in data and data['start_date']:
                     # Convert string to date object if needed
                     if isinstance(data['start_date'], str):
