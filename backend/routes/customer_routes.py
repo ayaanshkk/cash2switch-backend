@@ -137,7 +137,8 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'mpan_mpr': contract.mpan_number if contract else None,
         
         # From Supplier_Master (via Energy_Contract_Master)
-        'supplier_id': supplier.supplier_id if supplier else None,
+        'supplier_id': (supplier.supplier_id if supplier else 
+                        (contract.supplier_id if contract and hasattr(contract, 'supplier_id') else None)),
         'supplier_name': supplier.supplier_company_name if supplier else '',
         'supplier_contact': supplier.supplier_contact_name if supplier else '',
         'supplier_provisions': supplier.supplier_provisions if supplier else None,
@@ -432,7 +433,7 @@ def get_energy_customer(client_id):
         
         client, project, contract, opportunity, interaction, supplier, employee = result
 
-        # ✅ Fetch old supplier if old_supplier_id exists
+        # Fetch old supplier
         old_supplier = None
         if contract and hasattr(contract, 'old_supplier_id') and contract.old_supplier_id:
             old_supplier = session.query(Supplier_Master).filter_by(
@@ -447,10 +448,9 @@ def get_energy_customer(client_id):
             client, project, contract, opportunity, interaction, supplier, employee, old_supplier, stage
         )
 
-        # ✅ Prioritize Misc_Col1 if it exists
         if opportunity and opportunity.Misc_Col1:
             customer_data['status'] = opportunity.Misc_Col1
-        
+
         return jsonify(customer_data), 200
         
     except Exception as e:
@@ -643,16 +643,6 @@ def update_energy_customer(client_id):
         if not client:
             return jsonify({'error': 'Customer not found'}), 404
 
-        # Admin-only: assignment change
-        # user_role = get_user_role_name(request.current_user, session)
-        # if data and 'assigned_to_id' in data:
-        #     # Only Platform Admin can change assignments
-        #     if user_role not in ['Platform Admin', 'Tenant Super Admin']:
-        #         return jsonify({
-        #             'error': 'permission_denied',
-        #             'message': 'Only administrators can change customer assignments'
-        #         }), 403
-        
         current_app.logger.info(f"🔄 Updating energy customer {client_id}")
         
         # Update Client_Master
@@ -694,7 +684,6 @@ def update_energy_customer(client_id):
                 project.county = data['county']
             project.updated_at = datetime.utcnow()
         elif data.get('site_address') or data.get('annual_usage'):
-            # Create project if it doesn't exist
             project = Project_Details(
                 client_id=client_id,
                 project_title=f"Site - {client.client_company_name}",
@@ -721,31 +710,24 @@ def update_energy_customer(client_id):
                     val = data['old_supplier_id']
                     contract.old_supplier_id = None if (val is None or val == 0) else val
                 if 'start_date' in data and data['start_date']:
-                    # Convert string to date object if needed
                     if isinstance(data['start_date'], str):
                         contract.contract_start_date = datetime.fromisoformat(data['start_date'].replace('Z', '')).date()
                     else:
                         contract.contract_start_date = data['start_date']
-
                 if 'end_date' in data and data['end_date']:
-                    # Convert string to date object if needed
                     if isinstance(data['end_date'], str):
                         contract.contract_end_date = datetime.fromisoformat(data['end_date'].replace('Z', '')).date()
                     else:
                         contract.contract_end_date = data['end_date']
-                # ✅ FIX: Only update unit_rate if it's actually provided AND not None
                 if 'unit_rate' in data and data['unit_rate'] is not None:
                     contract.unit_rate = data['unit_rate']
                 if 'terms_of_sale' in data:
                     contract.terms_of_sale = data['terms_of_sale']
-                
                 if 'payment_type' in data:
                     contract.payment_type = data['payment_type']
-                
                 contract.updated_at = datetime.utcnow()
                 
             elif data.get('mpan_mpr') or data.get('supplier_id'):
-                # Create contract if it doesn't exist
                 contract = Energy_Contract_Master(
                     project_id=project.project_id,
                     employee_id=request.current_user.employee_id,
@@ -758,7 +740,7 @@ def update_energy_customer(client_id):
                 )
                 session.add(contract)
         
-        # ✅ Track assignment changes for interaction logging
+        # Track assignment changes for interaction logging
         old_assigned_to = None
         new_assigned_to = None
         assignment_notes = data.get('assignment_notes')
@@ -768,28 +750,22 @@ def update_energy_customer(client_id):
         if opportunity:
             if 'stage_id' in data:
                 opportunity.stage_id = data['stage_id']
-            
             if 'status' in data:
                 status_value = data['status']
                 if status_value in ['None', 'null', '', None]:
                     opportunity.Misc_Col1 = None
                 else:
                     opportunity.Misc_Col1 = status_value
-            
-            # ✅ Handle assignment with notes
             if 'assigned_to_id' in data:
                 old_assigned_to = opportunity.opportunity_owner_employee_id
                 new_assigned_to = data['assigned_to_id']
                 opportunity.opportunity_owner_employee_id = new_assigned_to
-                
                 current_app.logger.info(f"✅ Updated assignment from {old_assigned_to} to {new_assigned_to}")
-            
             if 'opportunity_value' in data:
                 opportunity.opportunity_value = data['opportunity_value']
         
-        # ✅ Create interaction for assignment change with notes
+        # Create interaction for assignment change with notes
         if old_assigned_to != new_assigned_to and 'assigned_to_id' in data:
-            # Get employee name
             if new_assigned_to:
                 employee = session.query(Employee_Master).filter_by(
                     employee_id=new_assigned_to
@@ -798,16 +774,14 @@ def update_energy_customer(client_id):
             else:
                 employee_name = "Unassigned"
             
-            # Build interaction notes
             interaction_notes = f"Assigned to {employee_name}"
             if assignment_notes:
                 interaction_notes += f" - {assignment_notes}"
             
-            # Create interaction
             assignment_interaction = Client_Interactions(
                 client_id=client_id,
                 contact_date=datetime.utcnow().date(),
-                contact_method=1,  # Internal note
+                contact_method=1,
                 notes=interaction_notes,
                 next_steps="Assignment",
                 created_at=datetime.utcnow()
@@ -815,9 +789,8 @@ def update_energy_customer(client_id):
             session.add(assignment_interaction)
             current_app.logger.info(f"✅ Created assignment interaction: {interaction_notes}")
         
-        # ✅ Handle callback_date and interaction_notes (separate from assignment)
+        # Handle callback_date and interaction_notes
         if data.get('callback_date') or data.get('interaction_notes'):
-            # Check if interaction exists
             interaction_check = session.execute(text("""
                 SELECT interaction_id 
                 FROM "StreemLyne_MT"."Client_Interactions"
@@ -827,7 +800,6 @@ def update_energy_customer(client_id):
             """), {'client_id': client_id}).fetchone()
             
             if interaction_check:
-                # Update existing interaction
                 update_query = text("""
                     UPDATE "StreemLyne_MT"."Client_Interactions"
                     SET 
@@ -842,7 +814,6 @@ def update_energy_customer(client_id):
                     'interaction_id': interaction_check[0]
                 })
             else:
-                # Create new interaction with raw SQL
                 insert_query = text("""
                     INSERT INTO "StreemLyne_MT"."Client_Interactions" 
                     (client_id, contact_date, contact_method, notes, reminder_date, created_at)
@@ -885,10 +856,17 @@ def update_energy_customer(client_id):
             Client_Master.client_id == client_id
         ).first()
         
-        client, project, contract, opportunity, interaction, supplier, employee, stage = updated_result 
-        
+        client, project, contract, opportunity, interaction, supplier, employee, stage = updated_result
+
+        # ✅ Fetch old supplier for the response
+        old_supplier = None
+        if contract and hasattr(contract, 'old_supplier_id') and contract.old_supplier_id:
+            old_supplier = session.query(Supplier_Master).filter_by(
+                supplier_id=contract.old_supplier_id
+            ).first()
+
         response_data = build_customer_response(
-            client, project, contract, opportunity, interaction, supplier, employee, None, stage 
+            client, project, contract, opportunity, interaction, supplier, employee, old_supplier, stage
         )
         
         if opportunity and opportunity.Misc_Col1:
