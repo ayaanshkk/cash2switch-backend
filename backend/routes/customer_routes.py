@@ -572,7 +572,8 @@ def create_energy_customer():
             mpan_bottom=mpan_bottom,  # ✅ Store MPAN bottom separately
             contract_start_date=data.get('start_date'),
             contract_end_date=data.get('end_date'),
-            unit_rate=data.get('unit_rate'),
+            unit_rate=data.get('unit_rate') or 0,
+
             currency_id=data.get('currency_id', 1),
             service_id=service_id,  # ✅ Use mapped service_id
             terms_of_sale=data.get('terms_of_sale', ''),

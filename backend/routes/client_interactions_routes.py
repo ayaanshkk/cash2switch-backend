@@ -66,6 +66,10 @@ def add_callback(client_id):
             "Meter De-energised": {"requires_date": False, "requires_sold": False, "deletes_record": True, "misc_col1": None, "requires_notes": False},
             "Broker in Place": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None, "requires_notes": False},
             "End Date Changed": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None, "requires_notes": False},
+            "Complaint": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None, "requires_notes": True},
+            "Email Only": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None, "requires_notes": False},
+            "Renewed Directly": {"requires_date": True, "requires_sold": False, "deletes_record": False, "misc_col1": None, "requires_notes": True},
+            "Incorrect Supplier": {"requires_date": False, "requires_sold": False, "deletes_record": False, "misc_col1": None, "requires_notes": True},
         }
         
         # Validation
