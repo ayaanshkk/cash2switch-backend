@@ -970,7 +970,8 @@ def get_renewal_performance():
             
             if status:
                 status_lower = status.lower()
-                if status_lower in ['priced', 'renewed']:
+                # ✅ FIX: Count 'Already Renewed' and 'End Date Changed' as renewed
+                if status_lower in ['priced', 'renewed', 'already renewed', 'end date changed']:
                     renewed_count += 1
                 elif status_lower in ['called', 'callback', 'contacted']:
                     contacted_count += 1
