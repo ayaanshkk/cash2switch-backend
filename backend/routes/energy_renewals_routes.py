@@ -240,7 +240,7 @@ def get_renewal_stats():
                     contacted_count += 1
                 elif status_lower == 'not_answered' or status_lower == 'not contacted':
                     not_contacted_count += 1
-                elif status_lower == 'priced' or status_lower == 'renewed':
+                elif status_lower in ['priced', 'renewed', 'already renewed', 'end date changed']:
                     renewed_count += 1
                 elif status_lower == 'lost':
                     lost_count += 1
