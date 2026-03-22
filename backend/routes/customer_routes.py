@@ -13,7 +13,7 @@ from .auth_helpers import token_required
 from backend.crm.utils.role_helpers import is_admin_user
 from datetime import datetime
 from sqlalchemy import and_, or_, func, text 
-
+from sqlalchemy.orm import aliased
 from ..db import SessionLocal
 
 # ✅ Import all models directly from backend.models
@@ -68,6 +68,7 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'client_id': client.client_id,
         'tenant_client_id': client.tenant_client_id,
         'display_id': client.display_id if hasattr(client, 'display_id') else None,
+        'display_order': getattr(client, 'display_order', None),
         'assigned_employee_id': client.assigned_employee_id if hasattr(client, 'assigned_employee_id') else None,
         'name': client.client_contact_name or '',
         'business_name': client.client_company_name or '',
@@ -200,11 +201,21 @@ def get_energy_customers():
             svc = service_param.strip().lower()
             _service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
  
+        latest_sq = (
+            session.query(
+                Client_Interactions.client_id,
+                func.max(Client_Interactions.interaction_id).label('max_id')
+            )
+            .group_by(Client_Interactions.client_id)
+            .subquery()
+        )
+        LatestInteraction = aliased(Client_Interactions)
+
         query = session.query(
             Client_Master,
             Project_Details,
             Energy_Contract_Master,
-            Client_Interactions,
+            LatestInteraction,
             Supplier_Master,
             Employee_Master,
         ).outerjoin(
@@ -214,8 +225,11 @@ def get_energy_customers():
             Energy_Contract_Master,
             Project_Details.project_id == Energy_Contract_Master.project_id
         ).outerjoin(
-            Client_Interactions,
-            Client_Master.client_id == Client_Interactions.client_id
+            latest_sq,
+            Client_Master.client_id == latest_sq.c.client_id
+        ).outerjoin(
+            LatestInteraction,
+            LatestInteraction.interaction_id == latest_sq.c.max_id
         ).outerjoin(
             Supplier_Master,
             Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
@@ -292,16 +306,28 @@ def get_energy_customers():
 def get_energy_customer(client_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
- 
+
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
- 
+
+        # Subquery: get only the latest interaction_id per client
+        latest_interaction_sq = (
+            session.query(
+                Client_Interactions.client_id,
+                func.max(Client_Interactions.interaction_id).label('max_id')
+            )
+            .group_by(Client_Interactions.client_id)
+            .subquery()
+        )
+
+        LatestInteraction = aliased(Client_Interactions)
+
         result = session.query(
             Client_Master,
             Project_Details,
             Energy_Contract_Master,
-            Client_Interactions,
+            LatestInteraction,
             Supplier_Master,
             Employee_Master
         ).outerjoin(
@@ -311,38 +337,41 @@ def get_energy_customer(client_id):
             Energy_Contract_Master,
             Project_Details.project_id == Energy_Contract_Master.project_id
         ).outerjoin(
-            Client_Interactions,
-            Client_Master.client_id == Client_Interactions.client_id
+            latest_interaction_sq,
+            Client_Master.client_id == latest_interaction_sq.c.client_id
+        ).outerjoin(
+            LatestInteraction,
+            LatestInteraction.interaction_id == latest_interaction_sq.c.max_id
         ).outerjoin(
             Supplier_Master,
             Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
         ).outerjoin(
             Employee_Master,
-            Project_Details.assigned_employee_id == Employee_Master.employee_id  # ✅ Changed
+            Project_Details.assigned_employee_id == Employee_Master.employee_id
         ).filter(
             and_(
                 Client_Master.client_id == client_id,
                 Client_Master.tenant_id == tenant_id
             )
         ).first()
- 
+
         if not result:
             return jsonify({'error': 'Customer not found'}), 404
- 
+
         client, project, contract, interaction, supplier, employee = result
- 
+
         old_supplier = None
         if contract and hasattr(contract, 'old_supplier_id') and contract.old_supplier_id:
             old_supplier = session.query(Supplier_Master).filter_by(
                 supplier_id=contract.old_supplier_id
             ).first()
- 
+
         customer_data = build_customer_response(
             client, project, contract, None, interaction, supplier, employee, old_supplier
         )
- 
+
         return jsonify(customer_data), 200
- 
+
     except Exception as e:
         current_app.logger.exception(f"❌ Error fetching energy customer {client_id}: {e}")
         return jsonify({'error': 'Failed to fetch customer'}), 500
@@ -412,8 +441,8 @@ def create_energy_customer():
             address=data.get('site_address') or data.get('address', ''),
             Misc_Col2=data.get('annual_usage'),
             employee_id=request.current_user.employee_id,
-            assigned_employee_id=assigned_employee_id,  # ✅ New column
-            status=None,                                 # ✅ New column
+            assigned_employee_id=assigned_employee_id,
+            status=None,                                 
             start_date=data.get('start_date'),
             created_at=datetime.utcnow()
         )
@@ -486,11 +515,16 @@ def update_energy_customer(client_id):
         tenant_id = get_tenant_id_from_user(request.current_user)
         data = request.get_json() or {}
  
-        client = session.query(Client_Master).filter_by(
-            client_id=client_id, tenant_id=tenant_id
-        ).first()
+        client = (
+            session.query(Client_Master).filter_by(display_order=client_id, tenant_id=tenant_id).first() or
+            session.query(Client_Master).filter_by(tenant_client_id=client_id, tenant_id=tenant_id).first() or
+            session.query(Client_Master).filter_by(client_id=client_id, tenant_id=tenant_id).first()
+        )
         if not client:
             return jsonify({'error': 'Customer not found'}), 404
+
+        # Resolve actual client_id for downstream use
+        client_id = client.client_id
  
         # Update Client_Master fields
         for field, col in [('business_name', 'client_company_name'), ('contact_person', 'client_contact_name'),
@@ -636,16 +670,27 @@ def update_energy_customer(client_id):
         session.expire_all()
  
         # Fetch updated data
+        latest_sq = (
+            session.query(
+                Client_Interactions.client_id,
+                func.max(Client_Interactions.interaction_id).label('max_id')
+            )
+            .group_by(Client_Interactions.client_id)
+            .subquery()
+        )
+        LatestInteraction = aliased(Client_Interactions)
+
         updated = session.query(
             Client_Master, Project_Details, Energy_Contract_Master,
-            Client_Interactions, Supplier_Master, Employee_Master
+            LatestInteraction, Supplier_Master, Employee_Master
         ).outerjoin(Project_Details, Client_Master.client_id == Project_Details.client_id
         ).outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
-        ).outerjoin(Client_Interactions, Client_Master.client_id == Client_Interactions.client_id
+        ).outerjoin(latest_sq, Client_Master.client_id == latest_sq.c.client_id
+        ).outerjoin(LatestInteraction, LatestInteraction.interaction_id == latest_sq.c.max_id
         ).outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
         ).outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id
         ).filter(Client_Master.client_id == client_id).first()
- 
+
         client, project, contract, interaction, supplier, employee = updated
  
         old_supplier = None
@@ -683,7 +728,7 @@ def delete_energy_customer(client_id):
  
         client = session.query(Client_Master).filter(
             and_(
-                Client_Master.client_id == client_id,
+                Client_Master.display_order == client_id,
                 Client_Master.tenant_id == tenant_id
             )
         ).first()
@@ -1457,19 +1502,25 @@ def restore_customer(client_id):
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
-        client = session.query(Client_Master).filter_by(
-            client_id=client_id, tenant_id=tenant_id, is_deleted=True
-        ).first()
+        client = (
+            session.query(Client_Master).filter_by(display_order=client_id, tenant_id=tenant_id).first() or
+            session.query(Client_Master).filter_by(tenant_client_id=client_id, tenant_id=tenant_id).first() or
+            session.query(Client_Master).filter_by(client_id=client_id, tenant_id=tenant_id).first()
+        )
+        if client and not client.is_deleted:
+            client = None
         if not client:
             return jsonify({'error': 'Customer not found in recycle bin'}), 404
- 
+
+        # Resolve actual client_id for downstream use
+        actual_client_id = client.client_id
+
         assigned_employee_id = client.assigned_employee_id
         client.is_deleted = False
         client.deleted_at = None
         client.deleted_reason = None
- 
-        # ✅ Clear status on Project_Details instead of Opportunity_Details
-        project = session.query(Project_Details).filter_by(client_id=client_id).first()
+
+        project = session.query(Project_Details).filter_by(client_id=actual_client_id).first()
         if project and project.status:
             project.status = None
  
@@ -1492,102 +1543,73 @@ def restore_customer(client_id):
 @token_required
 def permanent_delete_customer(client_id):
     """
-    Permanently delete a customer from recycle bin
-    This is a HARD DELETE - removes from database completely
-    Can only delete records that are already in recycle bin (is_deleted = TRUE)
+    Permanently delete a customer from recycle bin.
+    HARD DELETE — only works on records already in recycle bin (is_deleted = TRUE).
     """
-    
     if request.method == 'OPTIONS':
         return jsonify({}), 200
-    
+
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
-        
-        # Find the client - MUST be in recycle bin
-        client = session.query(Client_Master).filter_by(
-            client_id=client_id,
-            tenant_id=tenant_id,
-            is_deleted=True  # ✅ Only allow permanent delete from recycle bin
-        ).first()
-        
+
+        client = (
+            session.query(Client_Master).filter_by(display_order=client_id, tenant_id=tenant_id).first() or
+            session.query(Client_Master).filter_by(tenant_client_id=client_id, tenant_id=tenant_id).first() or
+            session.query(Client_Master).filter_by(client_id=client_id, tenant_id=tenant_id).first()
+        )
+        # For restore/permanent-delete, also verify the is_deleted flag:
+        if client and not client.is_deleted:
+            client = None
+
         if not client:
             return jsonify({'error': 'Customer not found in recycle bin'}), 404
-        
+
+        actual_client_id = client.client_id
         current_app.logger.info(f"🗑️ Permanently deleting customer {client_id}: {client.client_company_name}")
-        
-        # ============================================
-        # HARD DELETE: Delete in correct order (child → parent)
-        # ============================================
-        
-        # 1. Find all projects for this client
+
+        # 1. Find project IDs
         projects = session.query(Project_Details).filter_by(client_id=client_id).all()
         project_ids = [p.project_id for p in projects]
-        
+
+        # 2. Delete Energy_Contract_Master
         contracts_deleted = 0
         if project_ids:
-            # 2. Delete Energy_Contract_Master (references project_id)
             contracts_deleted = session.query(Energy_Contract_Master).filter(
                 Energy_Contract_Master.project_id.in_(project_ids)
             ).delete(synchronize_session=False)
             current_app.logger.info(f"   📋 Deleted {contracts_deleted} contracts")
-        
-        # 3. Delete Client_Interactions (references client_id)
+
+        # 3. Delete Client_Interactions
         interactions_deleted = session.query(Client_Interactions).filter_by(
-            client_id=client_id
+            client_id=actual_client_id
         ).delete(synchronize_session=False)
         current_app.logger.info(f"   📋 Deleted {interactions_deleted} interactions")
-        
-        # 4. Delete Invoice_Details and Invoice_Master
-        invoice_ids = [inv.invoice_id for inv in session.query(Invoice_Master).filter_by(client_id=client_id).all()]
-        invoices_deleted = 0
-        if invoice_ids:
-            session.query(Invoice_Details).filter(Invoice_Details.invoice_id.in_(invoice_ids)).delete(synchronize_session=False)
-            invoices_deleted = session.query(Invoice_Master).filter_by(client_id=client_id).delete(synchronize_session=False)
-            current_app.logger.info(f"   📋 Deleted {invoices_deleted} invoices")
-        
-        # 5. Delete Proposal_Details and Proposal_Master
-        proposal_ids = [prop.proposal_id for prop in session.query(Proposal_Master).filter_by(client_id=client_id).all()]
-        proposals_deleted = 0
-        if proposal_ids:
-            session.query(Proposal_Details).filter(Proposal_Details.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
-            proposals_deleted = session.query(Proposal_Master).filter_by(client_id=client_id).delete(synchronize_session=False)
-            current_app.logger.info(f"   📋 Deleted {proposals_deleted} proposals")
-        
-        # 6. Delete Opportunity_Details (references client_id)
-        opportunities_deleted = session.query(Opportunity_Details).filter_by(
-            client_id=client_id
-        ).delete(synchronize_session=False)
-        current_app.logger.info(f"   📋 Deleted {opportunities_deleted} opportunities")
-        
-        # 7. Delete Project_Details (references client_id and opportunity_id)
+
+        # 4. Delete Project_Details
         projects_deleted = session.query(Project_Details).filter_by(
-            client_id=client_id
+            client_id=actual_client_id
         ).delete(synchronize_session=False)
         current_app.logger.info(f"   📋 Deleted {projects_deleted} projects")
-        
-        # 8. Finally delete Client_Master
+
+        # 5. Delete Client_Master
         session.delete(client)
-        
-        # Commit all deletions
+
         session.commit()
-        
+
         current_app.logger.info(f"✅ Permanently deleted customer {client_id} from recycle bin")
-        
+
         return jsonify({
             'success': True,
             'message': 'Customer permanently deleted',
             'deleted': {
                 'contracts': contracts_deleted,
                 'interactions': interactions_deleted,
-                'invoices': invoices_deleted,
-                'proposals': proposals_deleted,
-                'opportunities': opportunities_deleted,
                 'projects': projects_deleted,
                 'client': 1
             }
         }), 200
-        
+
     except Exception as e:
         session.rollback()
         current_app.logger.exception(f"❌ Error permanently deleting customer: {e}")
@@ -1681,12 +1703,15 @@ def archive_customer(client_id):
         tenant_id = get_tenant_id_from_user(request.current_user)
         
         # Find the client
-        client = session.query(Client_Master).filter_by(
-            client_id=client_id,
-            tenant_id=tenant_id,
-            is_archived=False  # Must not already be archived
-        ).first()
-        
+        client = (
+            session.query(Client_Master).filter_by(display_order=client_id, tenant_id=tenant_id).first() or
+            session.query(Client_Master).filter_by(tenant_client_id=client_id, tenant_id=tenant_id).first() or
+            session.query(Client_Master).filter_by(client_id=client_id, tenant_id=tenant_id).first()
+        )
+        # Must not already be archived
+        if client and client.is_archived:
+            client = None
+
         if not client:
             return jsonify({'error': 'Customer not found'}), 404
         

@@ -1210,6 +1210,141 @@ def get_priced():
     """
     return crm_controller.get_priced()
 
+@crm_bp.route('/cleansing', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_cleansing():
+    from backend.crm.supabase_client import get_supabase_client
+
+    try:
+        tenant_id = g.tenant_id
+        db = get_supabase_client()
+        records = []
+
+        # ── 1. CRM Leads ──────────────────────────────────────────────────────
+        lead_rows = db.execute_query(
+            """
+            SELECT
+                od.opportunity_id                                       AS id,
+                od.opportunity_id                                       AS client_id,
+                od.tenant_lead_id                                       AS display_id,
+                od.tenant_lead_id                                       AS display_order,
+                COALESCE(od.business_name, od.opportunity_title)        AS business_name,
+                od.contact_person,
+                od.tel_number                                           AS phone,
+                od.mobile_no,
+                od.mpan_mpr,
+                od.mpan_mpr                                             AS mpan_top,
+                od.supplier_id,
+                sup.supplier_company_name                               AS supplier_name,
+                od.annual_usage,
+                od.start_date,
+                od.end_date,
+                sm.stage_name                                           AS cleansing_reason,
+                od.created_at                                           AS flagged_at,
+                od.notes                                             AS notes,
+                od.opportunity_owner_employee_id                        AS assigned_to_id,
+                em.employee_name                                        AS assigned_to_name
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od.stage_id    = sm.stage_id
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od.supplier_id = sup.supplier_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od.opportunity_owner_employee_id = em.employee_id
+            WHERE od.tenant_id = %s
+              AND sm.stage_name IN ('Invalid Number', 'Incorrect Supplier')
+            ORDER BY od.created_at DESC
+            """,
+            (tenant_id,),
+        )
+
+        for r in lead_rows or []:
+            def _s(v):
+                if v is None: return None
+                if hasattr(v, 'isoformat'): return v.isoformat()
+                return v
+
+            records.append({
+                'id':               r.get('id'),
+                'client_id':        r.get('client_id'),
+                'display_id':       r.get('display_id'),
+                'display_order':    r.get('display_order'),
+                'business_name':    r.get('business_name') or 'Unknown',
+                'contact_person':   r.get('contact_person'),
+                'phone':            r.get('phone'),
+                'mobile_no':        r.get('mobile_no'),
+                'mpan_mpr':         r.get('mpan_mpr'),
+                'mpan_top':         r.get('mpan_top'),
+                'supplier_id':      r.get('supplier_id'),
+                'supplier_name':    r.get('supplier_name'),
+                'annual_usage':     r.get('annual_usage'),
+                'start_date':       _s(r.get('start_date')),
+                'end_date':         _s(r.get('end_date')),
+                'cleansing_reason': r.get('cleansing_reason'),
+                'flagged_at':       _s(r.get('flagged_at')),
+                'notes':            r.get('notes'),
+                'assigned_to_id':   r.get('assigned_to_id'),
+                'assigned_to_name': r.get('assigned_to_name'),
+                'source':           'lead',
+            })
+
+        # ── 2. Energy Clients ─────────────────────────────────────────────────
+        try:
+            from backend.models import Client_Master, Energy_Contract_Master, Project_Details, Supplier_Master
+            from backend.db import SessionLocal
+
+            session = SessionLocal()
+            try:
+                client_rows = (
+                    session.query(Client_Master, Energy_Contract_Master, Supplier_Master)
+                    .outerjoin(Project_Details, Client_Master.client_id == Project_Details.client_id)
+                    .outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id)
+                    .outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id)
+                    .filter(
+                        Client_Master.tenant_id == tenant_id,
+                        Client_Master.is_deleted == True,
+                        Client_Master.deleted_reason.in_(['Invalid Number', 'Incorrect Supplier']),
+                    )
+                    .all()
+                )
+
+                for client, contract, supplier in client_rows:
+                    records.append({
+                        'id':               client.client_id,
+                        'client_id':        client.client_id,
+                        'display_id':       getattr(client, 'display_id', None),
+                        'display_order':    getattr(client, 'display_order', None),
+                        'business_name':    getattr(client, 'client_company_name', None) or 'Unknown',
+                        'contact_person':   getattr(client, 'client_contact_name', None),
+                        'phone':            getattr(client, 'client_phone', None),
+                        'mobile_no':        getattr(client, 'mobile_no', None),
+                        'mpan_mpr':         getattr(contract, 'mpan_mpr', None) if contract else None,
+                        'mpan_top':         getattr(contract, 'mpan_top', None) if contract else None,
+                        'supplier_id':      contract.supplier_id if contract else None,
+                        'supplier_name':    supplier.supplier_company_name if supplier else None,
+                        'annual_usage':     getattr(contract, 'annual_usage', None) if contract else None,
+                        'start_date':       contract.contract_start_date.isoformat() if contract and contract.contract_start_date else None,
+                        'end_date':         contract.contract_end_date.isoformat() if contract and contract.contract_end_date else None,
+                        'cleansing_reason': client.deleted_reason,
+                        'flagged_at':       client.deleted_at.isoformat() if client.deleted_at else None,
+                        'notes':            getattr(client, 'deleted_notes', None),
+                        'assigned_to_id':   getattr(client, 'assigned_to_id', None),
+                        'assigned_to_name': None,
+                        'source':           'energy_client',
+                    })
+            finally:
+                session.close()
+
+        except Exception as ec_err:
+            import logging
+            logging.getLogger(__name__).warning('Could not load energy clients for cleansing: %s', ec_err)
+
+        records.sort(key=lambda x: x.get('flagged_at') or '', reverse=True)
+
+        return jsonify({'records': records, 'total': len(records)}), 200
+
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
 @crm_bp.route('/leads/<int:opportunity_id>/callback', methods=['POST', 'OPTIONS'])
 @token_required
 @tenant_from_jwt
