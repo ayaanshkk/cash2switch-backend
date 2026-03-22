@@ -209,6 +209,7 @@ class Client_Master(Base):
     country_id = Column(SmallInteger)
     post_code = Column(String(20))
     client_phone = Column(String(50))
+    client_mobile = Column(String(50), nullable=True)
     client_email = Column(String(255))
     client_website = Column(String(255))
     default_currency_id = Column(SmallInteger)
@@ -232,6 +233,7 @@ class Client_Master(Base):
     archived_at = Column(DateTime)
     archived_reason = Column(String(255))
     display_order = Column(Integer, nullable=True)
+    is_allocated = Column(Boolean, default=False, nullable=True)
 
 
 class Project_Details(Base):
@@ -258,6 +260,8 @@ class Project_Details(Base):
     door_number = Column(String(20))
     town = Column(String(100))
     county = Column(String(100))
+    assigned_employee_id = Column(SmallInteger, nullable=True)
+    status = Column(String(255), nullable=True)  
 
 
 class Energy_Contract_Master(Base):

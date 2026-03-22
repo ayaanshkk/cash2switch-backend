@@ -12,95 +12,98 @@ class UserRepository:
     Repository for User_Master table (Tenant Users)
     All queries are tenant-filtered for multi-tenant isolation
     """
-    
+
     def __init__(self):
         self.db = get_supabase_client()
-    
+
     def get_all_users(self, tenant_id: int, active_only: bool = True) -> List[Dict[str, Any]]:
         """
         Get all users for a tenant
-        
+
         Args:
             tenant_id: Tenant identifier
             active_only: If True, only return active users
-        
+
         Returns:
             List of user records
         """
         query = """
-            SELECT 
+            SELECT
                 um.*,
                 rm."role_name",
                 rm."role_code"
             FROM "StreemLyne_MT"."User_Master" um
-            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON rm."role_id" = em."role_id"
+            LEFT JOIN "StreemLyne_MT"."User_Role_Mapping" urm ON urm.user_id = um.user_id
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON rm.role_id = urm.role_id
             WHERE um."Tenant_id" = %s
         """
-        
+
         if active_only:
             query += ' AND um."is_active" = TRUE'
-        
+
         query += ' ORDER BY um."user_name"'
-        
+
         try:
             return self.db.execute_query(query, (tenant_id,))
         except Exception as e:
             print(f"Error fetching users for tenant {tenant_id}: {e}")
             return []
-    
+
     def get_user_by_id(self, tenant_id: int, user_id: int) -> Optional[Dict[str, Any]]:
         """
         Get a specific user by ID (with tenant isolation)
-        
+
         Args:
             tenant_id: Tenant identifier
             user_id: User identifier
-        
+
         Returns:
             User record or None
         """
         query = """
-            SELECT 
+            SELECT
                 um.*,
                 rm."role_name",
                 rm."role_code"
             FROM "StreemLyne_MT"."User_Master" um
-            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON rm."role_id" = em."role_id"
+            LEFT JOIN "StreemLyne_MT"."User_Role_Mapping" urm ON urm.user_id = um.user_id
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON rm.role_id = urm.role_id
             WHERE um."Tenant_id" = %s
-            AND um."User_id" = %s
+            AND um."user_id" = %s
             LIMIT 1
         """
-        
+
         try:
             return self.db.execute_query(query, (tenant_id, user_id), fetch_one=True)
         except Exception as e:
             print(f"Error fetching user {user_id}: {e}")
             return None
-    
+
     def get_users_by_role(self, tenant_id: int, role_id: int) -> List[Dict[str, Any]]:
         """
         Get all users with a specific role
-        
+
         Args:
             tenant_id: Tenant identifier
             role_id: Role identifier
-        
+
         Returns:
             List of users with the specified role
         """
         query = """
-            SELECT 
+            SELECT
                 um.*,
                 rm."role_name",
                 rm."role_code"
             FROM "StreemLyne_MT"."User_Master" um
-            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON rm."role_id" = em."role_id"
+            LEFT JOIN "StreemLyne_MT"."User_Role_Mapping" urm ON urm.user_id = um.user_id
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON rm.role_id = urm.role_id
             WHERE um."Tenant_id" = %s
-            AND um."Role_id" = %s
+            AND urm.role_id = %s
             AND um."is_active" = TRUE
             ORDER BY um."user_name"
         """
-        
+
         try:
             return self.db.execute_query(query, (tenant_id, role_id))
         except Exception as e:

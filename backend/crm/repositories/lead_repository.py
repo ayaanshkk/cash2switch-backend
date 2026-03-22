@@ -119,6 +119,12 @@ class LeadRepository:
             LEFT JOIN "StreemLyne_MT"."User_Master" um ON od."opportunity_owner_employee_id" = um."user_id"
             -- NOTE: business rule change — leads are tenant-scoped on Opportunity_Details.tenant_id
             WHERE od."tenant_id" = %s
+
+            AND NOT EXISTS (
+                SELECT 1
+                FROM "StreemLyne_MT"."Project_Details" pd
+                WHERE pd.opportunity_id = od.opportunity_id
+            )
         """
         params = [tenant_id]
         
@@ -1009,6 +1015,11 @@ class LeadRepository:
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
             WHERE cm."tenant_id" = %s
+            AND NOT EXISTS (
+                SELECT 1
+                FROM "StreemLyne_MT"."Project_Details" pd
+                WHERE pd.opportunity_id = od.opportunity_id
+            )
             ORDER BY od."created_at" DESC
         """
         try:
@@ -1048,104 +1059,117 @@ class LeadRepository:
     def get_leads_list(self, tenant_id: int, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
         Return a minimal, tenant-scoped list of leads (read-only projection).
-        By default, excludes Lost leads (deleted_at IS NULL).
-
-        Fields returned (strict):
-          - opportunity_id
-          - business_name
-          - contact_person
-          - tel_number
-          - email
-          - mpan_mpr
-          - start_date
-          - stage_id
-          - stage_name
-          - created_at
-
-        Sorting: latest first (created_at DESC)
-        Uses ONLY Opportunity_Details table - NO Project_Details or Client_Master joins
+        Excludes records that have a Project_Details entry (those are renewals).
+        Includes supplier_name, annual_usage, end_date from Opportunity_Details columns.
         """
-        # Base query: use Opportunity_Details columns directly
-        # Tenant filter: od.tenant_id OR od.client_id -> Client_Master.tenant_id (for renewals with null od.tenant_id)
         query = '''
             SELECT
                 od."opportunity_id",
+                od."tenant_lead_id",
                 COALESCE(od."business_name", cm."client_company_name", od."opportunity_title") AS business_name,
                 COALESCE(od."contact_person", cm."client_contact_name") AS contact_person,
                 COALESCE(od."tel_number", cm."client_phone") AS tel_number,
                 COALESCE(od."email", cm."client_email") AS email,
                 od."mpan_mpr",
+                od."mpan_bottom",
                 od."start_date",
-                NULL AS end_date,
+                od."end_date",
                 od."service_id",
                 od."stage_id",
                 sm."stage_name",
                 od."opportunity_owner_employee_id",
-                em."employee_name" as assigned_to_name,
-                od."created_at"
+                em."employee_name" AS assigned_to_name,
+                od."created_at",
+                od."supplier_id",
+                sup."supplier_company_name" AS supplier_name,
+                od."annual_usage",
+                od."stand_charge",
+                od."rate_1",
+                od."net_notch",
+                od."payment_type",
+                od."postcode",
+                od."mobile_no"
             FROM "StreemLyne_MT"."Opportunity_Details" od
-            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
-            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
-            LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
+            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"                      = sm."stage_id"
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
+            LEFT JOIN "StreemLyne_MT"."Client_Master"   cm  ON od."client_id"                     = cm."client_id"
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"                   = sup."supplier_id"
             WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
+            AND NOT EXISTS (
+                SELECT 1
+                FROM "StreemLyne_MT"."Project_Details" pd
+                WHERE pd.opportunity_id = od.opportunity_id
+            )
         '''
-
+ 
         params = [tenant_id, tenant_id]
-        # support filtering by stage_id
-        if filters and isinstance(filters, dict) and filters.get('stage_id'):
-            query += ' AND od."stage_id" = %s'
-            params.append(int(filters.get('stage_id')))
-        
-        # support filtering by stage_name (e.g., ?stage=Lost)
-        if filters and isinstance(filters, dict) and filters.get('stage'):
-            query += ' AND sm."stage_name" = %s'
-            params.append(filters.get('stage'))
-        
-        # support excluding by stage_name (e.g., ?exclude_stage=Lost)
-        if filters and isinstance(filters, dict) and filters.get('exclude_stage'):
-            query += ' AND (sm."stage_name" IS NULL OR sm."stage_name" != %s)'
-            params.append(filters.get('exclude_stage'))
-
-        # Filter by service_id (electricity=1, water=2)
-        # Only include leads with matching service_id, exclude NULL values when filtering
-        if filters and isinstance(filters, dict) and filters.get('service_id') is not None:
-            query += ' AND od."service_id" = %s'
-            params.append(int(filters.get('service_id')))
-        
-        # Filter by assigned employee (opportunity_owner_employee_id)
-        if filters and isinstance(filters, dict) and filters.get('assigned_to') is not None:
-            query += ' AND od."opportunity_owner_employee_id" = %s'
-            params.append(int(filters.get('assigned_to')))
-
+ 
+        if filters and isinstance(filters, dict):
+            if filters.get('stage_id'):
+                query += ' AND od."stage_id" = %s'
+                params.append(int(filters['stage_id']))
+ 
+            if filters.get('stage'):
+                query += ' AND sm."stage_name" = %s'
+                params.append(filters['stage'])
+ 
+            if filters.get('exclude_stage'):
+                query += ' AND (sm."stage_name" IS NULL OR sm."stage_name" != %s)'
+                params.append(filters['exclude_stage'])
+ 
+            if filters.get('service_id') is not None:
+                query += ' AND od."service_id" = %s'
+                params.append(int(filters['service_id']))
+ 
+            if filters.get('assigned_to') is not None:
+                query += ' AND od."opportunity_owner_employee_id" = %s'
+                params.append(int(filters['assigned_to']))
+ 
         query += ' ORDER BY od."created_at" DESC'
-
+ 
         try:
             rows = self.db.execute_query(query, tuple(params))
             if not rows:
                 return []
-
+ 
             out = []
             for r in rows:
+                def _iso(v):
+                    return v.isoformat() if getattr(v, 'isoformat', None) else (v or None)
+ 
                 out.append({
-                    'opportunity_id': r.get('opportunity_id'),
-                    'business_name': r.get('business_name'),
-                    'contact_person': r.get('contact_person'),
-                    'tel_number': r.get('tel_number'),
-                    'email': r.get('email'),
-                    'mpan_mpr': r.get('mpan_mpr'),
-                    'start_date': r.get('start_date').isoformat() if getattr(r.get('start_date'), 'isoformat', None) else (r.get('start_date') or None),
-                    'end_date': r.get('end_date').isoformat() if getattr(r.get('end_date'), 'isoformat', None) else (r.get('end_date') or None),
-                    'service_id': r.get('service_id'),
-                    'stage_id': r.get('stage_id'),
-                    'stage_name': r.get('stage_name'),
+                    'opportunity_id':                r.get('opportunity_id'),
+                    'tenant_lead_id':                r.get('tenant_lead_id'),
+                    'business_name':                 r.get('business_name'),
+                    'contact_person':                r.get('contact_person'),
+                    'tel_number':                    str(r.get('tel_number')).replace('.0', '') if r.get('tel_number') else None,
+                    'mobile_no':                     r.get('mobile_no'),
+                    'email':                         r.get('email'),
+                    'mpan_mpr':                      r.get('mpan_mpr'),
+                    'mpan_bottom':                   r.get('mpan_bottom'),
+                    'start_date':                    _iso(r.get('start_date')),
+                    'end_date':                      _iso(r.get('end_date')),
+                    'service_id':                    r.get('service_id'),
+                    'stage_id':                      r.get('stage_id'),
+                    'stage_name':                    r.get('stage_name'),
                     'opportunity_owner_employee_id': r.get('opportunity_owner_employee_id'),
-                    'assigned_to_name': r.get('assigned_to_name'),
-                    'created_at': r.get('created_at').isoformat() if getattr(r.get('created_at'), 'isoformat', None) else (r.get('created_at') or None),
+                    'assigned_to_name':              r.get('assigned_to_name'),
+                    'created_at':                    _iso(r.get('created_at')),
+                    # ✅ New fields from ALTER TABLE migration
+                    'supplier_id':                   r.get('supplier_id'),
+                    'supplier_name':                 r.get('supplier_name'),
+                    'annual_usage':                  r.get('annual_usage'),
+                    'stand_charge':                  r.get('stand_charge'),
+                    'rate_1':                        r.get('rate_1'),
+                    'net_notch':                     r.get('net_notch'),
+                    'payment_type':                  r.get('payment_type'),
+                    'postcode':                      r.get('postcode'),
                 })
             return out
         except Exception as e:
             logger.exception('get_leads_list failed for tenant=%s: %s', tenant_id, e)
             return []
+
 
     def get_priced_leads(self, tenant_id: int) -> List[Dict[str, Any]]:
         """

@@ -68,21 +68,72 @@ def get_leads():
 @tenant_from_jwt
 def get_lead_detail(opportunity_id):
     """
-    Get details of a specific lead
-    
-    Path Parameters:
-        - opportunity_id: Opportunity identifier
-    
-    Authentication:
-        - JWT (token must include `tenant_id`)
-    
-    Returns:
-        200: Lead details with related interactions
-        404: Lead not found
-        500: Internal server error
+    GET /api/crm/leads/<id>
+    Accepts both tenant_lead_id (the display ID in the URL) and opportunity_id.
+    Tries tenant_lead_id first, then falls back to opportunity_id.
     """
-    return crm_controller.get_lead_detail(opportunity_id)
-
+    from backend.crm.supabase_client import get_supabase_client
+ 
+    try:
+        tenant_id = g.tenant_id
+        db = get_supabase_client()
+ 
+        LEAD_SELECT = '''
+            SELECT
+                od.*,
+                sm."stage_name",
+                em."employee_name"          AS assigned_to_name,
+                COALESCE(od."business_name", od."opportunity_title")
+                                            AS business_name,
+                sup."supplier_company_name" AS supplier_name
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm
+                   ON od."stage_id"     = sm."stage_id"
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em
+                   ON od."opportunity_owner_employee_id" = em."employee_id"
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup
+                   ON od."supplier_id"  = sup."supplier_id"
+            WHERE od."tenant_id" = %s
+        '''
+ 
+        # Try tenant_lead_id first (this is the display ID shown in the URL)
+        row = db.execute_query(
+            LEAD_SELECT + ' AND od."tenant_lead_id" = %s LIMIT 1',
+            (tenant_id, opportunity_id),
+            fetch_one=True
+        )
+ 
+        # Fall back to opportunity_id (internal DB primary key)
+        if not row:
+            row = db.execute_query(
+                LEAD_SELECT + ' AND od."opportunity_id" = %s LIMIT 1',
+                (tenant_id, opportunity_id),
+                fetch_one=True
+            )
+ 
+        if not row:
+            return jsonify({'error': 'Lead not found'}), 404
+ 
+        # Serialise dates / decimals so JSON doesn't choke
+        def _serial(v):
+            if v is None:
+                return None
+            if hasattr(v, 'isoformat'):
+                return v.isoformat()
+            try:
+                from decimal import Decimal
+                if isinstance(v, Decimal):
+                    return float(v)
+            except ImportError:
+                pass
+            return v
+ 
+        result = {k: _serial(v) for k, v in row.items()}
+        return jsonify(result), 200
+ 
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 @crm_bp.route('/leads', methods=['POST'])
 @token_required
@@ -110,32 +161,112 @@ def create_lead():
     return crm_controller.create_lead()
 
 
-@crm_bp.route('/leads/<int:opportunity_id>', methods=['PUT'])
+@crm_bp.route('/leads/<int:opportunity_id>', methods=['PUT', 'PATCH'])
 @token_required
 @tenant_from_jwt
 def update_lead(opportunity_id):
     """
-    Update an existing lead
-    
-    Path Parameters:
-        - opportunity_id: Opportunity identifier
-    
-    Request Body:
-        - opportunity_name: Lead/opportunity name (optional)
-        - client_name: Client name (optional)
-        - stage_id: Stage identifier (optional)
-        - status: Lead status (optional)
-        - estimated_value: Estimated value (optional)
-        - assigned_to: Assigned user ID (optional)
-    
-    Authentication:
-        - JWT (token must include `tenant_id`)
-    
-    Returns:
-        200: Lead updated successfully
-        404: Lead not found
-        500: Internal server error
+    PUT  /api/crm/leads/<opportunity_id>  — full update via controller
+    PATCH /api/crm/leads/<opportunity_id> — partial field update (any fields)
     """
+    if request.method == 'PATCH':
+        from backend.crm.supabase_client import get_supabase_client
+ 
+        # Fields that are safe to update directly via PATCH
+        ALLOWED_PATCH_FIELDS = {
+            'stage_id', 'status',
+            # contact
+            'business_name', 'contact_person', 'tel_number', 'mobile_no',
+            'email', 'position', 'company_number', 'date_of_birth',
+            'opportunity_owner_employee_id',
+            # contract
+            'mpan_mpr', 'mpan_bottom', 'supplier_id',
+            'annual_usage', 'start_date', 'end_date', 'payment_type',
+            'term_sold', 'net_notch', 'comms_paid', 'aggregator',
+            'site_name', 'month_sold',
+            # address
+            'house_name', 'house_number', 'door_number', 'address',
+            'town', 'county', 'postcode',
+            # charges
+            'stand_charge', 'rate_1', 'rate_2', 'rate_3',
+            'night_charge', 'eve_weekend_charge',
+            'other_charges_1', 'other_charges_2', 'other_charges_3',
+            # banking
+            'bank_name', 'bank_account_number', 'bank_sort_code',
+            'charity_ltd_company_number', 'partner_details',
+            # others
+            'meter_ref', 'uplift', 'comments', 'document_details',
+        }
+ 
+        try:
+            tenant_id = g.tenant_id
+            data = request.get_json() or {}
+ 
+            # Filter to only allowed fields.
+            # NOTE: explicitly keep None values so callers can nullify optional fields.
+            # Non-nullable columns (e.g. stage_id) must never be set to NULL —
+            # the frontend always sends a valid value for those.
+            update_fields = {
+                k: v for k, v in data.items()
+                if k in ALLOWED_PATCH_FIELDS
+            }
+ 
+            if not update_fields:
+                return jsonify({'error': 'No valid fields provided'}), 400
+ 
+            db = get_supabase_client()
+ 
+            # Resolve the actual opportunity_id from either tenant_lead_id or opportunity_id
+            id_row = db.execute_query('''
+                SELECT "opportunity_id" FROM "StreemLyne_MT"."Opportunity_Details"
+                WHERE "tenant_id" = %s
+                AND ("tenant_lead_id" = %s OR "opportunity_id" = %s)
+                LIMIT 1
+            ''', (tenant_id, opportunity_id, opportunity_id), fetch_one=True)
+ 
+            if not id_row:
+                return jsonify({'error': 'Lead not found'}), 404
+ 
+            real_id = id_row['opportunity_id']
+ 
+            # Build SET clause dynamically
+            set_parts = [f'"{k}" = %s' for k in update_fields]
+            params = list(update_fields.values()) + [real_id, tenant_id]
+ 
+            try:
+                db.execute_update(
+                    f'UPDATE "StreemLyne_MT"."Opportunity_Details" '
+                    f'SET {", ".join(set_parts)} '
+                    f'WHERE "opportunity_id" = %s AND "tenant_id" = %s',
+                    tuple(params)
+                )
+            except Exception as db_err:
+                import traceback; traceback.print_exc()
+                return jsonify({'error': f'Database update failed: {str(db_err)}'}), 500
+ 
+            # Return the updated record
+            updated = db.execute_query('''
+                SELECT
+                    od.*,
+                    sm."stage_name",
+                    em."employee_name" AS assigned_to_name,
+                    COALESCE(od."business_name", od."opportunity_title") AS business_name,
+                    sup."supplier_company_name" AS supplier_name
+                FROM "StreemLyne_MT"."Opportunity_Details" od
+                LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"   = sm."stage_id"
+                LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
+                LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id" = sup."supplier_id"
+                WHERE od."opportunity_id" = %s AND od."tenant_id" = %s
+                LIMIT 1
+            ''', (real_id, tenant_id), fetch_one=True)
+ 
+            return jsonify(updated or {'success': True}), 200
+ 
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            return jsonify({'error': str(e)}), 500
+ 
+    # PUT — full update via controller
     return crm_controller.update_lead(opportunity_id)
 
 
@@ -196,6 +327,158 @@ def delete_lead(opportunity_id):
         500: Internal server error
     """
     return crm_controller.delete_lead(opportunity_id)
+
+@crm_bp.route('/leads/performance', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_leads_performance():
+    """
+    GET /api/crm/leads/performance
+    Get lead performance metrics for the current tenant.
+    Query params:
+        - use_current_user: if 'true', filter by current logged-in user
+        - service: 'utilities' or 'water'
+    """
+    from backend.crm.supabase_client import get_supabase_client
+    from .auth_helpers import get_tenant_id_from_user
+ 
+    try:
+        tenant_id = g.tenant_id
+        service_param = request.args.get('service', 'utilities')
+        service_id = 2 if service_param.strip().lower() == 'water' else 1
+ 
+        use_current_user = request.args.get('use_current_user', 'false').lower() == 'true'
+        employee_id = None
+        if use_current_user:
+            current_user = request.current_user
+            employee_id = getattr(current_user, 'employee_id', None) or getattr(current_user, 'id', None)
+ 
+        db = get_supabase_client()
+ 
+        employee_filter = 'AND od."opportunity_owner_employee_id" = %s' if employee_id else ''
+ 
+        query = f'''
+            SELECT sm."stage_name"
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
+            WHERE od."tenant_id" = %s
+            AND od."service_id" = %s
+            AND NOT EXISTS (
+                SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd
+                WHERE pd.opportunity_id = od.opportunity_id
+            )
+            {employee_filter}
+        '''
+ 
+        params = [tenant_id, service_id]
+        if employee_id:
+            params.append(employee_id)
+ 
+        rows = db.execute_query(query, tuple(params))
+ 
+        converted_count = 0
+        renewed_count = 0
+        in_progress_count = 0
+        not_contacted_count = 0
+        lost_count = 0
+        renewed_directly_count = 0
+        end_date_changed_count = 0
+        priced_count = 0
+ 
+        for r in (rows or []):
+            stage = (r.get('stage_name') or '').lower()
+            if stage == 'converted':
+                converted_count += 1
+            elif stage in ['already renewed', 'renewed']:
+                renewed_count += 1
+            elif stage == 'renewed directly':
+                renewed_directly_count += 1
+            elif stage == 'end date changed':
+                end_date_changed_count += 1
+            elif stage == 'priced':
+                priced_count += 1
+            elif stage in ['callback', 'not answered', 'broker in place', 'email only',
+                           'complaint', 'incorrect supplier']:
+                in_progress_count += 1
+            elif stage in ['lost', 'lost cot', 'invalid number', 'meter de-energised']:
+                lost_count += 1
+            else:
+                not_contacted_count += 1
+ 
+        total = len(rows or [])
+        success_rate = round(
+            ((converted_count + renewed_count + renewed_directly_count) / total * 100), 1
+        ) if total > 0 else 0
+ 
+        return jsonify({
+            'converted_count':       converted_count,
+            'renewed_count':         renewed_count,
+            'renewed_directly_count': renewed_directly_count,
+            'end_date_changed_count': end_date_changed_count,
+            'priced_count':          priced_count,
+            'contacted_count':       in_progress_count,
+            'not_contacted_count':   not_contacted_count,
+            'lost_count':            lost_count,
+            'success_rate':          success_rate,
+            'total_customers':       total,
+        }), 200
+ 
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+ 
+ 
+@crm_bp.route('/leads/stats-by-employee', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_leads_stats_by_employee():
+    """
+    GET /api/crm/leads/stats-by-employee
+    Returns lead counts grouped by employee for the Team Overview panel.
+    """
+    from backend.crm.supabase_client import get_supabase_client
+ 
+    try:
+        tenant_id = g.tenant_id
+        service_param = request.args.get('service', 'utilities')
+        service_id = 2 if service_param.strip().lower() == 'water' else 1
+ 
+        db = get_supabase_client()
+ 
+        rows = db.execute_query('''
+            SELECT
+                em."employee_id",
+                em."employee_name",
+                COUNT(od."opportunity_id") AS count
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            JOIN "StreemLyne_MT"."Employee_Master" em
+                ON od."opportunity_owner_employee_id" = em."employee_id"
+            WHERE od."tenant_id" = %s
+            AND od."service_id" = %s
+            AND NOT EXISTS (
+                SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd
+                WHERE pd.opportunity_id = od.opportunity_id
+            )
+            GROUP BY em."employee_id", em."employee_name"
+            ORDER BY count DESC
+        ''', (tenant_id, service_id))
+ 
+        stats = [
+            {
+                'employee_id':   r.get('employee_id'),
+                'employee_name': r.get('employee_name'),
+                'count':         int(r.get('count') or 0),
+            }
+            for r in (rows or [])
+        ]
+ 
+        return jsonify({'stats': stats}), 200
+ 
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 @crm_bp.route('/leads/bulk-delete', methods=['POST'])
 @require_tenant
@@ -926,3 +1209,176 @@ def get_priced():
         500: Internal server error
     """
     return crm_controller.get_priced()
+
+@crm_bp.route('/leads/<int:opportunity_id>/callback', methods=['POST', 'OPTIONS'])
+@token_required
+@tenant_from_jwt
+def leads_callback(opportunity_id):
+    """
+    POST /api/crm/leads/<opportunity_id>/callback
+    Save a callback/status update for a lead.
+    Updates stage_id on Opportunity_Details based on status.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+ 
+    from backend.crm.supabase_client import get_supabase_client
+ 
+    try:
+        tenant_id = g.tenant_id
+ 
+        # ✅ FIX: force=True parses JSON even without Content-Type: application/json
+        # silent=True returns None instead of raising on parse error
+        data = request.get_json(force=True, silent=True) or {}
+ 
+        # Debug: log what we actually received so 400s are self-explanatory
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info('leads_callback: opportunity_id=%s tenant=%s data_keys=%s',
+                    opportunity_id, tenant_id, list(data.keys()) if data else 'EMPTY')
+ 
+        status           = data.get('status')
+        stage_id         = data.get('stage_id')
+        notes            = data.get('notes', '')
+        callback_date    = data.get('callback_date')
+        called_date      = data.get('called_date')
+        is_sold          = data.get('is_sold')
+        new_end_date_str = data.get('new_end_date')
+        renewed_by       = data.get('renewed_by')
+        new_supplier     = data.get('new_supplier')
+        new_address      = data.get('new_address')
+ 
+        if not status:
+            logger.warning('leads_callback: missing status, raw body=%s', request.get_data(as_text=True)[:200])
+            return jsonify({'error': 'Status is required'}), 400
+ 
+        # ── Status config ──────────────────────────────────────────────────────
+        status_config = {
+            "Callback":          {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
+            "Not Answered":      {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
+            "Priced":            {"requires_date": False, "requires_sold": True,  "deletes_record": False, "requires_notes": False},
+            "Lost":              {"requires_date": True,  "requires_sold": False, "deletes_record": True,  "requires_notes": True},
+            "Lost COT":          {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
+            "Already Renewed":   {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
+            "Invalid Number":    {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": False},
+            "Meter De-energised":{"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": False},
+            "Broker in Place":   {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
+            "End Date Changed":  {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
+            "Complaint":         {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": True},
+            "Email Only":        {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
+            "Renewed Directly":  {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": True},
+            "Incorrect Supplier":{"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": True},
+            "Converted":         {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
+        }
+ 
+        if status not in status_config:
+            return jsonify({'error': f'Invalid status: {status}'}), 400
+ 
+        cfg = status_config[status]
+ 
+        # ── Validation ─────────────────────────────────────────────────────────
+        if cfg['requires_notes'] and not (notes or '').strip():
+            return jsonify({'error': 'Notes are required for this status'}), 400
+ 
+        if cfg['requires_sold'] and is_sold is None:
+            return jsonify({'error': 'Please select if the contract was sold'}), 400
+ 
+        if status == 'Already Renewed' and not renewed_by:
+            return jsonify({'error': 'Please select if renewed by customer or agent'}), 400
+ 
+        db = get_supabase_client()
+ 
+        # ── Verify lead belongs to tenant and resolve real opportunity_id ────────
+        lead = db.execute_query('''
+            SELECT opportunity_id, stage_id
+            FROM "StreemLyne_MT"."Opportunity_Details"
+            WHERE tenant_id = %s
+            AND ("tenant_lead_id" = %s OR opportunity_id = %s)
+            LIMIT 1
+        ''', (tenant_id, opportunity_id, opportunity_id), fetch_one=True)
+ 
+        if not lead:
+            return jsonify({'error': 'Lead not found'}), 404
+ 
+        # Use the resolved real opportunity_id for all subsequent DB operations
+        real_id = lead['opportunity_id']
+ 
+        # ── Handle recycle bin statuses ────────────────────────────────────────
+        if cfg['deletes_record']:
+            lost_stage_id = stage_id
+            if not lost_stage_id:
+                lost_stage = db.execute_query(
+                    'SELECT stage_id FROM "StreemLyne_MT"."Stage_Master" '
+                    'WHERE LOWER(stage_name) = %s LIMIT 1',
+                    (status.lower(),), fetch_one=True
+                )
+                lost_stage_id = lost_stage.get('stage_id') if lost_stage else 5
+ 
+            db.execute_update('''
+                UPDATE "StreemLyne_MT"."Opportunity_Details"
+                SET stage_id = %s
+                WHERE opportunity_id = %s AND tenant_id = %s
+            ''', (lost_stage_id, real_id, tenant_id))
+ 
+            return jsonify({
+                'success': True,
+                'message': f'Moved to recycle bin ({status})',
+                'moved_to_recycle_bin': True,
+            }), 200
+ 
+        # ── Handle Priced: not sold → move to Priced page ─────────────────────
+        if status == 'Priced' and is_sold is False:
+            db.execute_update('''
+                UPDATE "StreemLyne_MT"."Opportunity_Details"
+                SET stage_id = %s
+                WHERE opportunity_id = %s AND tenant_id = %s
+            ''', (stage_id or 4, real_id, tenant_id))
+ 
+            return jsonify({
+                'success': True,
+                'message': 'Moved to Priced page',
+                'moved_to_priced': True,
+            }), 200
+ 
+        # ── Update end date if provided ────────────────────────────────────────
+        if new_end_date_str and status in ('End Date Changed', 'Already Renewed'):
+            db.execute_update('''
+                UPDATE "StreemLyne_MT"."Opportunity_Details"
+                SET end_date = %s
+                WHERE opportunity_id = %s AND tenant_id = %s
+            ''', (new_end_date_str, real_id, tenant_id))
+ 
+        # ── Update supplier if provided ────────────────────────────────────────
+        if new_supplier and new_supplier.strip():
+            sup = db.execute_query('''
+                SELECT supplier_id FROM "StreemLyne_MT"."Supplier_Master"
+                WHERE LOWER(supplier_company_name) = LOWER(%s)
+                LIMIT 1
+            ''', (new_supplier.strip(),), fetch_one=True)
+            if sup:
+                db.execute_update('''
+                    UPDATE "StreemLyne_MT"."Opportunity_Details"
+                    SET supplier_id = %s
+                    WHERE opportunity_id = %s AND tenant_id = %s
+                ''', (sup['supplier_id'], real_id, tenant_id))
+ 
+        # ── Update stage_id ────────────────────────────────────────────────────
+        if stage_id:
+            db.execute_update('''
+                UPDATE "StreemLyne_MT"."Opportunity_Details"
+                SET stage_id = %s
+                WHERE opportunity_id = %s AND tenant_id = %s
+            ''', (stage_id, real_id, tenant_id))
+ 
+        logger.info('leads_callback: saved status=%s for real_id=%s (url_id=%s)', status, real_id, opportunity_id)
+ 
+        return jsonify({
+            'success': True,
+            'message': 'Callback saved successfully',
+            'status': status,
+        }), 200
+ 
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500

@@ -43,6 +43,10 @@ else:
     # No pgBouncer-specific options are passed.
     engine = create_engine(
         DATABASE_URL,
+        pool_size=3,
+        max_overflow=2,
+        pool_timeout=30,
+        pool_recycle=1800,
         pool_pre_ping=True,
         connect_args={"sslmode": "require"}
     )

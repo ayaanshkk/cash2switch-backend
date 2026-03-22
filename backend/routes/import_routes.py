@@ -15,10 +15,12 @@ import tempfile
 
 from ..models import (
     Client_Master, Project_Details, Energy_Contract_Master,
-    Opportunity_Details, Supplier_Master, Employee_Master, Services_Master
+    Supplier_Master, Employee_Master, Services_Master
 )
 from .auth_helpers import token_required
 from ..db import SessionLocal
+from .leads_import_handler import import_leads_handler, download_leads_template_handler
+
 
 logger = logging.getLogger(__name__)
 import_bp = Blueprint('import', __name__)
@@ -249,6 +251,15 @@ def parse_number(value):
     except (ValueError, AttributeError):
         return None
 
+def safe_str(value):
+    """Convert value to clean string, remove .0 suffix from numeric strings"""
+    if pd.isna(value) or value is None or value == '':
+        return ''
+    str_value = str(value).strip()
+    if str_value.endswith('.0') and str_value[:-2].replace('.', '', 1).isdigit():
+        str_value = str_value[:-2]
+    return str_value
+
 
 @import_bp.route('/energy-customers', methods=['POST', 'OPTIONS'])
 @token_required
@@ -439,18 +450,6 @@ def import_energy_customers():
                 if col in possible_names:
                     actual_columns[field] = col
                     break
-
-        def safe_str(value):
-            if pd.isna(value) or value is None or value == '':
-                return ''
-            
-            str_value = str(value).strip()
-            
-            # Remove .0 suffix from numeric strings
-            if str_value.endswith('.0') and str_value[:-2].replace('.', '', 1).isdigit():
-                str_value = str_value[:-2]
-            
-            return str_value
         
         # PRE-LOAD SUPPLIERS
         suppliers_dict = {}
@@ -465,7 +464,7 @@ def import_energy_customers():
         existing_contracts_query = session.query(
             Energy_Contract_Master,
             Client_Master.tenant_id,
-            Client_Master.assigned_employee_id,
+            Project_Details.assigned_employee_id,
             Employee_Master.employee_name,
             Client_Master.client_company_name,
             Client_Master.is_archived
@@ -474,7 +473,7 @@ def import_energy_customers():
         ).join(
             Client_Master, Project_Details.client_id == Client_Master.client_id
         ).outerjoin(
-            Employee_Master, Client_Master.assigned_employee_id == Employee_Master.employee_id
+            Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id  
         ).all()
 
         for contract, contract_tenant_id, assigned_emp_id, emp_name, company_name, is_archived in existing_contracts_query:
@@ -738,7 +737,8 @@ def import_energy_customers():
                                         client_contact_name=contact_person or '',
                                         address=address or '',
                                         post_code=postcode or '',
-                                        client_phone=phone or '',
+                                        client_phone=tel_no or '',
+                                        client_mobile=mobile_no or None,
                                         client_email=email or '',
                                         client_website='',
                                         default_currency_id=1,
@@ -764,31 +764,17 @@ def import_energy_customers():
                                     
                                     archived_client_id = archived_client.client_id
                                     
-                                    # Create archived opportunity
-                                    archived_opportunity = Opportunity_Details(
-                                        client_id=archived_client_id,
-                                        opportunity_title=business_name or '',
-                                        opportunity_description='Imported from bulk upload',
-                                        opportunity_date=datetime.utcnow().date(),
-                                        opportunity_owner_employee_id=opportunity_owner_id,
-                                        stage_id=1,
-                                        opportunity_value=0,
-                                        currency_id=1,
-                                        created_at=datetime.utcnow(),
-                                        Misc_Col1=None
-                                    )
-                                    session.add(archived_opportunity)
-                                    session.flush()
-                                    
                                     # Create archived project
                                     archived_project = Project_Details(
                                         client_id=archived_client_id,
-                                        opportunity_id=archived_opportunity.opportunity_id,
+                                        opportunity_id=None,
                                         project_title=business_name or '',
                                         project_description='Imported site location',
                                         start_date=start_date if start_date else datetime.utcnow().date(),
                                         end_date=end_date,
                                         employee_id=employee_id,
+                                        assigned_employee_id=opportunity_owner_id,    
+                                        status=None,                                  
                                         created_at=datetime.utcnow(),
                                         updated_at=datetime.utcnow(),
                                         address=site_address or address or '',
@@ -894,47 +880,6 @@ def import_energy_customers():
 
                 # CREATE NEW CLIENT
                 try:
-                    # ✅ PRE-CHECK: Look for existing customer by email/phone (before database insert)
-                    existing_customer = None
-                    
-                    if email or phone:
-                        existing_customer = session.query(Client_Master).filter(
-                            Client_Master.tenant_id == tenant_id,
-                            or_(
-                                and_(
-                                    Client_Master.client_email == email,
-                                    Client_Master.client_email != '',
-                                    Client_Master.client_email.isnot(None)
-                                ) if email else False,
-                                and_(
-                                    Client_Master.client_phone == phone,
-                                    Client_Master.client_phone != '',
-                                    Client_Master.client_phone.isnot(None)
-                                ) if phone else False,
-                                and_(
-                                    Client_Master.client_contact_name == contact_person,
-                                    Client_Master.client_phone == phone,
-                                    Client_Master.client_contact_name != '',
-                                    Client_Master.client_phone != ''
-                                ) if contact_person and phone else False
-                            ),
-                            Client_Master.is_deleted == False,
-                            Client_Master.is_archived == False
-                        ).first()
-
-                    if existing_customer:
-                        error_msg = f"Customer '{contact_person}'"
-                        if business_name:
-                            error_msg += f" from '{business_name}'"
-                        if email:
-                            error_msg += f" (Email: {email})"
-                        error_msg += " already exists in your account"
-                        
-                        errors.append(error_msg)
-                        error_count += 1
-                        print(f"⏭️ Row {index + 2}: {error_msg}")
-                        continue
-
                     new_client = Client_Master(
                         tenant_id=tenant_id,
                         assigned_employee_id=opportunity_owner_id,
@@ -944,7 +889,8 @@ def import_energy_customers():
                         post_code=postcode or '',
                         home_door_number=home_door_number or None,
                         home_street=home_street or None,
-                        client_phone=phone or '',
+                        client_phone=tel_no or '',
+                        client_mobile=mobile_no or None,
                         client_email=email or '',
                         client_website='',
                         default_currency_id=1,
@@ -965,23 +911,7 @@ def import_energy_customers():
                     session.flush()
                     
                     client_id = new_client.client_id
-                    
-                    # Create Opportunity
-                    opportunity = Opportunity_Details(
-                        client_id=client_id,
-                        opportunity_title=business_name or '',
-                        opportunity_description='Imported from bulk upload',
-                        opportunity_date=datetime.utcnow().date(),
-                        opportunity_owner_employee_id=opportunity_owner_id,
-                        stage_id=1,
-                        opportunity_value=0,
-                        currency_id=1,
-                        created_at=datetime.utcnow(),
-                        Misc_Col1=None
-                    )
-                    session.add(opportunity)
-                    session.flush()
-                    
+                                        
                     # Create Project
                     project = None
                     if site_address or annual_usage or mpan_top or start_date or end_date:
@@ -989,12 +919,14 @@ def import_energy_customers():
                         project_end_date = end_date if end_date else None
                         project = Project_Details(
                             client_id=client_id,
-                            opportunity_id=opportunity.opportunity_id,
+                            opportunity_id=None,                      
                             project_title=business_name or '',
                             project_description='Imported site location',
                             start_date=project_start_date,
                             end_date=project_end_date,
                             employee_id=employee_id,
+                            assigned_employee_id=opportunity_owner_id,
+                            status=None,                                 
                             created_at=datetime.utcnow(),
                             updated_at=datetime.utcnow(),
                             address=site_address or address or '',
@@ -1339,17 +1271,8 @@ def reset_energy_client_sequence():
         # Reset Energy_Contract_Master sequence  
         session.execute(text("""
             SELECT setval(
-                pg_get_serial_sequence('"StreemLyne_MT"."Energy_Contract_Master"', 'ecm_id'),
-                COALESCE((SELECT MAX(ecm_id) FROM "StreemLyne_MT"."Energy_Contract_Master"), 0),
-                true
-            )
-        """))
-        
-        # Reset Opportunity_Details sequence
-        session.execute(text("""
-            SELECT setval(
-                pg_get_serial_sequence('"StreemLyne_MT"."Opportunity_Details"', 'opportunity_id'),
-                COALESCE((SELECT MAX(opportunity_id) FROM "StreemLyne_MT"."Opportunity_Details"), 0),
+                pg_get_serial_sequence('"StreemLyne_MT"."Energy_Contract_Master"', 'energy_contract_master_id'),
+                COALESCE((SELECT MAX(energy_contract_master_id) FROM "StreemLyne_MT"."Energy_Contract_Master"), 0),
                 true
             )
         """))
@@ -1447,3 +1370,391 @@ def archive_customer(session, client_id, reason="Superseded by newer contract"):
         client.archived_reason = reason
         
         current_app.logger.info(f"📦 Archived client {client_id}: {client.client_company_name}")
+
+@import_bp.route('/leads', methods=['POST', 'OPTIONS'])
+@token_required
+def import_leads():
+    """
+    Bulk import leads from Excel/CSV.
+    Uses the same column map as /import/energy-customers but writes
+    ONLY to Opportunity_Details (no Project_Details, no Energy_Contract_Master).
+    This keeps leads separate from renewals.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+ 
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+ 
+    file = request.files['file']
+    if not file.filename:
+        return jsonify({'error': 'No file selected'}), 400
+ 
+    filename = secure_filename(file.filename)
+    if not ('.' in filename and filename.rsplit('.', 1)[1].lower() in {'xlsx', 'xls', 'csv'}):
+        return jsonify({'error': 'Invalid file type. Please upload .xlsx, .xls, or .csv'}), 400
+ 
+    tenant_id = get_tenant_id_from_user(request.current_user)
+    if not tenant_id:
+        return jsonify({'error': 'Tenant not found for user'}), 400
+ 
+    employee_id = request.current_user.employee_id
+    assigned_employee_id = request.form.get('assigned_employee_id', type=int)
+    opportunity_owner_id = assigned_employee_id if assigned_employee_id else employee_id
+ 
+    # Get assigned employee name for response
+    assigned_employee_name = None
+    session = SessionLocal()
+    try:
+        if assigned_employee_id:
+            ae = session.query(Employee_Master).filter_by(
+                employee_id=assigned_employee_id,
+                tenant_id=tenant_id
+            ).first()
+            if ae:
+                assigned_employee_name = ae.employee_name
+            else:
+                return jsonify({'error': f'Invalid employee ID: {assigned_employee_id}'}), 400
+ 
+        service_param = request.args.get('service', 'electricity')
+        service_id_map = {'electricity': 1, 'utilities': 1, 'water': 2, 'gas': 3}
+        import_service_id = service_id_map.get(service_param.strip().lower(), 1)
+ 
+        # ── Read file ──────────────────────────────────────────────────────────
+        file_ext = filename.rsplit('.', 1)[1].lower()
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_ext}') as tmp:
+                file.save(tmp.name)
+                tmp_path = tmp.name
+            if file_ext == 'csv':
+                df = pd.read_csv(tmp_path, encoding='utf-8-sig', dtype=str)
+            else:
+                try:
+                    df = pd.read_excel(tmp_path, engine='openpyxl', dtype=str)
+                except Exception:
+                    df = pd.read_excel(tmp_path, engine='xlrd', dtype=str)
+            os.unlink(tmp_path)
+        except Exception as e:
+            return jsonify({'error': f'Failed to read file: {str(e)}'}), 400
+ 
+        # ── Same column map as energy-customers import ─────────────────────────
+        # Normalise headers first
+        original_cols = list(df.columns)
+        df.columns = df.columns.str.strip().str.lower().str.replace('_', ' ').str.replace(r'\s+', ' ', regex=True)
+ 
+        column_map = {
+            'client_name':    ['client name', 'business name', 'company name'],
+            'trading_name':   ['trading name', 'business', 'company'],
+            'main_contact':   ['main contact', 'contact person', 'contact'],
+            'position':       ['position', 'role', 'title'],
+            'tel_no':         ['tel no', 'phone', 'telephone', 'tel'],
+            'mobile_no':      ['mobile no', 'mobile', 'cell'],
+            'email':          ['email', 'e-mail'],
+            'site_name':      ['site name', 'site'],
+            'month_sold':     ['month sold', 'sale month'],
+            'house_name':     ['house name'],
+            'house_number':   ['house number', 'house no'],
+            'door_number':    ['door number'],
+            'address_line_1': ['address line 1', 'address 1', 'street'],
+            'address_line_2': ['address line 2', 'address 2'],
+            'address_line_3': ['address line 3', 'address 3'],
+            'town':           ['town', 'city'],
+            'county':         ['county', 'region'],
+            'postcode':       ['postcode', 'post code', 'zip', 'home post code', 'home postcode'],
+            'home_door_number': ['home door number', 'home door no'],
+            'home_street':    ['home street'],
+            'mpan_top':       ['mpan top', 'mpan core'],
+            'mpan_bottom':    ['mpan bottom', 'mpan llf'],
+            'data_source':    ['data source'],
+            'old_supplier':   ['old supplier'],
+            'supplier':       ['supplier', 'supplier name'],
+            'payment_type':   ['payment type'],
+            'net_notch':      ['net notch'],
+            'term_sold':      ['term sold', 'in contract', 'contract length'],
+            'agent_sold':     ['agent sold'],
+            'start_date':     ['start date', 'contract start'],
+            'contract_end':   ['contract end', 'end date', 'expiry'],
+            'stand_charge':   ['stand charge', 'standing charge'],
+            'rate_1':         ['rate 1', 'unit rate', 'rate'],
+            'rate_2':         ['rate 2'],
+            'rate_3':         ['rate 3'],
+            'aggregator':     ['aggregator'],
+            'annual_usage':   ['annual usage', 'usage', 'kwh'],
+            'comms_paid':     ['comms paid', 'commission'],
+            'trading_type':   ['trading type'],
+            'company_number': ['company number', 'co number'],
+            'date_of_birth':  ['date of birth', 'dob'],
+            'charity_ltd_company_number': ['charity/ltd company number', 'charity number'],
+            'bank_name':      ['bank name', 'bank'],
+            'ac_number':      ['ac number', 'account number'],
+            'sort_code':      ['sort code'],
+            'partner_details':['partner details', 'partner'],
+            'partner_dob':    ['partner date of birth', 'partner dob'],
+            'credit_score':   ['credit score'],
+            'password':       ['password'],
+        }
+ 
+        actual_columns = {}
+        for field, aliases in column_map.items():
+            for col in df.columns:
+                if col in aliases:
+                    actual_columns[field] = col
+                    break
+ 
+        # Restore original column names
+        df.columns = original_cols
+ 
+        # Rebuild mapping with original-cased column names
+        norm_to_orig = {}
+        for orig in original_cols:
+            normed = orig.strip().lower().replace('_', ' ')
+            import re
+            normed = re.sub(r'\s+', ' ', normed)
+            norm_to_orig[normed] = orig
+ 
+        actual_columns_orig = {}
+        for field, normed_col in actual_columns.items():
+            actual_columns_orig[field] = norm_to_orig.get(normed_col, normed_col)
+ 
+        def gcol(field):
+            return actual_columns_orig.get(field, '')
+ 
+        # Get default stage_id for leads
+        from ..models import Stage_Master
+        default_stage = session.query(Stage_Master).order_by(Stage_Master.stage_id).first()
+        default_stage_id = default_stage.stage_id if default_stage else 1
+ 
+        # ── Pre-load existing lead MPANs for duplicate checking ────────────────
+        existing_lead_mpans = {}
+        existing_leads_rows = session.execute(text("""
+            SELECT od."mpan_mpr", od."tenant_id", od."business_name", od."opportunity_title"
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            WHERE od."mpan_mpr" IS NOT NULL AND od."mpan_mpr" != ''
+            AND NOT EXISTS (
+                SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd
+                WHERE pd.opportunity_id = od.opportunity_id
+            )
+        """)).fetchall()
+ 
+        for lead_row in existing_leads_rows:
+            mpan_key = lead_row[0].strip().lower()
+            if mpan_key not in existing_lead_mpans:
+                existing_lead_mpans[mpan_key] = []
+            existing_lead_mpans[mpan_key].append({
+                'tenant_id': lead_row[1],
+                'business_name': lead_row[2] or lead_row[3],
+            })
+ 
+        current_app.logger.info(f"📊 Loaded {len(existing_lead_mpans)} existing lead MPANs for duplicate checking")
+ 
+        # Duplicate tracking
+        lead_duplicate_details = []
+        lead_cross_tenant_duplicates = []
+        lead_duplicate_count = 0
+ 
+        # ── Process rows ───────────────────────────────────────────────────────
+        total_rows = len(df)
+        success_count = 0
+        error_count = 0
+        errors = []
+ 
+        for index, row in df.iterrows():
+            try:
+                client_name    = safe_str(row.get(gcol('client_name'), ''))
+                trading_name   = safe_str(row.get(gcol('trading_name'), ''))
+                main_contact   = safe_str(row.get(gcol('main_contact'), ''))
+                tel_no         = safe_str(row.get(gcol('tel_no'), ''))
+                mobile_no      = safe_str(row.get(gcol('mobile_no'), ''))
+                email          = safe_str(row.get(gcol('email'), ''))
+                mpan_top       = safe_str(row.get(gcol('mpan_top'), ''))
+                mpan_bottom    = safe_str(row.get(gcol('mpan_bottom'), ''))
+                supplier_name  = safe_str(row.get(gcol('supplier'), ''))
+                start_date     = parse_date(row.get(gcol('start_date'), ''))
+                end_date       = parse_date(row.get(gcol('contract_end'), ''))
+                annual_usage   = parse_number(row.get(gcol('annual_usage'), ''))
+                payment_type   = safe_str(row.get(gcol('payment_type'), ''))
+                site_name      = safe_str(row.get(gcol('site_name'), ''))
+                town           = safe_str(row.get(gcol('town'), ''))
+                county         = safe_str(row.get(gcol('county'), ''))
+                postcode       = safe_str(row.get(gcol('postcode'), ''))
+                addr1          = safe_str(row.get(gcol('address_line_1'), ''))
+                position       = safe_str(row.get(gcol('position'), ''))
+                month_sold     = safe_str(row.get(gcol('month_sold'), ''))
+                house_name     = safe_str(row.get(gcol('house_name'), ''))
+                house_number   = safe_str(row.get(gcol('house_number'), ''))
+                door_number    = safe_str(row.get(gcol('door_number'), ''))
+                addr2          = safe_str(row.get(gcol('address_line_2'), ''))
+                addr3          = safe_str(row.get(gcol('address_line_3'), ''))
+ 
+                business_name  = trading_name or client_name
+                contact_person = main_contact or client_name
+                phone          = tel_no or mobile_no
+ 
+                # Skip blank rows
+                if not business_name and not phone and not email and not mpan_top and not contact_person:
+                    continue
+ 
+                # ── Duplicate check ────────────────────────────────────────────
+                if mpan_top:
+                    mpan_key = mpan_top.strip().lower()
+                    existing_records = existing_lead_mpans.get(mpan_key)
+ 
+                    if existing_records:
+                        lead_duplicate_count += 1
+ 
+                        cross_tenant = None
+                        same_tenant = None
+ 
+                        for rec in existing_records:
+                            if rec['tenant_id'] != tenant_id:
+                                cross_tenant = rec
+                                break
+                            else:
+                                same_tenant = rec
+ 
+                        # Cross-tenant: always skip
+                        if cross_tenant:
+                            lead_cross_tenant_duplicates.append({
+                                'row': index + 2,
+                                'mpan': mpan_top,
+                                'new_company': business_name,
+                                'existing_company': cross_tenant['business_name'],
+                            })
+                            current_app.logger.info(f"⚠️ Row {index + 2}: Cross-tenant duplicate MPAN {mpan_top} — skipping")
+                            continue
+ 
+                        # Same-tenant: skip duplicate
+                        if same_tenant:
+                            lead_duplicate_details.append({
+                                'row': index + 2,
+                                'mpan': mpan_top,
+                                'company': business_name,
+                                'action': 'Duplicate MPAN - skipped',
+                            })
+                            current_app.logger.info(f"⏭️ Row {index + 2}: Same-tenant duplicate MPAN {mpan_top} — skipping")
+                            continue
+ 
+                # Find supplier_id if supplier name provided
+                supplier_id = None
+                if supplier_name:
+                    sup = session.query(Supplier_Master).filter(
+                        Supplier_Master.supplier_company_name.ilike(f'%{supplier_name}%')
+                    ).first()
+                    if sup:
+                        supplier_id = sup.supplier_id
+ 
+                # ✅ INSERT ONLY INTO Opportunity_Details — no Client_Master, no Project_Details
+                result = session.execute(text("""
+                    INSERT INTO "StreemLyne_MT"."Opportunity_Details"
+                    (tenant_id, client_id, opportunity_title, opportunity_description,
+                    opportunity_date, opportunity_owner_employee_id, stage_id,
+                    opportunity_value, currency_id, created_at, "Misc_Col1",
+                    business_name, contact_person, tel_number, mobile_no, email,
+                    mpan_mpr, mpan_bottom, start_date, end_date, service_id,
+                    supplier_id, annual_usage, stand_charge, rate_1, rate_2,
+                    rate_3, net_notch, payment_type, postcode)
+                    VALUES
+                    (:tenant_id, NULL, :title, 'Imported lead',
+                    :opp_date, :owner_id, :stage_id,
+                    0, 1, :created_at, NULL,
+                    :business_name, :contact_person, :tel_number, :mobile_no, :email,
+                    :mpan_mpr, :mpan_bottom, :start_date, :end_date, :service_id,
+                    :supplier_id, :annual_usage, :stand_charge, :rate_1, :rate_2,
+                    :rate_3, :net_notch, :payment_type, :postcode)
+                """), {
+                    'tenant_id': tenant_id,
+                    'title': business_name or '',
+                    'opp_date': datetime.utcnow().date(),
+                    'owner_id': opportunity_owner_id,
+                    'stage_id': default_stage_id,
+                    'created_at': datetime.utcnow(),
+                    'business_name': business_name or None,
+                    'contact_person': contact_person or None,
+                    'tel_number': phone or None,
+                    'mobile_no': mobile_no or None,
+                    'email': email or None,
+                    'mpan_mpr': mpan_top or None,
+                    'mpan_bottom': mpan_bottom or None,
+                    'start_date': start_date,
+                    'end_date': end_date,
+                    'service_id': import_service_id,
+                    'supplier_id': supplier_id,
+                    'annual_usage': int(annual_usage) if annual_usage else None,
+                    'stand_charge': parse_number(row.get(gcol('stand_charge'), '')),
+                    'rate_1': parse_number(row.get(gcol('rate_1'), '')),
+                    'rate_2': parse_number(row.get(gcol('rate_2'), '')),
+                    'rate_3': parse_number(row.get(gcol('rate_3'), '')),
+                    'net_notch': parse_number(row.get(gcol('net_notch'), '')),
+                    'payment_type': payment_type or None,
+                    'postcode': postcode or None,
+                })
+                session.flush()
+                success_count += 1
+ 
+                # ✅ Register newly imported MPAN so subsequent rows in same file are checked
+                if mpan_top:
+                    mpan_key = mpan_top.strip().lower()
+                    if mpan_key not in existing_lead_mpans:
+                        existing_lead_mpans[mpan_key] = []
+                    existing_lead_mpans[mpan_key].append({
+                        'tenant_id': tenant_id,
+                        'business_name': business_name,
+                    })
+ 
+                if success_count % 50 == 0:
+                    session.commit()
+ 
+            except Exception as row_err:
+                session.rollback()
+                error_count += 1
+                err_str = str(row_err).split('\n')[0][:150]
+                errors.append(f"Row {index + 2}: {err_str}")
+                continue
+ 
+        # Final commit
+        try:
+            session.commit()
+        except Exception:
+            session.rollback()
+ 
+        current_app.logger.info(f"✅ Leads import: {success_count} inserted, {lead_duplicate_count} duplicates, {error_count} errors")
+ 
+        # ── Build duplicate report ─────────────────────────────────────────────
+        duplicate_report = []
+        if lead_duplicate_details:
+            duplicate_report.append("📋 SAME-TENANT DUPLICATES:")
+            for d in lead_duplicate_details:
+                duplicate_report.append(f"  Row {d['row']}: {d['company']} (MPAN: {d['mpan']}) — {d['action']}")
+        if lead_cross_tenant_duplicates:
+            duplicate_report.append("⚠️ CROSS-TENANT DUPLICATES (SKIPPED):")
+            for d in lead_cross_tenant_duplicates:
+                duplicate_report.append(f"  Row {d['row']}: {d['new_company']} (MPAN: {d['mpan']}) — exists in another account")
+ 
+        return jsonify({
+            'success': True,
+            'message': 'Import completed',
+            'total_rows': total_rows,
+            'successful': success_count,
+            'duplicates': lead_duplicate_count,
+            'same_tenant_duplicates': len(lead_duplicate_details),
+            'cross_tenant_duplicates': len(lead_cross_tenant_duplicates),
+            'failed': error_count,
+            'errors': errors[:50],
+            'duplicate_report': duplicate_report,
+            'assigned_to': assigned_employee_name,
+            'assigned_employee_id': assigned_employee_id,
+        }), 200
+ 
+    except Exception as e:
+        session.rollback()
+        import traceback
+        traceback.print_exc()
+        current_app.logger.error(f"❌ Leads import failed: {str(e)}")
+        return jsonify({'error': f'Import failed: {str(e)}'}), 500
+    finally:
+        session.close()
+
+@import_bp.route('/leads/template', methods=['GET'])
+@token_required
+def download_leads_template():
+    return download_leads_template_handler()
