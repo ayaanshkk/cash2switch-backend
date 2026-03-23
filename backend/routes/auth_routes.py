@@ -107,7 +107,8 @@ def token_required(f):
                     current_app.logger.warning("token missing user identifier")
                     return jsonify({'error': 'Invalid token payload'}), 401
 
-                user = local_session.get(UserMaster, user_id)
+                # ✅ FIX: Look up by employee_id, not by primary key
+                user = local_session.query(UserMaster).filter_by(employee_id=user_id).first()
 
                 if not user:
                     current_app.logger.warning(f"Auth token valid but UserMaster not found (id={user_id})")

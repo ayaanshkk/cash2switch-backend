@@ -44,23 +44,78 @@ crm_controller = CRMController()
 @tenant_from_jwt
 def get_leads():
     """
-    Get all leads for the current tenant
-    
-    Query Parameters:
-        - stage_id: Filter by stage
-        - status: Filter by status (Open, Won, Lost)
-        - assigned_to: Filter by assigned user
-    
-    Authentication:
-        - JWT (token must include `tenant_id`)
-    
-    Returns:
-        200: List of leads with statistics
-        401: Missing tenant in token
-        404: Tenant not found
-        500: Internal server error
+    Get leads scoped to current user (non-admin) or all leads (admin).
+    Supports use_current_user=true param for consistency with renewals.
     """
-    return crm_controller.get_leads()
+    from backend.crm.supabase_client import get_supabase_client
+
+    try:
+        tenant_id = g.tenant_id
+        current_user = request.current_user
+        service_param = request.args.get('service', 'utilities')
+        service_id = 2 if service_param.strip().lower() == 'water' else 1
+        exclude_stage = request.args.get('exclude_stage', '')
+
+        # Determine if user is admin
+        db = get_supabase_client()
+        role_row = db.execute_query('''
+            SELECT rm.role_name
+            FROM "StreemLyne_MT"."User_Role_Mapping" urm
+            JOIN "StreemLyne_MT"."Role_Master" rm ON urm.role_id = rm.role_id
+            WHERE urm.user_id = %s
+            LIMIT 1
+        ''', (current_user.user_id,), fetch_one=True)
+
+        role_name = role_row.get('role_name') if role_row else None
+        is_admin = role_name in ('Platform Admin', 'Tenant Super Admin')
+
+        employee_id = getattr(current_user, 'employee_id', None)
+
+        query = '''
+            SELECT
+                od.*,
+                sm."stage_name",
+                em."employee_name"          AS assigned_to_name,
+                COALESCE(od."business_name", od."opportunity_title") AS business_name,
+                sup."supplier_company_name" AS supplier_name
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"    = sm."stage_id"
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
+            WHERE od."tenant_id" = %s
+            AND od."service_id" = %s
+        '''
+        params = [tenant_id, service_id]
+
+        # Non-admins only see their own leads
+        if not is_admin and employee_id:
+            query += ' AND od."opportunity_owner_employee_id" = %s'
+            params.append(employee_id)
+
+        if exclude_stage:
+            query += ' AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") != LOWER(%s))'
+            params.append(exclude_stage)
+
+        query += ' ORDER BY od."created_at" DESC'
+
+        rows = db.execute_query(query, tuple(params))
+
+        def _s(v):
+            if v is None: return None
+            if hasattr(v, 'isoformat'): return v.isoformat()
+            try:
+                from decimal import Decimal
+                if isinstance(v, Decimal): return float(v)
+            except ImportError:
+                pass
+            return v
+
+        results = [{k: _s(v) for k, v in row.items()} for row in (rows or [])]
+        return jsonify(results), 200
+
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 
 @crm_bp.route('/leads/<int:opportunity_id>', methods=['GET'])
@@ -327,6 +382,69 @@ def delete_lead(opportunity_id):
         500: Internal server error
     """
     return crm_controller.delete_lead(opportunity_id)
+
+@crm_bp.route('/leads/search-all', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def search_all_leads():
+    """
+    GET /api/crm/leads/search-all?q=...&service=...
+    Cross-team search — returns all matching leads across the tenant.
+    Used by non-admins to see leads assigned to other team members (shown in amber).
+    """
+    from backend.crm.supabase_client import get_supabase_client
+
+    try:
+        tenant_id = g.tenant_id
+        q = request.args.get('q', '').strip()
+        service_param = request.args.get('service', 'utilities')
+        service_id = 2 if service_param.strip().lower() == 'water' else 1
+
+        if not q or len(q) < 2:
+            return jsonify([]), 200
+
+        db = get_supabase_client()
+
+        rows = db.execute_query('''
+            SELECT
+                od.*,
+                sm."stage_name",
+                em."employee_name"          AS assigned_to_name,
+                COALESCE(od."business_name", od."opportunity_title") AS business_name,
+                sup."supplier_company_name" AS supplier_name
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"    = sm."stage_id"
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
+            WHERE od."tenant_id" = %s
+            AND od."service_id" = %s
+            AND (
+                LOWER(COALESCE(od."business_name", od."opportunity_title", '')) LIKE LOWER(%s)
+                OR LOWER(COALESCE(od."contact_person", ''))  LIKE LOWER(%s)
+                OR LOWER(COALESCE(od."tel_number", ''))      LIKE LOWER(%s)
+                OR LOWER(COALESCE(od."email", ''))           LIKE LOWER(%s)
+                OR LOWER(COALESCE(od."mpan_mpr", ''))        LIKE LOWER(%s)
+            )
+            ORDER BY od."created_at" DESC
+            LIMIT 50
+        ''', (tenant_id, service_id, f'%{q}%', f'%{q}%', f'%{q}%', f'%{q}%', f'%{q}%'))
+
+        def _s(v):
+            if v is None: return None
+            if hasattr(v, 'isoformat'): return v.isoformat()
+            try:
+                from decimal import Decimal
+                if isinstance(v, Decimal): return float(v)
+            except ImportError:
+                pass
+            return v
+
+        results = [{k: _s(v) for k, v in row.items()} for row in (rows or [])]
+        return jsonify(results), 200
+
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 @crm_bp.route('/leads/performance', methods=['GET'])
 @token_required

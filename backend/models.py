@@ -261,7 +261,7 @@ class Project_Details(Base):
     town = Column(String(100))
     county = Column(String(100))
     assigned_employee_id = Column(SmallInteger, nullable=True)
-    status = Column(String(255), nullable=True)  
+    status = Column(String(255), nullable=True) 
 
 
 class Energy_Contract_Master(Base):

@@ -22,14 +22,10 @@ class CRMController:
     # ========================================
     
     def get_leads(self) -> tuple:
-        """
-        GET /api/crm/leads
-        Get all leads for the current tenant
-        """
         try:
             tenant_id = g.tenant_id
-            
-            # Extract query parameters for filtering
+            current_user = getattr(request, 'current_user', None)
+
             filters = {}
             if request.args.get('stage_id'):
                 filters['stage_id'] = int(request.args.get('stage_id'))
@@ -41,7 +37,6 @@ class CRMController:
                 filters['status'] = request.args.get('status')
             if request.args.get('assigned_to'):
                 filters['assigned_to'] = int(request.args.get('assigned_to'))
-            # Service filter: electricity=1, water=2
             service_param = request.args.get('service')
             if service_param and isinstance(service_param, str):
                 svc = service_param.strip().lower()
@@ -49,10 +44,22 @@ class CRMController:
                     filters['service_id'] = 2
                 elif svc == 'electricity':
                     filters['service_id'] = 1
-            
+                else:
+                    filters['service_id'] = 1  # default utilities = electricity = 1
+
+            # ✅ Scope by user — mirrors energy_customer_routes.py exactly
+            if current_user:
+                from backend.crm.utils.role_helpers import is_admin_user
+                if not is_admin_user(current_user):
+                    employee_id = getattr(current_user, 'employee_id', None)
+                    if not employee_id:
+                        # Can't identify user — return empty rather than leak all leads
+                        return jsonify([]), 200
+                    filters['employee_id'] = employee_id
+
             result = self.crm_service.get_leads(tenant_id, filters if filters else None)
             return jsonify(result), 200
-        
+
         except Exception as e:
             return jsonify({
                 'success': False,
