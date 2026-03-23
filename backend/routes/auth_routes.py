@@ -752,6 +752,15 @@ def toggle_user_status(user_id):
     finally:
         session.close()
 
+def get_tenant_id_from_token():
+    """Read tenant_id directly from the JWT — most reliable source."""
+    try:
+        token = request.headers.get('Authorization', '').split(' ')[1]
+        payload = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
+        return payload.get('tenant_id')
+    except Exception:
+        return None
+
 @auth_bp.route('/invite-user', methods=['POST'])
 @admin_required
 def invite_user():
@@ -1115,15 +1124,9 @@ def create_team_invite():
         user = request.current_user
 
         # Get tenant_id from the inviting admin
-        tenant_row = session.execute(text("""
-            SELECT tenant_id FROM "StreemLyne_MT"."Employee_Master"
-            WHERE employee_id = :eid LIMIT 1
-        """), {'eid': user.employee_id}).mappings().first()
-
-        if not tenant_row:
-            return jsonify({'error': 'Could not determine tenant'}), 400
-
-        tenant_id = tenant_row['tenant_id']
+        tenant_id = get_tenant_id_from_token()
+        if not tenant_id:
+            return jsonify({'error': 'Could not determine tenant from token'}), 400
 
         # Validate required fields
         if not data.get('employee_name'):
@@ -1381,15 +1384,11 @@ def list_invites():
     try:
         user = request.current_user
 
-        tenant_row = session.execute(text("""
-            SELECT tenant_id FROM "StreemLyne_MT"."Employee_Master"
-            WHERE employee_id = :eid LIMIT 1
-        """), {'eid': user.employee_id}).mappings().first()
+        tenant_id = get_tenant_id_from_token()
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found in token'}), 400
 
-        if not tenant_row:
-            return jsonify({'error': 'Tenant not found'}), 400
-
-        tenant_id = tenant_row['tenant_id']
+        current_app.logger.info(f"📋 list_invites: tenant_id={tenant_id}")
 
         rows = session.execute(text("""
             SELECT
@@ -1523,12 +1522,8 @@ def delete_team_member(employee_id):
             return jsonify({'error': 'Employee not found'}), 404
 
         # Verify same tenant
-        admin_tenant = session.execute(text("""
-            SELECT tenant_id FROM "StreemLyne_MT"."Employee_Master"
-            WHERE employee_id = :eid LIMIT 1
-        """), {'eid': admin.employee_id}).mappings().first()
-
-        if not admin_tenant or emp_row['tenant_id'] != admin_tenant['tenant_id']:
+        admin_tenant_id = get_tenant_id_from_token()
+        if not admin_tenant_id or emp_row['tenant_id'] != admin_tenant_id:
             return jsonify({'error': 'Cannot delete employee from another tenant'}), 403
 
         user_id = emp_row['user_id']
