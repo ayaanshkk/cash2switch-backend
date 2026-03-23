@@ -1059,3 +1059,506 @@ def change_password():
         
     finally:
         session.close()
+
+# ==========================================
+# INVITE SYSTEM FOR STREEMLYN MT
+# ==========================================
+
+def platform_admin_required(f):
+    """Decorator: only Platform Admin can access"""
+    @wraps(f)
+    @token_required
+    def decorated(*args, **kwargs):
+        session = SessionLocal()
+        try:
+            user = request.current_user
+            result = session.execute(text("""
+                SELECT rm.role_name
+                FROM "StreemLyne_MT"."User_Role_Mapping" urm
+                JOIN "StreemLyne_MT"."Role_Master" rm ON urm.role_id = rm.role_id
+                WHERE urm.user_id = :user_id
+                LIMIT 1
+            """), {'user_id': user.user_id}).fetchone()
+
+            role = result[0] if result else None
+            if role not in ['Platform Admin', 'Tenant Super Admin']:
+                return jsonify({'error': 'Platform Admin access required'}), 403
+
+            return f(*args, **kwargs)
+        finally:
+            session.close()
+    return decorated
+
+
+@auth_bp.route('/invite/create', methods=['POST', 'OPTIONS'])
+@platform_admin_required
+def create_team_invite():
+    """
+    Platform Admin creates a team member invite.
+    Creates Employee_Master + User_Master rows with a token.
+    Team member uses the token to set their password.
+
+    Expected JSON: {
+        "employee_name": "...",
+        "email": "...",          # optional
+        "phone": "...",          # optional
+        "username": "...",
+        "role_id": <int>         # from Role_Master
+    }
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        data = request.get_json() or {}
+        user = request.current_user
+
+        # Get tenant_id from the inviting admin
+        tenant_row = session.execute(text("""
+            SELECT tenant_id FROM "StreemLyne_MT"."Employee_Master"
+            WHERE employee_id = :eid LIMIT 1
+        """), {'eid': user.employee_id}).mappings().first()
+
+        if not tenant_row:
+            return jsonify({'error': 'Could not determine tenant'}), 400
+
+        tenant_id = tenant_row['tenant_id']
+
+        # Validate required fields
+        if not data.get('employee_name'):
+            return jsonify({'error': 'employee_name is required'}), 400
+        if not data.get('username'):
+            return jsonify({'error': 'username is required'}), 400
+        if not data.get('role_id'):
+            return jsonify({'error': 'role_id is required'}), 400
+
+        username = data['username'].strip()
+        employee_name = data['employee_name'].strip()
+        email = data.get('email', '').strip() or None
+        phone = data.get('phone', '').strip() or None
+        role_id = int(data['role_id'])
+
+        # Check username uniqueness
+        existing_user = session.execute(text("""
+            SELECT 1 FROM "StreemLyne_MT"."User_Master"
+            WHERE user_name = :username LIMIT 1
+        """), {'username': username}).first()
+
+        if existing_user:
+            return jsonify({'error': 'Username already exists'}), 400
+
+        # Check email uniqueness if provided
+        if email:
+            existing_email = session.execute(text("""
+                SELECT 1 FROM "StreemLyne_MT"."Employee_Master"
+                WHERE email = :email LIMIT 1
+            """), {'email': email}).first()
+            if existing_email:
+                return jsonify({'error': 'Email already exists'}), 400
+
+        # Verify role_id exists
+        role_row = session.execute(text("""
+            SELECT role_name FROM "StreemLyne_MT"."Role_Master"
+            WHERE role_id = :role_id LIMIT 1
+        """), {'role_id': role_id}).mappings().first()
+
+        if not role_row:
+            return jsonify({'error': 'Invalid role_id'}), 400
+
+        # Generate invite token (used as temp password placeholder)
+        invite_token = secrets.token_urlsafe(32)
+
+        # 1. Create Employee_Master row
+        emp_row = session.execute(text("""
+            INSERT INTO "StreemLyne_MT"."Employee_Master"
+                (tenant_id, employee_name, email, phone)
+            VALUES (:tenant_id, :employee_name, :email, :phone)
+            RETURNING employee_id
+        """), {
+            'tenant_id': tenant_id,
+            'employee_name': employee_name,
+            'email': email,
+            'phone': phone
+        }).mappings().first()
+
+        if not emp_row:
+            session.rollback()
+            return jsonify({'error': 'Failed to create employee'}), 500
+
+        employee_id = emp_row['employee_id']
+
+        # 2. Create User_Master row
+        # Store invite_token in password field temporarily — team member will replace it
+        user_row = session.execute(text("""
+            INSERT INTO "StreemLyne_MT"."User_Master"
+                (employee_id, user_name, password, invite_token, is_invite_pending)
+            VALUES (:employee_id, :user_name, :password, :invite_token, TRUE)
+            RETURNING user_id
+        """), {
+            'employee_id': employee_id,
+            'user_name': username,
+            'password': invite_token,  # placeholder until they set real password
+            'invite_token': invite_token
+        }).mappings().first()
+
+        if not user_row:
+            session.rollback()
+            return jsonify({'error': 'Failed to create user'}), 500
+
+        user_id = user_row['user_id']
+
+        # 3. Assign role via User_Role_Mapping
+        session.execute(text("""
+            INSERT INTO "StreemLyne_MT"."User_Role_Mapping" (user_id, role_id)
+            VALUES (:user_id, :role_id)
+        """), {'user_id': user_id, 'role_id': role_id})
+
+        session.commit()
+
+        # Build invite link (frontend handles this URL)
+        base_url = request.headers.get('Origin', 'https://your-app.vercel.app')
+        invite_link = f"{base_url}/accept-invite?token={invite_token}"
+
+        current_app.logger.info(
+            f"✅ Invite created: employee_id={employee_id} user_id={user_id} "
+            f"username={username} role={role_row['role_name']} tenant_id={tenant_id}"
+        )
+
+        return jsonify({
+            'success': True,
+            'message': 'Invite created successfully',
+            'invite': {
+                'employee_id': employee_id,
+                'user_id': user_id,
+                'employee_name': employee_name,
+                'username': username,
+                'role': role_row['role_name'],
+                'invite_token': invite_token,
+                'invite_link': invite_link,
+            }
+        }), 201
+
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"❌ Error creating invite: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@auth_bp.route('/invite/validate/<token>', methods=['GET', 'OPTIONS'])
+def validate_invite_token(token):
+    """
+    Public endpoint — validate an invite token.
+    Frontend calls this when team member lands on /accept-invite?token=...
+    Returns the username and employee name so the page can greet them.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        row = session.execute(text("""
+            SELECT
+                u.user_id,
+                u.user_name,
+                u.is_invite_pending,
+                e.employee_name,
+                e.email,
+                rm.role_name
+            FROM "StreemLyne_MT"."User_Master" u
+            JOIN "StreemLyne_MT"."Employee_Master" e ON u.employee_id = e.employee_id
+            LEFT JOIN "StreemLyne_MT"."User_Role_Mapping" urm ON u.user_id = urm.user_id
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON urm.role_id = rm.role_id
+            WHERE u.invite_token = :token
+            LIMIT 1
+        """), {'token': token}).mappings().first()
+
+        if not row:
+            return jsonify({'valid': False, 'error': 'Invalid invite link'}), 404
+
+        if not row['is_invite_pending']:
+            return jsonify({'valid': False, 'error': 'Invite already used'}), 400
+
+        return jsonify({
+            'valid': True,
+            'employee_name': row['employee_name'],
+            'username': row['user_name'],
+            'email': row['email'],
+            'role': row['role_name'],
+        }), 200
+
+    except Exception as e:
+        current_app.logger.exception(f"❌ Error validating invite token: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@auth_bp.route('/invite/accept', methods=['POST', 'OPTIONS'])
+def accept_invite():
+    """
+    Public endpoint — team member sets their password using the invite token.
+    After this, they can log in normally via /login.
+
+    Expected JSON: {
+        "token": "...",
+        "password": "..."
+    }
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        data = request.get_json() or {}
+        token = data.get('token')
+        password = data.get('password')
+
+        if not token or not password:
+            return jsonify({'error': 'token and password are required'}), 400
+
+        if len(password) < 6:
+            return jsonify({'error': 'Password must be at least 6 characters'}), 400
+
+        row = session.execute(text("""
+            SELECT u.user_id, u.user_name, u.is_invite_pending, e.employee_id, e.tenant_id, e.employee_name
+            FROM "StreemLyne_MT"."User_Master" u
+            JOIN "StreemLyne_MT"."Employee_Master" e ON u.employee_id = e.employee_id
+            WHERE u.invite_token = :token
+            LIMIT 1
+        """), {'token': token}).mappings().first()
+
+        if not row:
+            return jsonify({'error': 'Invalid invite token'}), 404
+
+        if not row['is_invite_pending']:
+            return jsonify({'error': 'Invite already used. Please log in.'}), 400
+
+        # Set real password, clear token, mark invite as complete
+        session.execute(text("""
+            UPDATE "StreemLyne_MT"."User_Master"
+            SET password = :password,
+                invite_token = NULL,
+                is_invite_pending = FALSE
+            WHERE user_id = :user_id
+        """), {
+            'password': password,
+            'user_id': row['user_id']
+        })
+
+        session.commit()
+
+        current_app.logger.info(
+            f"✅ Invite accepted: user_id={row['user_id']} username={row['user_name']}"
+        )
+
+        return jsonify({
+            'success': True,
+            'message': 'Password set successfully. You can now log in.',
+            'username': row['user_name'],
+        }), 200
+
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"❌ Error accepting invite: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@auth_bp.route('/invite/list', methods=['GET', 'OPTIONS'])
+@platform_admin_required
+def list_invites():
+    """
+    Platform Admin — list all team members (both pending and active) for their tenant.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        user = request.current_user
+
+        tenant_row = session.execute(text("""
+            SELECT tenant_id FROM "StreemLyne_MT"."Employee_Master"
+            WHERE employee_id = :eid LIMIT 1
+        """), {'eid': user.employee_id}).mappings().first()
+
+        if not tenant_row:
+            return jsonify({'error': 'Tenant not found'}), 400
+
+        tenant_id = tenant_row['tenant_id']
+
+        rows = session.execute(text("""
+            SELECT
+                e.employee_id,
+                e.employee_name,
+                e.email,
+                e.phone,
+                u.user_id,
+                u.user_name,
+                u.is_invite_pending,
+                u.invite_token,
+                rm.role_name,
+                rm.role_id
+            FROM "StreemLyne_MT"."Employee_Master" e
+            LEFT JOIN "StreemLyne_MT"."User_Master" u ON e.employee_id = u.employee_id
+            LEFT JOIN "StreemLyne_MT"."User_Role_Mapping" urm ON u.user_id = urm.user_id
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON urm.role_id = rm.role_id
+            WHERE e.tenant_id = :tenant_id
+            ORDER BY e.employee_name ASC
+        """), {'tenant_id': tenant_id}).mappings().all()
+
+        base_url = request.headers.get('Origin', 'https://your-app.vercel.app')
+
+        members = []
+        for r in rows:
+            member = {
+                'employee_id': r['employee_id'],
+                'employee_name': r['employee_name'],
+                'email': r['email'],
+                'phone': r['phone'],
+                'user_id': r['user_id'],
+                'username': r['user_name'],
+                'role': r['role_name'],
+                'role_id': r['role_id'],
+                'is_invite_pending': r['is_invite_pending'],
+                'invite_link': (
+                    f"{base_url}/accept-invite?token={r['invite_token']}"
+                    if r['is_invite_pending'] and r['invite_token']
+                    else None
+                ),
+            }
+            members.append(member)
+
+        return jsonify({'members': members}), 200
+
+    except Exception as e:
+        current_app.logger.exception(f"❌ Error listing invites: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@auth_bp.route('/invite/resend/<int:user_id>', methods=['POST', 'OPTIONS'])
+@platform_admin_required
+def resend_invite(user_id):
+    """
+    Generate a new invite token for a pending team member.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        row = session.execute(text("""
+            SELECT u.user_id, u.user_name, u.is_invite_pending, e.employee_name
+            FROM "StreemLyne_MT"."User_Master" u
+            JOIN "StreemLyne_MT"."Employee_Master" e ON u.employee_id = e.employee_id
+            WHERE u.user_id = :user_id LIMIT 1
+        """), {'user_id': user_id}).mappings().first()
+
+        if not row:
+            return jsonify({'error': 'User not found'}), 404
+
+        if not row['is_invite_pending']:
+            return jsonify({'error': 'User has already accepted their invite'}), 400
+
+        new_token = secrets.token_urlsafe(32)
+
+        session.execute(text("""
+            UPDATE "StreemLyne_MT"."User_Master"
+            SET invite_token = :token, password = :token
+            WHERE user_id = :user_id
+        """), {'token': new_token, 'user_id': user_id})
+
+        session.commit()
+
+        base_url = request.headers.get('Origin', 'https://your-app.vercel.app')
+        invite_link = f"{base_url}/accept-invite?token={new_token}"
+
+        return jsonify({
+            'success': True,
+            'message': 'New invite link generated',
+            'invite_token': new_token,
+            'invite_link': invite_link,
+        }), 200
+
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"❌ Error resending invite: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+@auth_bp.route('/invite/delete/<int:employee_id>', methods=['DELETE', 'OPTIONS'])
+@platform_admin_required
+def delete_team_member(employee_id):
+    """
+    Permanently delete a team member (Employee_Master + User_Master + Role_Mapping).
+    Cannot delete yourself.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        admin = request.current_user
+
+        # Prevent self-deletion
+        if admin.employee_id == employee_id:
+            return jsonify({'error': 'You cannot delete your own account'}), 400
+
+        # Check employee exists and belongs to same tenant
+        emp_row = session.execute(text("""
+            SELECT e.employee_id, e.tenant_id, u.user_id
+            FROM "StreemLyne_MT"."Employee_Master" e
+            LEFT JOIN "StreemLyne_MT"."User_Master" u ON e.employee_id = u.employee_id
+            WHERE e.employee_id = :eid LIMIT 1
+        """), {'eid': employee_id}).mappings().first()
+
+        if not emp_row:
+            return jsonify({'error': 'Employee not found'}), 404
+
+        # Verify same tenant
+        admin_tenant = session.execute(text("""
+            SELECT tenant_id FROM "StreemLyne_MT"."Employee_Master"
+            WHERE employee_id = :eid LIMIT 1
+        """), {'eid': admin.employee_id}).mappings().first()
+
+        if not admin_tenant or emp_row['tenant_id'] != admin_tenant['tenant_id']:
+            return jsonify({'error': 'Cannot delete employee from another tenant'}), 403
+
+        user_id = emp_row['user_id']
+
+        # Delete in order: Role_Mapping → User_Master → Employee_Master
+        if user_id:
+            session.execute(text("""
+                DELETE FROM "StreemLyne_MT"."User_Role_Mapping"
+                WHERE user_id = :user_id
+            """), {'user_id': user_id})
+
+            session.execute(text("""
+                DELETE FROM "StreemLyne_MT"."User_Master"
+                WHERE user_id = :user_id
+            """), {'user_id': user_id})
+
+        session.execute(text("""
+            DELETE FROM "StreemLyne_MT"."Employee_Master"
+            WHERE employee_id = :eid
+        """), {'eid': employee_id})
+
+        session.commit()
+
+        current_app.logger.info(f"✅ Deleted employee_id={employee_id} user_id={user_id}")
+
+        return jsonify({'success': True, 'message': 'Team member deleted successfully'}), 200
+
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"❌ Error deleting team member: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
