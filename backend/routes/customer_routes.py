@@ -811,7 +811,7 @@ def delete_energy_customer(client_id):
         client.is_deleted = True
         client.deleted_at = datetime.utcnow()
         client.deleted_reason = deletion_reason
-                
+
         session.commit()
         
         current_app.logger.info(f"✅ Soft deleted customer {actual_client_id}")
@@ -1904,32 +1904,50 @@ def auto_archive_older_contracts(session, tenant_id, business_name, mpan_top, mp
 
 def recalculate_display_order(session, tenant_id, employee_id=None):
     """
-    Recalculate display_order for all active (non-archived, non-deleted) records
-    If employee_id is provided, only recalculate for that employee's records
-    Otherwise, recalculate for all records in the tenant
+    Recalculate display_order starting from 1 PER EMPLOYEE.
+    Uses ROW_NUMBER() OVER (PARTITION BY assigned_employee_id ORDER BY created_at)
+    so each salesperson's list always starts at 1.
     """
-    from sqlalchemy import and_
-    
-    query = session.query(Client_Master).filter(
-        and_(
-            Client_Master.tenant_id == tenant_id,
-            Client_Master.is_deleted == False,
-            Client_Master.is_archived == False
-        )
-    )
-    
     if employee_id:
-        query = query.filter(Client_Master.assigned_employee_id == employee_id)
-    
-    # Order by created_at (oldest first)
-    clients = query.order_by(Client_Master.created_at.asc()).all()
-    
-    # Assign sequential display_order
-    for idx, client in enumerate(clients, start=1):
-        client.display_order = idx
+        # Recalculate only for this specific employee
+        session.execute(text("""
+            UPDATE "StreemLyne_MT"."Client_Master" cm
+            SET display_order = sub.rn
+            FROM (
+                SELECT client_id,
+                       ROW_NUMBER() OVER (ORDER BY created_at ASC) AS rn
+                FROM "StreemLyne_MT"."Client_Master"
+                WHERE tenant_id = :tenant_id
+                  AND assigned_employee_id = :employee_id
+                  AND is_deleted = FALSE
+                  AND is_archived = FALSE
+            ) sub
+            WHERE cm.client_id = sub.client_id
+        """), {'tenant_id': tenant_id, 'employee_id': employee_id})
+    else:
+        # Recalculate for ALL employees at once using PARTITION BY
+        session.execute(text("""
+            UPDATE "StreemLyne_MT"."Client_Master" cm
+            SET display_order = sub.rn
+            FROM (
+                SELECT client_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY assigned_employee_id
+                           ORDER BY created_at ASC
+                       ) AS rn
+                FROM "StreemLyne_MT"."Client_Master"
+                WHERE tenant_id = :tenant_id
+                  AND is_deleted = FALSE
+                  AND is_archived = FALSE
+            ) sub
+            WHERE cm.client_id = sub.client_id
+        """), {'tenant_id': tenant_id})
     
     session.flush()
-    current_app.logger.info(f"✅ Recalculated display_order for {len(clients)} clients (tenant={tenant_id}, employee={employee_id})")
+    current_app.logger.info(
+        f"✅ Recalculated display_order per-employee "
+        f"(tenant={tenant_id}, employee={employee_id or 'ALL'})"
+    )
 
 @energy_customer_bp.route('/energy-clients/allocated', methods=['GET', 'OPTIONS'])
 @token_required
@@ -2004,7 +2022,7 @@ def get_allocated_contacts():
                 ),
                 *([Energy_Contract_Master.service_id == _service_id] if _service_id is not None else [])
             )
-        ).order_by(Client_Master.created_at.desc())
+        ).order_by(Client_Master.display_order.asc())
  
         results = query.all()
         
