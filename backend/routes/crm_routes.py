@@ -1633,3 +1633,55 @@ def leads_callback(opportunity_id):
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+@crm_bp.route('/leads/allocated', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_allocated_leads():
+    """Get allocated/reassigned leads only"""
+    from backend.crm.supabase_client import get_supabase_client
+    from backend.crm.utils.role_helpers import is_admin_user
+
+    try:
+        tenant_id = g.tenant_id
+        current_user = request.current_user
+        service_param = request.args.get('service', 'utilities')
+        service_id = 2 if service_param.strip().lower() == 'water' else 1
+
+        is_admin = is_admin_user(current_user)
+        employee_id = getattr(current_user, 'employee_id', None)
+        db = get_supabase_client()
+
+        query = '''
+            SELECT od.*, sm."stage_name", em."employee_name" AS assigned_to_name,
+                   COALESCE(od."business_name", od."opportunity_title") AS business_name,
+                   sup."supplier_company_name" AS supplier_name
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id" = sup."supplier_id"
+            WHERE od."tenant_id" = %s AND od."service_id" = %s
+            AND od."opportunity_owner_employee_id" IS NOT NULL
+            AND od."is_allocated" = TRUE
+        '''
+        params = [tenant_id, service_id]
+
+        if not is_admin and employee_id:
+            query += ' AND od."opportunity_owner_employee_id" = %s'
+            params.append(employee_id)
+
+        query += ' ORDER BY od."created_at" DESC'
+        rows = db.execute_query(query, tuple(params))
+        
+        # Serialize dates/decimals
+        def _s(v):
+            if v is None: return None
+            if hasattr(v, 'isoformat'): return v.isoformat()
+            from decimal import Decimal
+            if isinstance(v, Decimal): return float(v)
+            return v
+
+        return jsonify([{k: _s(v) for k, v in row.items()} for row in (rows or [])]), 200
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
