@@ -211,6 +211,7 @@ def get_energy_customers():
         )
         LatestInteraction = aliased(Client_Interactions)
 
+        # ✅ EVERYONE (including admins) only sees their own NON-ALLOCATED contacts
         query = session.query(
             Client_Master,
             Project_Details,
@@ -235,24 +236,24 @@ def get_energy_customers():
             Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
         ).outerjoin(
             Employee_Master,
-            Project_Details.assigned_employee_id == Employee_Master.employee_id  # ✅ Changed
+            Project_Details.assigned_employee_id == Employee_Master.employee_id
         ).filter(
             and_(
                 Client_Master.tenant_id == tenant_id,
                 Client_Master.is_deleted == False,
                 Client_Master.is_archived == False,
+                # ✅ CRITICAL: Only show contacts assigned to THIS user
+                Project_Details.assigned_employee_id == user.employee_id,
+                # ✅ CRITICAL: Only show NON-ALLOCATED contacts (not reassigned)
+                or_(
+                    Client_Master.is_allocated == False,
+                    Client_Master.is_allocated == None
+                ),
                 or_(
                     Project_Details.status == None,
                     ~func.lower(Project_Details.status).in_(['priced', 'lost', 'lost_cot', 'lost cot'])
                 ),
                 *([Energy_Contract_Master.service_id == _service_id] if _service_id is not None else [])
-            )
-        ).filter(
-            Project_Details.assigned_employee_id == user.employee_id  # ✅ Changed
-        ).filter(
-            or_(
-                Client_Master.is_allocated == False,
-                Client_Master.is_allocated == None
             )
         ).order_by(Client_Master.created_at.desc())
  
@@ -432,6 +433,10 @@ def create_energy_customer():
         session.add(new_client)
         session.flush()
         client_id = new_client.client_id
+
+        if assigned_employee_id:
+            recalculate_display_order(session, tenant_id, assigned_employee_id)
+            session.flush()
  
         # 2. Create Project_Details (with assigned_employee_id and status)
         project = Project_Details(
@@ -512,14 +517,28 @@ def update_energy_customer(client_id):
  
     session = SessionLocal()
     try:
-        tenant_id = get_tenant_id_from_user(request.current_user)
         data = request.get_json() or {}
+        print(f"\n{'='*60}")
+        print(f"🔧 UPDATE REQUEST for client {client_id}")
+        print(f"   Data: {data}")
+        print(f"   User: {request.current_user.employee_id}")
+        
+        # ✅ CHECK DATABASE BEFORE ANY CHANGES
+        check_query = session.execute(text("""
+            SELECT cm.assigned_employee_id, pd.assigned_employee_id, cm.is_allocated
+            FROM "StreemLyne_MT"."Client_Master" cm
+            LEFT JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
+            WHERE cm.client_id = :cid
+        """), {'cid': client_id}).fetchone()
+        print(f"   DB BEFORE: client_assigned={check_query[0]}, project_assigned={check_query[1]}, is_allocated={check_query[2]}")
+        print(f"{'='*60}\n")
+        print(f"🔧 UPDATE REQUEST for client {client_id}: {data}")
+        tenant_id = get_tenant_id_from_user(request.current_user)
  
-        client = (
-            session.query(Client_Master).filter_by(display_order=client_id, tenant_id=tenant_id).first() or
-            session.query(Client_Master).filter_by(tenant_client_id=client_id, tenant_id=tenant_id).first() or
-            session.query(Client_Master).filter_by(client_id=client_id, tenant_id=tenant_id).first()
-        )
+        client = session.query(Client_Master).filter_by(
+            client_id=client_id,
+            tenant_id=tenant_id
+        ).first()
         if not client:
             return jsonify({'error': 'Customer not found'}), 404
 
@@ -533,7 +552,7 @@ def update_energy_customer(client_id):
                             ('post_code', 'post_code'), ('website', 'client_website')]:
             if field in data:
                 setattr(client, col, data[field])
- 
+
         # Update Project_Details
         project = session.query(Project_Details).filter_by(client_id=client_id).first()
         if project:
@@ -543,25 +562,51 @@ def update_energy_customer(client_id):
                                 ('door_number', 'door_number'), ('town', 'town'), ('county', 'county')]:
                 if field in data:
                     setattr(project, col, data[field])
- 
+
             # ✅ Status now on Project_Details
             if 'status' in data:
                 status_value = data['status']
                 project.status = None if status_value in ['None', 'null', '', None] else status_value
- 
-            # ✅ Assignment now on Project_Details
-            old_assigned_to = project.assigned_employee_id
-            new_assigned_to = None
-            assignment_notes = data.get('assignment_notes')
- 
+
+            # ✅ CRITICAL: Handle assignment SEPARATELY - query fresh data
             if 'assigned_to_id' in data:
+                # Flush any pending changes FIRST
+                session.flush()
+                
+                # ✅ RE-QUERY to get fresh assignment data from DB
+                fresh_project = session.query(Project_Details).filter_by(client_id=client_id).first()
+                old_assigned_to = fresh_project.assigned_employee_id
                 new_assigned_to = data['assigned_to_id']
+                current_user_employee_id = request.current_user.employee_id
+                assignment_notes = data.get('assignment_notes')
+                
+                print(f"\n📝 Assignment check:")
+                print(f"   Old: {old_assigned_to}")
+                print(f"   New: {new_assigned_to}")
+                print(f"   Current user: {current_user_employee_id}")
+                
+                # Update assignment on BOTH tables
                 project.assigned_employee_id = new_assigned_to
-                client.assigned_employee_id = new_assigned_to  # keep in sync
-                if old_assigned_to and old_assigned_to != new_assigned_to:
+                project.updated_at = datetime.utcnow()
+                client.assigned_employee_id = new_assigned_to
+                
+                # ✅ Determine is_allocated flag
+                if new_assigned_to is None:
+                    client.is_allocated = False
+                    print(f"   ✅ Unassigned - is_allocated = False")
+                elif old_assigned_to == new_assigned_to:
+                    print(f"   ℹ️  No change in assignment")
+                elif new_assigned_to == current_user_employee_id:
+                    client.is_allocated = False
+                    print(f"   ✅ Assigned to self - is_allocated = False")
+                else:
                     client.is_allocated = True
- 
-            project.updated_at = datetime.utcnow()
+                    print(f"   ✅ Assigned to someone else ({new_assigned_to}) - is_allocated = True")
+            else:
+                project.updated_at = datetime.utcnow()
+                old_assigned_to = None
+                new_assigned_to = None
+                assignment_notes = None
  
         elif data.get('site_address') or data.get('annual_usage'):
             project = Project_Details(
@@ -1957,24 +2002,73 @@ def get_allocated_contacts():
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
         user = request.current_user
+        
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found for user'}), 400
+        
+        _service_id = None
+        service_param = request.args.get('service')
+        if service_param and isinstance(service_param, str):
+            svc = service_param.strip().lower()
+            _service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
  
+        latest_sq = (
+            session.query(
+                Client_Interactions.client_id,
+                func.max(Client_Interactions.interaction_id).label('max_id')
+            )
+            .group_by(Client_Interactions.client_id)
+            .subquery()
+        )
+        LatestInteraction = aliased(Client_Interactions)
+
+        # ✅ Show contacts that are:
+        # 1. Assigned to THIS user (Project_Details.assigned_employee_id)
+        # 2. Marked as allocated (is_allocated = True)
         query = session.query(
-            Client_Master, Project_Details, Energy_Contract_Master,
-            Client_Interactions, Supplier_Master, Employee_Master
-        ).outerjoin(Project_Details, Client_Master.client_id == Project_Details.client_id
-        ).outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
-        ).outerjoin(Client_Interactions, Client_Master.client_id == Client_Interactions.client_id
-        ).outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
-        ).outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id
-        ).filter(and_(
-            Client_Master.tenant_id == tenant_id,
-            Client_Master.is_deleted == False,
-            Client_Master.is_archived == False,
-            Client_Master.is_allocated == True,
-            Project_Details.assigned_employee_id == user.employee_id  # ✅ Changed
-        )).order_by(Client_Master.created_at.desc())
+            Client_Master,
+            Project_Details,
+            Energy_Contract_Master,
+            LatestInteraction,
+            Supplier_Master,
+            Employee_Master
+        ).outerjoin(
+            Project_Details, 
+            Client_Master.client_id == Project_Details.client_id
+        ).outerjoin(
+            Energy_Contract_Master, 
+            Project_Details.project_id == Energy_Contract_Master.project_id
+        ).outerjoin(
+            latest_sq,
+            Client_Master.client_id == latest_sq.c.client_id
+        ).outerjoin(
+            LatestInteraction,
+            LatestInteraction.interaction_id == latest_sq.c.max_id
+        ).outerjoin(
+            Supplier_Master, 
+            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
+        ).outerjoin(
+            Employee_Master, 
+            Project_Details.assigned_employee_id == Employee_Master.employee_id
+        ).filter(
+            and_(
+                Client_Master.tenant_id == tenant_id,
+                Client_Master.is_deleted == False,
+                Client_Master.is_archived == False,
+                # ✅ Assigned to THIS user
+                Project_Details.assigned_employee_id == user.employee_id,
+                # ✅ Marked as allocated
+                Client_Master.is_allocated == True,
+                or_(
+                    Project_Details.status == None,
+                    ~func.lower(Project_Details.status).in_(['priced', 'lost', 'lost_cot', 'lost cot'])
+                ),
+                *([Energy_Contract_Master.service_id == _service_id] if _service_id is not None else [])
+            )
+        ).order_by(Client_Master.created_at.desc())
  
         results = query.all()
+        
         customers = []
         seen = set()
  
