@@ -219,7 +219,7 @@ def get_energy_customers():
             LatestInteraction,
             Supplier_Master,
             Employee_Master,
-        ).outerjoin(
+        ).join(
             Project_Details,
             Client_Master.client_id == Project_Details.client_id
         ).outerjoin(
@@ -331,7 +331,7 @@ def get_energy_customer(client_id):
             LatestInteraction,
             Supplier_Master,
             Employee_Master
-        ).outerjoin(
+        ).join(
             Project_Details,
             Client_Master.client_id == Project_Details.client_id
         ).outerjoin(
@@ -771,120 +771,59 @@ def delete_energy_customer(client_id):
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
  
-        client = session.query(Client_Master).filter(
-            and_(
-                Client_Master.display_order == client_id,
-                Client_Master.tenant_id == tenant_id
-            )
-        ).first()
+        # ✅ Try multiple ID fields (display_order, tenant_client_id, client_id)
+        client = (
+            session.query(Client_Master).filter(
+                and_(
+                    Client_Master.display_order == client_id,
+                    Client_Master.tenant_id == tenant_id
+                )
+            ).first() or
+            session.query(Client_Master).filter(
+                and_(
+                    Client_Master.tenant_client_id == client_id,
+                    Client_Master.tenant_id == tenant_id
+                )
+            ).first() or
+            session.query(Client_Master).filter(
+                and_(
+                    Client_Master.client_id == client_id,
+                    Client_Master.tenant_id == tenant_id
+                )
+            ).first()
+        )
  
         if not client:
+            current_app.logger.warning(f"Customer {client_id} not found for deletion")
             return jsonify({'error': 'Customer not found'}), 404
- 
+        
+        # ✅ Soft delete the customer (move to recycle bin)
         actual_client_id = client.client_id
-        assigned_employee_id = client.assigned_employee_id
- 
-        current_app.logger.info(f"🗑️ Deleting customer {actual_client_id}: {client.client_company_name}")
- 
-        session.expunge(client)
-        del client
- 
-        # 0. Customer_Auth
-        auth_deleted = session.execute(text("""
-            DELETE FROM "StreemLyne_MT"."Customer_Auth"
-            WHERE client_id = :client_id
-        """), {'client_id': actual_client_id}).rowcount
- 
-        # 1. Find project IDs
-        project_id_rows = session.execute(text("""
-            SELECT project_id FROM "StreemLyne_MT"."Project_Details"
-            WHERE client_id = :client_id
-        """), {'client_id': actual_client_id}).fetchall()
-        project_ids = [r[0] for r in project_id_rows]
- 
-        # 2. Energy_Contract_Master
-        contracts_deleted = 0
-        if project_ids:
-            contracts_deleted = session.execute(text("""
-                DELETE FROM "StreemLyne_MT"."Energy_Contract_Master"
-                WHERE project_id = ANY(:project_ids)
-            """), {'project_ids': project_ids}).rowcount
- 
-        # 3. Client_Interactions
-        interactions_deleted = session.execute(text("""
-            DELETE FROM "StreemLyne_MT"."Client_Interactions"
-            WHERE client_id = :client_id
-        """), {'client_id': actual_client_id}).rowcount
- 
-        # 4. Project_Details
-        projects_deleted = session.execute(text("""
-            DELETE FROM "StreemLyne_MT"."Project_Details"
-            WHERE client_id = :client_id
-        """), {'client_id': actual_client_id}).rowcount
- 
-        # 5. Client_Master
-        client_deleted = session.execute(text("""
-            DELETE FROM "StreemLyne_MT"."Client_Master"
-            WHERE client_id = :client_id AND tenant_id = :tenant_id
-        """), {'client_id': actual_client_id, 'tenant_id': tenant_id}).rowcount
- 
-        session.commit()
- 
-        if assigned_employee_id:
-            recalculate_display_order(session, tenant_id, assigned_employee_id)
-            session.commit()
- 
-        # Reset sequences
+        
+        # Get reason from request body if provided
         try:
-            max_client_id = session.execute(text("""
-                SELECT COALESCE(MAX(client_id), 0) FROM "StreemLyne_MT"."Client_Master"
-                WHERE tenant_id = :tenant_id
-            """), {'tenant_id': tenant_id}).scalar() or 0
- 
-            max_project_id = session.execute(text("""
-                SELECT COALESCE(MAX(pd.project_id), 0)
-                FROM "StreemLyne_MT"."Project_Details" pd
-                JOIN "StreemLyne_MT"."Client_Master" c ON pd.client_id = c.client_id
-                WHERE c.tenant_id = :tenant_id
-            """), {'tenant_id': tenant_id}).scalar() or 0
- 
-            max_contract_id = session.execute(text("""
-                SELECT COALESCE(MAX(ecm.energy_contract_master_id), 0)
-                FROM "StreemLyne_MT"."Energy_Contract_Master" ecm
-                JOIN "StreemLyne_MT"."Project_Details" p ON ecm.project_id = p.project_id
-                JOIN "StreemLyne_MT"."Client_Master" c ON p.client_id = c.client_id
-                WHERE c.tenant_id = :tenant_id
-            """), {'tenant_id': tenant_id}).scalar() or 0
- 
-            session.execute(text(f"""
-                SELECT setval(pg_get_serial_sequence('"StreemLyne_MT"."Client_Master"', 'client_id'), {max_client_id + 1}, false)
-            """))
-            session.execute(text(f"""
-                SELECT setval(pg_get_serial_sequence('"StreemLyne_MT"."Project_Details"', 'project_id'), {max_project_id + 1}, false)
-            """))
-            session.execute(text(f"""
-                SELECT setval(pg_get_serial_sequence('"StreemLyne_MT"."Energy_Contract_Master"', 'energy_contract_master_id'), {max_contract_id + 1}, false)
-            """))
-            session.commit()
- 
-        except Exception as seq_error:
-            current_app.logger.warning(f"⚠️ Could not reset sequences: {seq_error}")
- 
+            data = request.get_json(silent=True) or {}
+            deletion_reason = data.get('reason', 'Manually deleted')
+        except Exception:
+            deletion_reason = 'Manually deleted'
+        
+        # Soft delete
+        client.is_deleted = True
+        client.deleted_at = datetime.utcnow()
+        client.deleted_reason = deletion_reason
+                
+        session.commit()
+        
+        current_app.logger.info(f"✅ Soft deleted customer {actual_client_id}")
+        
         return jsonify({
             'success': True,
-            'message': 'Customer deleted successfully',
-            'deleted': {
-                'auth': auth_deleted,
-                'contracts': contracts_deleted,
-                'interactions': interactions_deleted,
-                'projects': projects_deleted,
-                'client': client_deleted,
-            }
+            'message': 'Customer moved to recycle bin successfully'
         }), 200
- 
+        
     except Exception as e:
         session.rollback()
-        current_app.logger.error(f"❌ Error deleting customer {client_id}: {str(e)}")
+        current_app.logger.exception(f"❌ Error deleting customer {client_id}: {e}")
         return jsonify({'error': f'Failed to delete customer: {str(e)}'}), 500
     finally:
         session.close()
@@ -914,7 +853,7 @@ def search_energy_customers():
             Client_Interactions,
             Supplier_Master,
             Employee_Master,
-        ).outerjoin(
+        ).join(
             Project_Details, Client_Master.client_id == Project_Details.client_id
         ).outerjoin(
             Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
@@ -1254,7 +1193,7 @@ def search_all_energy_customers():
             Client_Interactions,
             Supplier_Master,
             Employee_Master,
-        ).outerjoin(
+        ).join(
             Project_Details, Client_Master.client_id == Project_Details.client_id
         ).outerjoin(
             Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
@@ -1367,7 +1306,7 @@ def get_priced_customers():
         query = session.query(
             Client_Master, Project_Details, Energy_Contract_Master,
             Client_Interactions, Supplier_Master, Employee_Master
-        ).outerjoin(Project_Details, Client_Master.client_id == Project_Details.client_id
+        ).join(Project_Details, Client_Master.client_id == Project_Details.client_id
         ).outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
         ).outerjoin(Client_Interactions, Client_Master.client_id == Client_Interactions.client_id
         ).outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
@@ -1501,7 +1440,7 @@ def get_recycle_bin():
         query = session.query(
             Client_Master, Project_Details, Energy_Contract_Master,
             Supplier_Master, Employee_Master
-        ).outerjoin(Project_Details, Client_Master.client_id == Project_Details.client_id
+        ).join(Project_Details, Client_Master.client_id == Project_Details.client_id
         ).outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
         ).outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
         ).outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id  # ✅ Changed
@@ -1682,7 +1621,7 @@ def get_archived_customers():
         query = session.query(
             Client_Master, Project_Details, Energy_Contract_Master,
             Supplier_Master, Employee_Master
-        ).outerjoin(Project_Details, Client_Master.client_id == Project_Details.client_id
+        ).join(Project_Details, Client_Master.client_id == Project_Details.client_id
         ).outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
         ).outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
         ).outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id  # ✅ Changed
@@ -2032,7 +1971,7 @@ def get_allocated_contacts():
             LatestInteraction,
             Supplier_Master,
             Employee_Master
-        ).outerjoin(
+        ).join(
             Project_Details, 
             Client_Master.client_id == Project_Details.client_id
         ).outerjoin(

@@ -44,7 +44,7 @@ crm_controller = CRMController()
 @tenant_from_jwt
 def get_leads():
     from backend.crm.supabase_client import get_supabase_client
-    from backend.crm.utils.role_helpers import is_admin_user  # ← ADD THIS
+    from backend.crm.utils.role_helpers import is_admin_user
 
     try:
         tenant_id = g.tenant_id
@@ -52,15 +52,17 @@ def get_leads():
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
         exclude_stage = request.args.get('exclude_stage', '')
+        
+        # ✅ NEW: Check if filtering by current user
+        use_current_user = request.args.get('use_current_user', 'false').lower() == 'true'
 
-        # ── Mirror renewals exactly: use is_admin_user() from role_helpers ──
-        is_admin = is_admin_user(current_user)                  # ← REPLACES the DB role-check try/except block
+        is_admin = is_admin_user(current_user)
         employee_id = getattr(current_user, 'employee_id', None)
 
         import logging
         logging.getLogger(__name__).warning(
-            '🔍 get_leads: employee_id=%s is_admin=%s tenant=%s',
-            employee_id, is_admin, tenant_id
+            '🔍 get_leads: employee_id=%s is_admin=%s tenant=%s use_current_user=%s',
+            employee_id, is_admin, tenant_id, use_current_user
         )
 
         db = get_supabase_client()
@@ -81,8 +83,8 @@ def get_leads():
         '''
         params = [tenant_id, service_id]
 
-        # ── Mirror renewals: non-admins only see their own leads ──
-        if not is_admin:
+        # ✅ CRITICAL: Non-admins OR when use_current_user=true, filter by employee
+        if (not is_admin) or use_current_user:
             if not employee_id:
                 return jsonify([]), 200
             query += ' AND od."opportunity_owner_employee_id" = %s'

@@ -129,7 +129,7 @@ def register_get_cleansing(crm_bp, token_required, tenant_from_jwt):
                             Energy_Contract_Master,
                             Supplier_Master,
                         )
-                        .outerjoin(Project_Details, Client_Master.client_id == Project_Details.client_id)
+                        .join(Project_Details, Client_Master.client_id == Project_Details.client_id)
                         .outerjoin(
                             Energy_Contract_Master,
                             Project_Details.project_id == Energy_Contract_Master.project_id,
