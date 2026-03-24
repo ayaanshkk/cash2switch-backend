@@ -52,17 +52,14 @@ def get_renewals_calendar():
         
         # Build employee filter
         if is_admin and filter_employee_id:
-            employee_filter = f"AND od.opportunity_owner_employee_id = {filter_employee_id}"
-            callback_employee_filter = f"AND od2.opportunity_owner_employee_id = {filter_employee_id}"
-            logging.info(f"📊 Admin viewing calendar for employee_id: {filter_employee_id}")
+            employee_filter = f"AND pd.assigned_employee_id = {filter_employee_id}"
+            callback_employee_filter = f"AND pd2.assigned_employee_id = {filter_employee_id}"
         elif is_admin:
             employee_filter = ""
             callback_employee_filter = ""
-            logging.info(f"📊 Admin viewing all employees' calendars")
         else:
-            employee_filter = f"AND od.opportunity_owner_employee_id = {current_user.employee_id}"
-            callback_employee_filter = f"AND od2.opportunity_owner_employee_id = {current_user.employee_id}"
-            logging.info(f"📊 Salesperson viewing own calendar: {current_user.employee_id}")
+            employee_filter = f"AND pd.assigned_employee_id = {current_user.employee_id}"
+            callback_employee_filter = f"AND pd2.assigned_employee_id = {current_user.employee_id}"
         
         # PART 1: Get contract end dates
         contract_query = text(f'''
@@ -82,7 +79,7 @@ def get_renewals_calendar():
                 ecm.terms_of_sale as contract_notes,
                 srv.service_title,
                 ecm.unit_rate as rates,
-                od."Misc_Col1" as status,
+                pd.status as status,
                 em.employee_name as assigned_to,
                 'contract_end' as event_type
             FROM "StreemLyne_MT"."Client_Master" cm
@@ -90,12 +87,11 @@ def get_renewals_calendar():
             INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
             LEFT JOIN "StreemLyne_MT"."Services_Master" srv ON ecm.service_id = srv.service_id
-            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od ON cm.client_id = od.client_id
-            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON pd.assigned_employee_id = em.employee_id
             WHERE cm.tenant_id = :tenant_id
             AND cm.client_company_name != '[IMPORTED LEADS]'
             AND ecm.contract_end_date IS NOT NULL
-            AND (od."Misc_Col1" IS NULL OR LOWER(od."Misc_Col1") NOT IN ('priced', 'lost'))
+            AND (pd.status IS NULL OR LOWER(pd.status) NOT IN ('priced', 'lost'))
             {employee_filter}
         ''')
         
@@ -118,7 +114,7 @@ def get_renewals_calendar():
                 ci.notes as callback_notes,
                 srv.service_title,
                 ecm.unit_rate as rates,
-                od2."Misc_Col1" as status,
+                pd2.status as status,
                 em2.employee_name as assigned_to,
                 'callback' as event_type
             FROM "StreemLyne_MT"."Client_Interactions" ci
@@ -127,13 +123,13 @@ def get_renewals_calendar():
             LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
             LEFT JOIN "StreemLyne_MT"."Services_Master" srv ON ecm.service_id = srv.service_id
-            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od2 ON cm.client_id = od2.client_id
-            LEFT JOIN "StreemLyne_MT"."Employee_Master" em2 ON od2.opportunity_owner_employee_id = em2.employee_id
+            LEFT JOIN "StreemLyne_MT"."Project_Details" pd2 ON cm.client_id = pd2.client_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em2 ON pd2.assigned_employee_id = em2.employee_id
             WHERE cm.tenant_id = :tenant_id
             AND cm.client_company_name != '[IMPORTED LEADS]'
             AND ci.reminder_date IS NOT NULL
             AND ci.reminder_date >= CURRENT_DATE
-            AND (od2."Misc_Col1" IS NULL OR LOWER(od2."Misc_Col1") NOT IN ('priced', 'lost'))
+            AND (pd2.status IS NULL OR LOWER(pd2.status) NOT IN ('priced', 'lost'))
             {callback_employee_filter}
             ORDER BY cm.client_id, ci.reminder_date DESC
         ''')
@@ -278,11 +274,11 @@ def get_contract_schedule():
             LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
             LEFT JOIN "StreemLyne_MT"."Services_Master" srv ON ecm.service_id = srv.service_id
-            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od ON cm.client_id = od.client_id
+            LEFT JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
             LEFT JOIN "StreemLyne_MT"."Client_Interactions" ci ON cm.client_id = ci.client_id
             WHERE cm.tenant_id = %s
             AND (ecm.contract_end_date IS NOT NULL OR ci.reminder_date IS NOT NULL)
-            AND (od."Misc_Col1" IS NULL OR LOWER(od."Misc_Col1") NOT IN ('priced', 'lost'))
+            AND (pd.status IS NULL OR LOWER(pd.status) NOT IN ('priced', 'lost'))
             ORDER BY cm.client_id
         '''
         

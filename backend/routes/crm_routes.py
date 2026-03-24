@@ -43,11 +43,8 @@ crm_controller = CRMController()
 @token_required
 @tenant_from_jwt
 def get_leads():
-    """
-    Get leads scoped to current user (non-admin) or all leads (admin).
-    Supports use_current_user=true param for consistency with renewals.
-    """
     from backend.crm.supabase_client import get_supabase_client
+    from backend.crm.utils.role_helpers import is_admin_user  # ← ADD THIS
 
     try:
         tenant_id = g.tenant_id
@@ -56,20 +53,17 @@ def get_leads():
         service_id = 2 if service_param.strip().lower() == 'water' else 1
         exclude_stage = request.args.get('exclude_stage', '')
 
-        # Determine if user is admin
-        db = get_supabase_client()
-        role_row = db.execute_query('''
-            SELECT rm.role_name
-            FROM "StreemLyne_MT"."User_Role_Mapping" urm
-            JOIN "StreemLyne_MT"."Role_Master" rm ON urm.role_id = rm.role_id
-            WHERE urm.user_id = %s
-            LIMIT 1
-        ''', (current_user.user_id,), fetch_one=True)
-
-        role_name = role_row.get('role_name') if role_row else None
-        is_admin = role_name in ('Platform Admin', 'Tenant Super Admin')
-
+        # ── Mirror renewals exactly: use is_admin_user() from role_helpers ──
+        is_admin = is_admin_user(current_user)                  # ← REPLACES the DB role-check try/except block
         employee_id = getattr(current_user, 'employee_id', None)
+
+        import logging
+        logging.getLogger(__name__).warning(
+            '🔍 get_leads: employee_id=%s is_admin=%s tenant=%s',
+            employee_id, is_admin, tenant_id
+        )
+
+        db = get_supabase_client()
 
         query = '''
             SELECT
@@ -87,8 +81,10 @@ def get_leads():
         '''
         params = [tenant_id, service_id]
 
-        # Non-admins only see their own leads
-        if not is_admin and employee_id:
+        # ── Mirror renewals: non-admins only see their own leads ──
+        if not is_admin:
+            if not employee_id:
+                return jsonify([]), 200
             query += ' AND od."opportunity_owner_employee_id" = %s'
             params.append(employee_id)
 
@@ -96,7 +92,7 @@ def get_leads():
             query += ' AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") != LOWER(%s))'
             params.append(exclude_stage)
 
-        query += ' ORDER BY od."created_at" DESC'
+        query += ' ORDER BY od."created_at" ASC'
 
         rows = db.execute_query(query, tuple(params))
 

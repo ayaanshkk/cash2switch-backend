@@ -268,11 +268,6 @@ class CRMController:
             }), 500
     
     def assign_leads(self) -> tuple:
-        """
-        PATCH /api/crm/leads/assign
-        Bulk assign leads to an employee. Admin only.
-        Request body: { lead_ids: [...], employee_id: N } or { assigned_to_id: N }
-        """
         try:
             from flask import request
             from backend.crm.utils.role_helpers import is_admin_user
@@ -280,11 +275,9 @@ class CRMController:
             user = getattr(request, 'current_user', None)
             if not user:
                 return jsonify({'success': False, 'error': 'Authentication required'}), 401
-            if not is_admin_user(user):
-                return jsonify({
-                    'error': 'permission_denied',
-                    'message': 'Only administrators can assign'
-                }), 403
+
+            is_admin = is_admin_user(user)
+            employee_id = getattr(user, 'employee_id', None)
 
             tenant_id = g.tenant_id
             payload = request.get_json()
@@ -292,17 +285,33 @@ class CRMController:
                 return jsonify({'success': False, 'error': 'Request body required'}), 400
 
             lead_ids = payload.get('lead_ids')
-            employee_id = payload.get('employee_id') or payload.get('assigned_to_id')
+            target_employee_id = payload.get('employee_id') or payload.get('assigned_to_id')
             if not lead_ids or not isinstance(lead_ids, list) or len(lead_ids) == 0:
                 return jsonify({'success': False, 'error': 'lead_ids must be a non-empty list'}), 400
-            if employee_id is None:
+            if target_employee_id is None:
                 return jsonify({'success': False, 'error': 'employee_id or assigned_to_id required'}), 400
             try:
-                employee_id = int(employee_id)
+                target_employee_id = int(target_employee_id)
             except (ValueError, TypeError):
                 return jsonify({'success': False, 'error': 'employee_id must be a number'}), 400
 
-            result = self.crm_service.assign_leads(tenant_id, lead_ids, employee_id)
+            # Non-admins can only reassign leads that belong to them
+            if not is_admin:
+                from backend.crm.supabase_client import get_supabase_client
+                db = get_supabase_client()
+                placeholders = ','.join(['%s'] * len(lead_ids))
+                owned = db.execute_query(
+                    f'SELECT "opportunity_id" FROM "StreemLyne_MT"."Opportunity_Details" '
+                    f'WHERE "tenant_id" = %s AND "opportunity_owner_employee_id" = %s '
+                    f'AND "opportunity_id" IN ({placeholders})',
+                    (tenant_id, employee_id, *lead_ids)
+                )
+                owned_ids = [r['opportunity_id'] for r in (owned or [])]
+                if not owned_ids:
+                    return jsonify({'error': 'permission_denied', 'message': 'No leads found that belong to you'}), 403
+                lead_ids = owned_ids  # Only reassign what they own
+
+            result = self.crm_service.assign_leads(tenant_id, lead_ids, target_employee_id)
             if not result.get('success'):
                 return jsonify(result), 400
             return jsonify({
@@ -316,7 +325,7 @@ class CRMController:
                 'error': 'Internal server error',
                 'message': str(e)
             }), 500
-
+    
     def delete_lead(self, opportunity_id: int) -> tuple:
         """
         DELETE /api/crm/leads/<opportunity_id>
