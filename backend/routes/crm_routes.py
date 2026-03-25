@@ -550,14 +550,17 @@ def get_leads_stats_by_employee():
     """
     GET /api/crm/leads/stats-by-employee
     Returns lead counts grouped by employee for the Team Overview panel.
-    ✅ FIX: Use is_allocated=FALSE instead of NOT EXISTS check
     """
     from backend.crm.supabase_client import get_supabase_client
+    import logging
+    logger = logging.getLogger(__name__)
 
     try:
         tenant_id = g.tenant_id
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
+
+        logger.warning('🔍 stats-by-employee: tenant_id=%s service_id=%s', tenant_id, service_id)
 
         db = get_supabase_client()
 
@@ -578,6 +581,9 @@ def get_leads_stats_by_employee():
             ORDER BY count DESC
         ''', (tenant_id, service_id))
 
+        logger.warning('📊 Raw rows from DB: %s', rows)
+        logger.warning('📊 Number of rows: %s', len(rows) if rows else 0)
+
         stats = [
             {
                 'employee_id':   r.get('employee_id'),
@@ -587,14 +593,14 @@ def get_leads_stats_by_employee():
             for r in (rows or [])
         ]
 
-        import logging
-        logging.getLogger(__name__).warning('📊 Team Overview stats: %s', stats)
+        logger.warning('📊 Final stats array: %s', stats)
 
         return jsonify({'stats': stats}), 200
 
     except Exception as e:
         import traceback
         traceback.print_exc()
+        logger.error('❌ Error in stats-by-employee: %s', str(e))
         return jsonify({'error': str(e)}), 500
 
 @crm_bp.route('/leads/bulk-delete', methods=['POST'])
