@@ -550,16 +550,18 @@ def get_leads_stats_by_employee():
     """
     GET /api/crm/leads/stats-by-employee
     Returns lead counts grouped by employee for the Team Overview panel.
+    ✅ FIX: Use is_allocated=FALSE instead of NOT EXISTS check
     """
     from backend.crm.supabase_client import get_supabase_client
- 
+
     try:
         tenant_id = g.tenant_id
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
- 
+
         db = get_supabase_client()
- 
+
+        # ✅ FIX: Filter by is_allocated=FALSE to show unallocated leads
         rows = db.execute_query('''
             SELECT
                 em."employee_id",
@@ -570,14 +572,12 @@ def get_leads_stats_by_employee():
                 ON od."opportunity_owner_employee_id" = em."employee_id"
             WHERE od."tenant_id" = %s
             AND od."service_id" = %s
-            AND NOT EXISTS (
-                SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd
-                WHERE pd.opportunity_id = od.opportunity_id
-            )
+            AND COALESCE(od."is_allocated", FALSE) = FALSE
             GROUP BY em."employee_id", em."employee_name"
+            HAVING COUNT(od."opportunity_id") > 0
             ORDER BY count DESC
         ''', (tenant_id, service_id))
- 
+
         stats = [
             {
                 'employee_id':   r.get('employee_id'),
@@ -586,9 +586,12 @@ def get_leads_stats_by_employee():
             }
             for r in (rows or [])
         ]
- 
+
+        import logging
+        logging.getLogger(__name__).warning('📊 Team Overview stats: %s', stats)
+
         return jsonify({'stats': stats}), 200
- 
+
     except Exception as e:
         import traceback
         traceback.print_exc()

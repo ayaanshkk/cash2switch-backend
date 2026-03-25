@@ -773,3 +773,144 @@ def get_renewal_performance():
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
+
+@renewals_bp.route('/energy-renewals/staff-status-counts', methods=['GET'])
+@token_required
+def get_staff_status_counts():
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+
+        employee_id = request.args.get('employee_id', type=int)
+
+        base_sql = """
+            SELECT
+                em.employee_id,
+                em.employee_name,
+                pd.status,
+                COUNT(DISTINCT pd.project_id) as count
+            FROM "StreemLyne_MT"."Employee_Master" em
+            JOIN "StreemLyne_MT"."Project_Details" pd
+                ON em.employee_id = pd.assigned_employee_id
+            JOIN "StreemLyne_MT"."Client_Master" cm
+                ON pd.client_id = cm.client_id
+            LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm
+                ON pd.project_id = ecm.project_id
+            WHERE cm.tenant_id = :tenant_id
+            AND em.tenant_id = :tenant_id
+            AND cm.is_deleted = false
+            {employee_filter}
+            GROUP BY em.employee_id, em.employee_name, pd.status
+            ORDER BY em.employee_name
+        """
+
+        params = {"tenant_id": tenant_id}
+        if employee_id:
+            sql = base_sql.format(employee_filter="AND em.employee_id = :employee_id")
+            params["employee_id"] = employee_id
+        else:
+            sql = base_sql.format(employee_filter="")
+
+        results = session.execute(text(sql), params).fetchall()
+
+        employees = {}
+        for r in results:
+            eid = r.employee_id
+            if eid not in employees:
+                employees[eid] = {
+                    'employee_id': eid,
+                    'employee_name': r.employee_name,
+                    'renewed': 0,
+                    'in_progress': 0,
+                    'not_contacted': 0,
+                    'lost': 0,
+                    'renewed_directly': 0,
+                    'end_date_changed': 0,
+                    'priced': 0,
+                    'total': 0,
+                }
+            count = r.count or 0
+            s = (r.status or '').lower().strip()
+            employees[eid]['total'] += count
+
+            if s == 'already renewed':
+                employees[eid]['renewed'] += count
+            elif s in ('callback', 'called', 'contacted', 'not answered',
+                       'email only', 'broker in place', 'complaint',
+                       'incorrect supplier', 'invalid number'):
+                employees[eid]['in_progress'] += count
+            elif s in ('lost', 'lost cot'):
+                employees[eid]['lost'] += count
+            elif s == 'renewed directly':
+                employees[eid]['renewed_directly'] += count
+            elif s == 'end date changed':
+                employees[eid]['end_date_changed'] += count
+            elif s == 'priced':
+                employees[eid]['priced'] += count
+            else:
+                employees[eid]['not_contacted'] += count
+
+        output = []
+        for emp in employees.values():
+            total = emp['total'] or 1
+            rate = round((emp['renewed'] / total) * 100)
+            output.append({
+                'employee_id': emp['employee_id'],
+                'employee_name': emp['employee_name'],
+                'total_contacts': emp['total'],
+                'renewed_count': emp['renewed'],
+                'in_progress_count': emp['in_progress'],
+                'not_contacted_count': emp['not_contacted'],
+                'lost_count': emp['lost'],
+                'renewed_directly_count': emp['renewed_directly'],
+                'end_date_changed_count': emp['end_date_changed'],
+                'priced_count': emp['priced'],
+                'conversion_rate': rate,
+            })
+
+        return jsonify(output), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+@renewals_bp.route('/energy-renewals/debug-statuses', methods=['GET'])
+@token_required
+def debug_statuses():
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        
+        results = session.execute(text("""
+            SELECT 
+                em.employee_name,
+                pd.status,
+                COUNT(*) as count
+            FROM "StreemLyne_MT"."Employee_Master" em
+            JOIN "StreemLyne_MT"."Project_Details" pd 
+                ON em.employee_id = pd.assigned_employee_id
+            JOIN "StreemLyne_MT"."Client_Master" cm 
+                ON pd.client_id = cm.client_id
+            JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm 
+                ON pd.project_id = ecm.project_id
+            WHERE cm.tenant_id = :tenant_id
+            AND em.tenant_id = :tenant_id
+            GROUP BY em.employee_name, pd.status
+            ORDER BY em.employee_name, count DESC
+        """), {"tenant_id": tenant_id}).fetchall()
+
+        output = {}
+        for row in results:
+            name = row.employee_name
+            if name not in output:
+                output[name] = []
+            output[name].append({"status": row.status, "count": row.count})
+
+        return jsonify(output), 200
+    finally:
+        session.close()
