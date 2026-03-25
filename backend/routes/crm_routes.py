@@ -411,27 +411,19 @@ def search_all_leads():
 
         rows = db.execute_query('''
             SELECT
-                od.*,
-                sm."stage_name",
-                em."employee_name"          AS assigned_to_name,
-                COALESCE(od."business_name", od."opportunity_title") AS business_name,
-                sup."supplier_company_name" AS supplier_name
+                em."employee_id",
+                em."employee_name",
+                COUNT(od."opportunity_id") AS count
             FROM "StreemLyne_MT"."Opportunity_Details" od
-            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"    = sm."stage_id"
-            LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
-            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
+            JOIN "StreemLyne_MT"."Employee_Master" em
+                ON od."opportunity_owner_employee_id" = em."employee_id"
             WHERE od."tenant_id" = %s
             AND od."service_id" = %s
-            AND (
-                LOWER(COALESCE(od."business_name", od."opportunity_title", '')) LIKE LOWER(%s)
-                OR LOWER(COALESCE(od."contact_person", ''))  LIKE LOWER(%s)
-                OR LOWER(COALESCE(od."tel_number", ''))      LIKE LOWER(%s)
-                OR LOWER(COALESCE(od."email", ''))           LIKE LOWER(%s)
-                OR LOWER(COALESCE(od."mpan_mpr", ''))        LIKE LOWER(%s)
-            )
-            ORDER BY od."created_at" DESC
-            LIMIT 50
-        ''', (tenant_id, service_id, f'%{q}%', f'%{q}%', f'%{q}%', f'%{q}%', f'%{q}%'))
+            AND COALESCE(od."is_allocated", FALSE) = FALSE
+            GROUP BY em."employee_id", em."employee_name"
+            HAVING COUNT(od."opportunity_id") > 0
+            ORDER BY count DESC
+        ''', (tenant_id, service_id))
 
         def _s(v):
             if v is None: return None
