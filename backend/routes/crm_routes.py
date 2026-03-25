@@ -53,7 +53,7 @@ def get_leads():
         service_id = 2 if service_param.strip().lower() == 'water' else 1
         exclude_stage = request.args.get('exclude_stage', '')
         
-        # ✅ NEW: Check if filtering by current user
+        # ✅ FIX: Check if filtering by current user
         use_current_user = request.args.get('use_current_user', 'false').lower() == 'true'
 
         is_admin = is_admin_user(current_user)
@@ -61,8 +61,8 @@ def get_leads():
 
         import logging
         logging.getLogger(__name__).warning(
-            '🔍 get_leads: employee_id=%s is_admin=%s tenant=%s use_current_user=%s',
-            employee_id, is_admin, tenant_id, use_current_user
+            '🔍 get_leads: employee_id=%s is_admin=%s tenant=%s use_current_user=%s service=%s',
+            employee_id, is_admin, tenant_id, use_current_user, service_param
         )
 
         db = get_supabase_client()
@@ -83,9 +83,19 @@ def get_leads():
         '''
         params = [tenant_id, service_id]
 
-        # ✅ CRITICAL: Non-admins OR when use_current_user=true, filter by employee
-        if (not is_admin) or use_current_user:
+        # ✅ CRITICAL FIX: For non-admins, ALWAYS filter by employee_id (not just when use_current_user=true)
+        # Admins see all leads by default UNLESS use_current_user=true is explicitly set
+        if not is_admin:
+            # Non-admin: always filter to their own leads
             if not employee_id:
+                logging.getLogger(__name__).warning('⚠️ Non-admin user has no employee_id - returning empty')
+                return jsonify([]), 200
+            query += ' AND od."opportunity_owner_employee_id" = %s'
+            params.append(employee_id)
+        elif use_current_user:
+            # Admin requested their own leads only via use_current_user=true
+            if not employee_id:
+                logging.getLogger(__name__).warning('⚠️ Admin user has no employee_id but requested use_current_user - returning empty')
                 return jsonify([]), 200
             query += ' AND od."opportunity_owner_employee_id" = %s'
             params.append(employee_id)
@@ -94,7 +104,7 @@ def get_leads():
             query += ' AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") != LOWER(%s))'
             params.append(exclude_stage)
 
-        query += ' ORDER BY od."created_at" ASC'
+        query += ' ORDER BY od."created_at" DESC'
 
         rows = db.execute_query(query, tuple(params))
 
@@ -109,6 +119,12 @@ def get_leads():
             return v
 
         results = [{k: _s(v) for k, v in row.items()} for row in (rows or [])]
+        
+        logging.getLogger(__name__).warning(
+            '✅ get_leads returning %d leads for employee_id=%s is_admin=%s',
+            len(results), employee_id, is_admin
+        )
+        
         return jsonify(results), 200
 
     except Exception as e:
@@ -1638,7 +1654,7 @@ def leads_callback(opportunity_id):
 @token_required
 @tenant_from_jwt
 def get_allocated_leads():
-    """Get allocated/reassigned leads only"""
+    """Get allocated/reassigned leads only (leads with is_allocated=TRUE)"""
     from backend.crm.supabase_client import get_supabase_client
     from backend.crm.utils.role_helpers import is_admin_user
 
@@ -1650,6 +1666,13 @@ def get_allocated_leads():
 
         is_admin = is_admin_user(current_user)
         employee_id = getattr(current_user, 'employee_id', None)
+        
+        import logging
+        logging.getLogger(__name__).warning(
+            '🔍 get_allocated_leads: employee_id=%s is_admin=%s tenant=%s service=%s',
+            employee_id, is_admin, tenant_id, service_param
+        )
+        
         db = get_supabase_client()
 
         query = '''
@@ -1666,6 +1689,7 @@ def get_allocated_leads():
         '''
         params = [tenant_id, service_id]
 
+        # ✅ FIX: Non-admins can only see allocated leads assigned TO THEM
         if not is_admin and employee_id:
             query += ' AND od."opportunity_owner_employee_id" = %s'
             params.append(employee_id)
@@ -1681,7 +1705,15 @@ def get_allocated_leads():
             if isinstance(v, Decimal): return float(v)
             return v
 
-        return jsonify([{k: _s(v) for k, v in row.items()} for row in (rows or [])]), 200
+        results = [{k: _s(v) for k, v in row.items()} for row in (rows or [])]
+        
+        logging.getLogger(__name__).warning(
+            '✅ get_allocated_leads returning %d leads for employee_id=%s',
+            len(results), employee_id
+        )
+
+        return jsonify(results), 200
+        
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
