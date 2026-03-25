@@ -44,7 +44,6 @@ crm_controller = CRMController()
 @tenant_from_jwt
 def get_leads():
     from backend.crm.supabase_client import get_supabase_client
-    from backend.crm.utils.role_helpers import is_admin_user
 
     try:
         tenant_id = g.tenant_id
@@ -52,14 +51,13 @@ def get_leads():
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
         exclude_stage = request.args.get('exclude_stage', '')
-
-        is_admin = is_admin_user(current_user)
+        
         employee_id = getattr(current_user, 'employee_id', None)
 
         import logging
         logging.getLogger(__name__).warning(
-            '🔍 get_leads: employee_id=%s is_admin=%s tenant=%s service=%s',
-            employee_id, is_admin, tenant_id, service_param
+            '🔍 get_leads: employee_id=%s tenant=%s service=%s',
+            employee_id, tenant_id, service_param
         )
 
         db = get_supabase_client()
@@ -80,13 +78,17 @@ def get_leads():
         '''
         params = [tenant_id, service_id]
 
-        # ✅ Non-admins: always filter to their own leads
-        if not is_admin:
-            if not employee_id:
-                logging.getLogger(__name__).warning('⚠️ Non-admin user has no employee_id - returning empty')
-                return jsonify([]), 200
-            query += ' AND od."opportunity_owner_employee_id" = %s'
-            params.append(employee_id)
+        # ✅ COPY EXACT LOGIC FROM RENEWALS (customer_routes.py line 93-99)
+        # EVERYONE (including admins) only sees their own NON-ALLOCATED leads
+        if not employee_id:
+            logging.getLogger(__name__).warning('⚠️ User has no employee_id - returning empty')
+            return jsonify([]), 200
+        
+        query += '''
+            AND od."opportunity_owner_employee_id" = %s
+            AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
+        '''
+        params.extend([employee_id])
 
         if exclude_stage:
             query += ' AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") != LOWER(%s))'
@@ -109,8 +111,8 @@ def get_leads():
         results = [{k: _s(v) for k, v in row.items()} for row in (rows or [])]
         
         logging.getLogger(__name__).warning(
-            '✅ get_leads returning %d leads for employee_id=%s is_admin=%s',
-            len(results), employee_id, is_admin
+            '✅ get_leads returning %d leads for employee_id=%s',
+            len(results), employee_id
         )
         
         return jsonify(results), 200
@@ -1644,7 +1646,6 @@ def leads_callback(opportunity_id):
 def get_allocated_leads():
     """Get allocated/reassigned leads only (leads with is_allocated=TRUE)"""
     from backend.crm.supabase_client import get_supabase_client
-    from backend.crm.utils.role_helpers import is_admin_user
 
     try:
         tenant_id = g.tenant_id
@@ -1652,14 +1653,16 @@ def get_allocated_leads():
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
 
-        is_admin = is_admin_user(current_user)
         employee_id = getattr(current_user, 'employee_id', None)
         
         import logging
         logging.getLogger(__name__).warning(
-            '🔍 get_allocated_leads: employee_id=%s is_admin=%s tenant=%s service=%s',
-            employee_id, is_admin, tenant_id, service_param
+            '🔍 get_allocated_leads: employee_id=%s tenant=%s service=%s',
+            employee_id, tenant_id, service_param
         )
+        
+        if not employee_id:
+            return jsonify([]), 200
         
         db = get_supabase_client()
 
@@ -1671,21 +1674,15 @@ def get_allocated_leads():
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id" = sup."supplier_id"
-            WHERE od."tenant_id" = %s AND od."service_id" = %s
-            AND od."opportunity_owner_employee_id" IS NOT NULL
+            WHERE od."tenant_id" = %s 
+            AND od."service_id" = %s
+            AND od."opportunity_owner_employee_id" = %s
             AND od."is_allocated" = TRUE
+            ORDER BY od."created_at" DESC
         '''
-        params = [tenant_id, service_id]
-
-        # ✅ FIX: Non-admins can only see allocated leads assigned TO THEM
-        if not is_admin and employee_id:
-            query += ' AND od."opportunity_owner_employee_id" = %s'
-            params.append(employee_id)
-
-        query += ' ORDER BY od."created_at" DESC'
-        rows = db.execute_query(query, tuple(params))
         
-        # Serialize dates/decimals
+        rows = db.execute_query(query, (tenant_id, service_id, employee_id))
+        
         def _s(v):
             if v is None: return None
             if hasattr(v, 'isoformat'): return v.isoformat()
