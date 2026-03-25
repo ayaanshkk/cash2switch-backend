@@ -1302,10 +1302,11 @@ class LeadRepository:
                     'error': f'Some leads do not belong to tenant or do not exist'
                 }
             
-            # Perform bulk update
+            # ✅ FIX: Set is_allocated = TRUE when reassigning leads
             update_query = '''
                 UPDATE "StreemLyne_MT"."Opportunity_Details"
-                SET "opportunity_owner_employee_id" = %s
+                SET "opportunity_owner_employee_id" = %s,
+                    "is_allocated" = TRUE
                 WHERE "tenant_id" = %s AND "opportunity_id" = ANY(%s)
             '''
             updated = self.db.execute_update(update_query, (employee_id, tenant_id, lead_ids))
