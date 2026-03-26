@@ -44,7 +44,7 @@ crm_controller = CRMController()
 @tenant_from_jwt
 def get_leads():
     from backend.crm.supabase_client import get_supabase_client
-
+ 
     try:
         tenant_id = g.tenant_id
         current_user = request.current_user
@@ -53,15 +53,21 @@ def get_leads():
         exclude_stage = request.args.get('exclude_stage', '')
         
         employee_id = getattr(current_user, 'employee_id', None)
-
+ 
         import logging
         logging.getLogger(__name__).warning(
             '🔍 get_leads: employee_id=%s tenant=%s service=%s',
             employee_id, tenant_id, service_param
         )
-
+ 
+        # ✅ CRITICAL: Match renewals filtering exactly (customer_routes.py line 93-99)
+        # EVERYONE (including admins) only sees their own NON-ALLOCATED leads
+        if not employee_id:
+            logging.getLogger(__name__).warning('⚠️ User has no employee_id - returning empty')
+            return jsonify([]), 200
+ 
         db = get_supabase_client()
-
+ 
         query = '''
             SELECT
                 od.*,
@@ -75,29 +81,19 @@ def get_leads():
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
             WHERE od."tenant_id" = %s
             AND od."service_id" = %s
-        '''
-        params = [tenant_id, service_id]
-
-        # ✅ COPY EXACT LOGIC FROM RENEWALS (customer_routes.py line 93-99)
-        # EVERYONE (including admins) only sees their own NON-ALLOCATED leads
-        if not employee_id:
-            logging.getLogger(__name__).warning('⚠️ User has no employee_id - returning empty')
-            return jsonify([]), 200
-        
-        query += '''
             AND od."opportunity_owner_employee_id" = %s
             AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
         '''
-        params.extend([employee_id])
-
+        params = [tenant_id, service_id, employee_id]
+ 
         if exclude_stage:
             query += ' AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") != LOWER(%s))'
             params.append(exclude_stage)
-
+ 
         query += ' ORDER BY od."created_at" DESC'
-
+ 
         rows = db.execute_query(query, tuple(params))
-
+ 
         def _s(v):
             if v is None: return None
             if hasattr(v, 'isoformat'): return v.isoformat()
@@ -107,7 +103,7 @@ def get_leads():
             except ImportError:
                 pass
             return v
-
+ 
         results = [{k: _s(v) for k, v in row.items()} for row in (rows or [])]
         
         logging.getLogger(__name__).warning(
@@ -116,7 +112,7 @@ def get_leads():
         )
         
         return jsonify(results), 200
-
+ 
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -441,107 +437,6 @@ def search_all_leads():
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
-
-@crm_bp.route('/leads/performance', methods=['GET'])
-@token_required
-@tenant_from_jwt
-def get_leads_performance():
-    """
-    GET /api/crm/leads/performance
-    Get lead performance metrics for the current tenant.
-    Query params:
-        - use_current_user: if 'true', filter by current logged-in user
-        - service: 'utilities' or 'water'
-    """
-    from backend.crm.supabase_client import get_supabase_client
-    from .auth_helpers import get_tenant_id_from_user
- 
-    try:
-        tenant_id = g.tenant_id
-        service_param = request.args.get('service', 'utilities')
-        service_id = 2 if service_param.strip().lower() == 'water' else 1
- 
-        use_current_user = request.args.get('use_current_user', 'false').lower() == 'true'
-        employee_id = None
-        if use_current_user:
-            current_user = request.current_user
-            employee_id = getattr(current_user, 'employee_id', None) or getattr(current_user, 'id', None)
- 
-        db = get_supabase_client()
- 
-        employee_filter = 'AND od."opportunity_owner_employee_id" = %s' if employee_id else ''
- 
-        query = f'''
-            SELECT sm."stage_name"
-            FROM "StreemLyne_MT"."Opportunity_Details" od
-            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
-            WHERE od."tenant_id" = %s
-            AND od."service_id" = %s
-            AND NOT EXISTS (
-                SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd
-                WHERE pd.opportunity_id = od.opportunity_id
-            )
-            {employee_filter}
-        '''
- 
-        params = [tenant_id, service_id]
-        if employee_id:
-            params.append(employee_id)
- 
-        rows = db.execute_query(query, tuple(params))
- 
-        converted_count = 0
-        renewed_count = 0
-        in_progress_count = 0
-        not_contacted_count = 0
-        lost_count = 0
-        renewed_directly_count = 0
-        end_date_changed_count = 0
-        priced_count = 0
- 
-        for r in (rows or []):
-            stage = (r.get('stage_name') or '').lower()
-            if stage == 'converted':
-                converted_count += 1
-            elif stage in ['already renewed', 'renewed']:
-                renewed_count += 1
-            elif stage == 'renewed directly':
-                renewed_directly_count += 1
-            elif stage == 'end date changed':
-                end_date_changed_count += 1
-            elif stage == 'priced':
-                priced_count += 1
-            elif stage in ['callback', 'not answered', 'broker in place', 'email only',
-                           'complaint', 'incorrect supplier']:
-                in_progress_count += 1
-            elif stage in ['lost', 'lost cot', 'invalid number', 'meter de-energised']:
-                lost_count += 1
-            else:
-                not_contacted_count += 1
- 
-        total = len(rows or [])
-        success_rate = round(
-            ((converted_count + renewed_count + renewed_directly_count) / total * 100), 1
-        ) if total > 0 else 0
- 
-        return jsonify({
-            'converted_count':       converted_count,
-            'renewed_count':         renewed_count,
-            'renewed_directly_count': renewed_directly_count,
-            'end_date_changed_count': end_date_changed_count,
-            'priced_count':          priced_count,
-            'contacted_count':       in_progress_count,
-            'not_contacted_count':   not_contacted_count,
-            'lost_count':            lost_count,
-            'success_rate':          success_rate,
-            'total_customers':       total,
-        }), 200
- 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
- 
  
 @crm_bp.route('/leads/stats-by-employee', methods=['GET'])
 @token_required
@@ -1647,13 +1542,13 @@ def leads_callback(opportunity_id):
 def get_allocated_leads():
     """Get allocated/reassigned leads only (leads with is_allocated=TRUE)"""
     from backend.crm.supabase_client import get_supabase_client
-
+ 
     try:
         tenant_id = g.tenant_id
         current_user = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
-
+ 
         employee_id = getattr(current_user, 'employee_id', None)
         
         import logging
@@ -1666,7 +1561,10 @@ def get_allocated_leads():
             return jsonify([]), 200
         
         db = get_supabase_client()
-
+ 
+        # ✅ Show leads that are:
+        # 1. Assigned to THIS user (opportunity_owner_employee_id)
+        # 2. Marked as allocated (is_allocated = True)
         query = '''
             SELECT od.*, sm."stage_name", em."employee_name" AS assigned_to_name,
                    COALESCE(od."business_name", od."opportunity_title") AS business_name,
@@ -1690,14 +1588,14 @@ def get_allocated_leads():
             from decimal import Decimal
             if isinstance(v, Decimal): return float(v)
             return v
-
+ 
         results = [{k: _s(v) for k, v in row.items()} for row in (rows or [])]
         
         logging.getLogger(__name__).warning(
             '✅ get_allocated_leads returning %d leads for employee_id=%s',
             len(results), employee_id
         )
-
+ 
         return jsonify(results), 200
         
     except Exception as e:
