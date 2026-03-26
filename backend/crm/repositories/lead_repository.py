@@ -1124,7 +1124,10 @@ class LeadRepository:
             if filters.get('assigned_to') is not None:
                 query += ' AND od."opportunity_owner_employee_id" = %s'
                 params.append(int(filters['assigned_to']))
- 
+
+            if filters.get('unallocated_only'):
+                query += ' AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)'
+
         query += ' ORDER BY od."created_at" DESC'
  
         try:

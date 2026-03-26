@@ -149,6 +149,7 @@ class UserMaster(Base):
             'user_id': self.user_id,
             'employee_id': self.employee_id,
             'user_name': self.user_name,
+            'role': getattr(self, 'role', None),
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'is_active': self.is_active,
         }

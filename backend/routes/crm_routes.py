@@ -3,12 +3,11 @@
 CRM Routes Blueprint
 Defines API endpoints for CRM module
 """
-from flask import Blueprint, request, g, jsonify
+from flask import Blueprint, request, g, jsonify, current_app
 from functools import wraps
 from backend.crm.controllers.crm_controller import CRMController
 from backend.crm.middleware.tenant_middleware import require_tenant
 from .auth_helpers import token_required
-
 # Lightweight helper: attach tenant_id from decoded JWT to `g` (no new auth logic)
 def tenant_from_jwt(f):
     """Set g.tenant_id from request.current_user.tenant_id (returns 401 if missing).
@@ -43,7 +42,7 @@ crm_controller = CRMController()
 @token_required
 @tenant_from_jwt
 def get_leads():
-    from backend.crm.supabase_client import get_supabase_client
+    from backend.crm.repositories.lead_repository import LeadRepository
 
     try:
         tenant_id = g.tenant_id
@@ -52,67 +51,48 @@ def get_leads():
         service_id = 2 if service_param.strip().lower() == 'water' else 1
         exclude_stage = request.args.get('exclude_stage', '')
         
+        user_id = getattr(current_user, 'id', None) or getattr(current_user, 'user_id', None)
         employee_id = getattr(current_user, 'employee_id', None)
+        role_name = getattr(current_user, 'role', None)
+        normalized_role = str(role_name).strip().lower() if role_name else None
+        admin_user = 'admin' in normalized_role if normalized_role else False
 
-        import logging
-        logging.getLogger(__name__).warning(
-            '🔍 get_leads: employee_id=%s tenant=%s service=%s',
-            employee_id, tenant_id, service_param
+        current_app.logger.warning(
+            'crm.get_leads start tenant=%s user_id=%s employee_id=%s is_admin=%s role=%s service=%s exclude_stage=%s',
+            tenant_id, user_id, employee_id, admin_user, normalized_role, service_param, exclude_stage
         )
 
-        db = get_supabase_client()
-
-        query = '''
-            SELECT
-                od.*,
-                sm."stage_name",
-                em."employee_name"          AS assigned_to_name,
-                COALESCE(od."business_name", od."opportunity_title") AS business_name,
-                sup."supplier_company_name" AS supplier_name
-            FROM "StreemLyne_MT"."Opportunity_Details" od
-            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"    = sm."stage_id"
-            LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
-            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
-            WHERE od."tenant_id" = %s
-            AND od."service_id" = %s
-        '''
-        params = [tenant_id, service_id]
-
-        # ✅ COPY EXACT LOGIC FROM RENEWALS (customer_routes.py line 93-99)
-        # EVERYONE (including admins) only sees their own NON-ALLOCATED leads
-        if not employee_id:
-            logging.getLogger(__name__).warning('⚠️ User has no employee_id - returning empty')
-            return jsonify([]), 200
-        
-        query += '''
-            AND od."opportunity_owner_employee_id" = %s
-            AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
-        '''
-        params.extend([employee_id])
+        filters = {
+            'service_id': service_id,
+        }
 
         if exclude_stage:
-            query += ' AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") != LOWER(%s))'
-            params.append(exclude_stage)
+            filters['exclude_stage'] = exclude_stage
 
-        query += ' ORDER BY od."created_at" DESC'
+        if not employee_id:
+            current_app.logger.warning(
+                'crm.get_leads empty_result reason=no_employee_id tenant=%s user_id=%s',
+                tenant_id, user_id
+            )
+            return jsonify([]), 200
 
-        rows = db.execute_query(query, tuple(params))
+        # Match renewals: everyone, including admins, sees only their own
+        # non-allocated leads on the main page. Cross-team visibility comes
+        # from search-all and stats-by-employee.
+        filters['assigned_to'] = employee_id
+        filters['unallocated_only'] = True
 
-        def _s(v):
-            if v is None: return None
-            if hasattr(v, 'isoformat'): return v.isoformat()
-            try:
-                from decimal import Decimal
-                if isinstance(v, Decimal): return float(v)
-            except ImportError:
-                pass
-            return v
+        repo = LeadRepository()
+        results = repo.get_leads_list(tenant_id, filters)
 
-        results = [{k: _s(v) for k, v in row.items()} for row in (rows or [])]
-        
-        logging.getLogger(__name__).warning(
-            '✅ get_leads returning %d leads for employee_id=%s',
-            len(results), employee_id
+        current_app.logger.warning(
+            'crm.get_leads result tenant=%s user_id=%s employee_id=%s is_admin=%s returned=%s first_ids=%s',
+            tenant_id,
+            user_id,
+            employee_id,
+            admin_user,
+            len(results),
+            [r.get('tenant_lead_id') or r.get('opportunity_id') for r in results[:5]]
         )
         
         return jsonify(results), 200
@@ -409,33 +389,91 @@ def search_all_leads():
 
         db = get_supabase_client()
 
+        like_q = f'%{q.lower()}%'
         rows = db.execute_query('''
             SELECT
-                em."employee_id",
-                em."employee_name",
-                COUNT(od."opportunity_id") AS count
+                od."opportunity_id",
+                od."tenant_lead_id",
+                COALESCE(od."business_name", cm."client_company_name", od."opportunity_title") AS business_name,
+                COALESCE(od."contact_person", cm."client_contact_name") AS contact_person,
+                COALESCE(od."tel_number", cm."client_phone") AS tel_number,
+                od."mobile_no",
+                COALESCE(od."email", cm."client_email") AS email,
+                od."mpan_mpr",
+                od."mpan_bottom",
+                od."start_date",
+                od."end_date",
+                od."service_id",
+                od."stage_id",
+                sm."stage_name",
+                od."opportunity_owner_employee_id",
+                em."employee_name" AS assigned_to_name,
+                od."created_at",
+                od."supplier_id",
+                sup."supplier_company_name" AS supplier_name,
+                od."annual_usage",
+                od."stand_charge",
+                od."rate_1",
+                od."net_notch",
+                od."payment_type",
+                od."postcode"
             FROM "StreemLyne_MT"."Opportunity_Details" od
-            JOIN "StreemLyne_MT"."Employee_Master" em
-                ON od."opportunity_owner_employee_id" = em."employee_id"
-            WHERE od."tenant_id" = %s
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm
+                   ON od."stage_id" = sm."stage_id"
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em
+                   ON od."opportunity_owner_employee_id" = em."employee_id"
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm
+                   ON od."client_id" = cm."client_id"
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup
+                   ON od."supplier_id" = sup."supplier_id"
+            WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
             AND od."service_id" = %s
-            AND COALESCE(od."is_allocated", FALSE) = FALSE
-            GROUP BY em."employee_id", em."employee_name"
-            HAVING COUNT(od."opportunity_id") > 0
-            ORDER BY count DESC
-        ''', (tenant_id, service_id))
+            AND NOT EXISTS (
+                SELECT 1
+                FROM "StreemLyne_MT"."Project_Details" pd
+                WHERE pd.opportunity_id = od.opportunity_id
+            )
+            AND (
+                LOWER(COALESCE(od."business_name", cm."client_company_name", od."opportunity_title", '')) LIKE %s
+                OR LOWER(COALESCE(od."contact_person", cm."client_contact_name", '')) LIKE %s
+                OR LOWER(COALESCE(od."email", cm."client_email", '')) LIKE %s
+                OR LOWER(COALESCE(od."tel_number", cm."client_phone", '')) LIKE %s
+                OR LOWER(COALESCE(od."mpan_mpr", '')) LIKE %s
+            )
+            ORDER BY od."created_at" DESC
+        ''', (tenant_id, tenant_id, service_id, like_q, like_q, like_q, like_q, like_q))
 
-        def _s(v):
-            if v is None: return None
-            if hasattr(v, 'isoformat'): return v.isoformat()
-            try:
-                from decimal import Decimal
-                if isinstance(v, Decimal): return float(v)
-            except ImportError:
-                pass
-            return v
+        def _iso(v):
+            return v.isoformat() if getattr(v, 'isoformat', None) else (v or None)
 
-        results = [{k: _s(v) for k, v in row.items()} for row in (rows or [])]
+        results = [{
+            'opportunity_id':                r.get('opportunity_id'),
+            'tenant_lead_id':                r.get('tenant_lead_id'),
+            'business_name':                 r.get('business_name'),
+            'contact_person':                r.get('contact_person'),
+            'tel_number':                    str(r.get('tel_number')).replace('.0', '') if r.get('tel_number') else None,
+            'mobile_no':                     r.get('mobile_no'),
+            'email':                         r.get('email'),
+            'mpan_mpr':                      r.get('mpan_mpr'),
+            'mpan_bottom':                   r.get('mpan_bottom'),
+            'start_date':                    _iso(r.get('start_date')),
+            'end_date':                      _iso(r.get('end_date')),
+            'service_id':                    r.get('service_id'),
+            'stage_id':                      r.get('stage_id'),
+            'stage_name':                    r.get('stage_name'),
+            'opportunity_owner_employee_id': r.get('opportunity_owner_employee_id'),
+            'assigned_to_name':              r.get('assigned_to_name'),
+            'created_at':                    _iso(r.get('created_at')),
+            'supplier_id':                   r.get('supplier_id'),
+            'supplier_name':                 r.get('supplier_name'),
+            'annual_usage':                  r.get('annual_usage'),
+            'stand_charge':                  r.get('stand_charge'),
+            'rate_1':                        r.get('rate_1'),
+            'net_notch':                     r.get('net_notch'),
+            'payment_type':                  r.get('payment_type'),
+            'postcode':                      r.get('postcode'),
+        } for r in (rows or [])]
+
         return jsonify(results), 200
 
     except Exception as e:

@@ -53,12 +53,22 @@ def token_required(f):
                 if not getattr(user, 'is_active', True):
                     return jsonify({'error': 'User not active'}), 401
 
-                # ✅ Attach tenant_id AND employee_id from JWT to user object
+                role = payload.get('role')
+                normalized_role = str(role).strip().lower() if role else None
+
+                # ✅ Attach tenant_id, employee_id and role from JWT to user object
                 user.tenant_id = payload.get('tenant_id')
-                user.employee_id = payload.get('employee_id')  # ✅ ADD THIS LINE
+                user.employee_id = payload.get('employee_id')
+                user.role = normalized_role
 
                 # ✅ DEBUG: Log what we're attaching
-                current_app.logger.info(f"👤 User authenticated: user_id={user.user_id}, employee_id={user.employee_id}, tenant_id={user.tenant_id}")
+                current_app.logger.info(
+                    "👤 User authenticated: user_id=%s, employee_id=%s, tenant_id=%s, role=%s",
+                    user.user_id,
+                    user.employee_id,
+                    user.tenant_id,
+                    user.role,
+                )
 
                 # Attach user to request and g (for compatibility with both patterns)
                 g.user = user
