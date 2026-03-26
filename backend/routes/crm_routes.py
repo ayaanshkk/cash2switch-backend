@@ -42,7 +42,7 @@ crm_controller = CRMController()
 @token_required
 @tenant_from_jwt
 def get_leads():
-    from backend.crm.repositories.lead_repository import LeadRepository
+    from backend.crm.supabase_client import get_supabase_client
 
     try:
         tenant_id = g.tenant_id
@@ -79,11 +79,92 @@ def get_leads():
         # Match renewals: everyone, including admins, sees only their own
         # non-allocated leads on the main page. Cross-team visibility comes
         # from search-all and stats-by-employee.
-        filters['assigned_to'] = employee_id
-        filters['unallocated_only'] = True
+        db = get_supabase_client()
 
-        repo = LeadRepository()
-        results = repo.get_leads_list(tenant_id, filters)
+        query = '''
+            SELECT
+                od."opportunity_id",
+                od."tenant_lead_id",
+                COALESCE(od."business_name", od."opportunity_title") AS business_name,
+                od."contact_person",
+                od."tel_number",
+                od."email",
+                od."mpan_mpr",
+                od."mpan_bottom",
+                od."start_date",
+                od."end_date",
+                od."service_id",
+                od."stage_id",
+                sm."stage_name",
+                od."opportunity_owner_employee_id",
+                em."employee_name" AS assigned_to_name,
+                od."created_at",
+                od."supplier_id",
+                sup."supplier_company_name" AS supplier_name,
+                od."annual_usage",
+                od."stand_charge",
+                od."rate_1",
+                od."net_notch",
+                od."payment_type",
+                od."postcode",
+                od."mobile_no"
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm
+                ON od."stage_id" = sm."stage_id"
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em
+                ON od."opportunity_owner_employee_id" = em."employee_id"
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup
+                ON od."supplier_id" = sup."supplier_id"
+            WHERE od."tenant_id" = %s
+            AND od."service_id" = %s
+            AND od."opportunity_owner_employee_id" = %s
+            AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
+            AND NOT EXISTS (
+                SELECT 1
+                FROM "StreemLyne_MT"."Project_Details" pd
+                WHERE pd."opportunity_id" = od."opportunity_id"
+            )
+        '''
+        params = [tenant_id, service_id, employee_id]
+
+        if exclude_stage:
+            query += ' AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") != LOWER(%s))'
+            params.append(exclude_stage)
+
+        query += ' ORDER BY od."created_at" DESC'
+
+        rows = db.execute_query(query, tuple(params))
+
+        def _iso(v):
+            return v.isoformat() if getattr(v, 'isoformat', None) else (v or None)
+
+        results = [{
+            'opportunity_id':                r.get('opportunity_id'),
+            'tenant_lead_id':                r.get('tenant_lead_id'),
+            'business_name':                 r.get('business_name'),
+            'contact_person':                r.get('contact_person'),
+            'tel_number':                    str(r.get('tel_number')).replace('.0', '') if r.get('tel_number') else None,
+            'mobile_no':                     r.get('mobile_no'),
+            'email':                         r.get('email'),
+            'mpan_mpr':                      r.get('mpan_mpr'),
+            'mpan_bottom':                   r.get('mpan_bottom'),
+            'start_date':                    _iso(r.get('start_date')),
+            'end_date':                      _iso(r.get('end_date')),
+            'service_id':                    r.get('service_id'),
+            'stage_id':                      r.get('stage_id'),
+            'stage_name':                    r.get('stage_name'),
+            'opportunity_owner_employee_id': r.get('opportunity_owner_employee_id'),
+            'assigned_to_name':              r.get('assigned_to_name'),
+            'created_at':                    _iso(r.get('created_at')),
+            'supplier_id':                   r.get('supplier_id'),
+            'supplier_name':                 r.get('supplier_name'),
+            'annual_usage':                  r.get('annual_usage'),
+            'stand_charge':                  r.get('stand_charge'),
+            'rate_1':                        r.get('rate_1'),
+            'net_notch':                     r.get('net_notch'),
+            'payment_type':                  r.get('payment_type'),
+            'postcode':                      r.get('postcode'),
+        } for r in (rows or [])]
 
         current_app.logger.warning(
             'crm.get_leads result tenant=%s user_id=%s employee_id=%s is_admin=%s returned=%s first_ids=%s',
