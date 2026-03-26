@@ -800,7 +800,6 @@ def get_staff_status_counts():
                 ON pd.project_id = ecm.project_id
             WHERE cm.tenant_id = :tenant_id
             AND em.tenant_id = :tenant_id
-            AND cm.is_deleted = false
             {employee_filter}
             GROUP BY em.employee_id, em.employee_name, pd.status
             ORDER BY em.employee_name
@@ -835,11 +834,9 @@ def get_staff_status_counts():
             s = (r.status or '').lower().strip()
             employees[eid]['total'] += count
 
-            if s == 'already renewed':
+            if s in ('renewed', 'already renewed'):
                 employees[eid]['renewed'] += count
-            elif s in ('callback', 'called', 'contacted', 'not answered',
-                       'email only', 'broker in place', 'complaint',
-                       'incorrect supplier', 'invalid number'):
+            elif s in ('callback', 'called', 'contacted'):
                 employees[eid]['in_progress'] += count
             elif s in ('lost', 'lost cot'):
                 employees[eid]['lost'] += count
@@ -849,9 +846,13 @@ def get_staff_status_counts():
                 employees[eid]['end_date_changed'] += count
             elif s == 'priced':
                 employees[eid]['priced'] += count
-            else:
+            elif s in ('not answered', 'email only', 'broker in place', 
+                    'complaint', 'incorrect supplier', 'invalid number',
+                    'meter de-energised'):
                 employees[eid]['not_contacted'] += count
-
+            else:
+                # null/empty/unknown
+                employees[eid]['not_contacted'] += count
         output = []
         for emp in employees.values():
             total = emp['total'] or 1

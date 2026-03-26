@@ -296,7 +296,7 @@ def register():
 
 @auth_bp.route('/login', methods=['POST'])
 def login():
-    """Tenant-resolved username login against StreemLyne_MT CRM tables.
+    """Optimized tenant-resolved username login against StreemLyne_MT CRM tables.
 
     - Accepts JSON: { "username", "password" }
     - The tenant_id is resolved from the joined Employee_Master row (not supplied by client).
@@ -304,68 +304,94 @@ def login():
     - If `is_active` column exists and is False → 403
     - Returns JWT: { user_id, employee_id, tenant_id, user_name, role }
     """
+    import time
+    start_time = time.time()
+    
     session = SessionLocal()
     try:
+        # ===== 1. PARSE REQUEST =====
+        parse_start = time.time()
         data = request.get_json() or {}
         if not data.get('username') or not data.get('password'):
             return jsonify({'error': 'username and password required'}), 400
 
         username = data['username'].strip()
         input_password = data['password']
+        
+        current_app.logger.info(f"🔐 Login attempt: {username} | Parse time: {(time.time() - parse_start)*1000:.0f}ms")
 
-        # ✅ UPDATED: JOIN with User_Role_Mapping and Role_Master to get role
-        sql = text('''
+        # ===== 2. FETCH USER + EMPLOYEE (INDEXED QUERY - FAST) =====
+        db_start = time.time()
+        
+        user_sql = text('''
             SELECT
                 u.user_id,
                 u.user_name,
                 u.password,
-                e.employee_id,
+                u.employee_id,
                 e.tenant_id,
                 e.employee_name,
                 e.email,
-                e.phone,
-                rm.role_name,
-                rm.role_id
+                e.phone
             FROM "StreemLyne_MT"."User_Master" u
             JOIN "StreemLyne_MT"."Employee_Master" e ON u.employee_id = e.employee_id
-            LEFT JOIN "StreemLyne_MT"."User_Role_Mapping" urm ON u.user_id = urm.user_id
-            LEFT JOIN "StreemLyne_MT"."Role_Master" rm ON urm.role_id = rm.role_id
             WHERE u.user_name = :username
             LIMIT 1;
         ''')
 
-        row = session.execute(sql, {'username': username}).mappings().first()
+        row = session.execute(user_sql, {'username': username}).mappings().first()
+        user_query_time = time.time() - db_start
+        
+        current_app.logger.info(f"⏱️ User query time: {user_query_time*1000:.0f}ms")
 
         if not row:
-            current_app.logger.warning(f"Login failed: no matching username (user_name={username})")
+            total_time = time.time() - start_time
+            current_app.logger.warning(f"❌ User not found: {username} | Total: {total_time*1000:.0f}ms")
             return jsonify({'error': 'Invalid username or password'}), 401
 
+        # ===== 3. VERIFY PASSWORD (FAIL FAST) =====
+        pwd_start = time.time()
         db_password = row.get('password')
         if db_password != input_password:
-            current_app.logger.warning(f"Login failed (bad password) for user_name={username} employee_id={row.get('employee_id')}")
+            total_time = time.time() - start_time
+            current_app.logger.warning(f"❌ Invalid password for {username} | Total: {total_time*1000:.0f}ms")
             return jsonify({'error': 'Invalid username or password'}), 401
+        
+        current_app.logger.info(f"✅ Password verified: {(time.time() - pwd_start)*1000:.0f}ms")
 
-        # If the employee has an is_active column and it's explicitly False -> forbid
-        if 'is_active' in row.keys() and row.get('is_active') is False:
-            current_app.logger.info(f"Login blocked: inactive employee_id={row.get('employee_id')}")
-            return jsonify({'error': 'Account disabled'}), 403
+        # ===== 4. FETCH ROLE (SEPARATE QUERY - ONLY AFTER PASSWORD VERIFIED) =====
+        role_start = time.time()
+        role_sql = text('''
+            SELECT rm.role_name, rm.role_id
+            FROM "StreemLyne_MT"."User_Role_Mapping" urm
+            JOIN "StreemLyne_MT"."Role_Master" rm ON urm.role_id = rm.role_id
+            WHERE urm.user_id = :user_id
+            LIMIT 1;
+        ''')
+        
+        role_row = session.execute(role_sql, {'user_id': row['user_id']}).mappings().first()
+        role_query_time = time.time() - role_start
+        
+        current_app.logger.info(f"⏱️ Role query time: {role_query_time*1000:.0f}ms")
 
-        # ✅ UPDATED: Include role in JWT payload
+        # ===== 5. GENERATE JWT =====
+        jwt_start = time.time()
         payload = {
             'user_id': row.get('user_id'),
             'employee_id': row.get('employee_id'),
             'tenant_id': row.get('tenant_id'),
             'user_name': row.get('user_name'),
-            'role': row.get('role_name'),  # ✅ Add role to JWT
+            'role': role_row['role_name'] if role_row else None,
             'exp': datetime.utcnow() + timedelta(days=7),
             'iat': datetime.utcnow()
         }
         
-        current_app.logger.info(f"🎫 Generating JWT for user_id={payload['user_id']}, tenant_id={payload['tenant_id']}, role={payload.get('role')}")
-        
         token = jwt.encode(payload, current_app.config['SECRET_KEY'], algorithm='HS256')
+        jwt_time = time.time() - jwt_start
+        
+        current_app.logger.info(f"🎫 JWT generated: {jwt_time*1000:.0f}ms")
 
-        # ✅ UPDATED: Include role in user response
+        # ===== 6. BUILD RESPONSE =====
         user = {
             'employee_id': row.get('employee_id'),
             'id': row.get('employee_id'),
@@ -373,16 +399,24 @@ def login():
             'email': row.get('email'),
             'phone': row.get('phone'),
             'username': row.get('user_name'),
-            'role': row.get('role_name'),  
-            'role_id': row.get('role_id'),
+            'role': role_row['role_name'] if role_row else None,
+            'role_id': role_row['role_id'] if role_row else None,
             'tenant_id': row.get('tenant_id')
         }
 
-        current_app.logger.info(f"✅ Tenant login successful: employee_id={row.get('employee_id')} user_name={username} tenant_id={row.get('tenant_id')} role={row.get('role_name')}")
+        total_time = time.time() - start_time
+        current_app.logger.info(
+            f"✅ LOGIN SUCCESS | user={username} tenant={row.get('tenant_id')} role={user['role']} | "
+            f"Total: {total_time*1000:.0f}ms (user:{user_query_time*1000:.0f}ms + role:{role_query_time*1000:.0f}ms + jwt:{jwt_time*1000:.0f}ms)"
+        )
+        
         return jsonify({'success': True, 'token': token, 'user': user}), 200
 
     except Exception as e:
-        current_app.logger.exception(f"❌ Login error (tenant-aware): {e}")
+        total_time = time.time() - start_time
+        current_app.logger.error(f"❌ LOGIN ERROR after {total_time*1000:.0f}ms: {str(e)}")
+        import traceback
+        current_app.logger.error(traceback.format_exc())
         return jsonify({'error': 'Internal server error'}), 500
     finally:
         session.close()

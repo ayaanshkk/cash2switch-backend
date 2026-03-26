@@ -182,7 +182,7 @@ def get_leads():
         )
         
         return jsonify(results), 200
-
+ 
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -666,7 +666,6 @@ def get_leads_performance():
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
- 
  
 @crm_bp.route('/leads/stats-by-employee', methods=['GET'])
 @token_required
@@ -1779,13 +1778,13 @@ def leads_callback(opportunity_id):
 def get_allocated_leads():
     """Get allocated/reassigned leads only (leads with is_allocated=TRUE)"""
     from backend.crm.supabase_client import get_supabase_client
-
+ 
     try:
         tenant_id = g.tenant_id
         current_user = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
-
+ 
         employee_id = getattr(current_user, 'employee_id', None)
         role_name = getattr(current_user, 'role', None)
         normalized_role = str(role_name).strip().lower() if role_name else None
@@ -1842,14 +1841,14 @@ def get_allocated_leads():
             from decimal import Decimal
             if isinstance(v, Decimal): return float(v)
             return v
-
+ 
         results = [{k: _s(v) for k, v in row.items()} for row in (rows or [])]
         
         logging.getLogger(__name__).warning(
             '✅ get_allocated_leads returning %d leads for employee_id=%s',
             len(results), employee_id
         )
-
+ 
         return jsonify(results), 200
         
     except Exception as e:
