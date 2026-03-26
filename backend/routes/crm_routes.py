@@ -69,7 +69,8 @@ def get_leads():
         if exclude_stage:
             filters['exclude_stage'] = exclude_stage
 
-        if not employee_id:
+        # Non-admins must have employee_id to scope rows; admins list the whole tenant.
+        if not admin_user and not employee_id:
             current_app.logger.warning(
                 'crm.get_leads empty_result reason=no_employee_id tenant=%s user_id=%s',
                 tenant_id, user_id
@@ -577,7 +578,6 @@ def get_leads_performance():
         - service: 'utilities' or 'water'
     """
     from backend.crm.supabase_client import get_supabase_client
-    from .auth_helpers import get_tenant_id_from_user
  
     try:
         tenant_id = g.tenant_id
@@ -594,11 +594,13 @@ def get_leads_performance():
  
         employee_filter = 'AND od."opportunity_owner_employee_id" = %s' if employee_id else ''
  
+        # Same tenant resolution as GET /leads (direct tenant_id or via linked client).
         query = f'''
             SELECT sm."stage_name"
             FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
-            WHERE od."tenant_id" = %s
+            WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
             AND od."service_id" = %s
             AND NOT EXISTS (
                 SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd
@@ -607,7 +609,7 @@ def get_leads_performance():
             {employee_filter}
         '''
  
-        params = [tenant_id, service_id]
+        params = [tenant_id, tenant_id, service_id]
         if employee_id:
             params.append(employee_id)
  
@@ -1785,34 +1787,54 @@ def get_allocated_leads():
         service_id = 2 if service_param.strip().lower() == 'water' else 1
 
         employee_id = getattr(current_user, 'employee_id', None)
-        
+        role_name = getattr(current_user, 'role', None)
+        normalized_role = str(role_name).strip().lower() if role_name else None
+        admin_user = 'admin' in normalized_role if normalized_role else False
+
         import logging
         logging.getLogger(__name__).warning(
-            '🔍 get_allocated_leads: employee_id=%s tenant=%s service=%s',
-            employee_id, tenant_id, service_param
+            '🔍 get_allocated_leads: employee_id=%s is_admin=%s tenant=%s service=%s',
+            employee_id, admin_user, tenant_id, service_param
         )
-        
-        if not employee_id:
+
+        if not admin_user and not employee_id:
             return jsonify([]), 200
-        
+
         db = get_supabase_client()
 
-        query = '''
-            SELECT od.*, sm."stage_name", em."employee_name" AS assigned_to_name,
-                   COALESCE(od."business_name", od."opportunity_title") AS business_name,
-                   sup."supplier_company_name" AS supplier_name
-            FROM "StreemLyne_MT"."Opportunity_Details" od
-            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
-            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
-            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id" = sup."supplier_id"
-            WHERE od."tenant_id" = %s 
-            AND od."service_id" = %s
-            AND od."opportunity_owner_employee_id" = %s
-            AND od."is_allocated" = TRUE
-            ORDER BY od."created_at" DESC
-        '''
-        
-        rows = db.execute_query(query, (tenant_id, service_id, employee_id))
+        if admin_user:
+            query = '''
+                SELECT od.*, sm."stage_name", em."employee_name" AS assigned_to_name,
+                       COALESCE(od."business_name", od."opportunity_title") AS business_name,
+                       sup."supplier_company_name" AS supplier_name
+                FROM "StreemLyne_MT"."Opportunity_Details" od
+                LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
+                LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
+                LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id" = sup."supplier_id"
+                LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
+                WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
+                AND od."service_id" = %s
+                AND od."is_allocated" = TRUE
+                ORDER BY od."created_at" DESC
+            '''
+            rows = db.execute_query(query, (tenant_id, tenant_id, service_id))
+        else:
+            query = '''
+                SELECT od.*, sm."stage_name", em."employee_name" AS assigned_to_name,
+                       COALESCE(od."business_name", od."opportunity_title") AS business_name,
+                       sup."supplier_company_name" AS supplier_name
+                FROM "StreemLyne_MT"."Opportunity_Details" od
+                LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
+                LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
+                LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id" = sup."supplier_id"
+                LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
+                WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
+                AND od."service_id" = %s
+                AND od."opportunity_owner_employee_id" = %s
+                AND od."is_allocated" = TRUE
+                ORDER BY od."created_at" DESC
+            '''
+            rows = db.execute_query(query, (tenant_id, tenant_id, service_id, employee_id))
         
         def _s(v):
             if v is None: return None

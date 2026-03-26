@@ -56,9 +56,13 @@ def token_required(f):
                 role = payload.get('role')
                 normalized_role = str(role).strip().lower() if role else None
 
-                # ✅ Attach tenant_id, employee_id and role from JWT to user object
+                # Attach tenant_id and role from JWT. Never overwrite DB employee_id with
+                # None when the token omits it (older tokens / partial payloads) — that
+                # caused live users to see zero leads while localhost used fresh tokens.
                 user.tenant_id = payload.get('tenant_id')
-                user.employee_id = payload.get('employee_id')
+                _jwt_emp = payload.get('employee_id')
+                if _jwt_emp is not None:
+                    user.employee_id = _jwt_emp
                 user.role = normalized_role
 
                 # ✅ DEBUG: Log what we're attaching
