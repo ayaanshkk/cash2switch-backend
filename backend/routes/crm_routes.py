@@ -7,6 +7,7 @@ from flask import Blueprint, request, g, jsonify, current_app
 from functools import wraps
 from backend.crm.controllers.crm_controller import CRMController
 from backend.crm.middleware.tenant_middleware import require_tenant
+from backend.crm.utils.role_helpers import is_crm_leads_admin_role
 from .auth_helpers import token_required
 # Lightweight helper: attach tenant_id from decoded JWT to `g` (no new auth logic)
 def tenant_from_jwt(f):
@@ -55,7 +56,7 @@ def get_leads():
         employee_id = getattr(current_user, 'employee_id', None)
         role_name = getattr(current_user, 'role', None)
         normalized_role = str(role_name).strip().lower() if role_name else None
-        admin_user = 'admin' in normalized_role if normalized_role else False
+        admin_user = is_crm_leads_admin_role(role_name)
 
         current_app.logger.warning(
             'crm.get_leads start tenant=%s user_id=%s employee_id=%s is_admin=%s role=%s service=%s exclude_stage=%s',
@@ -139,6 +140,56 @@ def get_leads():
         query += ' ORDER BY od."created_at" DESC'
 
         rows = db.execute_query(query, tuple(params))
+
+        if admin_user and not (rows or []):
+            try:
+                tscope = (
+                    '(od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s)) '
+                    'AND od."service_id" = %s'
+                )
+                p = (tenant_id, tenant_id, service_id)
+                c_all = db.execute_query(
+                    f'SELECT COUNT(*) AS c FROM "StreemLyne_MT"."Opportunity_Details" od '
+                    f'LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id" '
+                    f'WHERE {tscope}',
+                    p,
+                    fetch_one=True,
+                )
+                c_no_proj = db.execute_query(
+                    f'SELECT COUNT(*) AS c FROM "StreemLyne_MT"."Opportunity_Details" od '
+                    f'LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id" '
+                    f'WHERE {tscope} AND NOT EXISTS ('
+                    f'SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd '
+                    f'WHERE pd."opportunity_id" = od."opportunity_id")',
+                    p,
+                    fetch_one=True,
+                )
+                c_after_lost = None
+                if exclude_stage:
+                    c_after_lost = db.execute_query(
+                        f'SELECT COUNT(*) AS c FROM "StreemLyne_MT"."Opportunity_Details" od '
+                        f'LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id" '
+                        f'LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id" '
+                        f'WHERE {tscope} AND NOT EXISTS ('
+                        f'SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd '
+                        f'WHERE pd."opportunity_id" = od."opportunity_id") '
+                        f'AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") != LOWER(%s))',
+                        p + (exclude_stage,),
+                        fetch_one=True,
+                    )
+                current_app.logger.warning(
+                    'crm.get_leads empty diagnostic tenant=%s service_id=%s exclude_stage=%r: '
+                    'opportunities_matching_tenant_service=%s without_project_row=%s after_exclude_stage=%s '
+                    '(if without_project_row=0 but first>0, every matching opportunity already has Project_Details)',
+                    tenant_id,
+                    service_id,
+                    exclude_stage,
+                    (c_all or {}).get('c'),
+                    (c_no_proj or {}).get('c'),
+                    (c_after_lost or {}).get('c') if exclude_stage else 'n/a',
+                )
+            except Exception as diag_e:
+                current_app.logger.warning('crm.get_leads diagnostic query failed: %s', diag_e)
 
         def _iso(v):
             return v.isoformat() if getattr(v, 'isoformat', None) else (v or None)
@@ -1788,7 +1839,7 @@ def get_allocated_leads():
         employee_id = getattr(current_user, 'employee_id', None)
         role_name = getattr(current_user, 'role', None)
         normalized_role = str(role_name).strip().lower() if role_name else None
-        admin_user = 'admin' in normalized_role if normalized_role else False
+        admin_user = is_crm_leads_admin_role(role_name)
 
         import logging
         logging.getLogger(__name__).warning(

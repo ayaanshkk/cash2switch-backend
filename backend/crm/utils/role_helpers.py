@@ -2,8 +2,37 @@
 """
 Role checking utilities for CRM
 """
+from typing import Any, Optional
+
 from flask import request, jsonify, current_app
 from functools import wraps
+
+
+def is_crm_leads_admin_role(jwt_role: Optional[Any]) -> bool:
+    """
+    True when the JWT `role` string should grant tenant-wide CRM leads visibility.
+
+    Uses explicit names / suffixes — not naive substring match — so roles like
+    `sales_admin` (one token) are not treated as full tenant admins.
+
+    `platform admin`, `super admin`, etc. are included.
+    """
+    if jwt_role is None:
+        return False
+    r = ' '.join(str(jwt_role).strip().lower().split())
+    if not r:
+        return False
+    if r in frozenset({
+        'admin',
+        'administrator',
+        'platform admin',
+        'super admin',
+        'superadmin',
+    }):
+        return True
+    if r.endswith(' admin') or r.endswith(' administrator'):
+        return True
+    return False
 
 
 def get_user_role_name(user) -> str:
