@@ -112,7 +112,9 @@ def get_leads():
                 ON od."opportunity_owner_employee_id" = em."employee_id"
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup
                 ON od."supplier_id" = sup."supplier_id"
-            WHERE od."tenant_id" = %s
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm
+                ON od."client_id" = cm."client_id"
+            WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
             AND od."service_id" = %s
             AND NOT EXISTS (
                 SELECT 1
@@ -120,7 +122,7 @@ def get_leads():
                 WHERE pd."opportunity_id" = od."opportunity_id"
             )
         '''
-        params = [tenant_id, service_id]
+        params = [tenant_id, tenant_id, service_id]
 
         if not admin_user:
             query += '''
@@ -692,15 +694,22 @@ def get_leads_stats_by_employee():
                 em."employee_name",
                 COUNT(od."opportunity_id") AS count
             FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm
+                ON od."client_id" = cm."client_id"
             JOIN "StreemLyne_MT"."Employee_Master" em
                 ON od."opportunity_owner_employee_id" = em."employee_id"
-            WHERE od."tenant_id" = %s
+            WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
             AND od."service_id" = %s
-            AND COALESCE(od."is_allocated", FALSE) = FALSE
+            AND od."opportunity_owner_employee_id" IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1
+                FROM "StreemLyne_MT"."Project_Details" pd
+                WHERE pd."opportunity_id" = od."opportunity_id"
+            )
             GROUP BY em."employee_id", em."employee_name"
             HAVING COUNT(od."opportunity_id") > 0
             ORDER BY count DESC
-        ''', (tenant_id, service_id))
+        ''', (tenant_id, tenant_id, service_id))
 
         logger.warning('📊 Raw rows from DB: %s', rows)
         logger.warning('📊 Number of rows: %s', len(rows) if rows else 0)
