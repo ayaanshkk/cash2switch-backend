@@ -115,15 +115,22 @@ def create_app():
         resources={r"/*": {
             "origins": [
                 "https://cash2switch.vercel.app",
-                "https://cash2switch-*.vercel.app",  # Preview deployments
+                "https://cash2switch-*.vercel.app",
+                "https://business-gas.vercel.app",  # ✅ ADD THIS
+                "https://business-gas-*.vercel.app",  # ✅ ADD THIS for preview deployments
                 "http://localhost:3000",
-                "*"  # Keep wildcard for development
+                "*"
             ],
             "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
+            "allow_headers": [
+                "Content-Type", 
+                "Authorization", 
+                "X-Requested-With",
+                "X-Tenant-ID"  # ✅ ADD THIS - was missing!
+            ],
             "expose_headers": ["Content-Type", "Authorization"],
             "supports_credentials": False,
-            "max_age": 3600,  # ⭐ Cache preflight responses for 1 hour
+            "max_age": 3600,
         }}
     )
 
