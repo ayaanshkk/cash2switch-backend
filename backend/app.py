@@ -112,31 +112,20 @@ def create_app():
     # ============================================
     CORS(
         app,
-        resources={r"/*": {"origins": "*"}},
-        supports_credentials=False,
+        resources={r"/*": {
+            "origins": [
+                "https://cash2switch.vercel.app",
+                "https://cash2switch-*.vercel.app",  # Preview deployments
+                "http://localhost:3000",
+                "*"  # Keep wildcard for development
+            ],
+            "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
+            "expose_headers": ["Content-Type", "Authorization"],
+            "supports_credentials": False,
+            "max_age": 3600,  # ⭐ Cache preflight responses for 1 hour
+        }}
     )
-
-    # ============================================
-    # PREFLIGHT HANDLER
-    # ============================================
-    @app.before_request
-    def handle_preflight():
-        if request.method == "OPTIONS":
-            resp = jsonify({"status": "ok"})
-            resp.headers["Access-Control-Allow-Origin"] = "*"
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-            resp.headers["Access-Control-Allow-Headers"] = "*"
-            return resp, 200
-
-    # ============================================
-    # AFTER-REQUEST HEADERS
-    # ============================================
-    @app.after_request
-    def add_cors_headers(resp):
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "*"
-        return resp
 
     # ============================================
     # BLUEPRINTS
