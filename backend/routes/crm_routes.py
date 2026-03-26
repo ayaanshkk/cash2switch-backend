@@ -76,9 +76,6 @@ def get_leads():
             )
             return jsonify([]), 200
 
-        # Match renewals: everyone, including admins, sees only their own
-        # non-allocated leads on the main page. Cross-team visibility comes
-        # from search-all and stats-by-employee.
         db = get_supabase_client()
 
         query = '''
@@ -117,15 +114,20 @@ def get_leads():
                 ON od."supplier_id" = sup."supplier_id"
             WHERE od."tenant_id" = %s
             AND od."service_id" = %s
-            AND od."opportunity_owner_employee_id" = %s
-            AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
             AND NOT EXISTS (
                 SELECT 1
                 FROM "StreemLyne_MT"."Project_Details" pd
                 WHERE pd."opportunity_id" = od."opportunity_id"
             )
         '''
-        params = [tenant_id, service_id, employee_id]
+        params = [tenant_id, service_id]
+
+        if not admin_user:
+            query += '''
+                AND od."opportunity_owner_employee_id" = %s
+                AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
+            '''
+            params.append(employee_id)
 
         if exclude_stage:
             query += ' AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") != LOWER(%s))'
