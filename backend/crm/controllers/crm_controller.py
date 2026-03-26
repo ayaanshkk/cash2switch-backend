@@ -55,7 +55,7 @@ class CRMController:
                     if not employee_id:
                         # Can't identify user — return empty rather than leak all leads
                         return jsonify([]), 200
-                    filters['employee_id'] = employee_id
+                    filters['assigned_to'] = employee_id
 
             result = self.crm_service.get_leads(tenant_id, filters if filters else None)
             return jsonify(result), 200
@@ -295,21 +295,12 @@ class CRMController:
             except (ValueError, TypeError):
                 return jsonify({'success': False, 'error': 'employee_id must be a number'}), 400
 
-            # Non-admins can only reassign leads that belong to them
             if not is_admin:
-                from backend.crm.supabase_client import get_supabase_client
-                db = get_supabase_client()
-                placeholders = ','.join(['%s'] * len(lead_ids))
-                owned = db.execute_query(
-                    f'SELECT "opportunity_id" FROM "StreemLyne_MT"."Opportunity_Details" '
-                    f'WHERE "tenant_id" = %s AND "opportunity_owner_employee_id" = %s '
-                    f'AND "opportunity_id" IN ({placeholders})',
-                    (tenant_id, employee_id, *lead_ids)
-                )
-                owned_ids = [r['opportunity_id'] for r in (owned or [])]
-                if not owned_ids:
-                    return jsonify({'error': 'permission_denied', 'message': 'No leads found that belong to you'}), 403
-                lead_ids = owned_ids  # Only reassign what they own
+                return jsonify({
+                    'success': False,
+                    'error': 'permission_denied',
+                    'message': 'Only admin users can assign leads'
+                }), 403
 
             result = self.crm_service.assign_leads(tenant_id, lead_ids, target_employee_id)
             if not result.get('success'):
