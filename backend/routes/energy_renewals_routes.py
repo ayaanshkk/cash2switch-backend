@@ -777,15 +777,31 @@ def get_renewal_performance():
 @renewals_bp.route('/energy-renewals/staff-status-counts', methods=['GET'])
 @token_required
 def get_staff_status_counts():
+    """
+    Returns status counts for all staff members, including those with 0 assignments.
+    This ensures all 18 team members appear, not just the 11 with active projects.
+    """
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
         if not tenant_id:
             return jsonify({'error': 'Tenant not found'}), 400
-
+ 
         employee_id = request.args.get('employee_id', type=int)
-
-        base_sql = """
+ 
+        # First, get ALL employees for this tenant
+        all_employees_query = """
+            SELECT DISTINCT
+                em.employee_id,
+                em.employee_name
+            FROM "StreemLyne_MT"."Employee_Master" em
+            WHERE em.tenant_id = :tenant_id
+            {employee_filter}
+            ORDER BY em.employee_name
+        """
+ 
+        # Then get project status counts
+        project_stats_query = """
             SELECT
                 em.employee_id,
                 em.employee_name,
@@ -804,59 +820,76 @@ def get_staff_status_counts():
             GROUP BY em.employee_id, em.employee_name, pd.status
             ORDER BY em.employee_name
         """
-
+ 
         params = {"tenant_id": tenant_id}
+        
+        # Get all employees
         if employee_id:
-            sql = base_sql.format(employee_filter="AND em.employee_id = :employee_id")
+            all_emp_sql = all_employees_query.format(employee_filter="AND em.employee_id = :employee_id")
             params["employee_id"] = employee_id
         else:
-            sql = base_sql.format(employee_filter="")
-
-        results = session.execute(text(sql), params).fetchall()
-
+            all_emp_sql = all_employees_query.format(employee_filter="")
+ 
+        all_employees = session.execute(text(all_emp_sql), params).fetchall()
+        
+        # Initialize all employees with zero counts
         employees = {}
+        for emp in all_employees:
+            employees[emp.employee_id] = {
+                'employee_id': emp.employee_id,
+                'employee_name': emp.employee_name,
+                'renewed': 0,
+                'in_progress': 0,
+                'not_contacted': 0,
+                'lost': 0,
+                'renewed_directly': 0,
+                'end_date_changed': 0,
+                'priced': 0,
+                'total': 0,
+            }
+ 
+        # Now get project stats
+        if employee_id:
+            stats_sql = project_stats_query.format(employee_filter="AND em.employee_id = :employee_id")
+        else:
+            stats_sql = project_stats_query.format(employee_filter="")
+ 
+        results = session.execute(text(stats_sql), params).fetchall()
+ 
+        # Update counts for employees with projects
         for r in results:
             eid = r.employee_id
-            if eid not in employees:
-                employees[eid] = {
-                    'employee_id': eid,
-                    'employee_name': r.employee_name,
-                    'renewed': 0,
-                    'in_progress': 0,
-                    'not_contacted': 0,
-                    'lost': 0,
-                    'renewed_directly': 0,
-                    'end_date_changed': 0,
-                    'priced': 0,
-                    'total': 0,
-                }
-            count = r.count or 0
-            s = (r.status or '').lower().strip()
-            employees[eid]['total'] += count
-
-            if s in ('renewed', 'already renewed'):
-                employees[eid]['renewed'] += count
-            elif s in ('callback', 'called', 'contacted'):
-                employees[eid]['in_progress'] += count
-            elif s in ('lost', 'lost cot'):
-                employees[eid]['lost'] += count
-            elif s == 'renewed directly':
-                employees[eid]['renewed_directly'] += count
-            elif s == 'end date changed':
-                employees[eid]['end_date_changed'] += count
-            elif s == 'priced':
-                employees[eid]['priced'] += count
-            elif s in ('not answered', 'email only', 'broker in place', 
-                    'complaint', 'incorrect supplier', 'invalid number',
-                    'meter de-energised'):
-                employees[eid]['not_contacted'] += count
-            else:
-                # null/empty/unknown
-                employees[eid]['not_contacted'] += count
+            if eid in employees:  # Should always be true
+                count = r.count or 0
+                s = (r.status or '').lower().strip()
+                employees[eid]['total'] += count
+ 
+                if s in ('renewed', 'already renewed'):
+                    employees[eid]['renewed'] += count
+                elif s in ('callback', 'called', 'contacted'):
+                    employees[eid]['in_progress'] += count
+                elif s in ('lost', 'lost cot'):
+                    employees[eid]['lost'] += count
+                elif s == 'renewed directly':
+                    employees[eid]['renewed_directly'] += count
+                elif s == 'end date changed':
+                    employees[eid]['end_date_changed'] += count
+                elif s == 'priced':
+                    employees[eid]['priced'] += count
+                elif s in ('not answered', 'email only', 'broker in place', 
+                        'complaint', 'incorrect supplier', 'invalid number',
+                        'meter de-energised'):
+                    employees[eid]['not_contacted'] += count
+                else:
+                    # null/empty/unknown
+                    employees[eid]['not_contacted'] += count
+ 
+        # Build output
         output = []
         for emp in employees.values():
-            total = emp['total'] or 1
-            rate = round((emp['renewed'] / total) * 100)
+            total = emp['total'] if emp['total'] > 0 else 1  # Avoid division by zero
+            rate = round((emp['renewed'] / total) * 100) if emp['total'] > 0 else 0
+            
             output.append({
                 'employee_id': emp['employee_id'],
                 'employee_name': emp['employee_name'],
@@ -869,10 +902,12 @@ def get_staff_status_counts():
                 'end_date_changed_count': emp['end_date_changed'],
                 'priced_count': emp['priced'],
                 'conversion_rate': rate,
+                'converted_count': emp['renewed'],  # Add this for sorting compatibility
             })
-
+ 
+        print(f"✅ Returning {len(output)} staff members (before filtering: {len(all_employees)} total employees)")
         return jsonify(output), 200
-
+ 
     except Exception as e:
         import traceback
         traceback.print_exc()
