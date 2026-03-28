@@ -9,6 +9,26 @@ from backend.crm.controllers.crm_controller import CRMController
 from backend.crm.middleware.tenant_middleware import require_tenant
 from .auth_helpers import token_required
 
+def _is_admin_from_db(user):
+    """Mirror renewals: look up role from DB instead of trusting user.role attribute."""
+    from backend.db import SessionLocal
+    from sqlalchemy import text
+    session = SessionLocal()
+    try:
+        result = session.execute(text("""
+            SELECT rm.role_name
+            FROM "StreemLyne_MT"."User_Role_Mapping" urm
+            JOIN "StreemLyne_MT"."Role_Master" rm ON urm.role_id = rm.role_id
+            WHERE urm.user_id = :user_id
+            LIMIT 1
+        """), {'user_id': user.user_id}).fetchone()
+        role = result[0] if result else None
+        return role in ['Platform Admin', 'Tenant Super Admin']
+    except Exception:
+        return False
+    finally:
+        session.close()
+
 # Lightweight helper: attach tenant_id from decoded JWT to `g` (no new auth logic)
 def tenant_from_jwt(f):
     """Set g.tenant_id from request.current_user.tenant_id (returns 401 if missing).
@@ -72,7 +92,7 @@ def get_leads():
         salesperson_param = request.args.get('salesperson')
 
         employee_id = getattr(current_user, 'employee_id', None)
-        is_admin    = is_admin_user(current_user)
+        is_admin = _is_admin_from_db(current_user)
 
         logger.warning(
             '🔍 get_leads: employee_id=%s is_admin=%s tenant=%s service=%s',
@@ -446,7 +466,7 @@ def get_leads_performance():
         current_user = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id    = 2 if service_param.strip().lower() == 'water' else 1
-        is_admin      = is_admin_user(current_user)
+        is_admin = _is_admin_from_db(current_user)
         employee_id   = getattr(current_user, 'employee_id', None)
 
         db = get_supabase_client()
@@ -535,7 +555,6 @@ def get_leads_stats_by_employee():
     Returns: { stats: [{ employee_id, employee_name, count }] }
     """
     from backend.crm.supabase_client import get_supabase_client
-    from backend.crm.utils.role_helpers import is_admin_user
     import logging
     logger = logging.getLogger(__name__)
 
@@ -544,7 +563,7 @@ def get_leads_stats_by_employee():
         current_user = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id    = 2 if service_param.strip().lower() == 'water' else 1
-        is_admin      = is_admin_user(current_user)
+        is_admin = _is_admin_from_db(current_user)
         employee_id   = getattr(current_user, 'employee_id', None)
 
         logger.warning(
