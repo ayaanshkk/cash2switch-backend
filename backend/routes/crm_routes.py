@@ -45,40 +45,42 @@ crm_controller = CRMController()
 def get_leads():
     """
     GET /api/crm/leads
-    Returns leads for the current user.
 
-    Business rules (mirrors energy_customer_routes.py exactly):
-      - EVERYONE (including admins) only sees their own NON-ALLOCATED leads.
-      - is_allocated = TRUE means the lead was reassigned to someone else and
-        should appear in the recipient's /allocated list, not here.
-      - If the user has no employee_id, return [] (cannot scope safely).
+    Business rules (mirrors renewals get_energy_customers + get_priced_customers):
+
+    ADMIN (Platform Admin / Tenant Super Admin):
+      - Sees ALL leads for the tenant across all employees.
+      - Optional ?salesperson=<employee_id> to drill into one agent.
+      - No is_allocated filter — admin needs full visibility to assign.
+
+    NON-ADMIN (Salesperson):
+      - Sees only their own NON-ALLOCATED leads.
+      - is_allocated=TRUE means the lead was reassigned away from them and
+        belongs in /allocated instead.
     """
     from backend.crm.supabase_client import get_supabase_client
+    from backend.crm.utils.role_helpers import is_admin_user
     import logging
     logger = logging.getLogger(__name__)
 
     try:
-        tenant_id = g.tenant_id
+        tenant_id    = g.tenant_id
         current_user = request.current_user
-        service_param = request.args.get('service', 'utilities')
-        service_id = 2 if service_param.strip().lower() == 'water' else 1
-        exclude_stage = request.args.get('exclude_stage', '')
+        service_param     = request.args.get('service', 'utilities')
+        service_id        = 2 if service_param.strip().lower() == 'water' else 1
+        exclude_stage     = request.args.get('exclude_stage', '')
+        salesperson_param = request.args.get('salesperson')
 
         employee_id = getattr(current_user, 'employee_id', None)
+        is_admin    = is_admin_user(current_user)
 
         logger.warning(
-            '🔍 get_leads: employee_id=%s tenant=%s service=%s',
-            employee_id, tenant_id, service_param
+            '🔍 get_leads: employee_id=%s is_admin=%s tenant=%s service=%s',
+            employee_id, is_admin, tenant_id, service_param
         )
-
-        # Cannot scope safely without employee_id — return empty
-        if not employee_id:
-            logger.warning('⚠️ User has no employee_id - returning empty')
-            return jsonify([]), 200
 
         db = get_supabase_client()
 
-        # ✅ MIRROR RENEWALS: Everyone sees only their own NON-ALLOCATED leads
         query = '''
             SELECT
                 od.*,
@@ -92,10 +94,27 @@ def get_leads():
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
             WHERE od."tenant_id" = %s
             AND od."service_id" = %s
-            AND od."opportunity_owner_employee_id" = %s
-            AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
         '''
-        params = [tenant_id, service_id, employee_id]
+        params = [tenant_id, service_id]
+
+        if is_admin:
+            # Admin sees all leads; optionally filter to one salesperson
+            if salesperson_param and salesperson_param != 'All':
+                try:
+                    query += ' AND od."opportunity_owner_employee_id" = %s'
+                    params.append(int(salesperson_param))
+                except ValueError:
+                    pass
+        else:
+            # Non-admin: own non-allocated leads only
+            if not employee_id:
+                logger.warning('⚠️ Non-admin has no employee_id - returning empty')
+                return jsonify([]), 200
+            query += '''
+                AND od."opportunity_owner_employee_id" = %s
+                AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
+            '''
+            params.append(employee_id)
 
         if exclude_stage:
             query += ' AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") != LOWER(%s))'
@@ -118,8 +137,8 @@ def get_leads():
         results = [{k: _s(v) for k, v in row.items()} for row in (rows or [])]
 
         logger.warning(
-            '✅ get_leads returning %d leads for employee_id=%s',
-            len(results), employee_id
+            '✅ get_leads returning %d leads (is_admin=%s employee_id=%s)',
+            len(results), is_admin, employee_id
         )
 
         return jsonify(results), 200
@@ -413,27 +432,25 @@ def search_all_leads():
 def get_leads_performance():
     """
     GET /api/crm/leads/performance?service=...
-    Get lead performance metrics.
 
-    Mirrors: /energy-renewals/performance in renewals.
-    Server-side scoping: non-admins already only have their own leads, so
-    querying all leads for this tenant+service+employee gives correct numbers.
+    Admin: metrics across ALL leads for the tenant.
+    Non-admin: metrics for their own leads only.
     """
     from backend.crm.supabase_client import get_supabase_client
+    from backend.crm.utils.role_helpers import is_admin_user
     import logging
     logger = logging.getLogger(__name__)
 
     try:
-        tenant_id = g.tenant_id
+        tenant_id    = g.tenant_id
         current_user = request.current_user
         service_param = request.args.get('service', 'utilities')
-        service_id = 2 if service_param.strip().lower() == 'water' else 1
-
-        employee_id = getattr(current_user, 'employee_id', None)
+        service_id    = 2 if service_param.strip().lower() == 'water' else 1
+        is_admin      = is_admin_user(current_user)
+        employee_id   = getattr(current_user, 'employee_id', None)
 
         db = get_supabase_client()
 
-        # Scope to employee (mirrors renewals: use_current_user scoping)
         query = '''
             SELECT sm."stage_name"
             FROM "StreemLyne_MT"."Opportunity_Details" od
@@ -443,7 +460,8 @@ def get_leads_performance():
         '''
         params = [tenant_id, service_id]
 
-        if employee_id:
+        # Non-admins only see their own performance numbers
+        if not is_admin and employee_id:
             query += ' AND od."opportunity_owner_employee_id" = %s'
             params.append(employee_id)
 
@@ -508,42 +526,69 @@ def get_leads_performance():
 def get_leads_stats_by_employee():
     """
     GET /api/crm/leads/stats-by-employee?service=...
-    Returns unallocated lead counts grouped by employee for the Team Overview panel.
-    Only meaningful for admins but callable by anyone.
+    Returns lead counts grouped by employee for the Team Overview panel.
+
+    Admin: counts ALL leads per employee (allocated + non-allocated) so the
+    team overview shows total workload per salesperson.
+    Non-admin: returns only their own count.
 
     Returns: { stats: [{ employee_id, employee_name, count }] }
-
-    Mirrors: /energy-clients/stats-by-employee in renewals.
     """
     from backend.crm.supabase_client import get_supabase_client
+    from backend.crm.utils.role_helpers import is_admin_user
     import logging
     logger = logging.getLogger(__name__)
 
     try:
-        tenant_id = g.tenant_id
+        tenant_id    = g.tenant_id
+        current_user = request.current_user
         service_param = request.args.get('service', 'utilities')
-        service_id = 2 if service_param.strip().lower() == 'water' else 1
+        service_id    = 2 if service_param.strip().lower() == 'water' else 1
+        is_admin      = is_admin_user(current_user)
+        employee_id   = getattr(current_user, 'employee_id', None)
 
-        logger.warning('🔍 stats-by-employee: tenant_id=%s service_id=%s', tenant_id, service_id)
+        logger.warning(
+            '🔍 stats-by-employee: tenant_id=%s service_id=%s is_admin=%s',
+            tenant_id, service_id, is_admin
+        )
 
         db = get_supabase_client()
 
-        # Count non-allocated leads per employee (mirrors renewals stats-by-employee)
-        rows = db.execute_query('''
-            SELECT
-                em."employee_id",
-                em."employee_name",
-                COUNT(od."opportunity_id") AS count
-            FROM "StreemLyne_MT"."Opportunity_Details" od
-            JOIN "StreemLyne_MT"."Employee_Master" em
-                ON od."opportunity_owner_employee_id" = em."employee_id"
-            WHERE od."tenant_id" = %s
-            AND od."service_id" = %s
-            AND COALESCE(od."is_allocated", FALSE) = FALSE
-            GROUP BY em."employee_id", em."employee_name"
-            HAVING COUNT(od."opportunity_id") > 0
-            ORDER BY count DESC
-        ''', (tenant_id, service_id))
+        if is_admin:
+            # Admin: show ALL leads per employee (no is_allocated filter)
+            # This matches what the admin sees in get_leads (all tenant leads)
+            rows = db.execute_query('''
+                SELECT
+                    em."employee_id",
+                    em."employee_name",
+                    COUNT(od."opportunity_id") AS count
+                FROM "StreemLyne_MT"."Opportunity_Details" od
+                JOIN "StreemLyne_MT"."Employee_Master" em
+                    ON od."opportunity_owner_employee_id" = em."employee_id"
+                WHERE od."tenant_id" = %s
+                AND od."service_id" = %s
+                GROUP BY em."employee_id", em."employee_name"
+                HAVING COUNT(od."opportunity_id") > 0
+                ORDER BY count DESC
+            ''', (tenant_id, service_id))
+        else:
+            # Non-admin: just their own non-allocated count
+            if not employee_id:
+                return jsonify({'stats': []}), 200
+            rows = db.execute_query('''
+                SELECT
+                    em."employee_id",
+                    em."employee_name",
+                    COUNT(od."opportunity_id") AS count
+                FROM "StreemLyne_MT"."Opportunity_Details" od
+                JOIN "StreemLyne_MT"."Employee_Master" em
+                    ON od."opportunity_owner_employee_id" = em."employee_id"
+                WHERE od."tenant_id" = %s
+                AND od."service_id" = %s
+                AND od."opportunity_owner_employee_id" = %s
+                AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
+                GROUP BY em."employee_id", em."employee_name"
+            ''', (tenant_id, service_id, employee_id))
 
         stats = [
             {
@@ -556,7 +601,6 @@ def get_leads_stats_by_employee():
 
         logger.warning('📊 stats-by-employee result: %s', stats)
 
-        # ✅ Return { stats: [...] } to match renewals response shape
         return jsonify({'stats': stats}), 200
 
     except Exception as e:
@@ -1391,192 +1435,3 @@ def debug_tenant_lookup(tenant_id):
             'error': str(e),
             'traceback': traceback.format_exc()
         }, 500
-    
-@crm_bp.route('/leads/diagnose', methods=['GET'])
-@token_required
-@tenant_from_jwt
-def diagnose_leads():
-    """
-    TEMPORARY diagnostic endpoint — remove after debugging.
-    Hit: GET /api/crm/leads/diagnose?service=utilities
-
-    Shows exactly what's in Opportunity_Details for this tenant so you can
-    see why get_leads returns 0 rows.
-    """
-    from backend.crm.supabase_client import get_supabase_client
-
-    try:
-        tenant_id   = g.tenant_id
-        current_user = request.current_user
-        employee_id  = getattr(current_user, 'employee_id', None)
-        service_param = request.args.get('service', 'utilities')
-        service_id    = 2 if service_param.strip().lower() == 'water' else 1
-
-        db = get_supabase_client()
-
-        # ── 1. Total rows for this tenant (no filters at all) ─────────────────
-        total = db.execute_query(
-            'SELECT COUNT(*) AS cnt FROM "StreemLyne_MT"."Opportunity_Details" WHERE "tenant_id" = %s',
-            (tenant_id,), fetch_one=True
-        )
-
-        # ── 2. Breakdown of service_id values ─────────────────────────────────
-        service_breakdown = db.execute_query(
-            '''SELECT "service_id", COUNT(*) AS cnt
-               FROM "StreemLyne_MT"."Opportunity_Details"
-               WHERE "tenant_id" = %s
-               GROUP BY "service_id"
-               ORDER BY "service_id"''',
-            (tenant_id,)
-        )
-
-        # ── 3. Breakdown of is_allocated values ───────────────────────────────
-        allocated_breakdown = db.execute_query(
-            '''SELECT "is_allocated", COUNT(*) AS cnt
-               FROM "StreemLyne_MT"."Opportunity_Details"
-               WHERE "tenant_id" = %s AND "service_id" = %s
-               GROUP BY "is_allocated"''',
-            (tenant_id, service_id)
-        )
-
-        # ── 4. Which employee_ids own leads for this service ──────────────────
-        owner_breakdown = db.execute_query(
-            '''SELECT "opportunity_owner_employee_id", COUNT(*) AS cnt
-               FROM "StreemLyne_MT"."Opportunity_Details"
-               WHERE "tenant_id" = %s AND "service_id" = %s
-               GROUP BY "opportunity_owner_employee_id"
-               ORDER BY cnt DESC
-               LIMIT 20''',
-            (tenant_id, service_id)
-        )
-
-        # ── 5. Sample of 5 raw rows (no filters) ─────────────────────────────
-        sample = db.execute_query(
-            '''SELECT "opportunity_id", "tenant_id", "service_id",
-                      "opportunity_owner_employee_id", "is_allocated",
-                      "stage_id", "business_name", "opportunity_title"
-               FROM "StreemLyne_MT"."Opportunity_Details"
-               WHERE "tenant_id" = %s
-               ORDER BY "created_at" DESC
-               LIMIT 5''',
-            (tenant_id,)
-        )
-
-        # ── 6. Exact query that get_leads runs ────────────────────────────────
-        leads_exact = db.execute_query(
-            '''SELECT COUNT(*) AS cnt
-               FROM "StreemLyne_MT"."Opportunity_Details" od
-               LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
-               WHERE od."tenant_id" = %s
-               AND od."service_id" = %s
-               AND od."opportunity_owner_employee_id" = %s
-               AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)''',
-            (tenant_id, service_id, employee_id),
-            fetch_one=True
-        )
-
-        # ── 7. Same but without the is_allocated filter ───────────────────────
-        leads_no_alloc = db.execute_query(
-            '''SELECT COUNT(*) AS cnt
-               FROM "StreemLyne_MT"."Opportunity_Details"
-               WHERE "tenant_id" = %s
-               AND "service_id" = %s
-               AND "opportunity_owner_employee_id" = %s''',
-            (tenant_id, service_id, employee_id),
-            fetch_one=True
-        )
-
-        # ── 8. Same but without the service_id filter ─────────────────────────
-        leads_no_service = db.execute_query(
-            '''SELECT COUNT(*) AS cnt
-               FROM "StreemLyne_MT"."Opportunity_Details"
-               WHERE "tenant_id" = %s
-               AND "opportunity_owner_employee_id" = %s
-               AND (is_allocated = FALSE OR is_allocated IS NULL)''',
-            (tenant_id, employee_id),
-            fetch_one=True
-        )
-
-        def _safe(rows):
-            if not rows:
-                return rows
-            if isinstance(rows, dict):
-                return {k: str(v) if hasattr(v, 'isoformat') else v for k, v in rows.items()}
-            return [{k: str(v) if hasattr(v, 'isoformat') else v for k, v in r.items()} for r in rows]
-
-        return jsonify({
-            'context': {
-                'tenant_id':   tenant_id,
-                'employee_id': employee_id,
-                'service_id':  service_id,
-                'service':     service_param,
-            },
-            'diagnosis': {
-                '1_total_rows_for_tenant':          _safe(total),
-                '2_service_id_breakdown':           _safe(service_breakdown),
-                '3_is_allocated_breakdown':         _safe(allocated_breakdown),
-                '4_owner_employee_ids':             _safe(owner_breakdown),
-                '5_sample_rows':                    _safe(sample),
-                '6_exact_get_leads_query_count':    _safe(leads_exact),
-                '7_without_is_allocated_filter':    _safe(leads_no_alloc),
-                '8_without_service_id_filter':      _safe(leads_no_service),
-            },
-            'conclusion': _build_conclusion(
-                total, leads_exact, leads_no_alloc, leads_no_service,
-                service_breakdown, allocated_breakdown, owner_breakdown,
-                employee_id, service_id
-            )
-        }), 200
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
-
-
-def _build_conclusion(total, leads_exact, leads_no_alloc, leads_no_service,
-                      service_breakdown, allocated_breakdown, owner_breakdown,
-                      employee_id, service_id):
-    """Plain-English diagnosis of why get_leads returns 0."""
-    reasons = []
-
-    total_cnt = int((total or {}).get('cnt', 0))
-    exact_cnt = int((leads_exact or {}).get('cnt', 0))
-    no_alloc_cnt = int((leads_no_alloc or {}).get('cnt', 0))
-    no_service_cnt = int((leads_no_service or {}).get('cnt', 0))
-
-    if total_cnt == 0:
-        return ["❌ NO ROWS AT ALL for this tenant_id. Either tenant_id is wrong or no data has been imported."]
-
-    if exact_cnt > 0:
-        reasons.append(f"✅ get_leads query returns {exact_cnt} rows — the issue is elsewhere (frontend/caching?).")
-        return reasons
-
-    if no_alloc_cnt > 0:
-        reasons.append(
-            f"❌ is_allocated filter is removing {no_alloc_cnt} lead(s). "
-            "These leads exist for this employee+service but is_allocated=TRUE. "
-            "Fix: check /api/crm/leads/allocated to see them, or set is_allocated=FALSE in DB."
-        )
-
-    if no_service_cnt > 0 and no_alloc_cnt == 0:
-        service_ids_present = [str(r.get('service_id')) for r in (service_breakdown or [])]
-        reasons.append(
-            f"❌ service_id filter is removing leads. "
-            f"employee_id={employee_id} has leads but NOT with service_id={service_id}. "
-            f"service_ids in DB for this tenant: {', '.join(service_ids_present) or 'none'}. "
-            "Fix: check what service_id your leads were imported with."
-        )
-
-    if no_service_cnt == 0 and no_alloc_cnt == 0:
-        owner_ids = [str(r.get('opportunity_owner_employee_id')) for r in (owner_breakdown or [])]
-        reasons.append(
-            f"❌ employee_id filter is removing leads. "
-            f"employee_id={employee_id} owns no leads with service_id={service_id}. "
-            f"Leads are owned by employee_ids: {', '.join(owner_ids) or 'none'}. "
-            "Fix: assign leads to this employee, or check that employee_id in JWT matches the DB."
-        )
-
-    return reasons if reasons else [
-        "❓ Could not determine cause. Check the raw numbers above."
-    ]
