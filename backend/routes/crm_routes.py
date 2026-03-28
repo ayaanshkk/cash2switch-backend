@@ -88,6 +88,10 @@ crm_controller = CRMController()
 @token_required
 @tenant_from_jwt
 def get_leads():
+    """
+    Get all leads with team overview stats
+    Admin sees all tenant leads, non-admin sees only their own non-allocated leads
+    """
     from backend.crm.supabase_client import get_supabase_client
     import logging
     logger = logging.getLogger(__name__)
@@ -107,12 +111,68 @@ def get_leads():
 
         if not employee_id:
             logger.warning('⚠️ No employee_id - returning empty')
-            return jsonify([]), 200
+            return jsonify({'data': [], 'team_stats': []}), 200
 
+        # ✅ Determine if admin
+        is_admin = _is_admin_from_db(current_user)
+        
         db = get_supabase_client()
 
-        # ✅ EVERYONE sees only their own NON-ALLOCATED leads (mirrors renewals exactly)
-        # Admin visibility is handled via search-all, not the main list
+        # ================================================================
+        # 1. TEAM STATS QUERY
+        # ================================================================
+        if is_admin:
+            # Admin: Show ALL employees in tenant with their lead counts
+            team_stats_query = '''
+                SELECT 
+                    em."employee_id",
+                    em."employee_name",
+                    COUNT(od."opportunity_id") as lead_count
+                FROM "StreemLyne_MT"."Employee_Master" em
+                LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od 
+                    ON em."employee_id" = od."opportunity_owner_employee_id"
+                    AND od."tenant_id" = %s
+                    AND od."service_id" = %s
+                    AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
+                WHERE em."tenant_id" = %s
+                GROUP BY em."employee_id", em."employee_name"
+                HAVING COUNT(od."opportunity_id") > 0
+                ORDER BY em."employee_name"
+            '''
+            team_stats_rows = db.execute_query(team_stats_query, (tenant_id, service_id, tenant_id))
+        else:
+            # Non-admin: Show only own stats
+            team_stats_query = '''
+                SELECT 
+                    em."employee_id",
+                    em."employee_name",
+                    COUNT(od."opportunity_id") as lead_count
+                FROM "StreemLyne_MT"."Employee_Master" em
+                LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od 
+                    ON em."employee_id" = od."opportunity_owner_employee_id"
+                    AND od."tenant_id" = %s
+                    AND od."service_id" = %s
+                    AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
+                WHERE em."employee_id" = %s
+                GROUP BY em."employee_id", em."employee_name"
+            '''
+            team_stats_rows = db.execute_query(team_stats_query, (tenant_id, service_id, employee_id))
+
+        team_stats = [
+            {
+                'employee_id': row.get('employee_id'),
+                'employee_name': row.get('employee_name'),
+                'lead_count': int(row.get('lead_count') or 0)
+            }
+            for row in (team_stats_rows or [])
+        ]
+
+        logger.warning('📊 Team stats: %s', team_stats)
+
+        # ================================================================
+        # 2. MAIN LEADS QUERY
+        # ================================================================
+        # Everyone (admin and non-admin) sees only their own non-allocated leads
         query = '''
             SELECT
                 od.*,
@@ -152,14 +212,24 @@ def get_leads():
         results = [{k: _s(v) for k, v in row.items()} for row in (rows or [])]
 
         logger.warning(
-            '✅ get_leads returning %d leads for employee_id=%s',
-            len(results), employee_id
+            '✅ get_leads returning %d leads + %d team stats for employee_id=%s (is_admin=%s)',
+            len(results), len(team_stats), employee_id, is_admin
         )
 
-        return jsonify(results), 200
+        # ✅ RETURN BOTH DATA AND TEAM_STATS
+        return jsonify({
+            'data': results,
+            'team_stats': team_stats,
+            'user_context': {
+                'is_admin': is_admin,
+                'employee_id': employee_id
+            }
+        }), 200
 
     except Exception as e:
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
+        logger.error('❌ get_leads error: %s', str(e))
         return jsonify({'error': str(e)}), 500
 
 
@@ -379,9 +449,10 @@ def get_leads_performance():
         """
         params = {'tenant_id': tenant_id, 'service_id': service_id}
 
-        if employee_id:
-            query += ' AND od."opportunity_owner_employee_id" = %s'
-            params.append(employee_id)
+        # ✅ FIX: Non-admin should only see own performance
+        if not is_admin and employee_id:
+            sql += ' AND od.opportunity_owner_employee_id = :employee_id'
+            params['employee_id'] = employee_id
 
         rows = session.execute(text(sql), params).mappings().all()
 
@@ -419,7 +490,8 @@ def get_leads_performance():
         }), 200
 
     except Exception as e:
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
         try: session.close()
