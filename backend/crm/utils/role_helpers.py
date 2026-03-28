@@ -7,6 +7,14 @@ from typing import Any, Optional
 from flask import request, jsonify, current_app
 from functools import wraps
 
+ADMIN_ROLES = {
+    "platform admin",
+    "tenant super admin",
+    "admin",
+    "superadmin",
+    "super admin",
+}
+
 
 def is_crm_leads_admin_role(jwt_role: Optional[Any]) -> bool:
     """
@@ -82,27 +90,23 @@ def get_user_role_name(user) -> str:
 
 def is_admin_user(user) -> bool:
     """
-    Check if user has admin role.
-    
-    Supports multiple admin identifiers:
-    1. Checks Role_Master.role_name for "admin" or "administrator"
-    2. Falls back to employee_id==1 or user_id==1 for backward compatibility
-    3. Checks user_name for "admin" or "administrator"
+    Return True if the user has an admin-level role.
+ 
+    Checks user.role case-insensitively against the known admin role names.
+    Returns False if user is None or has no role attribute.
+ 
+    Previously this compared against title-case strings only, which broke when
+    auth_helpers.py stored the role in lowercase. Now both sides are lowercased
+    so the comparison always works regardless of case.
     """
-    if not user:
+    if user is None:
         return False
-    
-    # First: Check actual role from Role_Master
-    role_name = get_user_role_name(user)
-    if role_name in {"admin", "administrator"}:
-        return True
-    
-    # Fallback: Legacy checks for backward compatibility
-    employee_id = getattr(user, 'employee_id', None)
-    user_id = getattr(user, 'user_id', None) or getattr(user, 'User_id', None)
-    user_name = str(getattr(user, 'user_name', '') or getattr(user, 'User_name', '') or '').strip().lower()
-
-    return employee_id == 1 or user_id == 1 or user_name in {"admin", "administrator"}
+ 
+    role = getattr(user, 'role', None)
+    if not role:
+        return False
+ 
+    return str(role).strip().lower() in ADMIN_ROLES
 
 
 def admin_required(f):

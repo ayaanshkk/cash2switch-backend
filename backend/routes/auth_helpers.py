@@ -90,7 +90,9 @@ def token_required(f):
                     user.employee_id = employee_id_from_jwt
 
                 raw_role = payload.get('role')
-                user.role = str(raw_role).strip().lower() if raw_role else None
+                # ✅ Preserve original case — JWT stores "Platform Admin" / "Tenant Super Admin".
+                # The old .lower() made is_admin_user() return False for all admins on live.
+                user.role = str(raw_role).strip() if raw_role else None
 
                 current_app.logger.info(
                     "👤 Authenticated: user_id=%s employee_id=%s tenant_id=%s role=%s",
@@ -114,7 +116,16 @@ def token_required(f):
 
             return f(*args, **kwargs)
         finally:
-            local_session.close()
+            # ✅ Guard against "server closed the connection unexpectedly" errors
+            # that crash inside session.close() itself when Render/Supabase has
+            # already dropped the idle connection. pool_pre_ping in db.py prevents
+            # most cases, but this is a belt-and-suspenders catch for the rest.
+            try:
+                local_session.close()
+            except Exception as close_err:
+                current_app.logger.warning(
+                    "Session close failed (stale connection — harmless): %s", close_err
+                )
 
     return decorated
 
