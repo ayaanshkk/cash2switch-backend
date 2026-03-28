@@ -31,11 +31,6 @@ def _is_admin_from_db(user):
 
 # Lightweight helper: attach tenant_id from decoded JWT to `g` (no new auth logic)
 def tenant_from_jwt(f):
-    """Set g.tenant_id from request.current_user.tenant_id (returns 401 if missing).
-
-    This is a thin wiring decorator that relies on the existing `token_required`
-    to populate `request.current_user`. It does NOT perform authentication itself.
-    """
     @wraps(f)
     def _wrap(*args, **kwargs):
         current_user = getattr(request, 'current_user', None)
@@ -44,8 +39,7 @@ def tenant_from_jwt(f):
                 'error': 'Missing tenant in token',
                 'message': 'Authenticated token must include tenant_id'
             }), 401
-        # Propagate tenant_id to Flask `g` for downstream code that expects it
-        g.tenant_id = getattr(current_user, 'tenant_id')
+        g.tenant_id = int(getattr(current_user, 'tenant_id'))  # ← cast to int
         return f(*args, **kwargs)
     return _wrap
 
