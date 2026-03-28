@@ -1391,3 +1391,192 @@ def debug_tenant_lookup(tenant_id):
             'error': str(e),
             'traceback': traceback.format_exc()
         }, 500
+    
+@crm_bp.route('/leads/diagnose', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def diagnose_leads():
+    """
+    TEMPORARY diagnostic endpoint — remove after debugging.
+    Hit: GET /api/crm/leads/diagnose?service=utilities
+
+    Shows exactly what's in Opportunity_Details for this tenant so you can
+    see why get_leads returns 0 rows.
+    """
+    from backend.crm.supabase_client import get_supabase_client
+
+    try:
+        tenant_id   = g.tenant_id
+        current_user = request.current_user
+        employee_id  = getattr(current_user, 'employee_id', None)
+        service_param = request.args.get('service', 'utilities')
+        service_id    = 2 if service_param.strip().lower() == 'water' else 1
+
+        db = get_supabase_client()
+
+        # ── 1. Total rows for this tenant (no filters at all) ─────────────────
+        total = db.execute_query(
+            'SELECT COUNT(*) AS cnt FROM "StreemLyne_MT"."Opportunity_Details" WHERE "tenant_id" = %s',
+            (tenant_id,), fetch_one=True
+        )
+
+        # ── 2. Breakdown of service_id values ─────────────────────────────────
+        service_breakdown = db.execute_query(
+            '''SELECT "service_id", COUNT(*) AS cnt
+               FROM "StreemLyne_MT"."Opportunity_Details"
+               WHERE "tenant_id" = %s
+               GROUP BY "service_id"
+               ORDER BY "service_id"''',
+            (tenant_id,)
+        )
+
+        # ── 3. Breakdown of is_allocated values ───────────────────────────────
+        allocated_breakdown = db.execute_query(
+            '''SELECT "is_allocated", COUNT(*) AS cnt
+               FROM "StreemLyne_MT"."Opportunity_Details"
+               WHERE "tenant_id" = %s AND "service_id" = %s
+               GROUP BY "is_allocated"''',
+            (tenant_id, service_id)
+        )
+
+        # ── 4. Which employee_ids own leads for this service ──────────────────
+        owner_breakdown = db.execute_query(
+            '''SELECT "opportunity_owner_employee_id", COUNT(*) AS cnt
+               FROM "StreemLyne_MT"."Opportunity_Details"
+               WHERE "tenant_id" = %s AND "service_id" = %s
+               GROUP BY "opportunity_owner_employee_id"
+               ORDER BY cnt DESC
+               LIMIT 20''',
+            (tenant_id, service_id)
+        )
+
+        # ── 5. Sample of 5 raw rows (no filters) ─────────────────────────────
+        sample = db.execute_query(
+            '''SELECT "opportunity_id", "tenant_id", "service_id",
+                      "opportunity_owner_employee_id", "is_allocated",
+                      "stage_id", "business_name", "opportunity_title"
+               FROM "StreemLyne_MT"."Opportunity_Details"
+               WHERE "tenant_id" = %s
+               ORDER BY "created_at" DESC
+               LIMIT 5''',
+            (tenant_id,)
+        )
+
+        # ── 6. Exact query that get_leads runs ────────────────────────────────
+        leads_exact = db.execute_query(
+            '''SELECT COUNT(*) AS cnt
+               FROM "StreemLyne_MT"."Opportunity_Details" od
+               LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
+               WHERE od."tenant_id" = %s
+               AND od."service_id" = %s
+               AND od."opportunity_owner_employee_id" = %s
+               AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)''',
+            (tenant_id, service_id, employee_id),
+            fetch_one=True
+        )
+
+        # ── 7. Same but without the is_allocated filter ───────────────────────
+        leads_no_alloc = db.execute_query(
+            '''SELECT COUNT(*) AS cnt
+               FROM "StreemLyne_MT"."Opportunity_Details"
+               WHERE "tenant_id" = %s
+               AND "service_id" = %s
+               AND "opportunity_owner_employee_id" = %s''',
+            (tenant_id, service_id, employee_id),
+            fetch_one=True
+        )
+
+        # ── 8. Same but without the service_id filter ─────────────────────────
+        leads_no_service = db.execute_query(
+            '''SELECT COUNT(*) AS cnt
+               FROM "StreemLyne_MT"."Opportunity_Details"
+               WHERE "tenant_id" = %s
+               AND "opportunity_owner_employee_id" = %s
+               AND (is_allocated = FALSE OR is_allocated IS NULL)''',
+            (tenant_id, employee_id),
+            fetch_one=True
+        )
+
+        def _safe(rows):
+            if not rows:
+                return rows
+            if isinstance(rows, dict):
+                return {k: str(v) if hasattr(v, 'isoformat') else v for k, v in rows.items()}
+            return [{k: str(v) if hasattr(v, 'isoformat') else v for k, v in r.items()} for r in rows]
+
+        return jsonify({
+            'context': {
+                'tenant_id':   tenant_id,
+                'employee_id': employee_id,
+                'service_id':  service_id,
+                'service':     service_param,
+            },
+            'diagnosis': {
+                '1_total_rows_for_tenant':          _safe(total),
+                '2_service_id_breakdown':           _safe(service_breakdown),
+                '3_is_allocated_breakdown':         _safe(allocated_breakdown),
+                '4_owner_employee_ids':             _safe(owner_breakdown),
+                '5_sample_rows':                    _safe(sample),
+                '6_exact_get_leads_query_count':    _safe(leads_exact),
+                '7_without_is_allocated_filter':    _safe(leads_no_alloc),
+                '8_without_service_id_filter':      _safe(leads_no_service),
+            },
+            'conclusion': _build_conclusion(
+                total, leads_exact, leads_no_alloc, leads_no_service,
+                service_breakdown, allocated_breakdown, owner_breakdown,
+                employee_id, service_id
+            )
+        }), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+def _build_conclusion(total, leads_exact, leads_no_alloc, leads_no_service,
+                      service_breakdown, allocated_breakdown, owner_breakdown,
+                      employee_id, service_id):
+    """Plain-English diagnosis of why get_leads returns 0."""
+    reasons = []
+
+    total_cnt = int((total or {}).get('cnt', 0))
+    exact_cnt = int((leads_exact or {}).get('cnt', 0))
+    no_alloc_cnt = int((leads_no_alloc or {}).get('cnt', 0))
+    no_service_cnt = int((leads_no_service or {}).get('cnt', 0))
+
+    if total_cnt == 0:
+        return ["❌ NO ROWS AT ALL for this tenant_id. Either tenant_id is wrong or no data has been imported."]
+
+    if exact_cnt > 0:
+        reasons.append(f"✅ get_leads query returns {exact_cnt} rows — the issue is elsewhere (frontend/caching?).")
+        return reasons
+
+    if no_alloc_cnt > 0:
+        reasons.append(
+            f"❌ is_allocated filter is removing {no_alloc_cnt} lead(s). "
+            "These leads exist for this employee+service but is_allocated=TRUE. "
+            "Fix: check /api/crm/leads/allocated to see them, or set is_allocated=FALSE in DB."
+        )
+
+    if no_service_cnt > 0 and no_alloc_cnt == 0:
+        service_ids_present = [str(r.get('service_id')) for r in (service_breakdown or [])]
+        reasons.append(
+            f"❌ service_id filter is removing leads. "
+            f"employee_id={employee_id} has leads but NOT with service_id={service_id}. "
+            f"service_ids in DB for this tenant: {', '.join(service_ids_present) or 'none'}. "
+            "Fix: check what service_id your leads were imported with."
+        )
+
+    if no_service_cnt == 0 and no_alloc_cnt == 0:
+        owner_ids = [str(r.get('opportunity_owner_employee_id')) for r in (owner_breakdown or [])]
+        reasons.append(
+            f"❌ employee_id filter is removing leads. "
+            f"employee_id={employee_id} owns no leads with service_id={service_id}. "
+            f"Leads are owned by employee_ids: {', '.join(owner_ids) or 'none'}. "
+            "Fix: assign leads to this employee, or check that employee_id in JWT matches the DB."
+        )
+
+    return reasons if reasons else [
+        "❓ Could not determine cause. Check the raw numbers above."
+    ]
