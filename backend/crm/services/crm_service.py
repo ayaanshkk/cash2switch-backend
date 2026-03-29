@@ -754,134 +754,206 @@ class CRMService:
     def preview_lead_import(self, tenant_id: int, file_storage) -> Dict[str, Any]:
         """
         Parse uploaded CSV/XLSX and return a validation-only preview (no DB writes).
-        This is intentionally permissive about column names (case-insensitive)
-        and only validates the rules required by the UI preview.
+        Column matching is case-insensitive and handles underscore/space variants.
         """
         import pandas as pd
+        import tempfile, os, re
 
         if not file_storage or not getattr(file_storage, 'filename', None):
             return {'success': False, 'error': 'No file provided', 'message': 'No file uploaded.'}
 
         filename = file_storage.filename or ''
         lower = filename.lower()
+
+        if lower.endswith('.csv'):
+            file_ext = 'csv'
+        elif lower.endswith('.xlsx') or lower.endswith('.xls'):
+            file_ext = 'xlsx'
+        else:
+            return {'success': False, 'error': 'Unsupported file type',
+                    'message': 'Only .csv and .xlsx files are accepted.'}
+
+        # ── Save to temp file (avoids stream exhaustion issues) ─────────────────
+        tmp_path = None
         try:
-            if lower.endswith('.csv'):
-                df = pd.read_csv(file_storage.stream, dtype=str)
-            elif lower.endswith('.xlsx') or lower.endswith('.xls'):
-                df = pd.read_excel(file_storage.stream, engine='openpyxl', dtype=str)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_ext}') as tmp:
+                file_storage.save(tmp.name)
+                tmp_path = tmp.name
+
+            if file_ext == 'csv':
+                df = pd.read_csv(tmp_path, encoding='utf-8-sig', dtype=str)
             else:
-                return {'success': False, 'error': 'Unsupported file type', 'message': 'Only .csv and .xlsx files are accepted.'}
+                try:
+                    df = pd.read_excel(tmp_path, engine='openpyxl', dtype=str)
+                except Exception:
+                    df = pd.read_excel(tmp_path, engine='xlrd', dtype=str)
         except Exception as e:
-            logger.exception('preview_lead_import: failed to read uploaded file: %s', e)
+            logger.exception('preview_lead_import: failed to read file: %s', e)
             return {'success': False, 'error': 'Failed to parse file', 'message': str(e)}
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
+        if len(df) == 0:
+            return {'success': False, 'error': 'Empty file',
+                    'message': 'Uploaded file contains no data rows.'}
+
+        # ── Build normalised DataFrame ───────────────────────────────────────────
+        # df_orig: original columns (used for output data dict)
+        # df_norm: normalised columns (used for all field lookups)
         original_columns = list(df.columns)
-        col_map = {c.lower().strip(): c for c in original_columns}
 
-        def get_col(df_row, *names):
-            for n in names:
-                key = n.lower()
-                if key in col_map:
-                    val = df_row.get(col_map[key])
-                    if pd.isna(val):
-                        return None
-                    return str(val).strip()
+        def normalise_col(c):
+            return re.sub(r'\s+', ' ', c.lower().strip().replace('_', ' '))
+
+        df_norm = df.copy()
+        df_norm.columns = [normalise_col(c) for c in original_columns]
+
+        # ── MPAN uniqueness check ────────────────────────────────────────────────
+        mpan_col = next(
+            (c for c in df_norm.columns
+            if c in ('mpan top', 'mpan mpr', 'mpan', 'mpr', 'mpan core')),
+            None
+        )
+        duplicated_mpans = set()
+        if mpan_col:
+            series = df_norm[mpan_col].astype(str).str.strip().replace('nan', '')
+            counts = series[series != ''].value_counts()
+            duplicated_mpans = set(counts[counts > 1].index)
+
+        # ── Field lookup helper ──────────────────────────────────────────────────
+        def get_col(norm_row, *aliases):
+            """
+            Return the first non-empty cell value from norm_row matching any alias.
+            norm_row is a pandas Series with normalised column names as its index.
+            Aliases are matched after normalising (lowercase, underscores→spaces).
+            """
+            for alias in aliases:
+                key = re.sub(r'\s+', ' ', alias.lower().strip().replace('_', ' '))
+                # Try space variant and underscore variant
+                for k in (key, key.replace(' ', '_')):
+                    if k in norm_row.index:
+                        val = norm_row[k]
+                        try:
+                            if pd.isna(val):
+                                continue
+                        except Exception:
+                            pass
+                        s = str(val).strip()
+                        if s and s.lower() != 'nan':
+                            return s
             return None
 
-        total_rows = len(df)
-        if total_rows == 0:
-            return {'success': False, 'error': 'Empty file', 'message': 'Uploaded file contains no data rows.'}
-
-        # MPAN column optional (same as renewals: not required). If present, enforce uniqueness.
-        mpan_col_candidates = [k for k in col_map.keys() if k in ('mpan_mpr', 'mpan', 'mpr')]
-        mpan_key = mpan_col_candidates[0] if mpan_col_candidates else None
-        duplicated_values = set()
-        if mpan_key:
-            series_mpan = df[col_map[mpan_key]].astype(str).fillna('').str.strip()
-            mpan_counts = series_mpan[series_mpan != ''].value_counts()
-            duplicated_values = set(mpan_counts[mpan_counts > 1].index.tolist())
-
+        # ── Validate each row ────────────────────────────────────────────────────
         rows_out = []
         valid_count = 0
         invalid_count = 0
 
-        for idx, row in df.iterrows():
-            row_number = int(idx) + 1
+        for idx in range(len(df_norm)):
+            norm_row = df_norm.iloc[idx]
+            orig_row = df.iloc[idx]
+            row_number = idx + 1
             errors = []
 
+            # MPAN duplicate check
             mpan_val = None
-            if mpan_key:
+            if mpan_col:
+                raw = norm_row.get(mpan_col, '')
                 try:
-                    raw_mpan = row.get(col_map[mpan_key], None)
-                    mpan_val = None if pd.isna(raw_mpan) else str(raw_mpan).strip()
+                    mpan_val = None if pd.isna(raw) else str(raw).strip() or None
                 except Exception:
                     mpan_val = None
-            if mpan_val and mpan_val in duplicated_values:
+            if mpan_val and mpan_val in duplicated_mpans:
                 errors.append('MPAN_MPR must be unique within the uploaded file')
 
-            # Required: Business Name OR Contact Person (same as renewals requiring business name)
-            bname = get_col(row, 'business_name', 'client_company_name', 'business name')
-            contact = get_col(row, 'contact_person', 'client_contact_name', 'contact person')
+            # Required: Business Name OR Contact Person
+            # Covers: "Client Name", "Trading Name", "Business Name", "Company Name"
+            bname = get_col(norm_row,
+                            'client name', 'trading name', 'business name',
+                            'company name', 'client company name')
+            contact = get_col(norm_row,
+                            'main contact', 'contact person',
+                            'client contact name', 'contact')
             if not (bname or contact):
                 errors.append('Business_Name OR Contact_Person must exist')
 
-            # Required: Phone (same as renewals)
-            tel = get_col(row, 'tel_number', 'phone', 'telephone', 'tel number')
+            # Required: Phone
+            # Covers: "Tel No", "Tel Number", "Phone", "Mobile No", "Mobile"
+            tel = get_col(norm_row,
+                        'tel no', 'tel number', 'phone', 'telephone',
+                        'mobile no', 'mobile')
             if not tel:
                 errors.append('Tel_Number must exist')
 
-            # Start_Date and End_Date mandatory; must be valid dates.
-            start_raw = get_col(row, 'start_date', 'contract_start_date', 'start date')
-            end_raw = get_col(row, 'end_date', 'contract_end_date', 'end date')
-            if not start_raw:
-                errors.append('Start_Date must exist')
-            else:
-                parsed = pd.to_datetime(start_raw, errors='coerce')
-                if pd.isna(parsed):
-                    errors.append('Start_Date is not a valid date')
+            # Required: End Date (must be a valid date)
+            # Covers: "Contract End", "End Date", "Expiry"
+            end_raw = get_col(norm_row,
+                            'contract end', 'end date',
+                            'contract end date', 'expiry')
             if not end_raw:
                 errors.append('End_Date must exist')
             else:
-                parsed = pd.to_datetime(end_raw, errors='coerce')
+                parsed = pd.to_datetime(end_raw, dayfirst=True, errors='coerce')
                 if pd.isna(parsed):
                     errors.append('End_Date is not a valid date')
+
+            # Start Date — optional but validated if present
+            # Covers: "Start Date", "Contract Start"
+            start_raw = get_col(norm_row, 'start date', 'contract start',
+                                'contract start date')
+            if start_raw:
+                parsed = pd.to_datetime(start_raw, dayfirst=True, errors='coerce')
+                if pd.isna(parsed):
+                    errors.append('Start_Date is not a valid date')
 
             is_valid = len(errors) == 0
             if is_valid:
                 valid_count += 1
             else:
                 invalid_count += 1
-                logger.warning('lead import preview - tenant=%s row=%s mpan=%s errors=%s', tenant_id, row_number, mpan_val, errors)
+                logger.warning(
+                    'lead import preview - tenant=%s row=%s mpan=%s errors=%s',
+                    tenant_id, row_number, mpan_val, errors
+                )
 
+            # Build output data dict using original column names
             data = {}
             for c in original_columns:
-                v = row.get(c)
-                if pd.isna(v):
+                v = orig_row[c]
+                try:
+                    is_na = pd.isna(v)
+                except Exception:
+                    is_na = False
+                if is_na:
                     data[c] = None
+                elif hasattr(v, 'isoformat'):
+                    try:
+                        data[c] = v.isoformat()
+                    except Exception:
+                        data[c] = str(v)
                 else:
-                    if hasattr(v, 'isoformat'):
-                        try:
-                            data[c] = v.isoformat()
-                        except Exception:
-                            data[c] = str(v)
-                    else:
-                        data[c] = None if (isinstance(v, float) and pd.isna(v)) else (str(v).strip())
+                    s = str(v).strip()
+                    data[c] = s if s and s.lower() != 'nan' else None
 
-            rows_out.append({'row_number': row_number, 'data': data, 'is_valid': is_valid, 'errors': errors})
+            rows_out.append({
+                'row_number': row_number,
+                'data': data,
+                'is_valid': is_valid,
+                'errors': errors
+            })
 
-        return {'success': True, 'total_rows': total_rows, 'valid_rows': valid_count, 'invalid_rows': invalid_count, 'rows': rows_out}
+        return {
+            'success': True,
+            'total_rows': len(df),
+            'valid_rows': valid_count,
+            'invalid_rows': invalid_count,
+            'rows': rows_out
+        }
 
     def confirm_lead_import(self, tenant_id: int, rows: list, created_by: int | None, service_id: int) -> Dict[str, Any]:
-        """
-        Confirm/import validated rows into Opportunity_Details.
-
-        - Stores MPAN_MPR directly in Opportunity_Details.mpan_mpr
-        - Inserts Opportunity_Details with stage_id=Not Called, tenant_id from JWT
-        - Skips rows where MPAN already exists in Opportunity_Details
-        - Partial success allowed; per-row reasons logged in response
-        - NO dependency on Project_Details or Client_Master
-        - Returns rejection reasons for each skipped row
-        """
         if not isinstance(rows, list) or len(rows) == 0:
             return {
                 'success': False,
@@ -889,15 +961,81 @@ class CRMService:
                 'message': 'Expected non-empty JSON array of validated rows.'
             }
 
-        # Delegate to repository which handles DB checks/inserts per-row
-        result = self.lead_repo.import_opportunities_from_import(tenant_id, rows, created_by, service_id)
-        
-        # Return detailed rejection reasons
+        import re
+
+        def normalise_key(k):
+            return re.sub(r'\s+', '_', k.lower().strip().replace(' ', '_'))
+
+        # Column alias map: normalised Excel header → repository field name
+        FIELD_MAP = {
+            'client_name':     'business_name',
+            'trading_name':    'business_name',   # fallback if client_name absent
+            'main_contact':    'contact_person',
+            'contact_person':  'contact_person',
+            'tel_no':          'tel_number',
+            'tel_number':      'tel_number',
+            'mobile_no':       'mobile_no',
+            'email':           'email',
+            'mpan_top':        'mpan_mpr',
+            'mpan_mpr':        'mpan_mpr',
+            'mpan_bottom':     'mpan_bottom',
+            'start_date':      'start_date',
+            'contract_start':  'start_date',
+            'contract_end':    'end_date',
+            'end_date':        'end_date',
+            'supplier':        'supplier',
+            'annual_usage':    'annual_usage',
+            'stand_charge':    'stand_charge',
+            'rate_1':          'rate_1',
+            'rate_2':          'rate_2',
+            'rate_3':          'rate_3',
+            'net_notch':       'net_notch',
+            'payment_type':    'payment_type',
+            'postcode':        'postcode',
+            'post_code':       'postcode',
+            'address_line_1':  'address',
+            'street':          'address',
+            'town':            'town',
+            'county':          'county',
+            'site_name':       'site_name',
+            'aggregator':      'aggregator',
+            'term_sold':       'term_sold',
+            'in_contract':     'term_sold',
+            'comms_paid':      'comms_paid',
+            'position':        'position',
+            'company_number':  'company_number',
+        }
+
+        def normalise_row(data: dict) -> dict:
+            """Convert Excel-header-keyed dict to repository-field-keyed dict."""
+            out = {}
+            for raw_key, val in data.items():
+                norm = normalise_key(raw_key)
+                repo_key = FIELD_MAP.get(norm, norm)
+                # Don't overwrite a field already set by a higher-priority key
+                if repo_key not in out or out[repo_key] is None:
+                    out[repo_key] = val
+
+            # business_name fallback: prefer trading_name over client_name
+            if not out.get('business_name'):
+                for raw_key, val in data.items():
+                    if normalise_key(raw_key) == 'trading_name' and val:
+                        out['business_name'] = val
+                        break
+
+            return out
+
+        normalised_rows = [normalise_row(r) for r in rows]
+
+        result = self.lead_repo.import_opportunities_from_import(
+            tenant_id, normalised_rows, created_by, service_id
+        )
+
         return {
             'success': True,
             'inserted': int(result.get('inserted', 0)),
             'skipped': int(result.get('skipped', 0)),
-            'reasons': result.get('errors', [])  # List of per-row rejection reasons
+            'reasons': result.get('errors', [])
         }
 
     def get_leads_by_customer_type(self, tenant_id: int, customer_type: Optional[str] = None, filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

@@ -423,37 +423,64 @@ class LeadRepository:
         Insert opportunities from a pre-validated import payload.
 
         Rules:
-          - MPAN_MPR is stored in Opportunity_Details.mpan_mpr
-          - stage_id = Not Called
-          - tenant-scoped via Opportunity_Details.tenant_id
-          - if MPAN already exists in Opportunity_Details -> skip and report
-          - partial success allowed; per-row reasons returned
-          - NO joins to Project_Details or Client_Master
-          
+        - MPAN_MPR is stored in Opportunity_Details.mpan_mpr
+        - stage_id = "Lead" (not "Not Called")
+        - display_order is per-salesperson sequential (starts at 1 for each employee)
+        - tenant-scoped via Opportunity_Details.tenant_id
+        - if MPAN already exists in Opportunity_Details -> skip and report
+        - partial success allowed; per-row reasons returned
+        - NO joins to Project_Details or Client_Master
+        
         Returns:
-          - inserted: count of successfully inserted rows
-          - skipped: count of rejected rows
-          - errors: list of {row, reason, details} for each skipped row
+        - inserted: count of successfully inserted rows
+        - skipped: count of rejected rows
+        - errors: list of {row, reason, details} for each skipped row
         """
         inserted = 0
         skipped = 0
         errors = []
 
-        # Resolve default stage_id for "Not Called"
+        # ✅ FIX 1: Resolve default stage_id for "Lead" (not "Not Called")
         default_stage_id = None
         try:
             default_stage = self.db.execute_query(
                 'SELECT "stage_id" FROM "StreemLyne_MT"."Stage_Master" WHERE LOWER("stage_name") = %s LIMIT 1',
-                ('not called',),
+                ('lead',),  # ✅ Changed from 'not called' to 'lead'
                 fetch_one=True
             )
             default_stage_id = default_stage.get('stage_id') if default_stage else None
         except Exception as e:
-            logger.exception('Failed to resolve default stage_id for Not Called: %s', e)
+            logger.exception('Failed to resolve default stage_id for Lead: %s', e)
 
         if not default_stage_id:
-            # Fallback to legacy default when Not Called is missing
-            default_stage_id = 1
+            # Fallback: create "Lead" stage if missing
+            try:
+                result = self.db.execute_insert(
+                    'INSERT INTO "StreemLyne_MT"."Stage_Master" ("stage_name", "stage_description") VALUES (%s, %s) RETURNING "stage_id"',
+                    ('Lead', 'Imported lead - not yet contacted'),
+                    returning=True
+                )
+                default_stage_id = result.get('stage_id') if result else 1
+                logger.info('✨ Created "Lead" stage with ID %s', default_stage_id)
+            except Exception:
+                default_stage_id = 1  # Last resort fallback
+
+        # ✅ FIX 2: Get current max display_order for this salesperson
+        next_display_order = 1
+        if created_by:
+            try:
+                max_order_result = self.db.execute_query(
+                    '''SELECT COALESCE(MAX("display_order"), 0) as max_order
+                    FROM "StreemLyne_MT"."Opportunity_Details"
+                    WHERE "tenant_id" = %s
+                    AND "opportunity_owner_employee_id" = %s''',
+                    (tenant_id, created_by),
+                    fetch_one=True
+                )
+                next_display_order = (max_order_result.get('max_order') if max_order_result else 0) + 1
+            except Exception as e:
+                logger.warning('Failed to get max display_order, starting from 1: %s', e)
+                next_display_order = 1
 
         # Client_id is optional for leads (no client relationship yet)
         default_client_id = None
@@ -490,6 +517,7 @@ class LeadRepository:
             tel_number = get_field('Tel_Number', 'phone', 'tel_number', 'telephone', 'Phone', 'Mobile') or None
             email = get_field('Email', 'email', 'Email_Address') or None
             start_date = get_field('Start_Date', 'start_date', 'contract_start_date', 'Contract_Start') or None
+            end_date = get_field('End_Date', 'end_date', 'contract_end_date', 'Contract_End') or None
             
             # Generate title from business name or contact person if no explicit title provided
             title = get_field('Title', 'opportunity_title') or business_name or contact_person or f'Imported lead {idx + 1}'
@@ -508,24 +536,44 @@ class LeadRepository:
                 logger.warning('import_opportunities_from_import skipped row=%s - no identifying info', row_number)
                 continue
 
-            # MPAN is not unique in DB: allow importing same MPAN again (e.g. lead in Water can
-            # also be imported in Electricity). Duplicate-within-file is still enforced in preview.
-
+            # ✅ FIX 3: Insert with display_order and opportunity_owner_employee_id
             insert_q = '''
                 INSERT INTO "StreemLyne_MT"."Opportunity_Details"
-                ("tenant_id", "client_id", "mpan_mpr", "opportunity_title", "opportunity_description", "business_name", "contact_person", "tel_number", "email", "start_date", "stage_id", "service_id", "created_at")
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ("tenant_id", "client_id", "mpan_mpr", "opportunity_title", "opportunity_description", 
+                "business_name", "contact_person", "tel_number", "email", "start_date", "end_date",
+                "stage_id", "service_id", "opportunity_owner_employee_id", "display_order", "created_at")
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                 RETURNING "opportunity_id"
             '''
             try:
                 out = self.db.execute_insert(
                     insert_q,
-                    (tenant_id, default_client_id, mpan, title, description, business_name, contact_person, tel_number, email, start_date, default_stage_id, service_id),
+                    (
+                        tenant_id,
+                        default_client_id,
+                        mpan,
+                        title,
+                        description,
+                        business_name,
+                        contact_person,
+                        tel_number,
+                        email,
+                        start_date,
+                        end_date,
+                        default_stage_id,      # ✅ "Lead" stage
+                        service_id,
+                        created_by,            # ✅ opportunity_owner_employee_id
+                        next_display_order,    # ✅ Per-salesperson sequential ID
+                    ),
                     returning=True
                 )
                 if out and out.get('opportunity_id'):
                     inserted += 1
-                    logger.info('import_opportunities_from_import inserted opportunity_id=%s mpan=%s', out.get('opportunity_id'), mpan)
+                    next_display_order += 1  # ✅ Increment for next lead
+                    logger.info(
+                        'import_opportunities_from_import inserted opportunity_id=%s mpan=%s display_order=%s',
+                        out.get('opportunity_id'), mpan, next_display_order - 1
+                    )
                 else:
                     skipped += 1
                     error_detail = {

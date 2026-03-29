@@ -89,13 +89,14 @@ crm_controller = CRMController()
 @tenant_from_jwt
 def get_leads():
     """
-    Get all leads with team overview stats
+    Get all leads with team overview stats and per-employee display_order
     Admin sees all tenant leads, non-admin sees only their own non-allocated leads
+    ✅ Each salesperson has their own display_order starting from 1
     """
     from backend.crm.supabase_client import get_supabase_client
     import logging
     logger = logging.getLogger(__name__)
-
+ 
     try:
         tenant_id    = g.tenant_id
         current_user = request.current_user
@@ -103,23 +104,53 @@ def get_leads():
         service_id    = 2 if service_param.strip().lower() == 'water' else 1
         exclude_stage = request.args.get('exclude_stage', '')
         employee_id   = getattr(current_user, 'employee_id', None)
-
+ 
         logger.warning(
             '🔍 get_leads: employee_id=%s tenant=%s service=%s',
             employee_id, tenant_id, service_param
         )
-
+ 
         if not employee_id:
             logger.warning('⚠️ No employee_id - returning empty')
             return jsonify({'data': [], 'team_stats': []}), 200
-
+ 
         # ✅ Determine if admin
         is_admin = _is_admin_from_db(current_user)
         
         db = get_supabase_client()
-
+        session = SessionLocal()
+ 
         # ================================================================
-        # 1. TEAM STATS QUERY
+        # 1. RECALCULATE DISPLAY_ORDER (per employee, starting from 1)
+        # ================================================================
+        try:
+            session.execute(text("""
+                UPDATE "StreemLyne_MT"."Opportunity_Details" od
+                SET display_order = sub.rn
+                FROM (
+                    SELECT opportunity_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY opportunity_owner_employee_id
+                               ORDER BY created_at ASC
+                           ) AS rn
+                    FROM "StreemLyne_MT"."Opportunity_Details"
+                    WHERE tenant_id = :tenant_id
+                      AND (is_allocated = FALSE OR is_allocated IS NULL)
+                      AND opportunity_owner_employee_id IS NOT NULL
+                ) sub
+                WHERE od.opportunity_id = sub.opportunity_id
+                  AND od.tenant_id = :tenant_id
+            """), {'tenant_id': tenant_id})
+            session.commit()
+            logger.warning('✅ Recalculated display_order for all employees')
+        except Exception as e:
+            session.rollback()
+            logger.error(f'❌ Error recalculating display_order: {e}')
+        finally:
+            session.close()
+ 
+        # ================================================================
+        # 2. TEAM STATS QUERY
         # ================================================================
         if is_admin:
             # Admin: Show ALL employees in tenant with their lead counts
@@ -157,7 +188,7 @@ def get_leads():
                 GROUP BY em."employee_id", em."employee_name"
             '''
             team_stats_rows = db.execute_query(team_stats_query, (tenant_id, service_id, employee_id))
-
+ 
         team_stats = [
             {
                 'employee_id': row.get('employee_id'),
@@ -166,16 +197,17 @@ def get_leads():
             }
             for row in (team_stats_rows or [])
         ]
-
+ 
         logger.warning('📊 Team stats: %s', team_stats)
-
+ 
         # ================================================================
-        # 2. MAIN LEADS QUERY
+        # 3. MAIN LEADS QUERY (with display_order)
         # ================================================================
         # Everyone (admin and non-admin) sees only their own non-allocated leads
         query = '''
             SELECT
                 od.*,
+                od.display_order,
                 sm."stage_name",
                 em."employee_name"          AS assigned_to_name,
                 COALESCE(od."business_name", od."opportunity_title") AS business_name,
@@ -190,15 +222,16 @@ def get_leads():
             AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
         '''
         params = [tenant_id, service_id, employee_id]
-
+ 
         if exclude_stage:
             query += ' AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") != LOWER(%s))'
             params.append(exclude_stage)
-
-        query += ' ORDER BY od."created_at" DESC'
-
+ 
+        # ✅ ORDER BY display_order (per-employee sequential numbering)
+        query += ' ORDER BY od."display_order" ASC'
+ 
         rows = db.execute_query(query, tuple(params))
-
+ 
         def _s(v):
             if v is None: return None
             if hasattr(v, 'isoformat'): return v.isoformat()
@@ -208,14 +241,14 @@ def get_leads():
             except ImportError:
                 pass
             return v
-
+ 
         results = [{k: _s(v) for k, v in row.items()} for row in (rows or [])]
-
+ 
         logger.warning(
             '✅ get_leads returning %d leads + %d team stats for employee_id=%s (is_admin=%s)',
             len(results), len(team_stats), employee_id, is_admin
         )
-
+ 
         # ✅ RETURN BOTH DATA AND TEAM_STATS
         return jsonify({
             'data': results,
@@ -225,7 +258,7 @@ def get_leads():
                 'employee_id': employee_id
             }
         }), 200
-
+ 
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -596,50 +629,125 @@ def get_recycle_bin():
 def delete_expired_lost_leads():
     return crm_controller.delete_expired_lost_leads()
 
+def recalculate_lead_display_order(session, tenant_id, employee_id=None):
+    """
+    Recalculate display_order starting from 1 PER EMPLOYEE.
+    Uses ROW_NUMBER() OVER (PARTITION BY opportunity_owner_employee_id ORDER BY created_at)
+    so each salesperson's list always starts at 1.
+    
+    Args:
+        session: SQLAlchemy session
+        tenant_id: Tenant ID
+        employee_id: Optional - recalculate only for this employee
+    """
+    if employee_id:
+        # Recalculate only for this specific employee
+        session.execute(text("""
+            UPDATE "StreemLyne_MT"."Opportunity_Details" od
+            SET display_order = sub.rn
+            FROM (
+                SELECT opportunity_id,
+                       ROW_NUMBER() OVER (ORDER BY created_at ASC) AS rn
+                FROM "StreemLyne_MT"."Opportunity_Details"
+                WHERE tenant_id = :tenant_id
+                  AND opportunity_owner_employee_id = :employee_id
+                  AND (is_allocated = FALSE OR is_allocated IS NULL)
+            ) sub
+            WHERE od.opportunity_id = sub.opportunity_id
+        """), {'tenant_id': tenant_id, 'employee_id': employee_id})
+    else:
+        # Recalculate for ALL employees at once using PARTITION BY
+        session.execute(text("""
+            UPDATE "StreemLyne_MT"."Opportunity_Details" od
+            SET display_order = sub.rn
+            FROM (
+                SELECT opportunity_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY opportunity_owner_employee_id
+                           ORDER BY created_at ASC
+                       ) AS rn
+                FROM "StreemLyne_MT"."Opportunity_Details"
+                WHERE tenant_id = :tenant_id
+                  AND (is_allocated = FALSE OR is_allocated IS NULL)
+                  AND opportunity_owner_employee_id IS NOT NULL
+            ) sub
+            WHERE od.opportunity_id = sub.opportunity_id
+        """), {'tenant_id': tenant_id})
+    
+    session.flush()
+    logging.getLogger(__name__).info(
+        f"✅ Recalculated lead display_order per-employee "
+        f"(tenant={tenant_id}, employee={employee_id or 'ALL'})"
+    )
 
 @crm_bp.route('/leads/import', methods=['POST'])
 @token_required
 @tenant_from_jwt
 def import_leads():
+    """
+    ✅ UPDATED: Now recalculates display_order after import
+    """
+    session = SessionLocal()
     try:
         tenant_id     = g.tenant_id
         service_param = request.args.get('service', 'electricity')
         service_id    = 2 if (service_param or '').strip().lower() == 'water' else 1
-
+ 
         if 'file' not in request.files:
             return jsonify({'success': False, 'message': 'No file provided',
                             'total_rows': 0, 'successful': 0, 'failed': 1,
                             'errors': ['No file uploaded']}), 400
-
+ 
         file           = request.files.get('file')
         preview_result = crm_controller.crm_service.preview_lead_import(tenant_id, file)
-
+ 
         if not preview_result.get('success'):
             return jsonify({'success': False,
                             'message': preview_result.get('message', 'Validation failed'),
                             'total_rows': preview_result.get('total_rows', 0),
                             'successful': 0, 'failed': preview_result.get('total_rows', 1),
                             'errors': preview_result.get('errors', ['Validation failed'])}), 400
-
+ 
         if not preview_result.get('valid_rows', 0):
             return jsonify({'success': False, 'message': 'No valid rows to import',
                             'total_rows': preview_result.get('total_rows', 0),
                             'successful': 0, 'failed': preview_result.get('invalid_rows', 0),
                             'errors': preview_result.get('errors', ['No valid data found'])}), 400
-
+ 
         validated_data = [r['data'] for r in preview_result.get('rows', []) if r.get('is_valid')]
         created_by     = getattr(request.current_user, 'id', None)
         confirm_result = crm_controller.crm_service.confirm_lead_import(
             tenant_id, validated_data, created_by, service_id)
-
+ 
         if 'success' in confirm_result and not confirm_result['success']:
             return jsonify({'success': False,
                             'message': confirm_result.get('message', 'Import failed'),
                             'total_rows': preview_result.get('total_rows', 0),
                             'successful': 0, 'failed': preview_result.get('total_rows', 0),
                             'errors': [confirm_result.get('error', 'Import failed')]}), 400
-
+ 
         inserted = confirm_result.get('inserted', 0)
+        
+        # ✅ RECALCULATE DISPLAY_ORDER after successful import
+        if inserted > 0:
+            try:
+                # Get the employee who owns these leads
+                importing_employee_id = getattr(request.current_user, 'employee_id', None)
+                
+                # Recalculate for the importing employee
+                if importing_employee_id:
+                    recalculate_lead_display_order(session, tenant_id, importing_employee_id)
+                    session.commit()
+                    logger.info(f'✅ Recalculated display_order after importing {inserted} leads for employee {importing_employee_id}')
+                else:
+                    # Fallback: recalculate for all employees
+                    recalculate_lead_display_order(session, tenant_id)
+                    session.commit()
+                    logger.info(f'✅ Recalculated display_order after importing {inserted} leads')
+            except Exception as recalc_error:
+                logger.error(f'❌ Error recalculating display_order after import: {recalc_error}')
+                # Don't fail the import if recalculation fails
+        
         return jsonify({
             'success': inserted > 0,
             'message': f"Successfully imported {inserted} lead(s)" if inserted else "No new leads imported",
@@ -648,11 +756,13 @@ def import_leads():
             'failed': confirm_result.get('skipped', 0),
             'errors': confirm_result.get('errors', [])
         }), 200
-
+ 
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({'success': False, 'message': str(e), 'total_rows': 0,
                         'successful': 0, 'failed': 1, 'errors': [str(e)]}), 500
+    finally:
+        session.close()
 
 
 @crm_bp.route('/leads/import/template', methods=['GET'])
@@ -666,21 +776,61 @@ def download_leads_template():
         wb = Workbook()
         ws = wb.active
         ws.title = "Leads Import"
-        headers = ['Business Name','Contact Person','Tel Number','Email',
-                   'MPAN_MPR','Start Date','End Date','Annual Usage','Address','Site Address']
+        
+        # ✅ Headers match what preview_lead_import expects (case-insensitive)
+        headers = [
+            'Business Name',      # Matches 'business name'
+            'Contact Person',     # Matches 'contact person'  
+            'Tel Number',         # Matches 'tel number' ✓
+            'Email',
+            'MPAN_MPR',
+            'Start Date',         # Matches 'start date' ✓
+            'End Date',           # Matches 'end date' ✓
+            'Annual Usage',
+            'Address',
+            'Site Address'
+        ]
         ws.append(headers)
-        ws.append(['Acme Corp','John Doe','0207123456','john@acme.com',
-                   '1234567890123','2024-01-01','2025-01-01','50000',
-                   '123 Main St, London','456 Business Park, London'])
+        
+        # ✅ Example row with VALID data that will pass all validation checks
+        ws.append([
+            'Acme Corp',           # Business Name ✓
+            'John Doe',            # Contact Person ✓
+            '02071234567',         # Tel Number ✓ (UK format, 11 digits)
+            'john@acme.com',       # Email
+            '1234567890123',       # MPAN_MPR (13 digits)
+            '01/01/2024',          # Start Date ✓ (DD/MM/YYYY UK format)
+            '31/12/2024',          # End Date ✓ (DD/MM/YYYY UK format)
+            '50000',               # Annual Usage
+            '123 Main St, London', # Address
+            '456 Business Park, London'  # Site Address
+        ])
+        
+        # Style the header row
         for cell in ws[1]:
             cell.font = Font(bold=True, color="FFFFFF")
             cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        
+        # Auto-adjust column widths for better readability
+        for col in ws.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            adjusted_width = min(max_length + 2, 30)
+            ws.column_dimensions[column].width = adjusted_width
+        
         output = BytesIO()
         wb.save(output)
         output.seek(0)
-        return send_file(output,
-                         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                         as_attachment=True, download_name='leads_import_template.xlsx')
+        
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True, 
+            download_name='leads_import_template.xlsx'
+        )
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

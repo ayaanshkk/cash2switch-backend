@@ -22,10 +22,14 @@ class CRMController:
     # ========================================
     
     def get_leads(self) -> tuple:
+        """
+        GET /api/crm/leads
+        Get all leads for the current tenant
+        """
         try:
             tenant_id = g.tenant_id
-            current_user = getattr(request, 'current_user', None)
-
+            
+            # Extract query parameters for filtering
             filters = {}
             if request.args.get('stage_id'):
                 filters['stage_id'] = int(request.args.get('stage_id'))
@@ -37,6 +41,7 @@ class CRMController:
                 filters['status'] = request.args.get('status')
             if request.args.get('assigned_to'):
                 filters['assigned_to'] = int(request.args.get('assigned_to'))
+            # Service filter: electricity=1, water=2
             service_param = request.args.get('service')
             if service_param and isinstance(service_param, str):
                 svc = service_param.strip().lower()
@@ -44,22 +49,10 @@ class CRMController:
                     filters['service_id'] = 2
                 elif svc == 'electricity':
                     filters['service_id'] = 1
-                else:
-                    filters['service_id'] = 1  # default utilities = electricity = 1
-
-            # ✅ Scope by user — mirrors energy_customer_routes.py exactly
-            if current_user:
-                from backend.crm.utils.role_helpers import is_admin_user
-                if not is_admin_user(current_user):
-                    employee_id = getattr(current_user, 'employee_id', None)
-                    if not employee_id:
-                        # Can't identify user — return empty rather than leak all leads
-                        return jsonify([]), 200
-                    filters['assigned_to'] = employee_id
-
+            
             result = self.crm_service.get_leads(tenant_id, filters if filters else None)
             return jsonify(result), 200
-
+        
         except Exception as e:
             return jsonify({
                 'success': False,
@@ -268,49 +261,103 @@ class CRMController:
             }), 500
     
     def assign_leads(self) -> tuple:
+        """
+        PATCH /api/crm/leads/assign
+        Bulk assign leads to an employee. Admin only.
+        Request body: { lead_ids: [...], employee_id: N } or { assigned_to_id: N }
+        ✅ UPDATED: Now recalculates display_order for affected employees
+        """
         try:
-            from flask import request
+            from flask import request, jsonify, g
             from backend.crm.utils.role_helpers import is_admin_user
-
+            from backend.db import SessionLocal
+            from sqlalchemy import text
+            import logging
+            
+            logger = logging.getLogger(__name__)
+    
             user = getattr(request, 'current_user', None)
             if not user:
                 return jsonify({'success': False, 'error': 'Authentication required'}), 401
-
-            is_admin = is_admin_user(user)
-            employee_id = getattr(user, 'employee_id', None)
-
+            if not is_admin_user(user):
+                return jsonify({
+                    'error': 'permission_denied',
+                    'message': 'Only administrators can assign'
+                }), 403
+    
             tenant_id = g.tenant_id
             payload = request.get_json()
             if not payload:
                 return jsonify({'success': False, 'error': 'Request body required'}), 400
-
+    
             lead_ids = payload.get('lead_ids')
-            target_employee_id = payload.get('employee_id') or payload.get('assigned_to_id')
+            employee_id = payload.get('employee_id') or payload.get('assigned_to_id')
+            assignment_notes = payload.get('assignment_notes', '')
+            
             if not lead_ids or not isinstance(lead_ids, list) or len(lead_ids) == 0:
                 return jsonify({'success': False, 'error': 'lead_ids must be a non-empty list'}), 400
-            if target_employee_id is None:
+            if employee_id is None:
                 return jsonify({'success': False, 'error': 'employee_id or assigned_to_id required'}), 400
             try:
-                target_employee_id = int(target_employee_id)
+                employee_id = int(employee_id)
             except (ValueError, TypeError):
                 return jsonify({'success': False, 'error': 'employee_id must be a number'}), 400
-
-            if not is_admin:
+    
+            # ✅ Track old employees for display_order recalculation
+            session = SessionLocal()
+            old_employee_ids = set()
+            
+            try:
+                # Get old employee IDs before reassignment
+                for lead_id in lead_ids:
+                    result = session.execute(text("""
+                        SELECT opportunity_owner_employee_id 
+                        FROM "StreemLyne_MT"."Opportunity_Details"
+                        WHERE opportunity_id = :id AND tenant_id = :tid
+                    """), {'id': lead_id, 'tid': tenant_id}).fetchone()
+                    
+                    if result and result[0]:
+                        old_employee_ids.add(result[0])
+                
+                # Perform the assignment using the service
+                result = self.crm_service.assign_leads(tenant_id, lead_ids, employee_id)
+                
+                if not result.get('success'):
+                    return jsonify(result), 400
+                
+                # ✅ Recalculate display_order for all affected employees
+                # Import the helper function
+                from backend.routes.crm_routes import recalculate_lead_display_order
+                
+                # Recalculate for old employees (who lost leads)
+                for old_emp_id in old_employee_ids:
+                    if old_emp_id != employee_id:  # Don't recalculate twice for same employee
+                        recalculate_lead_display_order(session, tenant_id, old_emp_id)
+                        logger.info(f'✅ Recalculated display_order for employee {old_emp_id} after losing leads')
+                
+                # Recalculate for new employee (who gained leads)
+                if employee_id:
+                    recalculate_lead_display_order(session, tenant_id, employee_id)
+                    logger.info(f'✅ Recalculated display_order for employee {employee_id} after gaining leads')
+                
+                session.commit()
+                
                 return jsonify({
-                    'success': False,
-                    'error': 'permission_denied',
-                    'message': 'Only admin users can assign leads'
-                }), 403
-
-            result = self.crm_service.assign_leads(tenant_id, lead_ids, target_employee_id)
-            if not result.get('success'):
-                return jsonify(result), 400
-            return jsonify({
-                'success': True,
-                'assigned_count': result.get('updated', 0),
-                'message': f"Assigned {result.get('updated', 0)} lead(s) successfully"
-            }), 200
+                    'success': True,
+                    'assigned_count': result.get('updated', 0),
+                    'message': f"Assigned {result.get('updated', 0)} lead(s) successfully"
+                }), 200
+                
+            except Exception as e:
+                session.rollback()
+                logger.error(f"❌ Error in assign_leads: {e}")
+                raise
+            finally:
+                session.close()
+                
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return jsonify({
                 'success': False,
                 'error': 'Internal server error',
