@@ -26,8 +26,7 @@ def get_tenant_id_from_user(user):
 CLEANSING_STATUSES = {"Invalid Number", "Incorrect Supplier"}
  
 # ── Statuses that go to Recycle Bin (soft-delete with is_cleansing=False) ────
-RECYCLE_BIN_STATUSES = {"Lost", "Lost COT", "Meter De-energised"}
- 
+RECYCLE_BIN_STATUSES = {"Lost", "Lost COT", "Meter De-energised", "Complaint"}
  
 @client_interaction_bp.route('/energy-clients/<int:client_id>/callback', methods=['POST', 'OPTIONS'])
 @token_required
@@ -56,6 +55,7 @@ def add_callback(client_id):
             "Callback":           {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Not Answered":       {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Priced":             {"requires_date": False, "requires_sold": True,  "deletes_record": False, "requires_notes": False},
+            "Sold":               {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Lost":               {"requires_date": True,  "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Lost COT":           {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Already Renewed":    {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
@@ -64,7 +64,7 @@ def add_callback(client_id):
             "Meter De-energised": {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": False},
             "Broker in Place":    {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "End Date Changed":   {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
-            "Complaint":          {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": True},
+            "Complaint":          {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Email Only":         {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Renewed Directly":   {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": True},
             # ✅ CHANGED: Incorrect Supplier now deletes_record=True so it soft-deletes to Cleansing
