@@ -197,45 +197,44 @@ def get_leads():
         # ================================================================
         # 3. MAIN LEADS QUERY - ✅ Properly scoped by employee and is_allocated
         # ================================================================
-        if is_admin:
-            # Admin sees ALL non-allocated leads in tenant
-            query = """
-                SELECT
-                    od.*,
-                    od.display_order,
-                    sm."stage_name",
-                    em."employee_name" AS assigned_to_name,
-                    COALESCE(od."business_name", od."opportunity_title") AS business_name,
-                    sup."supplier_company_name" AS supplier_name
-                FROM "StreemLyne_MT"."Opportunity_Details" od
-                LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"    = sm."stage_id"
-                LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
-                LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
-                WHERE od."tenant_id" = :tenant_id
-                  AND od."service_id" = :service_id
-                  AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
-            """
-            params = {'tenant_id': tenant_id, 'service_id': service_id}
-        else:
-            # Non-admin sees only their own non-allocated leads
-            query = """
-                SELECT
-                    od.*,
-                    od.display_order,
-                    sm."stage_name",
-                    em."employee_name" AS assigned_to_name,
-                    COALESCE(od."business_name", od."opportunity_title") AS business_name,
-                    sup."supplier_company_name" AS supplier_name
-                FROM "StreemLyne_MT"."Opportunity_Details" od
-                LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"    = sm."stage_id"
-                LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
-                LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
-                WHERE od."tenant_id" = :tenant_id
-                  AND od."service_id" = :service_id
-                  AND od."opportunity_owner_employee_id" = :employee_id
-                  AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
-            """
-            params = {'tenant_id': tenant_id, 'service_id': service_id, 'employee_id': employee_id}
+        query = """
+            SELECT
+                od.*,
+                od.display_order,
+                sm."stage_name",
+                em."employee_name" AS assigned_to_name,
+                COALESCE(od."business_name", od."opportunity_title") AS business_name,
+                sup."supplier_company_name" AS supplier_name
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"    = sm."stage_id"
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
+            WHERE od."tenant_id" = :tenant_id
+            AND od."service_id" = :service_id
+            AND od."opportunity_owner_employee_id" = :employee_id
+            AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
+        """
+        params = {'tenant_id': tenant_id, 'service_id': service_id, 'employee_id': employee_id}
+        # else:
+        #     # Non-admin sees only their own non-allocated leads
+        #     query = """
+        #         SELECT
+        #             od.*,
+        #             od.display_order,
+        #             sm."stage_name",
+        #             em."employee_name" AS assigned_to_name,
+        #             COALESCE(od."business_name", od."opportunity_title") AS business_name,
+        #             sup."supplier_company_name" AS supplier_name
+        #         FROM "StreemLyne_MT"."Opportunity_Details" od
+        #         LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"    = sm."stage_id"
+        #         LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
+        #         LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
+        #         WHERE od."tenant_id" = :tenant_id
+        #           AND od."service_id" = :service_id
+        #           AND od."opportunity_owner_employee_id" = :employee_id
+        #           AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
+        #     """
+        #     params = {'tenant_id': tenant_id, 'service_id': service_id, 'employee_id': employee_id}
 
         if exclude_stage:
             query += ' AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") != LOWER(:exclude_stage))'
@@ -486,7 +485,7 @@ def get_leads_performance():
         params = {'tenant_id': tenant_id, 'service_id': service_id}
 
         # ✅ FIX: Non-admin should only see own performance
-        if not is_admin and employee_id:
+        if employee_id:
             sql += ' AND od.opportunity_owner_employee_id = :employee_id'
             params['employee_id'] = employee_id
 
