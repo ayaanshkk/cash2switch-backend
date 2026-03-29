@@ -1487,9 +1487,9 @@ def restore_customer(client_id):
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
         client = (
-            session.query(Client_Master).filter_by(display_order=client_id, tenant_id=tenant_id).first() or
-            session.query(Client_Master).filter_by(tenant_client_id=client_id, tenant_id=tenant_id).first() or
-            session.query(Client_Master).filter_by(client_id=client_id, tenant_id=tenant_id).first()
+            session.query(Client_Master).filter_by(display_order=client_id, tenant_id=tenant_id, is_deleted=True).first() or
+            session.query(Client_Master).filter_by(tenant_client_id=client_id, tenant_id=tenant_id, is_deleted=True).first() or
+            session.query(Client_Master).filter_by(client_id=client_id, tenant_id=tenant_id, is_deleted=True).first()
         )
         if client and not client.is_deleted:
             client = None

@@ -84,6 +84,8 @@ crm_controller = CRMController()
 # LEAD ROUTES
 # ========================================
 
+# backend/routes/crm_routes.py
+
 @crm_bp.route('/leads', methods=['GET'])
 @token_required
 @tenant_from_jwt
@@ -91,7 +93,7 @@ def get_leads():
     """
     Get all leads with team overview stats and per-employee display_order
     Admin sees all tenant leads, non-admin sees only their own non-allocated leads
-    ✅ Uses ONLY SessionLocal (same connection throughout)
+    ✅ FIXED: Team stats now show correctly, is_allocated scoping fixed
     """
     import logging
     logger = logging.getLogger(__name__)
@@ -145,9 +147,10 @@ def get_leads():
             logger.error(f'❌ Error recalculating display_order: {e}')
 
         # ================================================================
-        # 2. TEAM STATS QUERY (using SessionLocal, NOT Supabase client)
+        # 2. TEAM STATS QUERY - ✅ FIXED: Removed HAVING clause
         # ================================================================
         if is_admin:
+            # Admin: Show ALL employees in tenant with their lead counts (including 0)
             team_stats_rows = session.execute(text("""
                 SELECT 
                     em."employee_id",
@@ -161,7 +164,6 @@ def get_leads():
                     AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
                 WHERE em."tenant_id" = :tenant_id
                 GROUP BY em."employee_id", em."employee_name"
-                -- ✅ REMOVED: HAVING COUNT(od."opportunity_id") > 0
                 ORDER BY em."employee_name"
             """), {'tenant_id': tenant_id, 'service_id': service_id}).mappings().all()
         else:
@@ -193,33 +195,52 @@ def get_leads():
         logger.warning('📊 Team stats: %s', team_stats)
 
         # ================================================================
-        # 3. MAIN LEADS QUERY (with display_order, using SessionLocal)
+        # 3. MAIN LEADS QUERY - ✅ Properly scoped by employee and is_allocated
         # ================================================================
-        # Build query dynamically based on admin status
-        query = """
-            SELECT
-                od.*,
-                od.display_order,
-                sm."stage_name",
-                em."employee_name" AS assigned_to_name,
-                COALESCE(od."business_name", od."opportunity_title") AS business_name,
-                sup."supplier_company_name" AS supplier_name
-            FROM "StreemLyne_MT"."Opportunity_Details" od
-            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"    = sm."stage_id"
-            LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
-            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
-            WHERE od."tenant_id" = :tenant_id
-            AND od."service_id" = :service_id
-            AND od."opportunity_owner_employee_id" = :employee_id
-            AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
-        """
-        params = {'tenant_id': tenant_id, 'service_id': service_id, 'employee_id': employee_id}
+        if is_admin:
+            # Admin sees ALL non-allocated leads in tenant
+            query = """
+                SELECT
+                    od.*,
+                    od.display_order,
+                    sm."stage_name",
+                    em."employee_name" AS assigned_to_name,
+                    COALESCE(od."business_name", od."opportunity_title") AS business_name,
+                    sup."supplier_company_name" AS supplier_name
+                FROM "StreemLyne_MT"."Opportunity_Details" od
+                LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"    = sm."stage_id"
+                LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
+                LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
+                WHERE od."tenant_id" = :tenant_id
+                  AND od."service_id" = :service_id
+                  AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
+            """
+            params = {'tenant_id': tenant_id, 'service_id': service_id}
+        else:
+            # Non-admin sees only their own non-allocated leads
+            query = """
+                SELECT
+                    od.*,
+                    od.display_order,
+                    sm."stage_name",
+                    em."employee_name" AS assigned_to_name,
+                    COALESCE(od."business_name", od."opportunity_title") AS business_name,
+                    sup."supplier_company_name" AS supplier_name
+                FROM "StreemLyne_MT"."Opportunity_Details" od
+                LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"    = sm."stage_id"
+                LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
+                LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
+                WHERE od."tenant_id" = :tenant_id
+                  AND od."service_id" = :service_id
+                  AND od."opportunity_owner_employee_id" = :employee_id
+                  AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
+            """
+            params = {'tenant_id': tenant_id, 'service_id': service_id, 'employee_id': employee_id}
 
         if exclude_stage:
             query += ' AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") != LOWER(:exclude_stage))'
             params['exclude_stage'] = exclude_stage
 
-        # ✅ ORDER BY display_order (per-employee sequential numbering)
         query += ' ORDER BY od."display_order" ASC'
 
         rows = session.execute(text(query), params).mappings().all()
@@ -230,7 +251,6 @@ def get_leads():
             len(results), len(team_stats), employee_id, is_admin
         )
 
-        # ✅ RETURN BOTH DATA AND TEAM_STATS
         return jsonify({
             'data': results,
             'team_stats': team_stats,
@@ -668,7 +688,7 @@ def recalculate_lead_display_order(session, tenant_id, employee_id=None):
 @tenant_from_jwt
 def import_leads():
     """
-    ✅ UPDATED: Now recalculates display_order after import AND ensures is_allocated = FALSE
+    ✅ FIXED: Ensures is_allocated = FALSE for imported leads + recalculates display_order
     """
     session = SessionLocal()
     try:
@@ -699,8 +719,6 @@ def import_leads():
  
         validated_data = [r['data'] for r in preview_result.get('rows', []) if r.get('is_valid')]
         created_by     = getattr(request.current_user, 'id', None)
-        
-        # ✅ ADD: Get the importing employee's ID
         importing_employee_id = getattr(request.current_user, 'employee_id', None)
         
         confirm_result = crm_controller.crm_service.confirm_lead_import(
@@ -715,37 +733,28 @@ def import_leads():
  
         inserted = confirm_result.get('inserted', 0)
         
-        # ✅ CRITICAL FIX: Ensure all imported leads are NOT allocated
-        if inserted > 0 and importing_employee_id:
+        # ✅ CRITICAL: Force is_allocated = FALSE for newly imported leads
+        if inserted > 0:
             try:
-                # Force is_allocated = FALSE for all leads imported by this user
+                # Update all recently created leads by this employee
                 session.execute(text("""
                     UPDATE "StreemLyne_MT"."Opportunity_Details"
                     SET is_allocated = FALSE
                     WHERE tenant_id = :tenant_id
                       AND opportunity_owner_employee_id = :employee_id
-                      AND is_allocated IS NULL OR is_allocated = TRUE
-                      AND created_at >= NOW() - INTERVAL '5 minutes'
+                      AND created_at >= NOW() - INTERVAL '2 minutes'
+                      AND (is_allocated IS NULL OR is_allocated = TRUE)
                 """), {'tenant_id': tenant_id, 'employee_id': importing_employee_id})
                 session.commit()
-                logger.info(f'✅ Forced is_allocated = FALSE for {inserted} newly imported leads')
-            except Exception as alloc_error:
-                logger.error(f'❌ Error fixing is_allocated: {alloc_error}')
+                logger.info(f'✅ Set is_allocated = FALSE for {inserted} imported leads')
+                
+                # Recalculate display_order
+                recalculate_lead_display_order(session, tenant_id, importing_employee_id)
+                session.commit()
+                logger.info(f'✅ Recalculated display_order after importing {inserted} leads')
+            except Exception as e:
+                logger.error(f'❌ Post-import fix error: {e}')
                 session.rollback()
-        
-        # ✅ RECALCULATE DISPLAY_ORDER after successful import
-        if inserted > 0:
-            try:
-                if importing_employee_id:
-                    recalculate_lead_display_order(session, tenant_id, importing_employee_id)
-                    session.commit()
-                    logger.info(f'✅ Recalculated display_order after importing {inserted} leads for employee {importing_employee_id}')
-                else:
-                    recalculate_lead_display_order(session, tenant_id)
-                    session.commit()
-                    logger.info(f'✅ Recalculated display_order after importing {inserted} leads')
-            except Exception as recalc_error:
-                logger.error(f'❌ Error recalculating display_order after import: {recalc_error}')
         
         return jsonify({
             'success': inserted > 0,

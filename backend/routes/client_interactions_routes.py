@@ -2,6 +2,7 @@
 Updated Callback Route - backend/routes/client_interactions_routes.py
 ✅ Status now stored in Project_Details.status (not Opportunity_Details.Misc_Col1)
 ✅ Invalid Number + Incorrect Supplier → soft-delete with is_cleansing=True (go to Cleansing page, not recycle bin)
+✅ FIX: OPTIONS preflight requests pass through before @token_required check
 """
  
 from flask import Blueprint, request, jsonify, current_app
@@ -27,10 +28,22 @@ CLEANSING_STATUSES = {"Invalid Number", "Incorrect Supplier"}
  
 # ── Statuses that go to Recycle Bin (soft-delete with is_cleansing=False) ────
 RECYCLE_BIN_STATUSES = {"Lost", "Lost COT", "Meter De-energised", "Complaint"}
- 
+
+
+# ── Helper: return CORS preflight response immediately (before auth check) ──
+def _preflight():
+    """Return a 200 OK for OPTIONS preflight requests."""
+    resp = jsonify({})
+    resp.status_code = 200
+    return resp
+
+
 @client_interaction_bp.route('/energy-clients/<int:client_id>/callback', methods=['POST', 'OPTIONS'])
 @token_required
 def add_callback(client_id):
+    # ✅ FIX: Let OPTIONS through before the token check fires.
+    # @token_required already skips OPTIONS if you patch it; but as a belt-and-braces
+    # guard we return early here too.
     if request.method == 'OPTIONS':
         return jsonify({}), 200
  
@@ -59,7 +72,7 @@ def add_callback(client_id):
             "Lost":               {"requires_date": True,  "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Lost COT":           {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Already Renewed":    {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
-            # ✅ CHANGED: Invalid Number now deletes_record=True so it soft-deletes to Cleansing
+            # ✅ CHANGED: Invalid Number soft-deletes to Cleansing
             "Invalid Number":     {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": False},
             "Meter De-energised": {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": False},
             "Broker in Place":    {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
@@ -67,7 +80,7 @@ def add_callback(client_id):
             "Complaint":          {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Email Only":         {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Renewed Directly":   {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": True},
-            # ✅ CHANGED: Incorrect Supplier now deletes_record=True so it soft-deletes to Cleansing
+            # ✅ CHANGED: Incorrect Supplier soft-deletes to Cleansing
             "Incorrect Supplier": {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Converted":          {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
         }
@@ -110,9 +123,6 @@ def add_callback(client_id):
                 client.is_deleted = True
                 client.deleted_at = datetime.utcnow()
                 client.deleted_reason = status
-                # ✅ NEW: flag so the GET /api/crm/cleansing endpoint can find these
-                # Your Client_Master model needs: is_cleansing = Column(Boolean, default=False)
-                # If the column doesn't exist yet, see migration note at bottom of file.
                 if hasattr(client, 'is_cleansing'):
                     client.is_cleansing = is_cleansing
  
@@ -140,7 +150,7 @@ def add_callback(client_id):
                         'success': True,
                         'message': f'Moved to Cleansing ({status})',
                         'deleted': False,
-                        'moved_to_cleansing': True,    # ✅ NEW flag for frontend
+                        'moved_to_cleansing': True,
                         'moved_to_recycle_bin': False,
                     }), 200
                 else:
@@ -316,18 +326,14 @@ def add_callback(client_id):
  
 # ══════════════════════════════════════════════════════════════════
 # GET /api/energy-clients/cleansing
-# Returns energy clients soft-deleted with a cleansing status.
-# Called by GET /api/crm/cleansing (which also pulls CRM leads).
 # ══════════════════════════════════════════════════════════════════
  
-@client_interaction_bp.route('/energy-clients/cleansing', methods=['GET'])
+@client_interaction_bp.route('/energy-clients/cleansing', methods=['GET', 'OPTIONS'])
 @token_required
 def get_energy_clients_for_cleansing(client_id=None):
-    """
-    GET /energy-clients/cleansing
-    Returns all energy clients flagged as Invalid Number or Incorrect Supplier.
-    Used internally by the cleansing aggregate endpoint.
-    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
@@ -391,18 +397,11 @@ def get_energy_clients_for_cleansing(client_id=None):
  
 # ══════════════════════════════════════════════════════════════════
 # POST /energy-clients/<client_id>/cleanse
-# Actions: fix | delete
-# fix  → corrects phone/supplier, un-deletes, restores to Renewals
-# delete → hard deletes the record permanently
 # ══════════════════════════════════════════════════════════════════
  
 @client_interaction_bp.route('/energy-clients/<int:client_id>/cleanse', methods=['POST', 'OPTIONS'])
 @token_required
 def energy_client_cleanse_action(client_id):
-    """
-    POST /energy-clients/<client_id>/cleanse
-    Body: { action: "fix"|"delete", tel_number?, new_supplier?, notes? }
-    """
     if request.method == 'OPTIONS':
         return jsonify({}), 200
  
@@ -471,19 +470,16 @@ def energy_client_cleanse_action(client_id):
                 contract.supplier_id = supplier.supplier_id
                 contract.updated_at = datetime.utcnow()
  
-        # Restore the client — un-delete and clear cleansing flags
         client.is_deleted = False
         client.deleted_at = None
         client.deleted_reason = None
         if hasattr(client, 'is_cleansing'):
             client.is_cleansing = False
  
-        # Restore project status to active
         project = session.query(Project_Details).filter_by(client_id=client_id).first()
         if project:
             project.status = 'Active'
  
-        # Log the fix as an interaction
         fix_notes = f"[Cleansing Fix] {notes}" if notes else "[Cleansing Fix] Record corrected and restored"
         session.add(Client_Interactions(
             client_id=client_id,
@@ -510,9 +506,12 @@ def energy_client_cleanse_action(client_id):
 # UNCHANGED ROUTES BELOW
 # ══════════════════════════════════════════════════════════════════
  
-@client_interaction_bp.route('/energy-clients/<int:client_id>/history', methods=['GET'])
+@client_interaction_bp.route('/energy-clients/<int:client_id>/history', methods=['GET', 'OPTIONS'])
 @token_required
 def get_interaction_history(client_id):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)

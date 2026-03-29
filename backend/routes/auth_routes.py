@@ -80,13 +80,12 @@ def log_login_attempt(email, ip_address, success):
 # --- Decorators ---
 
 def token_required(f):
-    """Decorator to require valid JWT token (stateless).
-
-    Verifies the JWT signature and loads `UserMaster` by `employee_id` (or
-    legacy `user_id` in payload). Does NOT rely on `user_sessions` table.
-    """
     @wraps(f)
     def decorated(*args, **kwargs):
+        # ✅ ADD THIS
+        if request.method == 'OPTIONS':
+            return jsonify({}), 200
+
         local_session = SessionLocal()
         try:
             token = None

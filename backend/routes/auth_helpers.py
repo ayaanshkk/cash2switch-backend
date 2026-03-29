@@ -23,7 +23,7 @@ def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if request.method == 'OPTIONS':
-            return f(*args, **kwargs)
+            return jsonify({}), 200
 
         local_session = SessionLocal()
         try:
