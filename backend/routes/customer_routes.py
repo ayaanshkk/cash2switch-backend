@@ -113,7 +113,7 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'end_date': safe_date_to_iso(contract.contract_end_date if contract else None),
         'unit_rate': float(contract.unit_rate) if contract and contract.unit_rate else None,
         'terms_of_sale': contract.terms_of_sale if contract else None,
-        'standing_charge': float(contract.standing_charge) if contract and hasattr(contract, 'standing_charge') and contract.standing_charge else None,
+        'standing_charge': contract.standing_charge if contract and hasattr(contract, 'standing_charge') else None,
         'aggregator': getattr(contract, 'aggregator', None) if contract else None,
         'rate_1': float(contract.rate_1) if contract and hasattr(contract, 'rate_1') and contract.rate_1 else None,
         'payment_type': getattr(contract, 'payment_type', None) if contract else None,
@@ -638,6 +638,8 @@ def update_energy_customer(client_id):
                 if 'mpan_top' in data: contract.mpan_number = data['mpan_top']
                 if 'mpan_bottom' in data: contract.mpan_bottom = data['mpan_bottom']
                 if 'supplier_id' in data: contract.supplier_id = data['supplier_id']
+                if 'standing_charge' in data:
+                    contract.standing_charge = str(data['standing_charge']) if data['standing_charge'] else None
                 if 'new_supplier' in data and data['new_supplier']:
                     new_supplier_name = data['new_supplier'].strip()
                     matched = session.query(Supplier_Master).filter(

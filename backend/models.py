@@ -291,7 +291,8 @@ class Energy_Contract_Master(Base):
     rate_3 = Column(Numeric(10, 4))
     comms_paid = Column(Numeric(10, 2))
     term_sold = Column(Numeric(10, 2))
-    standing_charge = Column(Numeric(10, 2))
+    standing_charge = Column(String(50))
+
     aggregator = Column(String(255))
     rate_1 = Column(Numeric(10, 4))
     payment_type = Column(String(50))
