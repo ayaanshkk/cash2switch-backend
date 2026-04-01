@@ -184,9 +184,10 @@ def get_renewal_stats():
             status = project.status
             if status:
                 status_lower = status.lower()
-                if status_lower in ['called', 'callback', 'contacted']:
+                # ✅ FIX: Include 'callback' and 'not answered' in contacted_count
+                if status_lower in ['called', 'callback', 'contacted', 'not answered']:
                     contacted_count += 1
-                elif status_lower in ['not_answered', 'not contacted']:
+                elif status_lower in ['not contacted']:
                     not_contacted_count += 1
                 elif status_lower in ['priced', 'renewed', 'already renewed', 'end date changed']:
                     renewed_count += 1
@@ -739,11 +740,12 @@ def get_renewal_performance():
                     priced_count += 1
                 elif status_lower in ['renewed', 'already renewed']:
                     renewed_count += 1
-                elif status_lower in ['called', 'callback', 'contacted']:
+                # ✅ FIX: Include 'callback' and 'not answered' in contacted_count
+                elif status_lower in ['called', 'callback', 'contacted', 'not answered']:
                     contacted_count += 1
                 elif status_lower in ['lost', 'lost cot']:
                     lost_count += 1
-                elif status_lower in ['not answered', 'not contacted']:
+                elif status_lower in ['not contacted']:
                     not_contacted_count += 1
                 else:
                     not_contacted_count += 1
@@ -859,14 +861,15 @@ def get_staff_status_counts():
         # Update counts for employees with projects
         for r in results:
             eid = r.employee_id
-            if eid in employees:  # Should always be true
+            if eid in employees:
                 count = r.count or 0
                 s = (r.status or '').lower().strip()
                 employees[eid]['total'] += count
- 
+
                 if s in ('renewed', 'already renewed'):
                     employees[eid]['renewed'] += count
-                elif s in ('callback', 'called', 'contacted'):
+                # ✅ FIX: Include 'callback' and 'not answered' in in_progress
+                elif s in ('callback', 'called', 'contacted', 'not answered'):
                     employees[eid]['in_progress'] += count
                 elif s in ('lost', 'lost cot'):
                     employees[eid]['lost'] += count

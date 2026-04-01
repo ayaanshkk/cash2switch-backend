@@ -177,6 +177,44 @@ def get_user_role_name(user, session):
         current_app.logger.error(f"Error getting user role: {e}")
         return None
 
+
+def log_field_change(session, client_id: int, field_name: str, old_value, new_value, changed_by_employee_id: int = None):
+    """
+    Log a field change to the interaction history with old → new format
+    """
+    # Format values for display
+    def format_value(val):
+        if val is None or val == '':
+            return "—"
+        if isinstance(val, (int, float)):
+            return str(val)
+        if isinstance(val, datetime):
+            return val.strftime('%d/%m/%Y')
+        if hasattr(val, 'isoformat'):  # date objects
+            return val.strftime('%d/%m/%Y')
+        return str(val)
+    
+    old_formatted = format_value(old_value)
+    new_formatted = format_value(new_value)
+    
+    # Skip logging if values are actually the same
+    if old_formatted == new_formatted:
+        return
+    
+    # Create change note with old → new format
+    change_note = f"Changed {field_name}: '{old_formatted}' → '{new_formatted}'"
+    
+    # Add to Client_Interactions with special interaction_type
+    session.add(Client_Interactions(
+        client_id=client_id,
+        contact_date=datetime.utcnow().date(),
+        contact_method=1,  # Assuming 1 = system/internal
+        notes=change_note,
+        next_steps='Field Updated',
+        interaction_type='Field Updated',  # ✅ This is the key for frontend filtering
+        created_at=datetime.utcnow()
+    ))
+
 # ==========================================
 # GET ALL CUSTOMERS
 # ==========================================
@@ -523,16 +561,6 @@ def update_energy_customer(client_id):
         print(f"   Data: {data}")
         print(f"   User: {request.current_user.employee_id}")
         
-        # ✅ CHECK DATABASE BEFORE ANY CHANGES
-        check_query = session.execute(text("""
-            SELECT cm.assigned_employee_id, pd.assigned_employee_id, cm.is_allocated
-            FROM "StreemLyne_MT"."Client_Master" cm
-            LEFT JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
-            WHERE cm.client_id = :cid
-        """), {'cid': client_id}).fetchone()
-        print(f"   DB BEFORE: client_assigned={check_query[0]}, project_assigned={check_query[1]}, is_allocated={check_query[2]}")
-        print(f"{'='*60}\n")
-        print(f"🔧 UPDATE REQUEST for client {client_id}: {data}")
         tenant_id = get_tenant_id_from_user(request.current_user)
  
         client = session.query(Client_Master).filter_by(
@@ -545,35 +573,77 @@ def update_energy_customer(client_id):
         # Resolve actual client_id for downstream use
         client_id = client.client_id
  
-        # Update Client_Master fields
-        for field, col in [('business_name', 'client_company_name'), ('contact_person', 'client_contact_name'),
-                            ('phone', 'client_phone'), ('mobile_no', 'client_mobile'),
-                            ('email', 'client_email'), ('address', 'address'),
-                            ('post_code', 'post_code'), ('website', 'client_website')]:
-            if field in data:
-                setattr(client, col, data[field])
+        # ✅ Get current employee ID for change logging
+        current_employee_id = request.current_user.employee_id if hasattr(request.current_user, 'employee_id') else None
+        
+        # ✅ TRACK CHANGES - Client_Master fields
+        CLIENT_FIELDS = {
+            'business_name': ('client_company_name', 'Trading Name'),
+            'contact_person': ('client_contact_name', 'Client Name'),
+            'phone': ('client_phone', 'Tel Number'),
+            'mobile_no': ('client_mobile', 'Mobile Number'),
+            'email': ('client_email', 'Email'),
+            'address': ('address', 'Street'),
+            'post_code': ('post_code', 'Post Code'),
+            'website': ('client_website', 'Website'),
+            'position': ('position', 'Position'),
+            'company_number': ('company_number', 'Company Number'),
+            'date_of_birth': ('date_of_birth', 'Date of Birth'),
+            'bank_name': ('bank_name', 'Bank Name'),
+            'bank_account_number': ('account_number', 'Account Number'),
+            'bank_sort_code': ('sort_code', 'Sort Code'),
+            'charity_ltd_company_number': ('charity_ltd_company_number', 'Charity/Ltd Company Number'),
+            'partner_details': ('partner_details', 'Partner Details'),
+        }
+        
+        # Update Client_Master fields WITH CHANGE TRACKING
+        for api_field, (db_field, display_name) in CLIENT_FIELDS.items():
+            if api_field in data:
+                old_value = getattr(client, db_field, None)
+                new_value = data[api_field]
+                
+                if old_value != new_value:
+                    log_field_change(session, client_id, display_name, old_value, new_value, current_employee_id)
+                    setattr(client, db_field, new_value)
 
         # Update Project_Details
         project = session.query(Project_Details).filter_by(client_id=client_id).first()
         if project:
-            for field, col in [('site_address', 'address'), ('annual_usage', 'Misc_Col2'),
-                                ('site_name', 'site_name'), ('month_sold', 'month_sold'),
-                                ('house_name', 'house_name'), ('house_number', 'house_number'),
-                                ('door_number', 'door_number'), ('town', 'town'), ('county', 'county')]:
-                if field in data:
-                    setattr(project, col, data[field])
+            # ✅ TRACK CHANGES - Project_Details fields
+            PROJECT_FIELDS = {
+                'site_address': ('address', 'Site Address'),
+                'annual_usage': ('Misc_Col2', 'Annual Usage'),
+                'site_name': ('site_name', 'Site Name'),
+                'month_sold': ('month_sold', 'Month Sold'),
+                'house_name': ('house_name', 'House Name'),
+                'house_number': ('house_number', 'House Number'),
+                'door_number': ('door_number', 'Door Number'),
+                'town': ('town', 'Town'),
+                'county': ('county', 'County'),
+            }
+            
+            for api_field, (db_field, display_name) in PROJECT_FIELDS.items():
+                if api_field in data:
+                    old_value = getattr(project, db_field, None)
+                    new_value = data[api_field]
+                    
+                    if old_value != new_value:
+                        log_field_change(session, client_id, display_name, old_value, new_value, current_employee_id)
+                        setattr(project, db_field, new_value)
 
-            # ✅ Status now on Project_Details
+            # ✅ Status tracking
             if 'status' in data:
                 status_value = data['status']
-                project.status = None if status_value in ['None', 'null', '', None] else status_value
-
-            # ✅ CRITICAL: Handle assignment SEPARATELY - query fresh data
-            if 'assigned_to_id' in data:
-                # Flush any pending changes FIRST
-                session.flush()
+                new_status = None if status_value in ['None', 'null', '', None] else status_value
+                old_status = project.status
                 
-                # ✅ RE-QUERY to get fresh assignment data from DB
+                if old_status != new_status:
+                    log_field_change(session, client_id, 'Status', old_status, new_status, current_employee_id)
+                    project.status = new_status
+
+            # ✅ Assignment tracking (SEPARATE from change tracking)
+            if 'assigned_to_id' in data:
+                session.flush()
                 fresh_project = session.query(Project_Details).filter_by(client_id=client_id).first()
                 old_assigned_to = fresh_project.assigned_employee_id
                 new_assigned_to = data['assigned_to_id']
@@ -584,6 +654,16 @@ def update_energy_customer(client_id):
                 print(f"   Old: {old_assigned_to}")
                 print(f"   New: {new_assigned_to}")
                 print(f"   Current user: {current_user_employee_id}")
+                
+                # Track assignment change with employee names
+                if old_assigned_to != new_assigned_to:
+                    old_emp = session.query(Employee_Master).filter_by(employee_id=old_assigned_to).first() if old_assigned_to else None
+                    new_emp = session.query(Employee_Master).filter_by(employee_id=new_assigned_to).first() if new_assigned_to else None
+                    
+                    old_name = old_emp.employee_name if old_emp else "Unassigned"
+                    new_name = new_emp.employee_name if new_emp else "Unassigned"
+                    
+                    log_field_change(session, client_id, 'Assigned To', old_name, new_name, current_employee_id)
                 
                 # Update assignment on BOTH tables
                 project.assigned_employee_id = new_assigned_to
@@ -628,18 +708,105 @@ def update_energy_customer(client_id):
             new_assigned_to = None
             assignment_notes = None
  
-        # Update Energy_Contract_Master
+        # ✅ Update Energy_Contract_Master WITH CHANGE TRACKING
         if project:
             contract = session.query(Energy_Contract_Master).filter_by(
                 project_id=project.project_id
             ).first()
             if contract:
-                if 'mpan_mpr' in data: contract.mpan_number = data['mpan_mpr']
-                if 'mpan_top' in data: contract.mpan_number = data['mpan_top']
-                if 'mpan_bottom' in data: contract.mpan_bottom = data['mpan_bottom']
-                if 'supplier_id' in data: contract.supplier_id = data['supplier_id']
+                # MPAN changes
+                if 'mpan_mpr' in data or 'mpan_top' in data:
+                    new_mpan = data.get('mpan_mpr') or data.get('mpan_top')
+                    if contract.mpan_number != new_mpan:
+                        log_field_change(session, client_id, 'MPAN Top', contract.mpan_number, new_mpan, current_employee_id)
+                        contract.mpan_number = new_mpan
+                
+                if 'mpan_bottom' in data and contract.mpan_bottom != data['mpan_bottom']:
+                    log_field_change(session, client_id, 'MPAN Bottom', contract.mpan_bottom, data['mpan_bottom'], current_employee_id)
+                    contract.mpan_bottom = data['mpan_bottom']
+                
+                # Supplier changes - show names not IDs
+                if 'supplier_id' in data:
+                    new_supplier_id = data['supplier_id']
+                    if contract.supplier_id != new_supplier_id:
+                        old_supp = session.query(Supplier_Master).filter_by(supplier_id=contract.supplier_id).first() if contract.supplier_id else None
+                        new_supp = session.query(Supplier_Master).filter_by(supplier_id=new_supplier_id).first() if new_supplier_id else None
+                        
+                        old_name = old_supp.supplier_company_name if old_supp else "—"
+                        new_name = new_supp.supplier_company_name if new_supp else "—"
+                        
+                        log_field_change(session, client_id, 'New Supplier', old_name, new_name, current_employee_id)
+                        contract.supplier_id = new_supplier_id
+                
+                if 'old_supplier_id' in data:
+                    val = data['old_supplier_id']
+                    new_old_supplier_id = None if (val is None or val == 0) else val
+                    
+                    if contract.old_supplier_id != new_old_supplier_id:
+                        old_supp = session.query(Supplier_Master).filter_by(supplier_id=contract.old_supplier_id).first() if contract.old_supplier_id else None
+                        new_supp = session.query(Supplier_Master).filter_by(supplier_id=new_old_supplier_id).first() if new_old_supplier_id else None
+                        
+                        old_name = old_supp.supplier_company_name if old_supp else "—"
+                        new_name = new_supp.supplier_company_name if new_supp else "—"
+                        
+                        log_field_change(session, client_id, 'Old Supplier', old_name, new_name, current_employee_id)
+                        contract.old_supplier_id = new_old_supplier_id
+                
+                # Standing charge
                 if 'standing_charge' in data:
-                    contract.standing_charge = str(data['standing_charge']) if data['standing_charge'] else None
+                    new_sc = str(data['standing_charge']) if data['standing_charge'] else None
+                    if contract.standing_charge != new_sc:
+                        log_field_change(session, client_id, 'Standing Charge', contract.standing_charge, new_sc, current_employee_id)
+                        contract.standing_charge = new_sc
+                
+                # Contract dates
+                if 'start_date' in data and data['start_date']:
+                    new_start = datetime.fromisoformat(data['start_date'].replace('Z', '')).date() if isinstance(data['start_date'], str) else data['start_date']
+                    if contract.contract_start_date != new_start:
+                        log_field_change(session, client_id, 'Start Date', contract.contract_start_date, new_start, current_employee_id)
+                        contract.contract_start_date = new_start
+                
+                if 'end_date' in data and data['end_date']:
+                    new_end = datetime.fromisoformat(data['end_date'].replace('Z', '')).date() if isinstance(data['end_date'], str) else data['end_date']
+                    if contract.contract_end_date != new_end:
+                        log_field_change(session, client_id, 'Contract End', contract.contract_end_date, new_end, current_employee_id)
+                        contract.contract_end_date = new_end
+                
+                # Rates and charges
+                if 'unit_rate' in data and data['unit_rate'] is not None:
+                    if contract.unit_rate != data['unit_rate']:
+                        log_field_change(session, client_id, 'Rate 1', contract.unit_rate, data['unit_rate'], current_employee_id)
+                        contract.unit_rate = data['unit_rate']
+                
+                if 'rate_2' in data and contract.rate_2 != data.get('rate_2'):
+                    log_field_change(session, client_id, 'Rate 2', contract.rate_2, data['rate_2'], current_employee_id)
+                    contract.rate_2 = data['rate_2']
+                
+                if 'rate_3' in data and contract.rate_3 != data.get('rate_3'):
+                    log_field_change(session, client_id, 'Rate 3', contract.rate_3, data['rate_3'], current_employee_id)
+                    contract.rate_3 = data['rate_3']
+                
+                if 'net_notch' in data and contract.net_notch != data.get('net_notch'):
+                    log_field_change(session, client_id, 'Net Notch', contract.net_notch, data['net_notch'], current_employee_id)
+                    contract.net_notch = data['net_notch']
+                
+                if 'term_sold' in data and contract.term_sold != data.get('term_sold'):
+                    log_field_change(session, client_id, 'Term Sold', contract.term_sold, data['term_sold'], current_employee_id)
+                    contract.term_sold = data['term_sold']
+                
+                if 'comms_paid' in data and contract.comms_paid != data.get('comms_paid'):
+                    log_field_change(session, client_id, 'Comms Paid', contract.comms_paid, data['comms_paid'], current_employee_id)
+                    contract.comms_paid = data['comms_paid']
+                
+                if 'terms_of_sale' in data and contract.terms_of_sale != data.get('terms_of_sale'):
+                    log_field_change(session, client_id, 'Terms of Sale', contract.terms_of_sale, data['terms_of_sale'], current_employee_id)
+                    contract.terms_of_sale = data['terms_of_sale']
+                
+                if 'payment_type' in data and contract.payment_type != data.get('payment_type'):
+                    log_field_change(session, client_id, 'Payment Type', contract.payment_type, data['payment_type'], current_employee_id)
+                    contract.payment_type = data['payment_type']
+                
+                # Handle new supplier by name
                 if 'new_supplier' in data and data['new_supplier']:
                     new_supplier_name = data['new_supplier'].strip()
                     matched = session.query(Supplier_Master).filter(
@@ -648,6 +815,9 @@ def update_energy_customer(client_id):
                     if matched:
                         if contract.supplier_id and contract.supplier_id != matched.supplier_id:
                             contract.old_supplier_id = contract.supplier_id
+                            log_field_change(session, client_id, 'New Supplier', 
+                                           session.query(Supplier_Master).filter_by(supplier_id=contract.supplier_id).first().supplier_company_name if contract.supplier_id else "—",
+                                           matched.supplier_company_name, current_employee_id)
                         contract.supplier_id = matched.supplier_id
                     else:
                         new_sup = Supplier_Master(
@@ -659,25 +829,12 @@ def update_energy_customer(client_id):
                         session.add(new_sup)
                         session.flush()
                         contract.old_supplier_id = contract.supplier_id
+                        log_field_change(session, client_id, 'New Supplier', "—", new_supplier_name, current_employee_id)
                         contract.supplier_id = new_sup.supplier_id
-                if 'old_supplier_id' in data:
-                    val = data['old_supplier_id']
-                    contract.old_supplier_id = None if (val is None or val == 0) else val
-                if 'start_date' in data and data['start_date']:
-                    contract.contract_start_date = datetime.fromisoformat(
-                        data['start_date'].replace('Z', '')
-                    ).date() if isinstance(data['start_date'], str) else data['start_date']
-                if 'end_date' in data and data['end_date']:
-                    contract.contract_end_date = datetime.fromisoformat(
-                        data['end_date'].replace('Z', '')
-                    ).date() if isinstance(data['end_date'], str) else data['end_date']
-                if 'unit_rate' in data and data['unit_rate'] is not None:
-                    contract.unit_rate = data['unit_rate']
-                if 'terms_of_sale' in data: contract.terms_of_sale = data['terms_of_sale']
-                if 'payment_type' in data: contract.payment_type = data['payment_type']
+                
                 contract.updated_at = datetime.utcnow()
  
-        # Create assignment interaction if assignment changed
+        # Create assignment interaction if assignment changed (SEPARATE from field change tracking)
         if 'assigned_to_id' in data and old_assigned_to != new_assigned_to:
             emp = session.query(Employee_Master).filter_by(employee_id=new_assigned_to).first() if new_assigned_to else None
             emp_name = emp.employee_name if emp else "Unassigned"
@@ -690,6 +847,7 @@ def update_energy_customer(client_id):
                 contact_method=1,
                 notes=note,
                 next_steps="Assignment",
+                interaction_type="Assignment",  # ✅ Different from field changes
                 created_at=datetime.utcnow()
             ))
  

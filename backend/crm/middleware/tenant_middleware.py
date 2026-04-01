@@ -73,14 +73,15 @@ def require_tenant(f):
         if not tenant:
             if not _is_production():
                 default_tenant = tenant_repo.ensure_default_tenant()
-                if default_tenant and default_tenant.get("Tenant_id") is not None:
-                    tenant_id = int(default_tenant["Tenant_id"])
+                # ✅ FIX: Use lowercase keys (PostgreSQL returns lowercase)
+                if default_tenant and default_tenant.get("tenant_id") is not None:
+                    tenant_id = int(default_tenant["tenant_id"])
                     tenant = default_tenant
                     if not tenant.get("is_active", True):
                         tenant["is_active"] = True
                 else:
                     # Stub or read-only DB: accept requested tenant_id so dev/test can proceed
-                    tenant = {"Tenant_id": tenant_id, "tenant_company_name": "Default Tenant", "is_active": True}
+                    tenant = {"tenant_id": tenant_id, "tenant_company_name": "Default Tenant", "is_active": True}
             else:
                 return jsonify({
                     'error': 'Tenant not found',
@@ -103,20 +104,10 @@ def require_tenant(f):
     
     return decorated_function
 
-
 def require_tenant_jwt_only(f):
     """
     Decorator for endpoints that MUST take tenant_id from the authenticated JWT only.
-
-    Behavior:
-      - Reads tenant_id from request.current_user.tenant_id (decoded JWT)
-      - If the JWT is missing or does not include tenant_id -> return 401 Unauthorized
-      - Validates tenant exists (same as require_tenant) but DOES NOT accept X-Tenant-ID header
     """
-    from functools import wraps
-    from flask import request, jsonify, g
-    from backend.crm.repositories.tenant_repository import TenantRepository
-
     @wraps(f)
     def decorated(*args, **kwargs):
         # Must have an authenticated user with tenant_id in the token
@@ -154,13 +145,14 @@ def require_tenant_jwt_only(f):
             # Keep non-production convenience behaviour from require_tenant
             if not _is_production():
                 default_tenant = tenant_repo.ensure_default_tenant()
-                if default_tenant and default_tenant.get("Tenant_id") is not None:
-                    tenant_id = int(default_tenant["Tenant_id"])
+                # ✅ FIX: Use lowercase keys (PostgreSQL returns lowercase)
+                if default_tenant and default_tenant.get("tenant_id") is not None:
+                    tenant_id = int(default_tenant["tenant_id"])
                     tenant = default_tenant
                     if not tenant.get("is_active", True):
                         tenant["is_active"] = True
                 else:
-                    tenant = {"Tenant_id": tenant_id, "tenant_company_name": "Default Tenant", "is_active": True}
+                    tenant = {"tenant_id": tenant_id, "tenant_company_name": "Default Tenant", "is_active": True}
             else:
                 return jsonify({
                     'error': 'Tenant not found',
