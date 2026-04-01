@@ -204,14 +204,13 @@ def log_field_change(session, client_id: int, field_name: str, old_value, new_va
     # Create change note with old → new format
     change_note = f"Changed {field_name}: '{old_formatted}' → '{new_formatted}'"
     
-    # Add to Client_Interactions with special interaction_type
+    # Add to Client_Interactions with special next_steps marker
     session.add(Client_Interactions(
         client_id=client_id,
         contact_date=datetime.utcnow().date(),
-        contact_method=1,  # Assuming 1 = system/internal
+        contact_method=1,  # System/internal
         notes=change_note,
-        next_steps='Field Updated',
-        interaction_type='Field Updated',  # ✅ This is the key for frontend filtering
+        next_steps='Field Updated',  # ✅ This is how frontend identifies it
         created_at=datetime.utcnow()
     ))
 
@@ -846,8 +845,7 @@ def update_energy_customer(client_id):
                 contact_date=datetime.utcnow().date(),
                 contact_method=1,
                 notes=note,
-                next_steps="Assignment",
-                interaction_type="Assignment",  # ✅ Different from field changes
+                next_steps="Assignment",  # ✅ Keep only this
                 created_at=datetime.utcnow()
             ))
  
