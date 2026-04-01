@@ -1428,36 +1428,52 @@ def get_stats_by_employee():
 def get_recycle_bin():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
- 
+
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
         user = request.current_user
         if not tenant_id:
             return jsonify({'error': 'Tenant not found for user'}), 400
- 
+
         service_param = request.args.get('service', 'utilities')
         service_id = {'utilities': 1, 'water': 2, 'gas': 3}.get(service_param.strip().lower(), 1)
- 
+        salesperson_param = request.args.get('salesperson')  # ✅ NEW
+
         query = session.query(
             Client_Master, Project_Details, Energy_Contract_Master,
             Supplier_Master, Employee_Master
         ).join(Project_Details, Client_Master.client_id == Project_Details.client_id
         ).outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
         ).outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
-        ).outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id  # ✅ Changed
+        ).outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id
         ).filter(and_(
             Client_Master.tenant_id == tenant_id,
             Client_Master.is_deleted == True,
             *([Energy_Contract_Master.service_id == service_id] if service_id is not None else [])
-        )).filter(
-            Project_Details.assigned_employee_id == user.employee_id  # ✅ Changed
-        ).order_by(Client_Master.deleted_at.desc())
- 
-        results = query.all()
+        ))
+
+        # ✅ Admin sees all (with optional salesperson filter); non-admin sees only their own
+        user_role = get_user_role_name(user, session)
+        is_admin = user_role in ['Platform Admin', 'Tenant Super Admin']
+
+        if is_admin:
+            if salesperson_param and salesperson_param != "All":
+                try:
+                    query = query.filter(
+                        Project_Details.assigned_employee_id == int(salesperson_param)
+                    )
+                except ValueError:
+                    pass
+        else:
+            query = query.filter(
+                Project_Details.assigned_employee_id == user.employee_id
+            )
+
+        results = query.order_by(Client_Master.deleted_at.desc()).all()
         customers = []
         seen_clients = set()
- 
+
         for client, project, contract, supplier, employee in results:
             if client.client_id in seen_clients:
                 continue
@@ -1469,9 +1485,9 @@ def get_recycle_bin():
             customer_data['deleted_at'] = client.deleted_at.isoformat() if client.deleted_at else None
             customer_data['deleted_reason'] = client.deleted_reason
             customers.append(customer_data)
- 
+
         return jsonify(customers), 200
- 
+
     except Exception as e:
         current_app.logger.exception(f"❌ Error fetching recycle bin: {e}")
         return jsonify({'error': 'Failed to fetch recycle bin'}), 500
