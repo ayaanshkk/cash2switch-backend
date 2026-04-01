@@ -247,7 +247,7 @@ class LeadRepository:
     
     def create_lead(self, tenant_id: int, lead_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Create a new lead/opportunity
+        Create a new lead/opportunity with per-employee display_id
         
         Args:
             tenant_id: Tenant identifier
@@ -263,16 +263,28 @@ class LeadRepository:
         """
         
         try:
-            client = self.db.execute_query(client_check_query, (lead_data.get('client_id'), tenant_id), fetch_one=True)
+            client = self.db.execute_query(
+                client_check_query, 
+                (lead_data.get('client_id'), tenant_id), 
+                fetch_one=True
+            )
             if not client:
-                print(f"Error: client_id {lead_data.get('client_id')} does not belong to tenant {tenant_id}")
+                logger.warning('create_lead: client_id=%s not found for tenant=%s', 
+                            lead_data.get('client_id'), tenant_id)
                 return None
+            
+            # ✅ Get next display_id for the assigned employee
+            employee_id = lead_data.get('opportunity_owner_employee_id')
+            display_id = None
+            if employee_id:
+                display_id = self.get_next_display_id_for_employee(tenant_id, employee_id)
             
             query = """
                 INSERT INTO "StreemLyne_MT"."Opportunity_Details"
                 ("client_id", "opportunity_title", "opportunity_description", 
-                 "stage_id", "opportunity_value", "opportunity_owner_employee_id", "created_at")
-                VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                "stage_id", "opportunity_value", "opportunity_owner_employee_id", 
+                "display_id", "tenant_id", "created_at")
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                 RETURNING *
             """
             
@@ -284,15 +296,14 @@ class LeadRepository:
                     lead_data.get('opportunity_description', ''),
                     lead_data.get('stage_id'),
                     lead_data.get('opportunity_value', 0),
-                    lead_data.get('opportunity_owner_employee_id')
+                    employee_id,
+                    display_id,  # ✅ Per-employee sequential ID
+                    tenant_id
                 ),
                 returning=True
             )
         except Exception as e:
-            # Print exact SQL/DB error so failures are visible; then re-raise instead of returning None.
-            print(f"LeadRepository.create_lead SQL/DB error: {e!r}")
-            import traceback
-            traceback.print_exc()
+            logger.exception('create_lead SQL/DB error: %s', e)
             raise
 
     def update_lead(self, opportunity_id: int, tenant_id: int, lead_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -425,7 +436,7 @@ class LeadRepository:
         Rules:
         - MPAN_MPR is stored in Opportunity_Details.mpan_mpr
         - stage_id = "Lead" (not "Not Called")
-        - display_order is per-salesperson sequential (starts at 1 for each employee)
+        - display_id is per-salesperson sequential (starts at 1 for each employee)
         - tenant-scoped via Opportunity_Details.tenant_id
         - if MPAN already exists in Opportunity_Details -> skip and report
         - partial success allowed; per-row reasons returned
@@ -440,12 +451,12 @@ class LeadRepository:
         skipped = 0
         errors = []
 
-        # ✅ FIX 1: Resolve default stage_id for "Lead" (not "Not Called")
+        # Resolve default stage_id for "Lead"
         default_stage_id = None
         try:
             default_stage = self.db.execute_query(
                 'SELECT "stage_id" FROM "StreemLyne_MT"."Stage_Master" WHERE LOWER("stage_name") = %s LIMIT 1',
-                ('lead',),  # ✅ Changed from 'not called' to 'lead'
+                ('lead',),
                 fetch_one=True
             )
             default_stage_id = default_stage.get('stage_id') if default_stage else None
@@ -463,34 +474,22 @@ class LeadRepository:
                 default_stage_id = result.get('stage_id') if result else 1
                 logger.info('✨ Created "Lead" stage with ID %s', default_stage_id)
             except Exception:
-                default_stage_id = 1  # Last resort fallback
+                default_stage_id = 1
 
-        # ✅ FIX 2: Get current max display_order for this salesperson
-        next_display_order = 1
+        # ✅ NEW: Get current max display_id for this employee
+        next_display_id = 1
         if created_by:
-            try:
-                max_order_result = self.db.execute_query(
-                    '''SELECT COALESCE(MAX("display_order"), 0) as max_order
-                    FROM "StreemLyne_MT"."Opportunity_Details"
-                    WHERE "tenant_id" = %s
-                    AND "opportunity_owner_employee_id" = %s''',
-                    (tenant_id, created_by),
-                    fetch_one=True
-                )
-                next_display_order = (max_order_result.get('max_order') if max_order_result else 0) + 1
-            except Exception as e:
-                logger.warning('Failed to get max display_order, starting from 1: %s', e)
-                next_display_order = 1
+            next_display_id = self.get_next_display_id_for_employee(tenant_id, created_by)
 
-        # Client_id is optional for leads (no client relationship yet)
+        # Client_id is optional for leads
         default_client_id = None
 
         for idx, raw in enumerate(rows or []):
-            # Accept either preview row shape ({row_number,data,is_valid,...}) or plain dict
+            # Accept either preview row shape or plain dict
             row_number = raw.get('row_number') if isinstance(raw, dict) and raw.get('row_number') else (idx + 1)
             data = raw.get('data') if isinstance(raw, dict) and raw.get('data') else (raw if isinstance(raw, dict) else {})
 
-            # Normalize keys for tolerant access (Excel often uses "Business Name", we use business_name)
+            # Normalize keys for tolerant access
             def _norm(s):
                 if not s:
                     return ""
@@ -511,7 +510,7 @@ class LeadRepository:
             mpan = (get_field('MPAN_MPR', 'mpan_mpr', 'mpan', 'MPAN', 'MPR') or '')
             mpan = mpan.strip() if isinstance(mpan, str) else str(mpan) if mpan else ''
 
-            # Map fields -> Opportunity_Details columns
+            # Map fields
             business_name = get_field('Business_Name', 'business_name', 'client_company_name', 'Company_Name', 'Company') or None
             contact_person = get_field('Contact_Person', 'contact_person', 'client_contact_name', 'Contact', 'Name') or None
             tel_number = get_field('Tel_Number', 'phone', 'tel_number', 'telephone', 'Phone', 'Mobile') or None
@@ -519,11 +518,10 @@ class LeadRepository:
             start_date = get_field('Start_Date', 'start_date', 'contract_start_date', 'Contract_Start') or None
             end_date = get_field('End_Date', 'end_date', 'contract_end_date', 'Contract_End') or None
             
-            # Generate title from business name or contact person if no explicit title provided
             title = get_field('Title', 'opportunity_title') or business_name or contact_person or f'Imported lead {idx + 1}'
             description = get_field('Notes', 'notes', 'call_summary', 'Description') or None
 
-            # Skip row only if it has no identifying information at all
+            # Skip row only if it has no identifying information
             if not mpan and not business_name and not contact_person and not email:
                 skipped += 1
                 error_detail = {
@@ -536,12 +534,12 @@ class LeadRepository:
                 logger.warning('import_opportunities_from_import skipped row=%s - no identifying info', row_number)
                 continue
 
-            # ✅ FIX 3: Insert with display_order and opportunity_owner_employee_id
+            # ✅ CHANGED: Insert with per-employee display_id instead of display_order
             insert_q = '''
                 INSERT INTO "StreemLyne_MT"."Opportunity_Details"
                 ("tenant_id", "client_id", "mpan_mpr", "opportunity_title", "opportunity_description", 
                 "business_name", "contact_person", "tel_number", "email", "start_date", "end_date",
-                "stage_id", "service_id", "opportunity_owner_employee_id", "display_order", "created_at")
+                "stage_id", "service_id", "opportunity_owner_employee_id", "display_id", "created_at")
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                 RETURNING "opportunity_id"
             '''
@@ -560,20 +558,20 @@ class LeadRepository:
                         email,
                         start_date,
                         end_date,
-                        default_stage_id,      # ✅ "Lead" stage
+                        default_stage_id,
                         service_id,
-                        created_by,            # ✅ opportunity_owner_employee_id
-                        next_display_order,    # ✅ Per-salesperson sequential ID
+                        created_by,
+                        next_display_id,  # ✅ Per-employee sequential ID
                     ),
                     returning=True
                 )
                 if out and out.get('opportunity_id'):
                     inserted += 1
-                    next_display_order += 1  # ✅ Increment for next lead
                     logger.info(
-                        'import_opportunities_from_import inserted opportunity_id=%s mpan=%s display_order=%s',
-                        out.get('opportunity_id'), mpan, next_display_order - 1
+                        'import_opportunities_from_import inserted opportunity_id=%s display_id=%s',
+                        out.get('opportunity_id'), next_display_id
                     )
+                    next_display_id += 1  # ✅ Increment for next lead
                 else:
                     skipped += 1
                     error_detail = {
@@ -581,7 +579,7 @@ class LeadRepository:
                         'mpan': mpan,
                         'reason': 'INSERT_NO_ID',
                         'message': 'Insert succeeded but returned no opportunity_id',
-                        'details': f'Database insert executed but no RETURNING clause result'
+                        'details': 'Database insert executed but no RETURNING clause result'
                     }
                     errors.append(error_detail)
             except Exception as e:
@@ -595,7 +593,6 @@ class LeadRepository:
                     'details': str(e)
                 }
                 errors.append(error_detail)
-                # Continue with next row (partial success allowed)
                 continue
 
         return {'inserted': inserted, 'skipped': skipped, 'errors': errors}
@@ -1103,17 +1100,101 @@ class LeadRepository:
             import traceback
             traceback.print_exc()
             return []
+        
+    def get_next_display_id_for_employee(self, tenant_id: int, employee_id: int) -> int:
+        """
+        Get the next display_id for a specific employee within a tenant.
+        Each employee's leads are numbered starting from 1.
+        
+        Args:
+            tenant_id: Tenant identifier
+            employee_id: Employee identifier
+        
+        Returns:
+            Next sequential display_id for this employee (starts at 1)
+        """
+        query = '''
+            SELECT COALESCE(MAX("display_id"), 0) + 1 as next_id
+            FROM "StreemLyne_MT"."Opportunity_Details"
+            WHERE "tenant_id" = %s 
+            AND "opportunity_owner_employee_id" = %s
+            AND "deleted_at" IS NULL
+        '''
+        
+        try:
+            result = self.db.execute_query(query, (tenant_id, employee_id), fetch_one=True)
+            return result.get('next_id', 1) if result else 1
+        except Exception as e:
+            logger.warning('get_next_display_id_for_employee failed: %s', e)
+            return 1
+        
+    def recalculate_display_ids_for_employee(self, tenant_id: int, employee_id: int) -> Dict[str, Any]:
+        """
+        Recalculate display_ids for all leads owned by an employee.
+        Orders by created_at and assigns sequential numbers starting from 1.
+        This ensures no gaps in the sequence when leads are deleted or reassigned.
+        
+        Args:
+            tenant_id: Tenant identifier
+            employee_id: Employee identifier
+        
+        Returns:
+            Dictionary with success status and recalculated count
+        """
+        try:
+            # Get all leads for this employee ordered by creation
+            get_leads_query = '''
+                SELECT "opportunity_id"
+                FROM "StreemLyne_MT"."Opportunity_Details"
+                WHERE "tenant_id" = %s 
+                AND "opportunity_owner_employee_id" = %s
+                AND "deleted_at" IS NULL
+                ORDER BY "created_at" ASC, "opportunity_id" ASC
+            '''
+            
+            leads = self.db.execute_query(get_leads_query, (tenant_id, employee_id))
+            
+            if not leads:
+                return {'success': True, 'recalculated_count': 0}
+            
+            # Update each lead with new sequential display_id
+            update_query = '''
+                UPDATE "StreemLyne_MT"."Opportunity_Details"
+                SET "display_id" = %s
+                WHERE "opportunity_id" = %s
+            '''
+            
+            for idx, lead in enumerate(leads, start=1):
+                opp_id = lead.get('opportunity_id')
+                self.db.execute_update(update_query, (idx, opp_id))
+            
+            logger.info(
+                'Recalculated %d display_ids for employee %s in tenant %s',
+                len(leads), employee_id, tenant_id
+            )
+            
+            return {
+                'success': True,
+                'recalculated_count': len(leads)
+            }
+            
+        except Exception as e:
+            logger.exception('recalculate_display_ids_for_employee failed: %s', e)
+            return {
+                'success': False,
+                'recalculated_count': 0,
+                'error': str(e)
+            }
 
     def get_leads_list(self, tenant_id: int, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
         Return a minimal, tenant-scoped list of leads (read-only projection).
-        Excludes records that have a Project_Details entry (those are renewals).
-        Includes supplier_name, annual_usage, end_date from Opportunity_Details columns.
         """
         query = '''
             SELECT
                 od."opportunity_id",
                 od."tenant_lead_id",
+                od."display_id",  -- ✅ ADDED
                 COALESCE(od."business_name", cm."client_company_name", od."opportunity_title") AS business_name,
                 COALESCE(od."contact_person", cm."client_contact_name") AS contact_person,
                 COALESCE(od."tel_number", cm."client_phone") AS tel_number,
@@ -1191,6 +1272,7 @@ class LeadRepository:
                 out.append({
                     'opportunity_id':                r.get('opportunity_id'),
                     'tenant_lead_id':                r.get('tenant_lead_id'),
+                    'display_id':                    r.get('display_id'),
                     'business_name':                 r.get('business_name'),
                     'contact_person':                r.get('contact_person'),
                     'tel_number':                    str(r.get('tel_number')).replace('.0', '') if r.get('tel_number') else None,
@@ -1307,13 +1389,12 @@ class LeadRepository:
 
     def bulk_assign_leads(self, tenant_id: int, lead_ids: List[int], employee_id: int) -> Dict[str, Any]:
         """
-        Bulk assign leads to an employee.
-        Updates Opportunity_Details.opportunity_owner_employee_id for multiple leads.
+        Bulk assign leads to an employee and recalculate display_ids for affected employees.
         
         Args:
             tenant_id: Tenant identifier for isolation
             lead_ids: List of opportunity IDs to assign
-            employee_id: Employee ID to assign leads to
+            employee_id: Employee ID to assign leads to (or None to unassign)
         
         Returns:
             Dictionary with success status and updated count
@@ -1322,22 +1403,33 @@ class LeadRepository:
             return {'success': False, 'updated': 0, 'error': 'No lead IDs provided'}
 
         try:
-            # Validate assigned_to_id exists and belongs to tenant (prevent privilege escalation)
-            emp_check = self.db.execute_query(
-                'SELECT 1 FROM "StreemLyne_MT"."Employee_Master" WHERE "employee_id" = %s AND "tenant_id" = %s LIMIT 1',
-                (employee_id, tenant_id),
-                fetch_one=True
-            )
-            if not emp_check:
-                logger.warning('bulk_assign_leads: employee_id=%s not found for tenant_id=%s', employee_id, tenant_id)
-                return {
-                    'success': False,
-                    'updated': 0,
-                    'error': 'Employee not found',
-                    'message': 'assigned_to_id must be an existing employee in your tenant'
-                }
+            # Validate employee if not None/0
+            if employee_id:
+                emp_check = self.db.execute_query(
+                    'SELECT 1 FROM "StreemLyne_MT"."Employee_Master" WHERE "employee_id" = %s AND "tenant_id" = %s LIMIT 1',
+                    (employee_id, tenant_id),
+                    fetch_one=True
+                )
+                if not emp_check:
+                    logger.warning('bulk_assign_leads: employee_id=%s not found for tenant_id=%s', employee_id, tenant_id)
+                    return {
+                        'success': False,
+                        'updated': 0,
+                        'error': 'Employee not found',
+                        'message': 'assigned_to_id must be an existing employee in your tenant'
+                    }
 
-            # Verify all leads belong to the tenant before updating
+            # ✅ Track old employees for display_id recalculation
+            old_employees_query = '''
+                SELECT DISTINCT "opportunity_owner_employee_id"
+                FROM "StreemLyne_MT"."Opportunity_Details"
+                WHERE "tenant_id" = %s AND "opportunity_id" = ANY(%s)
+                AND "opportunity_owner_employee_id" IS NOT NULL
+            '''
+            old_employees_result = self.db.execute_query(old_employees_query, (tenant_id, lead_ids))
+            old_employee_ids = {row.get('opportunity_owner_employee_id') for row in old_employees_result if row.get('opportunity_owner_employee_id')}
+            
+            # Verify all leads belong to the tenant
             verify_query = '''
                 SELECT COUNT(*) as cnt FROM "StreemLyne_MT"."Opportunity_Details"
                 WHERE "tenant_id" = %s AND "opportunity_id" = ANY(%s)
@@ -1350,17 +1442,31 @@ class LeadRepository:
                 return {
                     'success': False,
                     'updated': 0,
-                    'error': f'Some leads do not belong to tenant or do not exist'
+                    'error': 'Some leads do not belong to tenant or do not exist'
                 }
             
-            # ✅ FIX: Set is_allocated = TRUE when reassigning leads
+            # ✅ Update assignment and set is_allocated
             update_query = '''
                 UPDATE "StreemLyne_MT"."Opportunity_Details"
                 SET "opportunity_owner_employee_id" = %s,
-                    "is_allocated" = TRUE
+                    "is_allocated" = CASE WHEN %s IS NOT NULL THEN TRUE ELSE FALSE END
                 WHERE "tenant_id" = %s AND "opportunity_id" = ANY(%s)
             '''
-            updated = self.db.execute_update(update_query, (employee_id, tenant_id, lead_ids))
+            updated = self.db.execute_update(
+                update_query, 
+                (employee_id if employee_id else None, employee_id if employee_id else None, tenant_id, lead_ids)
+            )
+            
+            # ✅ Recalculate display_ids for all affected employees
+            for old_emp_id in old_employee_ids:
+                if old_emp_id != employee_id:  # Don't recalculate twice
+                    self.recalculate_display_ids_for_employee(tenant_id, old_emp_id)
+                    logger.info('✅ Recalculated display_ids for employee %s after losing leads', old_emp_id)
+            
+            # Recalculate for new employee
+            if employee_id:
+                self.recalculate_display_ids_for_employee(tenant_id, employee_id)
+                logger.info('✅ Recalculated display_ids for employee %s after gaining leads', employee_id)
             
             logger.info(f'bulk_assign_leads: assigned {updated} leads to employee_id={employee_id} tenant={tenant_id}')
             
@@ -1372,7 +1478,7 @@ class LeadRepository:
             }
             
         except Exception as e:
-            logger.exception(f'bulk_assign_leads failed tenant={tenant_id} employee={employee_id}: {e}')
+            logger.exception(f'bulk_assign_leads failed tenant={tenant_id} employee={employee_id}: %s', e)
             return {
                 'success': False,
                 'updated': 0,

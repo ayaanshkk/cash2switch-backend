@@ -263,33 +263,27 @@ class CRMController:
     def assign_leads(self) -> tuple:
         """
         PATCH /api/crm/leads/assign
-        Bulk assign leads to an employee. Admin only.
-        Request body: { lead_ids: [...], employee_id: N } or { assigned_to_id: N }
-        ✅ UPDATED: Now recalculates display_order for affected employees
+        Bulk assign leads to an employee. Now allows any authenticated user.
+        Request body: { lead_ids: [...], employee_id: N, assignment_notes?: string }
+        ✅ UPDATED: Recalculates display_order for affected employees
         """
         try:
             from flask import request, jsonify, g
-            from backend.crm.utils.role_helpers import is_admin_user
             from backend.db import SessionLocal
             from sqlalchemy import text
             import logging
             
             logger = logging.getLogger(__name__)
-    
+
             user = getattr(request, 'current_user', None)
             if not user:
                 return jsonify({'success': False, 'error': 'Authentication required'}), 401
-            if not is_admin_user(user):
-                return jsonify({
-                    'error': 'permission_denied',
-                    'message': 'Only administrators can assign'
-                }), 403
-    
+
             tenant_id = g.tenant_id
             payload = request.get_json()
             if not payload:
                 return jsonify({'success': False, 'error': 'Request body required'}), 400
-    
+
             lead_ids = payload.get('lead_ids')
             employee_id = payload.get('employee_id') or payload.get('assigned_to_id')
             assignment_notes = payload.get('assignment_notes', '')
@@ -302,7 +296,7 @@ class CRMController:
                 employee_id = int(employee_id)
             except (ValueError, TypeError):
                 return jsonify({'success': False, 'error': 'employee_id must be a number'}), 400
-    
+
             # ✅ Track old employees for display_order recalculation
             session = SessionLocal()
             old_employee_ids = set()
@@ -326,7 +320,6 @@ class CRMController:
                     return jsonify(result), 400
                 
                 # ✅ Recalculate display_order for all affected employees
-                # Import the helper function
                 from backend.routes.crm_routes import recalculate_lead_display_order
                 
                 # Recalculate for old employees (who lost leads)
