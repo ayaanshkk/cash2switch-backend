@@ -381,29 +381,22 @@ class CRMController:
     def bulk_delete_leads(self):
         """
         Bulk delete multiple leads and automatically reset sequence if all deleted
-        
-        Request Body:
-            {
-                "opportunity_ids": [15, 16, 17, 18]
-            }
-        
-        Returns:
-            200: Deletion results with count
-            400: Invalid request
-            500: Internal server error
         """
         try:
             from flask import request, jsonify, g
             import logging
             
             logger = logging.getLogger(__name__)
-            logger.info('=== BULK DELETE LEADS REQUEST ===')
+            logger.warning('🔥 BULK DELETE START')
+            logger.warning(f'🔥 Request headers: {dict(request.headers)}')
+            logger.warning(f'🔥 Request data: {request.get_json()}')
+            logger.warning(f'🔥 g.tenant_id: {g.get("tenant_id")}')
             
             # Get request data
             data = request.get_json()
-            logger.info('Request data: %s', data)
             
             if not data or 'opportunity_ids' not in data:
+                logger.error('❌ Missing opportunity_ids in request')
                 return jsonify({
                     'success': False,
                     'error': 'opportunity_ids is required'
@@ -412,74 +405,65 @@ class CRMController:
             opportunity_ids = data.get('opportunity_ids', [])
             
             if not isinstance(opportunity_ids, list) or len(opportunity_ids) == 0:
+                logger.error('❌ opportunity_ids is not a valid list')
                 return jsonify({
                     'success': False,
                     'error': 'opportunity_ids must be a non-empty list'
                 }), 400
             
-            logger.info('Deleting %d leads: %s', len(opportunity_ids), opportunity_ids[:10])
+            logger.warning(f'🔥 Deleting {len(opportunity_ids)} leads')
             
-            # Get tenant_id from g (set by @tenant_from_jwt or @require_tenant)
-            tenant_id = g.get('tenant_id') or getattr(request, 'tenant_id', None)
+            # Get tenant_id from g (set by @require_tenant)
+            tenant_id = g.get('tenant_id')
             
             if not tenant_id:
-                logger.error('No tenant_id found in request context')
+                logger.error('❌ No tenant_id found in g')
                 return jsonify({
                     'success': False,
                     'error': 'Tenant ID not found in request context'
                 }), 400
             
-            logger.info('Tenant ID: %s', tenant_id)
+            logger.warning(f'🔥 Tenant ID: {tenant_id}')
             
             # Call repository bulk delete method
             from backend.crm.repositories.lead_repository import LeadRepository
             repo = LeadRepository()
             
-            logger.info('Calling repo.bulk_delete_leads...')
+            logger.warning('🔥 Calling repo.bulk_delete_leads...')
             result = repo.bulk_delete_leads(tenant_id, opportunity_ids)
-            logger.info('Repository result: %s', result)
+            logger.warning(f'🔥 Repository result: {result}')
             
             if not result.get('success'):
-                logger.error('Repository returned failure: %s', result)
+                logger.error(f'❌ Repository returned failure: {result}')
                 return jsonify(result), 400
             
-            # Build response message
+            # Build response
             deleted = result.get('deleted', 0)
             total = result.get('total_requested', 0)
             errors = result.get('errors', [])
             
-            # Check if sequence was reset
-            sequence_reset_message = ""
-            if deleted > 0:
-                try:
-                    # Check if all leads are deleted
-                    remaining = repo.get_all_leads(tenant_id)
-                    if len(remaining) == 0:
-                        sequence_reset_message = " ID sequence reset to 1."
-                except Exception as e:
-                    logger.warning('Could not check remaining leads: %s', e)
-            
             message = f"{deleted} lead(s) deleted successfully."
             if deleted < total:
                 message += f" {total - deleted} failed."
-            message += sequence_reset_message
             
-            logger.info('=== BULK DELETE COMPLETE: %s ===', message)
-            
-            return jsonify({
+            response_data = {
                 'success': True,
                 'deleted': deleted,
                 'total_requested': total,
                 'errors': errors,
                 'message': message
-            }), 200
+            }
+            
+            logger.warning(f'🔥 Returning response: {response_data}')
+            
+            return jsonify(response_data), 200
             
         except Exception as e:
             import traceback
             import logging
             
             logger = logging.getLogger(__name__)
-            logger.exception('❌ BULK DELETE EXCEPTION: %s', e)
+            logger.exception(f'❌ BULK DELETE EXCEPTION: {e}')
             traceback.print_exc()
             
             return jsonify({
