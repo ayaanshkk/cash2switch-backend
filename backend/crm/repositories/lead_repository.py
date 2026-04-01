@@ -720,7 +720,7 @@ class LeadRepository:
 
     def delete_lead(self, opportunity_id: int, tenant_id: int) -> bool:
         """
-        Delete a lead/opportunity
+        Delete a lead/opportunity and recalculate display_ids for the affected employee
         
         Args:
             opportunity_id: Opportunity identifier
@@ -729,20 +729,49 @@ class LeadRepository:
         Returns:
             True if deleted successfully
         """
-        # Validate tenant ownership via Opportunity_Details.tenant_id
-        query = """
-            DELETE FROM "StreemLyne_MT"."Opportunity_Details"
-            WHERE "tenant_id" = %s
-            AND "opportunity_id" = %s
-        """
-        
         try:
+            # ✅ Get the employee who owned this lead before deleting
+            get_employee_query = '''
+                SELECT "opportunity_owner_employee_id"
+                FROM "StreemLyne_MT"."Opportunity_Details"
+                WHERE "tenant_id" = %s AND "opportunity_id" = %s
+            '''
+            
+            employee_result = self.db.execute_query(
+                get_employee_query, 
+                (tenant_id, opportunity_id), 
+                fetch_one=True
+            )
+            
+            employee_id = employee_result.get('opportunity_owner_employee_id') if employee_result else None
+            
+            # Delete the lead
+            query = """
+                DELETE FROM "StreemLyne_MT"."Opportunity_Details"
+                WHERE "tenant_id" = %s
+                AND "opportunity_id" = %s
+            """
+            
             rows_affected = self.db.execute_delete(query, (tenant_id, opportunity_id))
+            
+            # ✅ Recalculate display_ids for the affected employee
+            if rows_affected > 0 and employee_id:
+                result = self.recalculate_display_ids_for_employee(tenant_id, employee_id)
+                if result.get('success'):
+                    logger.info(
+                        '✅ Recalculated %d display_ids for employee %s after delete',
+                        result.get('recalculated_count', 0), employee_id
+                    )
+                else:
+                    logger.warning(
+                        '⚠️ Failed to recalculate display_ids for employee %s: %s',
+                        employee_id, result.get('error')
+                    )
+            
             return rows_affected > 0
+            
         except Exception as e:
-            print(f"Error deleting lead: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception('delete_lead error: %s', e)
             return False
     
     def get_leads_with_customer_type(self, tenant_id: int, customer_type: Optional[str] = None, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -1483,4 +1512,123 @@ class LeadRepository:
                 'success': False,
                 'updated': 0,
                 'error': str(e)
+            }
+
+    def bulk_delete_leads(self, tenant_id: int, opportunity_ids: List[int]) -> Dict[str, Any]:
+        """
+        Bulk delete multiple leads and recalculate display_ids for affected employees.
+        
+        Args:
+            tenant_id: Tenant identifier
+            opportunity_ids: List of opportunity IDs to delete
+        
+        Returns:
+            Dictionary with deleted count, total_requested, and errors list
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        logger.info('bulk_delete_leads START: tenant=%s, count=%d', tenant_id, len(opportunity_ids))
+        
+        if not opportunity_ids:
+            return {
+                'success': False, 
+                'deleted': 0, 
+                'total_requested': 0,
+                'errors': ['No opportunity IDs provided']
+            }
+
+        try:
+            # ✅ Track which employees owned these leads
+            logger.info('Step 1: Finding affected employees...')
+            track_employees_query = '''
+                SELECT DISTINCT "opportunity_owner_employee_id"
+                FROM "StreemLyne_MT"."Opportunity_Details"
+                WHERE "tenant_id" = %s 
+                AND "opportunity_id" = ANY(%s)
+                AND "opportunity_owner_employee_id" IS NOT NULL
+            '''
+            
+            employees_result = self.db.execute_query(
+                track_employees_query, 
+                (tenant_id, opportunity_ids)
+            )
+            affected_employee_ids = {
+                row.get('opportunity_owner_employee_id') 
+                for row in employees_result 
+                if row.get('opportunity_owner_employee_id')
+            }
+            
+            logger.info('Affected employees: %s', affected_employee_ids)
+            
+            # Verify all leads belong to tenant before deleting
+            logger.info('Step 2: Verifying ownership...')
+            verify_query = '''
+                SELECT COUNT(*) as cnt 
+                FROM "StreemLyne_MT"."Opportunity_Details"
+                WHERE "tenant_id" = %s AND "opportunity_id" = ANY(%s)
+            '''
+            verify_result = self.db.execute_query(
+                verify_query, 
+                (tenant_id, opportunity_ids), 
+                fetch_one=True
+            )
+            verified_count = verify_result.get('cnt', 0) if verify_result else 0
+            
+            logger.info('Verified: %d out of %d requested', verified_count, len(opportunity_ids))
+            
+            errors = []
+            if verified_count != len(opportunity_ids):
+                error_msg = f'{len(opportunity_ids) - verified_count} lead(s) not found or not owned by tenant'
+                logger.warning(error_msg)
+                errors.append(error_msg)
+            
+            # ✅ Perform bulk delete
+            logger.info('Step 3: Executing DELETE query...')
+            delete_query = '''
+                DELETE FROM "StreemLyne_MT"."Opportunity_Details"
+                WHERE "tenant_id" = %s AND "opportunity_id" = ANY(%s)
+            '''
+            
+            deleted_count = self.db.execute_delete(delete_query, (tenant_id, opportunity_ids))
+            logger.info('Deleted %d leads', deleted_count)
+            
+            # ✅ Recalculate display_ids for all affected employees
+            logger.info('Step 4: Recalculating display_ids for %d employees...', len(affected_employee_ids))
+            recalc_errors = []
+            for employee_id in affected_employee_ids:
+                logger.info('Recalculating for employee %s...', employee_id)
+                result = self.recalculate_display_ids_for_employee(tenant_id, employee_id)
+                if result.get('success'):
+                    logger.info(
+                        '✅ Recalculated %d display_ids for employee %s',
+                        result.get('recalculated_count', 0), employee_id
+                    )
+                else:
+                    error_msg = f'Failed to recalculate display_ids for employee {employee_id}'
+                    logger.warning('⚠️ %s: %s', error_msg, result.get('error'))
+                    recalc_errors.append(error_msg)
+            
+            if recalc_errors:
+                errors.extend(recalc_errors)
+            
+            logger.info('bulk_delete_leads COMPLETE: deleted=%d, errors=%d', deleted_count, len(errors))
+            
+            return {
+                'success': True,
+                'deleted': deleted_count,
+                'total_requested': len(opportunity_ids),
+                'errors': errors,
+                'affected_employees': len(affected_employee_ids)
+            }
+            
+        except Exception as e:
+            logger.exception('❌ bulk_delete_leads FAILED: %s', e)
+            import traceback
+            traceback.print_exc()
+            return {
+                'success': False,
+                'deleted': 0,
+                'total_requested': len(opportunity_ids),
+                'errors': [f'{type(e).__name__}: {str(e)}']
             }

@@ -594,6 +594,14 @@ def get_leads_stats_by_employee():
 @crm_bp.route('/leads/bulk-delete', methods=['POST'])
 @require_tenant
 def bulk_delete_leads():
+    """Bulk delete multiple leads"""
+    # ✅ Add logging to verify decorator worked
+    import logging
+    from flask import g
+    
+    logger = logging.getLogger(__name__)
+    logger.info('Route handler: tenant_id=%s', g.get('tenant_id'))
+    
     return crm_controller.bulk_delete_leads()
 
 
