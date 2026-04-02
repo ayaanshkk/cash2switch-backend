@@ -2,19 +2,39 @@
 
 from flask import Blueprint, jsonify, request, current_app
 from datetime import datetime, timedelta
-from sqlalchemy import text, func, case, and_
+from sqlalchemy import text, func, case, and_, cast, Float, String
+from ..numeric_parse import safe_float
 from ..models import (
     Client_Master, Project_Details, Energy_Contract_Master,
     Supplier_Master, Employee_Master, Client_Interactions
 )
 from ..db import SessionLocal
 from .auth_helpers import token_required, get_tenant_id_from_user
+from ..dummy_local_dashboard_data import (
+    dummy_aq_breakdown,
+    dummy_energy_renewals_list,
+    dummy_period_breakdown,
+    dummy_renewal_performance,
+    dummy_renewal_stats,
+    dummy_salesperson_performance,
+    dummy_staff_status_counts,
+    dummy_supplier_breakdown,
+    local_demo_dashboard_enabled,
+)
 
 renewals_bp = Blueprint("renewals", __name__)
+
+
+def _misc_col2_sql_float():
+    """Annual usage may be varchar in DB; use for SQL aggregates and arithmetic."""
+    trimmed = func.replace(func.trim(cast(Project_Details.Misc_Col2, String)), ",", "")
+    return cast(func.nullif(trimmed, ""), Float)
 
 @renewals_bp.route("/energy-renewals", methods=["GET"])
 @token_required
 def get_renewals():
+    if local_demo_dashboard_enabled():
+        return jsonify(dummy_energy_renewals_list()), 200
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
         if not tenant_id:
@@ -117,6 +137,8 @@ def get_renewals():
 @renewals_bp.route('/energy-renewals/stats', methods=['GET'])
 @token_required
 def get_renewal_stats():
+    if local_demo_dashboard_enabled():
+        return jsonify(dummy_renewal_stats()), 200
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
@@ -159,9 +181,9 @@ def get_renewal_stats():
 
         for client, project, contract in all_results:
             end_date = contract.contract_end_date
-
-            if project.Misc_Col2:
-                total_aq += project.Misc_Col2
+            aq = safe_float(project.Misc_Col2)
+            if aq:
+                total_aq += aq
 
             if not end_date:
                 continue
@@ -177,8 +199,9 @@ def get_renewal_stats():
             elif 91 <= days_until_renewal <= 180:
                 total_renewals_90_plus_days += 1
 
-            if contract.unit_rate and project.Misc_Col2:
-                annual_cost = (contract.unit_rate * project.Misc_Col2) / 100
+            ur = safe_float(contract.unit_rate)
+            if ur and aq:
+                annual_cost = (ur * aq) / 100
                 total_revenue_at_risk += annual_cost
 
             status = project.status
@@ -222,6 +245,8 @@ def get_renewal_stats():
 @renewals_bp.route('/energy-renewals/supplier-breakdown', methods=['GET'])
 @token_required
 def get_supplier_breakdown():
+    if local_demo_dashboard_enabled():
+        return jsonify(dummy_supplier_breakdown()), 200
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
@@ -240,7 +265,7 @@ def get_supplier_breakdown():
                             Energy_Contract_Master.unit_rate.isnot(None),
                             Project_Details.Misc_Col2.isnot(None)
                         ),
-                        (Energy_Contract_Master.unit_rate * Project_Details.Misc_Col2) / 100
+                        (Energy_Contract_Master.unit_rate * _misc_col2_sql_float()) / 100
                     ),
                     else_=0
                 )
@@ -272,7 +297,7 @@ def get_supplier_breakdown():
                             Energy_Contract_Master.unit_rate.isnot(None),
                             Project_Details.Misc_Col2.isnot(None)
                         ),
-                        (Energy_Contract_Master.unit_rate * Project_Details.Misc_Col2) / 100
+                        (Energy_Contract_Master.unit_rate * _misc_col2_sql_float()) / 100
                     ),
                     else_=0
                 )
@@ -300,6 +325,9 @@ def get_supplier_breakdown():
 @renewals_bp.route('/energy-renewals/period-breakdown', methods=['GET'])
 @token_required
 def get_period_breakdown():
+    if local_demo_dashboard_enabled():
+        period = request.args.get('period')
+        return jsonify(dummy_period_breakdown(period)), 200
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
@@ -363,8 +391,10 @@ def get_period_breakdown():
         breakdown = []
         for r in results:
             revenue = 0
-            if r.unit_rate and r.annual_usage:
-                revenue = (r.unit_rate * r.annual_usage) / 100
+            ur = safe_float(r.unit_rate)
+            usage = safe_float(r.annual_usage)
+            if ur and usage:
+                revenue = (ur * usage) / 100
 
             days_until_expiry = (r.contract_end_date - today).days if r.contract_end_date else 0
 
@@ -378,7 +408,7 @@ def get_period_breakdown():
                 'contract_end_date': r.contract_end_date.isoformat() if r.contract_end_date else None,
                 'days_until_expiry': days_until_expiry,
                 'mpan_number': r.mpan_number,
-                'annual_usage': r.annual_usage,
+                'annual_usage': usage,
                 'estimated_revenue': round(revenue, 2),
                 'assigned_to': r.employee_name or 'Unassigned',
                 'status': r.status or 'Pending'
@@ -405,6 +435,9 @@ def get_period_breakdown():
 @renewals_bp.route('/energy-renewals/salesperson-performance', methods=['GET'])
 @token_required
 def get_salesperson_performance():
+    if local_demo_dashboard_enabled():
+        period = request.args.get('period', 'month')
+        return jsonify(dummy_salesperson_performance(period)), 200
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
@@ -482,9 +515,11 @@ def get_salesperson_performance():
                     'customers_contacted': []
                 }
 
+            ur = safe_float(r.unit_rate)
+            usage = safe_float(r.annual_usage)
             revenue = 0
-            if r.unit_rate and r.annual_usage:
-                revenue = (r.unit_rate * r.annual_usage) / 100
+            if ur and usage:
+                revenue = (ur * usage) / 100
 
             customer_exists = any(
                 c['client_id'] == r.client_id
@@ -508,7 +543,7 @@ def get_salesperson_performance():
                     'status': r.status,
                     'supplier': r.supplier_company_name,
                     'contract_end_date': r.contract_end_date.isoformat() if r.contract_end_date else None,
-                    'annual_usage': r.annual_usage,
+                    'annual_usage': usage,
                     'estimated_revenue': round(revenue, 2)
                 })
 
@@ -554,6 +589,8 @@ def get_salesperson_performance():
 @renewals_bp.route('/energy-renewals/aq-breakdown', methods=['GET'])
 @token_required
 def get_aq_breakdown():
+    if local_demo_dashboard_enabled():
+        return jsonify(dummy_aq_breakdown()), 200
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
@@ -562,11 +599,12 @@ def get_aq_breakdown():
 
         employee_id = request.args.get('employee_id', type=int)
 
+        misc_sq = _misc_col2_sql_float()
         query = session.query(
             Employee_Master.employee_id,
             Employee_Master.employee_name,
             func.count(Client_Master.client_id).label('customer_count'),
-            func.sum(Project_Details.Misc_Col2).label('total_aq'),
+            func.sum(misc_sq).label('total_aq'),
             func.sum(
                 case(
                     (
@@ -574,7 +612,7 @@ def get_aq_breakdown():
                             Energy_Contract_Master.unit_rate.isnot(None),
                             Project_Details.Misc_Col2.isnot(None)
                         ),
-                        (Energy_Contract_Master.unit_rate * Project_Details.Misc_Col2) / 100
+                        (Energy_Contract_Master.unit_rate * misc_sq) / 100
                     ),
                     else_=0
                 )
@@ -601,7 +639,7 @@ def get_aq_breakdown():
         query = query.group_by(
             Employee_Master.employee_id,
             Employee_Master.employee_name
-        ).order_by(func.sum(Project_Details.Misc_Col2).desc())
+        ).order_by(func.sum(misc_sq).desc())
 
         results = query.all()
 
@@ -680,6 +718,8 @@ def test_renewals_endpoint():
 @renewals_bp.route('/energy-renewals/performance', methods=['GET'])
 @token_required
 def get_renewal_performance():
+    if local_demo_dashboard_enabled():
+        return jsonify(dummy_renewal_performance()), 200
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
@@ -777,6 +817,8 @@ def get_renewal_performance():
 @renewals_bp.route('/energy-renewals/staff-status-counts', methods=['GET'])
 @token_required
 def get_staff_status_counts():
+    if local_demo_dashboard_enabled():
+        return jsonify(dummy_staff_status_counts()), 200
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
@@ -785,6 +827,7 @@ def get_staff_status_counts():
 
         employee_id = request.args.get('employee_id', type=int)
 
+        # Exclude offshore / leads-only users (CRM role_id 5) from renewals team performance
         base_sql = """
             SELECT
                 em.employee_id,
@@ -800,6 +843,14 @@ def get_staff_status_counts():
                 ON pd.project_id = ecm.project_id
             WHERE cm.tenant_id = :tenant_id
             AND em.tenant_id = :tenant_id
+            AND NOT EXISTS (
+                SELECT 1
+                FROM "StreemLyne_MT"."User_Master" um_r5
+                INNER JOIN "StreemLyne_MT"."User_Role_Mapping" urm_r5
+                    ON urm_r5.user_id = um_r5.user_id
+                    AND urm_r5.role_id = 5
+                WHERE um_r5.employee_id = em.employee_id
+            )
             {employee_filter}
             GROUP BY em.employee_id, em.employee_name, pd.status
             ORDER BY em.employee_name
