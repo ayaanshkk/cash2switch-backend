@@ -134,7 +134,7 @@ def create_app():
         notification_routes,
         customer_routes, file_routes,
         crm_routes, document_routes, calendar_routes,
-        import_routes, energy_renewals_routes, bulk_import_optimized, async_bulk_routes, client_interactions_routes,
+        import_routes, energy_renewals_routes, bulk_import_optimized, async_bulk_routes, client_interactions_routes, 
     )
 
     app.register_blueprint(auth_routes.auth_bp, url_prefix='/auth')
