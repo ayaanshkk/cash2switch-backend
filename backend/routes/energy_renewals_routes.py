@@ -792,7 +792,8 @@ def get_renewal_performance():
 def get_staff_status_counts():
     """
     Staff performance for renewals - role_id 2, 3 only
-    Renewals are stored in Client_Master table (no stage tracking)
+    Returns 4 categories: Renewed, In Progress, Not Contacted, Lost
+    Each category is separate and NOT combined
     """
     session = SessionLocal()
     try:
@@ -842,19 +843,43 @@ def get_staff_status_counts():
             emp_id = emp.employee_id
             emp_name = emp.employee_name
             
-            # ✅ CORRECT: Query Client_Master for renewals
-            # Client_Master doesn't have stage tracking, so we count based on is_archived/is_deleted
+            # ✅ SEPARATE BREAKDOWN - DO NOT COMBINE
             stats_query = """
                 SELECT 
                     COUNT(*) as total_contacts,
-                    SUM(CASE WHEN is_archived = true THEN 1 ELSE 0 END) as renewed_count,
-                    SUM(CASE WHEN is_archived = false AND is_deleted = false THEN 1 ELSE 0 END) as in_progress_count,
-                    0 as not_contacted_count,
-                    SUM(CASE WHEN is_deleted = true THEN 1 ELSE 0 END) as lost_count
-                FROM "StreemLyne_MT"."Client_Master"
-                WHERE tenant_id = :tenant_id
-                AND assigned_employee_id = :emp_id
-                AND is_deleted = false
+                    
+                    -- Renewed: ONLY "Already Renewed" (not including other success statuses)
+                    SUM(CASE 
+                        WHEN pd.status = 'Already Renewed'
+                        THEN 1 ELSE 0 
+                    END) as renewed_count,
+                    
+                    -- In Progress: Callback, Called, Contacted, Not Answered
+                    SUM(CASE 
+                        WHEN pd.status IN ('Callback', 'Called', 'Contacted', 'Not Answered')
+                        THEN 1 ELSE 0 
+                    END) as in_progress_count,
+                    
+                    -- Not Contacted: NULL status only
+                    SUM(CASE 
+                        WHEN pd.status IS NULL
+                        THEN 1 ELSE 0 
+                    END) as not_contacted_count,
+                    
+                    -- Lost: ONLY "Lost COT" (not including Meter De-energised)
+                    SUM(CASE 
+                        WHEN pd.status = 'Lost COT'
+                        THEN 1 ELSE 0 
+                    END) as lost_count
+                    
+                FROM "StreemLyne_MT"."Client_Master" cm
+                INNER JOIN "StreemLyne_MT"."Project_Details" pd 
+                    ON cm.client_id = pd.client_id
+                INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm 
+                    ON pd.project_id = ecm.project_id
+                WHERE cm.tenant_id = :tenant_id
+                AND pd.assigned_employee_id = :emp_id
+                AND ecm.contract_end_date IS NOT NULL
             """
             
             stats_result = session.execute(
@@ -868,9 +893,15 @@ def get_staff_status_counts():
             not_contacted = stats_result.not_contacted_count or 0
             lost = stats_result.lost_count or 0
             
+            # Conversion = Renewed / Total (only counting "Already Renewed")
             conversion_rate = round((renewed / total * 100), 1) if total > 0 else 0
             
-            print(f"   📊 {emp_name}: {total} clients, {renewed} archived ({conversion_rate}%)")
+            print(f"   📊 {emp_name}:")
+            print(f"      Total: {total}")
+            print(f"      Renewed: {renewed} ({conversion_rate}%)")
+            print(f"      In Progress: {in_progress}")
+            print(f"      Not Contacted: {not_contacted}")
+            print(f"      Lost: {lost}")
             
             results.append({
                 'employee_id': emp_id,
@@ -897,7 +928,6 @@ def get_staff_status_counts():
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
-
 
 @renewals_bp.route('/energy-renewals/debug-statuses', methods=['GET'])
 @token_required
@@ -945,7 +975,8 @@ def debug_statuses():
 def get_leads_staff_performance():
     """
     Leads staff performance - role_id 2, 3, 5 (local + offshore)
-    Leads are stored in Opportunity_Details with stage_type = 1
+    Returns 4 categories: Converted, In Progress, Not Contacted, Lost
+    Uses exact stage names from database
     """
     session = SessionLocal()
     try:
@@ -966,7 +997,7 @@ def get_leads_staff_performance():
         if employee_id:
             employee_filter = " AND em.employee_id = :employee_id "
         
-        # Get employees with role 2, 3, 5
+        # Get employees with role 2, 3, 5 (includes offshore)
         all_emp_sql = """
             SELECT DISTINCT
                 em.employee_id,
@@ -995,19 +1026,56 @@ def get_leads_staff_performance():
             emp_id = emp.employee_id
             emp_name = emp.employee_name
             
-            # ✅ CORRECT: Query Opportunity_Details for leads with stage tracking
+            # ✅ Using EXACT stage names from your database
             stats_query = """
                 SELECT 
                     COUNT(*) as total_contacts,
-                    SUM(CASE WHEN sm.stage_name = 'Converted' THEN 1 ELSE 0 END) as converted_count,
-                    SUM(CASE WHEN sm.stage_name IN ('Callback', 'Not Answered', 'Follow Up') THEN 1 ELSE 0 END) as in_progress_count,
-                    SUM(CASE WHEN sm.stage_name = 'Not Contacted' THEN 1 ELSE 0 END) as not_contacted_count,
-                    SUM(CASE WHEN sm.stage_name = 'Lost' THEN 1 ELSE 0 END) as lost_count
+                    
+                    -- Converted: All success outcomes
+                    SUM(CASE 
+                        WHEN sm.stage_name IN (
+                            'Already Renewed',
+                            'Renewed Directly',
+                            'End Date Changed',
+                            'Won',
+                            'Priced'
+                        )
+                        THEN 1 ELSE 0 
+                    END) as converted_count,
+                    
+                    -- In Progress: Active engagement
+                    SUM(CASE 
+                        WHEN sm.stage_name IN (
+                            'Callback',
+                            'Not Answered',
+                            'Email Only'
+                        )
+                        THEN 1 ELSE 0 
+                    END) as in_progress_count,
+                    
+                    -- Not Contacted: Never reached out or just imported
+                    SUM(CASE 
+                        WHEN sm.stage_name IN ('Not Called', 'Lead') OR sm.stage_name IS NULL
+                        THEN 1 ELSE 0 
+                    END) as not_contacted_count,
+                    
+                    -- Lost: All failure outcomes
+                    SUM(CASE 
+                        WHEN sm.stage_name IN (
+                            'Lost',
+                            'Lost COT',
+                            'Broker in Place',
+                            'Invalid Number',
+                            'Incorrect Supplier'
+                        )
+                        THEN 1 ELSE 0 
+                    END) as lost_count
+                    
                 FROM "StreemLyne_MT"."Opportunity_Details" od
                 LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
                 WHERE od.tenant_id = :tenant_id
                 AND od.opportunity_owner_employee_id = :emp_id
-                AND sm.stage_type = 1
+                AND (sm.stage_type = 1 OR sm.stage_type IS NULL)
             """
             
             stats_result = session.execute(
@@ -1021,16 +1089,22 @@ def get_leads_staff_performance():
             not_contacted = stats_result.not_contacted_count or 0
             lost = stats_result.lost_count or 0
             
-            conversion_rate = round((converted / total * 100), 1) if total > 0 else 0
+            # ✅ FIX: Conversion = Converted / Total (with proper decimal handling)
+            conversion_rate = round((converted / total * 100), 1) if total > 0 else 0.0
             
-            print(f"   📊 {emp_name}: {total} leads, {converted} converted ({conversion_rate}%)")
+            print(f"   📊 {emp_name}:")
+            print(f"      Total: {total}")
+            print(f"      Converted: {converted} ({conversion_rate}%)")
+            print(f"      In Progress: {in_progress}")
+            print(f"      Not Contacted: {not_contacted}")
+            print(f"      Lost: {lost}")
             
             results.append({
                 'employee_id': emp_id,
                 'employee_name': emp_name,
                 'total_contacts': total,
                 'converted_count': converted,
-                'renewed_count': converted,  # Alias for frontend compatibility
+                'renewed_count': converted,  # Frontend uses 'renewed_count'
                 'conversion_rate': conversion_rate,
                 'in_progress_count': in_progress,
                 'not_contacted_count': not_contacted,
