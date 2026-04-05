@@ -791,8 +791,8 @@ def get_renewal_performance():
 @token_required
 def get_staff_status_counts():
     """
-    Returns status counts for all staff members, including those with 0 assignments.
-    Excludes employees with role_ids containing '5' (leads-only salespeople).
+    Staff performance for renewals - role_id 2, 3 only
+    Renewals are stored in Client_Master table (no stage tracking)
     """
     session = SessionLocal()
     try:
@@ -801,149 +801,97 @@ def get_staff_status_counts():
             return jsonify({'error': 'Tenant not found'}), 400
  
         employee_id = request.args.get('employee_id', type=int)
+        
+        print(f"\n{'='*80}")
+        print(f"🔍 RENEWALS STAFF PERFORMANCE REQUEST")
+        print(f"{'='*80}")
+        print(f"Tenant ID: {tenant_id}")
+        print(f"Employee ID filter: {employee_id}")
+        print(f"{'='*80}\n")
  
-        # Get ALL employees for this tenant, excluding those with role '5'
-        all_employees_query = """
+        employee_filter = ""
+        if employee_id:
+            employee_filter = " AND em.employee_id = :employee_id "
+        
+        # Get employees with role 2, 3
+        all_emp_sql = """
             SELECT DISTINCT
                 em.employee_id,
-                em.employee_name,
-                em.role_ids
+                em.employee_name
             FROM "StreemLyne_MT"."Employee_Master" em
+            INNER JOIN "StreemLyne_MT"."User_Master" um
+                ON em.employee_id = um.employee_id
+            INNER JOIN "StreemLyne_MT"."User_Role_Mapping" urm
+                ON um.user_id = urm.user_id
             WHERE em.tenant_id = :tenant_id
-            AND (em.role_ids IS NULL OR em.role_ids NOT LIKE '%5%')
-            {employee_filter}
+            AND urm.role_id IN (2, 3)
+        """ + employee_filter + """
             ORDER BY em.employee_name
         """
- 
-        # Get project status counts
-        project_stats_query = """
-            SELECT
-                em.employee_id,
-                em.employee_name,
-                pd.status,
-                COUNT(DISTINCT pd.project_id) as count
-            FROM "StreemLyne_MT"."Employee_Master" em
-            JOIN "StreemLyne_MT"."Project_Details" pd
-                ON em.employee_id = pd.assigned_employee_id
-            JOIN "StreemLyne_MT"."Client_Master" cm
-                ON pd.client_id = cm.client_id
-            LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm
-                ON pd.project_id = ecm.project_id
-            WHERE cm.tenant_id = :tenant_id
-            AND em.tenant_id = :tenant_id
-            AND (em.role_ids IS NULL OR em.role_ids NOT LIKE '%5%')
-            {employee_filter}
-            GROUP BY em.employee_id, em.employee_name, pd.status
-            ORDER BY em.employee_name
-        """
- 
-        params = {"tenant_id": tenant_id}
         
-        # Get all employees (excluding those with role_id 5)
+        params = {'tenant_id': tenant_id}
         if employee_id:
-            all_emp_sql = all_employees_query.format(employee_filter="AND em.employee_id = :employee_id")
-            params["employee_id"] = employee_id
-        else:
-            all_emp_sql = all_employees_query.format(employee_filter="")
- 
-        print(f"🔍 Executing query to get all employees for tenant {tenant_id}...")
-        
+            params['employee_id'] = employee_id
+            
         all_employees = session.execute(text(all_emp_sql), params).fetchall()
         
-        print(f"✅ Found {len(all_employees)} employees")
-        for emp in all_employees:
-            print(f"  - {emp.employee_name} (ID: {emp.employee_id}, role_ids: '{emp.role_ids}')")
+        print(f"✅ Found {len(all_employees)} employees with roles 2, 3\n")
         
-        # Initialize all employees with zero counts
-        employees = {}
+        results = []
         for emp in all_employees:
-            employees[emp.employee_id] = {
-                'employee_id': emp.employee_id,
-                'employee_name': emp.employee_name,
-                'renewed': 0,
-                'in_progress': 0,
-                'not_contacted': 0,
-                'lost': 0,
-                'renewed_directly': 0,
-                'end_date_changed': 0,
-                'priced': 0,
-                'total': 0,
-            }
- 
-        # Get project stats
-        if employee_id:
-            stats_sql = project_stats_query.format(employee_filter="AND em.employee_id = :employee_id")
-        else:
-            stats_sql = project_stats_query.format(employee_filter="")
- 
-        print(f"🔍 Executing query to get project stats...")
-        results = session.execute(text(stats_sql), params).fetchall()
-        
-        print(f"✅ Found {len(results)} project status records")
- 
-        # Update counts for employees with projects
-        for r in results:
-            eid = r.employee_id
-            if eid in employees:
-                count = r.count or 0
-                s = (r.status or '').lower().strip()
-                employees[eid]['total'] += count
-                
-                print(f"  - Employee {eid}: status='{r.status}' ({s}), count={count}")
-
-                if s in ('renewed', 'already renewed'):
-                    employees[eid]['renewed'] += count
-                elif s in ('callback', 'called', 'contacted', 'not answered'):
-                    employees[eid]['in_progress'] += count
-                elif s in ('lost', 'lost cot'):
-                    employees[eid]['lost'] += count
-                elif s == 'renewed directly':
-                    employees[eid]['renewed_directly'] += count
-                elif s == 'end date changed':
-                    employees[eid]['end_date_changed'] += count
-                elif s == 'priced':
-                    employees[eid]['priced'] += count
-                elif s in ('email only', 'broker in place', 'complaint', 
-                          'incorrect supplier', 'invalid number', 'meter de-energised'):
-                    employees[eid]['not_contacted'] += count
-                elif s == 'not contacted':
-                    employees[eid]['not_contacted'] += count
-                else:
-                    # null/empty/unknown - default to not contacted
-                    employees[eid]['not_contacted'] += count
-                    print(f"    ⚠️  Unknown status '{s}' - defaulting to not_contacted")
- 
-        # Build output
-        output = []
-        for emp in employees.values():
-            total = emp['total'] if emp['total'] > 0 else 1
-            rate = round((emp['renewed'] / total) * 100) if emp['total'] > 0 else 0
+            emp_id = emp.employee_id
+            emp_name = emp.employee_name
             
-            output.append({
-                'employee_id': emp['employee_id'],
-                'employee_name': emp['employee_name'],
-                'total_contacts': emp['total'],
-                'renewed_count': emp['renewed'],
-                'in_progress_count': emp['in_progress'],
-                'not_contacted_count': emp['not_contacted'],
-                'lost_count': emp['lost'],
-                'renewed_directly_count': emp['renewed_directly'],
-                'end_date_changed_count': emp['end_date_changed'],
-                'priced_count': emp['priced'],
-                'conversion_rate': rate,
-                'converted_count': emp['renewed'],
+            # ✅ CORRECT: Query Client_Master for renewals
+            # Client_Master doesn't have stage tracking, so we count based on is_archived/is_deleted
+            stats_query = """
+                SELECT 
+                    COUNT(*) as total_contacts,
+                    SUM(CASE WHEN is_archived = true THEN 1 ELSE 0 END) as renewed_count,
+                    SUM(CASE WHEN is_archived = false AND is_deleted = false THEN 1 ELSE 0 END) as in_progress_count,
+                    0 as not_contacted_count,
+                    SUM(CASE WHEN is_deleted = true THEN 1 ELSE 0 END) as lost_count
+                FROM "StreemLyne_MT"."Client_Master"
+                WHERE tenant_id = :tenant_id
+                AND assigned_employee_id = :emp_id
+                AND is_deleted = false
+            """
+            
+            stats_result = session.execute(
+                text(stats_query), 
+                {'tenant_id': tenant_id, 'emp_id': emp_id}
+            ).fetchone()
+            
+            total = stats_result.total_contacts or 0
+            renewed = stats_result.renewed_count or 0
+            in_progress = stats_result.in_progress_count or 0
+            not_contacted = stats_result.not_contacted_count or 0
+            lost = stats_result.lost_count or 0
+            
+            conversion_rate = round((renewed / total * 100), 1) if total > 0 else 0
+            
+            print(f"   📊 {emp_name}: {total} clients, {renewed} archived ({conversion_rate}%)")
+            
+            results.append({
+                'employee_id': emp_id,
+                'employee_name': emp_name,
+                'total_contacts': total,
+                'renewed_count': renewed,
+                'conversion_rate': conversion_rate,
+                'in_progress_count': in_progress,
+                'not_contacted_count': not_contacted,
+                'lost_count': lost,
+                'total_value_touched': 0,
+                'renewed_directly_count': 0,
+                'end_date_changed_count': 0,
+                'priced_count': 0,
             })
- 
-        print(f"\n✅ FINAL OUTPUT: Returning {len(output)} staff members")
-        for member in output:
-            print(f"  - {member['employee_name']}: total={member['total_contacts']}, "
-                  f"renewed={member['renewed_count']}, in_progress={member['in_progress_count']}, "
-                  f"not_contacted={member['not_contacted_count']}, lost={member['lost_count']}, "
-                  f"rate={member['conversion_rate']}%")
         
-        return jsonify(output), 200
- 
+        print(f"\n✅ Returning {len(results)} staff performance records\n")
+        return jsonify(results)
+        
     except Exception as e:
+        print(f"❌ Error in staff status counts: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -996,7 +944,8 @@ def debug_statuses():
 @token_required
 def get_leads_staff_performance():
     """
-    Staff performance for leads - uses Opportunity_Details table
+    Leads staff performance - role_id 2, 3, 5 (local + offshore)
+    Leads are stored in Opportunity_Details with stage_type = 1
     """
     session = SessionLocal()
     try:
@@ -1005,147 +954,110 @@ def get_leads_staff_performance():
             return jsonify({'error': 'Tenant not found'}), 400
  
         employee_id = request.args.get('employee_id', type=int)
+        
+        print(f"\n{'='*80}")
+        print(f"🔍 LEADS STAFF PERFORMANCE REQUEST")
+        print(f"{'='*80}")
+        print(f"Tenant ID: {tenant_id}")
+        print(f"Employee ID filter: {employee_id}")
+        print(f"{'='*80}\n")
  
-        # ✅ Get ALL salespeople - use role_ids column (contains '2', '3', or '5')
-        all_employees_query = """
+        employee_filter = ""
+        if employee_id:
+            employee_filter = " AND em.employee_id = :employee_id "
+        
+        # Get employees with role 2, 3, 5
+        all_emp_sql = """
             SELECT DISTINCT
                 em.employee_id,
                 em.employee_name
             FROM "StreemLyne_MT"."Employee_Master" em
+            INNER JOIN "StreemLyne_MT"."User_Master" um
+                ON em.employee_id = um.employee_id
+            INNER JOIN "StreemLyne_MT"."User_Role_Mapping" urm
+                ON um.user_id = urm.user_id
             WHERE em.tenant_id = :tenant_id
-            AND (
-                em.role_ids LIKE '%2%' OR 
-                em.role_ids LIKE '%3%' OR 
-                em.role_ids LIKE '%5%'
-            )
-            {employee_filter}
+            AND urm.role_id IN (2, 3, 5)
+        """ + employee_filter + """
             ORDER BY em.employee_name
         """
- 
-        # Get lead status counts from Opportunity_Details + Stage_Master
-        lead_stats_query = """
-            SELECT
-                em.employee_id,
-                em.employee_name,
-                sm.stage_name,
-                COUNT(DISTINCT od.opportunity_id) as count
-            FROM "StreemLyne_MT"."Employee_Master" em
-            LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od
-                ON em.employee_id = od.opportunity_owner_employee_id
-                AND od.tenant_id = :tenant_id
-                AND od.is_allocated = true
-            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm
-                ON od.stage_id = sm.stage_id
-            WHERE em.tenant_id = :tenant_id
-            AND (
-                em.role_ids LIKE '%2%' OR 
-                em.role_ids LIKE '%3%' OR 
-                em.role_ids LIKE '%5%'
-            )
-            {employee_filter}
-            GROUP BY em.employee_id, em.employee_name, sm.stage_name
-            ORDER BY em.employee_name
-        """
- 
-        params = {"tenant_id": tenant_id}
         
-        # Apply employee filter if specified
+        params = {'tenant_id': tenant_id}
         if employee_id:
-            all_emp_sql = all_employees_query.format(employee_filter="AND em.employee_id = :employee_id")
-            stats_sql = lead_stats_query.format(employee_filter="AND em.employee_id = :employee_id")
-            params["employee_id"] = employee_id
-        else:
-            all_emp_sql = all_employees_query.format(employee_filter="")
-            stats_sql = lead_stats_query.format(employee_filter="")
- 
-        # Get all employees
+            params['employee_id'] = employee_id
+            
         all_employees = session.execute(text(all_emp_sql), params).fetchall()
         
-        # Initialize all employees with zero counts
-        employees = {}
+        print(f"✅ Found {len(all_employees)} employees with roles 2, 3, 5\n")
+        
+        results = []
         for emp in all_employees:
-            employees[emp.employee_id] = {
-                'employee_id': emp.employee_id,
-                'employee_name': emp.employee_name,
-                'total_leads': 0,
-                'converted_leads': 0,
-                'in_progress_leads': 0,
-                'not_contacted_leads': 0,
-                'lost_leads': 0,
-                'by_stage': []
-            }
- 
-        # Get lead stats
-        results = session.execute(text(stats_sql), params).fetchall()
- 
-        # Update counts for employees with leads
-        for r in results:
-            eid = r.employee_id
-            if eid in employees and r.stage_name:  # Skip NULL stages
-                count = r.count or 0
-                stage = (r.stage_name or '').lower().strip()
-                employees[eid]['total_leads'] += count
-                
-                # Track by stage for debugging
-                employees[eid]['by_stage'].append({
-                    'stage_name': r.stage_name,
-                    'count': count
-                })
- 
-                # Categorize stages (adjust these based on your actual Stage_Master values)
-                if stage in ('converted', 'won', 'renewed', 'signed', 'closed won'):
-                    employees[eid]['converted_leads'] += count
-                elif stage in ('callback', 'contacted', 'in progress', 'follow up', 'qualified', 'proposal sent', 'negotiation'):
-                    employees[eid]['in_progress_leads'] += count
-                elif stage in ('not contacted', 'new', 'unassigned', 'open'):
-                    employees[eid]['not_contacted_leads'] += count
-                elif stage in ('lost', 'rejected', 'not interested', 'closed lost'):
-                    employees[eid]['lost_leads'] += count
-                else:
-                    # Default unknown stages to in_progress
-                    employees[eid]['in_progress_leads'] += count
- 
-        # Build output matching StaffPerformanceGrid expectations
-        output = []
-        for emp in employees.values():
-            total = emp['total_leads'] if emp['total_leads'] > 0 else 1
-            rate = round((emp['converted_leads'] / total) * 100) if emp['total_leads'] > 0 else 0
+            emp_id = emp.employee_id
+            emp_name = emp.employee_name
             
-            output.append({
-                # Required fields for StaffPerformanceGrid
-                'employee_id': emp['employee_id'],
-                'employee_name': emp['employee_name'],
-                'total_contacts': emp['total_leads'],
-                'converted_count': emp['converted_leads'],
-                'conversion_rate': rate,
-                'renewed_count': emp['converted_leads'],  # For leads, "renewed" = "converted"
-                'in_progress_count': emp['in_progress_leads'],
-                'not_contacted_count': emp['not_contacted_leads'],
-                'lost_count': emp['lost_leads'],
-                
-                # Additional compatibility fields
+            # ✅ CORRECT: Query Opportunity_Details for leads with stage tracking
+            stats_query = """
+                SELECT 
+                    COUNT(*) as total_contacts,
+                    SUM(CASE WHEN sm.stage_name = 'Converted' THEN 1 ELSE 0 END) as converted_count,
+                    SUM(CASE WHEN sm.stage_name IN ('Callback', 'Not Answered', 'Follow Up') THEN 1 ELSE 0 END) as in_progress_count,
+                    SUM(CASE WHEN sm.stage_name = 'Not Contacted' THEN 1 ELSE 0 END) as not_contacted_count,
+                    SUM(CASE WHEN sm.stage_name = 'Lost' THEN 1 ELSE 0 END) as lost_count
+                FROM "StreemLyne_MT"."Opportunity_Details" od
+                LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
+                WHERE od.tenant_id = :tenant_id
+                AND od.opportunity_owner_employee_id = :emp_id
+                AND sm.stage_type = 1
+            """
+            
+            stats_result = session.execute(
+                text(stats_query), 
+                {'tenant_id': tenant_id, 'emp_id': emp_id}
+            ).fetchone()
+            
+            total = stats_result.total_contacts or 0
+            converted = stats_result.converted_count or 0
+            in_progress = stats_result.in_progress_count or 0
+            not_contacted = stats_result.not_contacted_count or 0
+            lost = stats_result.lost_count or 0
+            
+            conversion_rate = round((converted / total * 100), 1) if total > 0 else 0
+            
+            print(f"   📊 {emp_name}: {total} leads, {converted} converted ({conversion_rate}%)")
+            
+            results.append({
+                'employee_id': emp_id,
+                'employee_name': emp_name,
+                'total_contacts': total,
+                'converted_count': converted,
+                'renewed_count': converted,  # Alias for frontend compatibility
+                'conversion_rate': conversion_rate,
+                'in_progress_count': in_progress,
+                'not_contacted_count': not_contacted,
+                'lost_count': lost,
+                'total_value_touched': 0,
                 'renewed_directly_count': 0,
                 'end_date_changed_count': 0,
                 'priced_count': 0,
-                'total_value_touched': 0,
             })
- 
-        print(f"✅ Returning {len(output)} LEADS staff members (using Opportunity_Details)")
-        return jsonify(output), 200
- 
+        
+        print(f"\n✅ Returning {len(results)} leads performance records\n")
+        return jsonify(results)
+        
     except Exception as e:
+        print(f"❌ Error in leads staff performance: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
  
- 
 @renewals_bp.route('/api/crm/leads/stats', methods=['GET'])
 @token_required
 def get_leads_dashboard_stats():
     """
-    Dashboard overview statistics for leads - uses Opportunity_Details table
+    Dashboard overview statistics for leads
+    ✅ FIXED: Uses end_date column (not expected_close_date)
     """
     session = SessionLocal()
     try:
@@ -1154,99 +1066,189 @@ def get_leads_dashboard_stats():
             return jsonify({'error': 'Tenant not found'}), 400
  
         employee_id = request.args.get('employee_id', type=int)
+        today = datetime.utcnow().date()
+ 
+        print(f"\n{'='*80}")
+        print(f"📊 LEADS STATS REQUEST")
+        print(f"{'='*80}")
+        print(f"Tenant ID: {tenant_id}")
+        print(f"Employee ID: {employee_id}")
+        print(f"Today: {today}")
+        print(f"{'='*80}\n")
  
         # Base WHERE clause
-        base_conditions = """
-            WHERE od.tenant_id = :tenant_id
-        """
- 
+        base_conditions = "WHERE od.tenant_id = :tenant_id"
         params = {"tenant_id": tenant_id}
         
-        # Add employee filter if specified
         if employee_id:
             base_conditions += " AND od.opportunity_owner_employee_id = :employee_id"
             params["employee_id"] = employee_id
  
+        # ===== PERIOD-BASED COUNTS (Using end_date) =====
+        
+        # 30-60 Days
+        query_30_60 = text(f"""
+            SELECT COUNT(DISTINCT od.opportunity_id)
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
+            {base_conditions}
+            AND od.end_date IS NOT NULL
+            AND od.end_date BETWEEN :start_30 AND :end_60
+            AND LOWER(COALESCE(sm.stage_name, '')) NOT IN ('lost', 'converted', 'won', 'rejected', 'not interested', 'closed lost')
+        """)
+        
+        params_30_60 = {
+            **params,
+            "start_30": today + timedelta(days=30),
+            "end_60": today + timedelta(days=60)
+        }
+        leads_30_60_days = session.execute(query_30_60, params_30_60).scalar() or 0
+        print(f"✅ 30-60 Days: {leads_30_60_days}")
+        
+        # 61-90 Days
+        query_61_90 = text(f"""
+            SELECT COUNT(DISTINCT od.opportunity_id)
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
+            {base_conditions}
+            AND od.end_date IS NOT NULL
+            AND od.end_date BETWEEN :start_61 AND :end_90
+            AND LOWER(COALESCE(sm.stage_name, '')) NOT IN ('lost', 'converted', 'won', 'rejected', 'not interested', 'closed lost')
+        """)
+        
+        params_61_90 = {
+            **params,
+            "start_61": today + timedelta(days=61),
+            "end_90": today + timedelta(days=90)
+        }
+        leads_61_90_days = session.execute(query_61_90, params_61_90).scalar() or 0
+        print(f"✅ 61-90 Days: {leads_61_90_days}")
+        
+        # 91-180 Days
+        query_91_180 = text(f"""
+            SELECT COUNT(DISTINCT od.opportunity_id)
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
+            {base_conditions}
+            AND od.end_date IS NOT NULL
+            AND od.end_date BETWEEN :start_91 AND :end_180
+            AND LOWER(COALESCE(sm.stage_name, '')) NOT IN ('lost', 'converted', 'won', 'rejected', 'not interested', 'closed lost')
+        """)
+        
+        params_91_180 = {
+            **params,
+            "start_91": today + timedelta(days=91),
+            "end_180": today + timedelta(days=180)
+        }
+        leads_91_180_days = session.execute(query_91_180, params_91_180).scalar() or 0
+        print(f"✅ 91-180 Days: {leads_91_180_days}")
+        
+        # Not Due (365+ days)
+        query_not_due = text(f"""
+            SELECT COUNT(DISTINCT od.opportunity_id)
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
+            {base_conditions}
+            AND od.end_date IS NOT NULL
+            AND od.end_date > :future_365
+            AND LOWER(COALESCE(sm.stage_name, '')) NOT IN ('lost', 'converted', 'won', 'rejected', 'not interested', 'closed lost')
+        """)
+        
+        params_not_due = {**params, "future_365": today + timedelta(days=365)}
+        not_due_leads = session.execute(query_not_due, params_not_due).scalar() or 0
+        print(f"✅ Not Due: {not_due_leads}")
+        
+        # Total Annual Usage
+        query_usage = text(f"""
+            SELECT COALESCE(SUM(od.annual_usage), 0)
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            {base_conditions}
+        """)
+        total_annual_usage = session.execute(query_usage, params).scalar() or 0
+        print(f"✅ Total Usage: {total_annual_usage}")
+ 
+        # ===== EXISTING STATS =====
+        
         # Total leads
-        total_leads_query = f"""
+        query_total = text(f"""
             SELECT COUNT(DISTINCT od.opportunity_id)
             FROM "StreemLyne_MT"."Opportunity_Details" od
             {base_conditions}
-        """
-        total_leads = session.execute(text(total_leads_query), params).scalar() or 0
+        """)
+        total_leads = session.execute(query_total, params).scalar() or 0
  
-        # Active leads (not Lost/Converted)
-        active_leads_query = f"""
+        # Active leads
+        query_active = text(f"""
             SELECT COUNT(DISTINCT od.opportunity_id)
             FROM "StreemLyne_MT"."Opportunity_Details" od
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
             {base_conditions}
             AND LOWER(COALESCE(sm.stage_name, '')) NOT IN ('lost', 'converted', 'won', 'rejected', 'not interested', 'closed lost')
-        """
-        active_leads = session.execute(text(active_leads_query), params).scalar() or 0
+        """)
+        active_leads = session.execute(query_active, params).scalar() or 0
  
         # Converted leads
-        converted_query = f"""
+        query_converted = text(f"""
             SELECT COUNT(DISTINCT od.opportunity_id)
             FROM "StreemLyne_MT"."Opportunity_Details" od
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
             {base_conditions}
             AND LOWER(COALESCE(sm.stage_name, '')) IN ('converted', 'won', 'signed', 'renewed', 'closed won')
-        """
-        converted_leads = session.execute(text(converted_query), params).scalar() or 0
+        """)
+        converted_leads = session.execute(query_converted, params).scalar() or 0
  
         # New/Uncontacted
-        new_leads_query = f"""
+        query_new = text(f"""
             SELECT COUNT(DISTINCT od.opportunity_id)
             FROM "StreemLyne_MT"."Opportunity_Details" od
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
             {base_conditions}
             AND LOWER(COALESCE(sm.stage_name, '')) IN ('new', 'not contacted', 'unassigned', 'open')
-        """
-        new_leads = session.execute(text(new_leads_query), params).scalar() or 0
+        """)
+        new_leads = session.execute(query_new, params).scalar() or 0
  
         # In Progress
-        in_progress_query = f"""
+        query_progress = text(f"""
             SELECT COUNT(DISTINCT od.opportunity_id)
             FROM "StreemLyne_MT"."Opportunity_Details" od
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
             {base_conditions}
             AND LOWER(COALESCE(sm.stage_name, '')) IN ('contacted', 'callback', 'in progress', 'follow up', 'qualified', 'proposal sent', 'negotiation')
-        """
-        in_progress = session.execute(text(in_progress_query), params).scalar() or 0
+        """)
+        in_progress = session.execute(query_progress, params).scalar() or 0
  
         # Lost leads
-        lost_query = f"""
+        query_lost = text(f"""
             SELECT COUNT(DISTINCT od.opportunity_id)
             FROM "StreemLyne_MT"."Opportunity_Details" od
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
             {base_conditions}
             AND LOWER(COALESCE(sm.stage_name, '')) IN ('lost', 'rejected', 'not interested', 'closed lost')
-        """
-        lost_leads = session.execute(text(lost_query), params).scalar() or 0
+        """)
+        lost_leads = session.execute(query_lost, params).scalar() or 0
  
-        # Total estimated value (using opportunity_value column)
-        total_value_query = f"""
+        # Total value
+        query_value = text(f"""
             SELECT COALESCE(SUM(od.opportunity_value), 0)
             FROM "StreemLyne_MT"."Opportunity_Details" od
             {base_conditions}
-        """
-        total_value = session.execute(text(total_value_query), params).scalar() or 0
+        """)
+        total_value = session.execute(query_value, params).scalar() or 0
  
         # Conversion rate
         conversion_rate = round((converted_leads / total_leads * 100), 1) if total_leads > 0 else 0.0
  
-        # Recent activity (leads created in last 30 days)
-        recent_leads_query = f"""
+        # Recent leads (30 days)
+        query_recent = text(f"""
             SELECT COUNT(DISTINCT od.opportunity_id)
             FROM "StreemLyne_MT"."Opportunity_Details" od
             {base_conditions}
             AND od.created_at >= CURRENT_DATE - INTERVAL '30 days'
-        """
-        recent_leads = session.execute(text(recent_leads_query), params).scalar() or 0
+        """)
+        recent_leads = session.execute(query_recent, params).scalar() or 0
  
-        # Stage breakdown for charts/analytics
-        stage_breakdown_query = f"""
+        # Stage breakdown
+        query_stages = text(f"""
             SELECT 
                 COALESCE(sm.stage_name, 'Unknown') as stage_name, 
                 COUNT(DISTINCT od.opportunity_id) as count
@@ -1255,29 +1257,28 @@ def get_leads_dashboard_stats():
             {base_conditions}
             GROUP BY sm.stage_name
             ORDER BY count DESC
-        """
-        stage_results = session.execute(text(stage_breakdown_query), params).fetchall()
+        """)
+        stage_results = session.execute(query_stages, params).fetchall()
         stages = {stage: count for stage, count in stage_results}
  
         # Allocated vs Unallocated
-        allocated_query = f"""
+        query_allocated = text(f"""
             SELECT COUNT(DISTINCT od.opportunity_id)
             FROM "StreemLyne_MT"."Opportunity_Details" od
             {base_conditions}
             AND od.is_allocated = true
-        """
-        allocated_leads = session.execute(text(allocated_query), params).scalar() or 0
+        """)
+        allocated_leads = session.execute(query_allocated, params).scalar() or 0
  
-        unallocated_query = f"""
+        query_unallocated = text(f"""
             SELECT COUNT(DISTINCT od.opportunity_id)
             FROM "StreemLyne_MT"."Opportunity_Details" od
             {base_conditions}
             AND (od.is_allocated = false OR od.is_allocated IS NULL)
-        """
-        unallocated_leads = session.execute(text(unallocated_query), params).scalar() or 0
+        """)
+        unallocated_leads = session.execute(query_unallocated, params).scalar() or 0
  
-        return jsonify({
-            # Core metrics
+        result = {
             'total_leads': total_leads,
             'active_leads': active_leads,
             'converted_leads': converted_leads,
@@ -1285,28 +1286,29 @@ def get_leads_dashboard_stats():
             'in_progress': in_progress,
             'lost_leads': lost_leads,
             'conversion_rate': conversion_rate,
-            
-            # Financial
             'total_value': float(total_value),
-            
-            # Time-based
             'recent_leads_30d': recent_leads,
-            
-            # Allocation
             'allocated_leads': allocated_leads,
             'unallocated_leads': unallocated_leads,
-            
-            # Breakdown for charts
             'stage_breakdown': stages,
-        }), 200
+            'leads_30_60_days': leads_30_60_days,
+            'leads_61_90_days': leads_61_90_days,
+            'leads_91_180_days': leads_91_180_days,
+            'not_due_leads': not_due_leads,
+            'total_annual_usage': float(total_annual_usage),
+        }
+        
+        print(f"\n✅ Returning stats: {result}\n")
+        return jsonify(result), 200
  
     except Exception as e:
+        session.rollback()
         import traceback
         traceback.print_exc()
+        print(f"\n❌ ERROR: {str(e)}\n")
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
- 
  
 @renewals_bp.route('/api/crm/leads/stage-breakdown', methods=['GET'])
 @token_required
@@ -1592,3 +1594,115 @@ def get_leads_by_stage_endpoint():
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+@renewals_bp.route('/api/crm/leads/period-breakdown', methods=['GET'])
+@token_required
+def get_leads_period_breakdown():
+    """
+    Get leads grouped by time period until end_date
+    Uses end_date column from Opportunity_Details
+    """
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+
+        period = request.args.get('period')
+        employee_id = request.args.get('employee_id', type=int)
+        today = datetime.utcnow().date()
+
+        # Define date ranges based on period
+        if period == 'not-due':
+            start_date = today + timedelta(days=366)
+            end_date = today + timedelta(days=365 * 10)
+        elif period == '30-60':
+            start_date = today + timedelta(days=30)
+            end_date = today + timedelta(days=60)
+        elif period == '61-90':
+            start_date = today + timedelta(days=61)
+            end_date = today + timedelta(days=90)
+        elif period == '91-180':
+            start_date = today + timedelta(days=91)
+            end_date = today + timedelta(days=180)
+        else:
+            return jsonify({'error': 'Invalid period parameter'}), 400
+
+        query = text("""
+            SELECT 
+                od.opportunity_id,
+                od.business_name,
+                od.contact_person,
+                od.tel_number,
+                od.email,
+                sm.stage_name,
+                od.opportunity_value,
+                em.employee_name as assigned_to_name,
+                od.opportunity_owner_employee_id as assigned_to_id,
+                od.created_at,
+                od.annual_usage,
+                srv.service_title as service_name,
+                od.end_date,
+                (od.end_date - CURRENT_DATE) as days_until_due
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
+            LEFT JOIN "StreemLyne_MT"."Services_Master" srv ON od.service_id = srv.service_id
+            WHERE od.tenant_id = :tenant_id
+            AND od.end_date BETWEEN :start_date AND :end_date
+            AND LOWER(COALESCE(sm.stage_name, '')) NOT IN ('lost', 'converted', 'won', 'rejected', 'not interested', 'closed lost')
+            {employee_filter}
+            ORDER BY od.end_date ASC
+        """.format(
+            employee_filter="AND od.opportunity_owner_employee_id = :employee_id" if employee_id else ""
+        ))
+
+        params = {
+            "tenant_id": tenant_id,
+            "start_date": start_date,
+            "end_date": end_date
+        }
+        if employee_id:
+            params["employee_id"] = employee_id
+
+        results = session.execute(query, params).fetchall()
+
+        leads = []
+        total_usage = 0
+        for r in results:
+            usage = float(r.annual_usage or 0)
+            total_usage += usage
+            
+            leads.append({
+                'opportunity_id': r.opportunity_id,
+                'business_name': r.business_name or 'Unknown',
+                'contact_person': r.contact_person or 'N/A',
+                'tel_number': r.tel_number or 'N/A',
+                'email': r.email or 'N/A',
+                'stage_name': r.stage_name or 'Unknown',
+                'opportunity_value': float(r.opportunity_value or 0),
+                'assigned_to_name': r.assigned_to_name or 'Unassigned',
+                'assigned_to_id': r.assigned_to_id,
+                'created_at': r.created_at.isoformat() if r.created_at else None,
+                'annual_usage': usage,
+                'service_name': r.service_name or 'Energy',
+                'end_date': r.end_date.isoformat() if r.end_date else None,
+                'days_until_due': r.days_until_due
+            })
+
+        return jsonify({
+            'period': period,
+            'start_date': start_date.isoformat(),
+            'end_date': end_date.isoformat(),
+            'total_count': len(leads),
+            'total_annual_usage': round(total_usage, 2),
+            'leads': leads
+        }), 200
+
+    except Exception as e:
+        session.rollback()
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
