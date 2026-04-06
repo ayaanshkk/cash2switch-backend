@@ -699,6 +699,8 @@ def get_renewal_performance():
             return jsonify({'error': 'Tenant not found'}), 400
 
         use_current_user = request.args.get('use_current_user', 'false').lower() == 'true'
+        service_param = request.args.get('service', 'utilities')
+        service_id = {'utilities': 1, 'water': 2, 'gas': 3}.get(service_param.strip().lower(), 1)
 
         if use_current_user:
             current_user = request.current_user
@@ -711,6 +713,8 @@ def get_renewal_performance():
         else:
             employee_id = request.args.get('employee_id', type=int)
 
+        today = datetime.utcnow().date()
+
         base_query = session.query(
             Project_Details,
             Energy_Contract_Master,
@@ -720,7 +724,8 @@ def get_renewal_performance():
             Client_Master, Project_Details.client_id == Client_Master.client_id
         ).filter(
             Client_Master.tenant_id == tenant_id,
-            Energy_Contract_Master.contract_end_date.isnot(None)
+            Energy_Contract_Master.contract_end_date.isnot(None),
+            Energy_Contract_Master.service_id == service_id
         )
 
         if employee_id:
@@ -737,8 +742,17 @@ def get_renewal_performance():
         renewed_directly_count = 0
         end_date_changed_count = 0
         priced_count = 0
+        not_due_count = 0
 
         for project, contract in all_results:
+            # ✅ Calculate days until renewal
+            days_until_renewal = (contract.contract_end_date - today).days
+            
+            # ✅ Count not_due (365+ days) FIRST
+            if days_until_renewal > 365:
+                not_due_count += 1
+                continue  # Don't count in other categories
+            
             status = project.status
 
             if status:
@@ -776,6 +790,7 @@ def get_renewal_performance():
             'renewed_directly_count': renewed_directly_count,
             'end_date_changed_count': end_date_changed_count,
             'priced_count': priced_count,
+            'not_due': not_due_count,
         })
 
     except Exception as e:

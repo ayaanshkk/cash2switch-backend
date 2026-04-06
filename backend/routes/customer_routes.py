@@ -1594,7 +1594,7 @@ def get_recycle_bin():
 
         service_param = request.args.get('service', 'utilities')
         service_id = {'utilities': 1, 'water': 2, 'gas': 3}.get(service_param.strip().lower(), 1)
-        salesperson_param = request.args.get('salesperson')  # ✅ NEW
+        salesperson_param = request.args.get('salesperson')
 
         query = session.query(
             Client_Master, Project_Details, Energy_Contract_Master,
@@ -1605,7 +1605,7 @@ def get_recycle_bin():
         ).outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id
         ).filter(and_(
             Client_Master.tenant_id == tenant_id,
-            Client_Master.is_deleted == True,
+            Client_Master.is_deleted == True,  # ✅ SOFT DELETED
             *([Energy_Contract_Master.service_id == service_id] if service_id is not None else [])
         ))
 
@@ -1798,10 +1798,11 @@ def get_archived_customers():
         ).join(Project_Details, Client_Master.client_id == Project_Details.client_id
         ).outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
         ).outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
-        ).outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id  # ✅ Changed
+        ).outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id
         ).filter(and_(
             Client_Master.tenant_id == tenant_id,
-            Client_Master.is_archived == True,
+            Client_Master.is_archived == True,  # ✅ ARCHIVED (not deleted)
+            Client_Master.is_deleted == False,   # ✅ NOT DELETED
             *([Energy_Contract_Master.service_id == service_id] if service_id is not None else [])
         ))
  
@@ -1812,13 +1813,13 @@ def get_archived_customers():
             if salesperson_param and salesperson_param != "All":
                 try:
                     query = query.filter(
-                        Project_Details.assigned_employee_id == int(salesperson_param)  # ✅ Changed
+                        Project_Details.assigned_employee_id == int(salesperson_param)
                     )
                 except ValueError:
                     pass
         else:
             query = query.filter(
-                Project_Details.assigned_employee_id == user.employee_id  # ✅ Changed
+                Project_Details.assigned_employee_id == user.employee_id
             )
  
         results = query.order_by(Energy_Contract_Master.contract_end_date.desc()).all()
