@@ -13,9 +13,12 @@ Routes:
   POST /api/energy-clients/<id>/cleanse – action on an energy client
 """
 
+from backend.db import SessionLocal
+from sqlalchemy import text
 from flask import Blueprint, request, jsonify, g
-from datetime import datetime
-from functools import wraps
+import logging
+
+logger = logging.getLogger(__name__)
 
 cleansing_bp = Blueprint("cleansing", __name__)
 
@@ -41,153 +44,131 @@ CLEANSING_STATUSES = {"Invalid Number", "Incorrect Supplier"}
 # Returns all records from both sources that are in a cleansing status.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def register_get_cleansing(crm_bp, token_required, tenant_from_jwt):
-    """
-    Call this from crm_routes.py to attach the GET /api/crm/cleansing endpoint
-    to the existing crm_bp Blueprint, e.g.:
-
-        from backend.routes.cleansing_routes import register_get_cleansing
-        register_get_cleansing(crm_bp, token_required, tenant_from_jwt)
-    """
-
-    @crm_bp.route("/cleansing", methods=["GET"])
-    @token_required
-    @tenant_from_jwt
+def register_get_cleansing(blueprint, token_required_decorator, tenant_from_jwt_decorator):
+    @blueprint.route('/cleansing', methods=['GET', 'OPTIONS'])
+    @token_required_decorator
+    @tenant_from_jwt_decorator
     def get_cleansing():
-        """
-        GET /api/crm/cleansing
-        Returns records from:
-          1. Opportunity_Details (CRM leads) where stage maps to cleansing statuses
-          2. Client_Master / Energy clients where deleted_reason is a cleansing status
-
-        Response:
-          { records: [...], total: int }
-        """
-        from backend.crm.supabase_client import get_supabase_client
-
+        if request.method == 'OPTIONS':
+            return jsonify({}), 200
+        
+        from flask import g
+        session = SessionLocal()
         try:
-            tenant_id = _get_tenant_id()
-            if not tenant_id:
-                return jsonify({"error": "Missing tenant"}), 401
-
-            db = get_supabase_client()
+            tenant_id = g.tenant_id
             records = []
 
-            # ── 1. CRM Leads: stage_name matches a cleansing reason ─────────────
-            lead_rows = db.execute_query(
-                """
+            # ✅ Fetch leads with Invalid Number or Incorrect Supplier
+            lead_rows = session.execute(text("""
                 SELECT
-                    od.opportunity_id        AS id,
+                    od.opportunity_id AS id,
+                    od.opportunity_id AS client_id,
+                    od.tenant_lead_id AS display_id,
+                    od.display_order,
                     COALESCE(od.business_name, od.opportunity_title) AS business_name,
                     od.contact_person,
-                    od.tel_number,
+                    od.tel_number AS phone,
+                    od.mobile_no,
                     od.mpan_mpr,
+                    od.mpan_mpr AS mpan_top,
+                    od.supplier_id,
                     sup.supplier_company_name AS supplier_name,
+                    od.annual_usage,
+                    od.start_date,
                     od.end_date,
-                    od.address,
-                    sm.stage_name            AS cleansing_reason,
-                    od.updated_at            AS flagged_at,
-                    od.comments              AS notes
+                    sm.stage_name AS cleansing_reason,
+                    od.created_at AS flagged_at,
+                    od.notes,
+                    od.opportunity_owner_employee_id AS assigned_to_id,
+                    em.employee_name AS assigned_to_name
                 FROM "StreemLyne_MT"."Opportunity_Details" od
-                LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od.stage_id    = sm.stage_id
+                LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
                 LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od.supplier_id = sup.supplier_id
-                WHERE od.tenant_id = %s
+                LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
+                WHERE od.tenant_id = :tenant_id
                   AND sm.stage_name IN ('Invalid Number', 'Incorrect Supplier')
-                ORDER BY od.updated_at DESC
-                """,
-                (tenant_id,),
-            )
+                ORDER BY od.created_at DESC
+            """), {'tenant_id': tenant_id}).mappings().all()
 
-            for r in lead_rows or []:
-                records.append(
-                    {
-                        "id": r.get("id"),
-                        "business_name": r.get("business_name") or "Unknown",
-                        "contact_person": r.get("contact_person"),
-                        "tel_number": r.get("tel_number"),
-                        "mpan_mpr": r.get("mpan_mpr"),
-                        "supplier_name": r.get("supplier_name"),
-                        "end_date": r.get("end_date").isoformat() if r.get("end_date") else None,
-                        "address": r.get("address"),
-                        "cleansing_reason": r.get("cleansing_reason"),
-                        "flagged_at": r.get("flagged_at").isoformat() if r.get("flagged_at") else None,
-                        "notes": r.get("notes"),
-                        "source": "lead",
-                    }
+            # ✅ Process leads - keep original values, don't use _serial
+            for row in lead_rows:
+                record = dict(row)
+                # Convert datetime objects to ISO strings
+                if record.get('flagged_at') and hasattr(record['flagged_at'], 'isoformat'):
+                    record['flagged_at'] = record['flagged_at'].isoformat()
+                if record.get('start_date') and hasattr(record['start_date'], 'isoformat'):
+                    record['start_date'] = record['start_date'].isoformat()
+                if record.get('end_date') and hasattr(record['end_date'], 'isoformat'):
+                    record['end_date'] = record['end_date'].isoformat()
+                
+                record['source'] = 'lead'
+                records.append(record)
+
+            # ✅ Fetch renewals (energy clients) with Invalid Number or Incorrect Supplier
+            try:
+                from backend.models import Client_Master, Energy_Contract_Master, Project_Details, Supplier_Master, Employee_Master
+                
+                client_rows = (
+                    session.query(
+                        Client_Master,
+                        Energy_Contract_Master,
+                        Project_Details,
+                        Supplier_Master,
+                        Employee_Master
+                    )
+                    .outerjoin(Project_Details, Client_Master.client_id == Project_Details.client_id)
+                    .outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id)
+                    .outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id)
+                    .outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id)
+                    .filter(
+                        Client_Master.tenant_id == tenant_id,
+                        Client_Master.is_deleted == True,
+                        Client_Master.deleted_reason.in_(['Invalid Number', 'Incorrect Supplier'])
+                    )
+                    .all()
                 )
 
-            # ── 2. Energy Clients: is_deleted=True, deleted_reason is cleansing ─
-            try:
-                from backend.models import Client_Master, Energy_Contract_Master, Project_Details, Supplier_Master
-                from backend.db import SessionLocal
-
-                session = SessionLocal()
-                try:
-                    client_rows = (
-                        session.query(
-                            Client_Master,
-                            Energy_Contract_Master,
-                            Supplier_Master,
-                        )
-                        .outerjoin(Project_Details, Client_Master.client_id == Project_Details.client_id)
-                        .outerjoin(
-                            Energy_Contract_Master,
-                            Project_Details.project_id == Energy_Contract_Master.project_id,
-                        )
-                        .outerjoin(
-                            Supplier_Master,
-                            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id,
-                        )
-                        .filter(
-                            Client_Master.tenant_id == tenant_id,
-                            Client_Master.is_deleted == True,
-                            Client_Master.deleted_reason.in_(CLEANSING_STATUSES),
-                        )
-                        .all()
-                    )
-
-                    for client, contract, supplier in client_rows:
-                        records.append(
-                            {
-                                "id": client.client_id,
-                                "business_name": client.client_company_name or "Unknown",
-                                "contact_person": getattr(client, "client_contact_name", None),
-                                "tel_number": getattr(client, "client_phone", None),
-                                "mpan_mpr": getattr(contract, "mpan_mpr", None) if contract else None,
-                                "supplier_name": supplier.supplier_company_name if supplier else None,
-                                "end_date": (
-                                    contract.contract_end_date.isoformat()
-                                    if contract and contract.contract_end_date
-                                    else None
-                                ),
-                                "address": getattr(client, "address", None),
-                                "cleansing_reason": client.deleted_reason,
-                                "flagged_at": (
-                                    client.deleted_at.isoformat() if client.deleted_at else None
-                                ),
-                                "notes": getattr(client, "deleted_notes", None),
-                                "source": "energy_client",
-                            }
-                        )
-                finally:
-                    session.close()
+                for client, contract, project, supplier, employee in client_rows:
+                    record = {
+                        'id': client.client_id,
+                        'client_id': client.client_id,
+                        'display_id': getattr(client, 'display_id', None),
+                        'display_order': getattr(client, 'display_order', None),
+                        'business_name': getattr(client, 'client_company_name', None) or 'Unknown',
+                        'contact_person': getattr(client, 'client_contact_name', None),
+                        'phone': getattr(client, 'client_phone', None),
+                        'mobile_no': getattr(client, 'client_mobile', None),
+                        'mpan_mpr': getattr(contract, 'mpan_number', None) if contract else None,
+                        'mpan_top': getattr(contract, 'mpan_number', None) if contract else None,
+                        'supplier_id': contract.supplier_id if contract else None,
+                        'supplier_name': supplier.supplier_company_name if supplier else None,
+                        'annual_usage': project.Misc_Col2 if project else None,
+                        'start_date': contract.contract_start_date.isoformat() if contract and contract.contract_start_date else None,
+                        'end_date': contract.contract_end_date.isoformat() if contract and contract.contract_end_date else None,
+                        'cleansing_reason': client.deleted_reason,
+                        'flagged_at': client.deleted_at.isoformat() if client.deleted_at else None,
+                        'notes': getattr(client, 'deleted_notes', None),
+                        'assigned_to_id': employee.employee_id if employee else None,
+                        'assigned_to_name': employee.employee_name if employee else None,
+                        'source': 'energy_client'
+                    }
+                    records.append(record)
 
             except Exception as ec_err:
-                # Energy client import may fail in CRM-only deployments — log and continue
                 import logging
-                logging.getLogger(__name__).warning(
-                    "Could not load energy clients for cleansing: %s", ec_err
-                )
+                logging.getLogger(__name__).warning(f'Could not load energy clients for cleansing: {ec_err}')
 
-            # Sort combined list by flagged_at desc (nulls last)
-            records.sort(key=lambda x: x.get("flagged_at") or "", reverse=True)
-
-            return jsonify({"records": records, "total": len(records)}), 200
+            # Sort by flagged_at descending
+            records.sort(key=lambda x: x.get('flagged_at') or '', reverse=True)
+            
+            return jsonify({'records': records, 'total': len(records)}), 200
 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            return jsonify({"error": str(e)}), 500
+            return jsonify({'error': str(e)}), 500
+        finally:
+            session.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

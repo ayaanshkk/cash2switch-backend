@@ -2218,3 +2218,8 @@ def get_allocated_contacts():
         return jsonify({'error': 'Failed to fetch allocated contacts'}), 500
     finally:
         session.close()
+
+from backend.routes.cleansing_routes import register_energy_client_cleanse
+
+# Register energy client cleansing route
+register_energy_client_cleanse(energy_customer_bp, token_required)

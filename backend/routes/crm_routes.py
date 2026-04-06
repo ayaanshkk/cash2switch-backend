@@ -967,6 +967,37 @@ def leads_callback(opportunity_id):
 
         real_id = lead['opportunity_id']
 
+        # ✅ NEW: Handle "Converted" with assignment
+        if status == 'Converted' and data.get('assigned_to'):
+            new_employee_id = data.get('assigned_to')
+            current_employee_id = request.current_user.employee_id if hasattr(request.current_user, 'employee_id') else None
+            
+            # Update assignment and set is_allocated flag
+            session.execute(text("""
+                UPDATE "StreemLyne_MT"."Opportunity_Details"
+                SET opportunity_owner_employee_id = :new_emp,
+                    is_allocated = CASE 
+                        WHEN :new_emp != :current_emp THEN TRUE 
+                        ELSE FALSE 
+                    END,
+                    stage_id = :stage_id
+                WHERE opportunity_id = :id AND tenant_id = :t
+            """), {
+                'new_emp': new_employee_id,
+                'current_emp': current_employee_id,
+                'id': real_id,
+                't': tenant_id,
+                'stage_id': stage_id or 16  # 16 = Converted stage_id
+            })
+            
+            session.commit()
+            
+            return jsonify({
+                'success': True, 
+                'message': 'Lead converted and assigned',
+                'allocated': new_employee_id != current_employee_id
+            }), 200
+
         if cfg['deletes_record']:
             if not stage_id:
                 s = session.execute(text(
@@ -1200,87 +1231,14 @@ def get_priced():
     return crm_controller.get_priced()
 
 
-@crm_bp.route('/cleansing', methods=['GET'])
-@token_required
-@tenant_from_jwt
-def get_cleansing():
-    session = SessionLocal()
-    try:
-        tenant_id = g.tenant_id
-        records   = []
+from backend.routes.cleansing_routes import (
+    register_get_cleansing,
+    register_lead_cleanse,
+)
 
-        lead_rows = session.execute(text("""
-            SELECT
-                od.opportunity_id AS id, od.opportunity_id AS client_id,
-                od.tenant_lead_id AS display_id, od.tenant_lead_id AS display_order,
-                COALESCE(od.business_name, od.opportunity_title) AS business_name,
-                od.contact_person, od.tel_number AS phone, od.mobile_no,
-                od.mpan_mpr, od.mpan_mpr AS mpan_top, od.supplier_id,
-                sup.supplier_company_name AS supplier_name, od.annual_usage,
-                od.start_date, od.end_date,
-                sm.stage_name AS cleansing_reason, od.created_at AS flagged_at,
-                od.notes, od.opportunity_owner_employee_id AS assigned_to_id,
-                em.employee_name AS assigned_to_name
-            FROM "StreemLyne_MT"."Opportunity_Details" od
-            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od.stage_id    = sm.stage_id
-            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od.supplier_id = sup.supplier_id
-            LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od.opportunity_owner_employee_id = em.employee_id
-            WHERE od.tenant_id = :t
-            AND sm.stage_name IN ('Invalid Number', 'Incorrect Supplier')
-            ORDER BY od.created_at DESC
-        """), {'t': tenant_id}).mappings().all()
-
-        for r in lead_rows:
-            rd = dict(r)
-            records.append({k: _serial(v) for k, v in rd.items()} | {'source': 'lead'})
-
-        try:
-            from backend.models import Client_Master, Energy_Contract_Master, Project_Details, Supplier_Master
-            client_rows = (
-                session.query(Client_Master, Energy_Contract_Master, Supplier_Master)
-                .outerjoin(Project_Details, Client_Master.client_id == Project_Details.client_id)
-                .outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id)
-                .outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id)
-                .filter(
-                    Client_Master.tenant_id == tenant_id,
-                    Client_Master.is_deleted == True,
-                    Client_Master.deleted_reason.in_(['Invalid Number', 'Incorrect Supplier']),
-                ).all()
-            )
-            for client, contract, supplier in client_rows:
-                records.append({
-                    'id': client.client_id, 'client_id': client.client_id,
-                    'display_id': getattr(client, 'display_id', None),
-                    'display_order': getattr(client, 'display_order', None),
-                    'business_name': getattr(client, 'client_company_name', None) or 'Unknown',
-                    'contact_person': getattr(client, 'client_contact_name', None),
-                    'phone': getattr(client, 'client_phone', None),
-                    'mobile_no': getattr(client, 'mobile_no', None),
-                    'mpan_mpr': getattr(contract, 'mpan_number', None) if contract else None,
-                    'mpan_top': getattr(contract, 'mpan_number', None) if contract else None,
-                    'supplier_id': contract.supplier_id if contract else None,
-                    'supplier_name': supplier.supplier_company_name if supplier else None,
-                    'annual_usage': None,
-                    'start_date': contract.contract_start_date.isoformat() if contract and contract.contract_start_date else None,
-                    'end_date': contract.contract_end_date.isoformat() if contract and contract.contract_end_date else None,
-                    'cleansing_reason': client.deleted_reason,
-                    'flagged_at': client.deleted_at.isoformat() if client.deleted_at else None,
-                    'notes': getattr(client, 'deleted_notes', None),
-                    'assigned_to_id': getattr(client, 'assigned_to_id', None),
-                    'assigned_to_name': None, 'source': 'energy_client',
-                })
-        except Exception as ec_err:
-            logger.warning('Could not load energy clients for cleansing: %s', ec_err)
-
-        records.sort(key=lambda x: x.get('flagged_at') or '', reverse=True)
-        return jsonify({'records': records, 'total': len(records)}), 200
-
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
-    finally:
-        try: session.close()
-        except Exception: pass
+# Register cleansing routes
+register_get_cleansing(crm_bp, token_required, tenant_from_jwt)
+register_lead_cleanse(crm_bp, token_required, tenant_from_jwt)
 
 
 # ========================================
