@@ -1146,7 +1146,7 @@ def get_leads_staff_performance():
 def get_leads_dashboard_stats():
     """
     Dashboard overview statistics for leads
-    ✅ FIXED: Uses end_date column (not expected_close_date)
+    ✅ FIXED: Uses end_date column + tenant_id casting
     """
     session = SessionLocal()
     try:
@@ -1165,9 +1165,9 @@ def get_leads_dashboard_stats():
         print(f"Today: {today}")
         print(f"{'='*80}\n")
  
-        # Base WHERE clause
-        base_conditions = "WHERE od.tenant_id = :tenant_id"
-        params = {"tenant_id": tenant_id}
+        # Base WHERE clause - ✅ CAST tenant_id
+        base_conditions = "WHERE od.tenant_id = CAST(:tenant_id AS VARCHAR)"
+        params = {"tenant_id": str(tenant_id)}
         
         if employee_id:
             base_conditions += " AND od.opportunity_owner_employee_id = :employee_id"
@@ -1255,9 +1255,7 @@ def get_leads_dashboard_stats():
         """)
         total_annual_usage = session.execute(query_usage, params).scalar() or 0
         print(f"✅ Total Usage: {total_annual_usage}")
- 
-        # ===== EXISTING STATS =====
-        
+         
         # Total leads
         query_total = text(f"""
             SELECT COUNT(DISTINCT od.opportunity_id)
@@ -1292,7 +1290,7 @@ def get_leads_dashboard_stats():
             FROM "StreemLyne_MT"."Opportunity_Details" od
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
             {base_conditions}
-            AND LOWER(COALESCE(sm.stage_name, '')) IN ('new', 'not contacted', 'unassigned', 'open')
+            AND LOWER(COALESCE(sm.stage_name, '')) IN ('new', 'not contacted', 'unassigned', 'open', 'lead')
         """)
         new_leads = session.execute(query_new, params).scalar() or 0
  
@@ -1302,7 +1300,7 @@ def get_leads_dashboard_stats():
             FROM "StreemLyne_MT"."Opportunity_Details" od
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
             {base_conditions}
-            AND LOWER(COALESCE(sm.stage_name, '')) IN ('contacted', 'callback', 'in progress', 'follow up', 'qualified', 'proposal sent', 'negotiation')
+            AND LOWER(COALESCE(sm.stage_name, '')) IN ('contacted', 'callback', 'in progress', 'follow up', 'qualified', 'proposal sent', 'negotiation', 'not answered', 'email only')
         """)
         in_progress = session.execute(query_progress, params).scalar() or 0
  
@@ -1312,7 +1310,7 @@ def get_leads_dashboard_stats():
             FROM "StreemLyne_MT"."Opportunity_Details" od
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
             {base_conditions}
-            AND LOWER(COALESCE(sm.stage_name, '')) IN ('lost', 'rejected', 'not interested', 'closed lost')
+            AND LOWER(COALESCE(sm.stage_name, '')) IN ('lost', 'rejected', 'not interested', 'closed lost', 'lost cot', 'invalid number')
         """)
         lost_leads = session.execute(query_lost, params).scalar() or 0
  
@@ -1534,6 +1532,64 @@ def get_leads_salesperson_breakdown():
         return jsonify(breakdown), 200
  
     except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+@renewals_bp.route('/api/crm/leads/supplier-breakdown', methods=['GET'])
+@token_required
+def get_leads_supplier_breakdown():
+    """
+    ✅ FIXED: Proper tenant_id casting for leads supplier breakdown
+    """
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+ 
+        employee_id = request.args.get('employee_id', type=int)
+        
+        # ✅ Build query with proper CAST and string conversion
+        query = """
+            SELECT 
+                COALESCE(sm.supplier_company_name, 'Unknown') as supplier_name,
+                COUNT(DISTINCT od.opportunity_id) as lead_count,
+                COALESCE(SUM(od.opportunity_value), 0) as total_value
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm 
+                ON od.supplier_id = sm.supplier_id
+            WHERE od.tenant_id = CAST(:tenant_id AS VARCHAR)
+            {employee_filter}
+            GROUP BY sm.supplier_company_name
+            ORDER BY total_value DESC
+        """
+ 
+        params = {"tenant_id": str(tenant_id)}
+        
+        if employee_id:
+            query = query.format(employee_filter="AND od.opportunity_owner_employee_id = :employee_id")
+            params["employee_id"] = employee_id
+        else:
+            query = query.format(employee_filter="")
+ 
+        results = session.execute(text(query), params).fetchall()
+ 
+        supplier_breakdown = [
+            {
+                'supplier_name': r.supplier_name or 'Unknown',
+                'lead_count': r.lead_count or 0,
+                'total_value': float(r.total_value or 0)
+            }
+            for r in results
+        ]
+ 
+        return jsonify(supplier_breakdown), 200
+ 
+    except Exception as e:
+        current_app.logger.error(f"Error getting leads supplier breakdown: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500

@@ -84,8 +84,6 @@ crm_controller = CRMController()
 # LEAD ROUTES
 # ========================================
 
-# backend/routes/crm_routes.py
-
 @crm_bp.route('/leads', methods=['GET'])
 @token_required
 @tenant_from_jwt
@@ -93,14 +91,13 @@ def get_leads():
     """
     Get all leads with team overview stats and per-employee display_order
     Admin sees all tenant leads, non-admin sees only their own non-allocated leads
-    ✅ FIXED: Team stats now show correctly, is_allocated scoping fixed
     """
     import logging
     logger = logging.getLogger(__name__)
     
     session = SessionLocal()
     try:
-        tenant_id    = g.tenant_id
+        tenant_id    = str(g.tenant_id)  # ✅ CHANGED: Cast to string immediately
         current_user = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id    = 2 if service_param.strip().lower() == 'water' else 1
@@ -147,7 +144,7 @@ def get_leads():
             logger.error(f'❌ Error recalculating display_order: {e}')
 
         # ================================================================
-        # 2. TEAM STATS QUERY - ✅ FIXED: Removed HAVING clause
+        # 2. TEAM STATS QUERY - ✅ FIXED: tenant_id as string
         # ================================================================
         if is_admin:
             # Admin: Show ALL employees in tenant with their lead counts (including 0)
@@ -165,7 +162,7 @@ def get_leads():
                 WHERE em."tenant_id" = :tenant_id
                 GROUP BY em."employee_id", em."employee_name"
                 ORDER BY em."employee_name"
-            """), {'tenant_id': tenant_id, 'service_id': service_id}).mappings().all()
+            """), {'tenant_id': tenant_id, 'service_id': service_id}).mappings().all()  
         else:
             # Non-admin: Show only own stats
             team_stats_rows = session.execute(text("""
@@ -195,7 +192,7 @@ def get_leads():
         logger.warning('📊 Team stats: %s', team_stats)
 
         # ================================================================
-        # 3. MAIN LEADS QUERY - ✅ Properly scoped by employee and is_allocated
+        # 3. MAIN LEADS QUERY - ✅ Fixed tenant_id as string
         # ================================================================
         query = """
             SELECT
@@ -215,26 +212,6 @@ def get_leads():
             AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
         """
         params = {'tenant_id': tenant_id, 'service_id': service_id, 'employee_id': employee_id}
-        # else:
-        #     # Non-admin sees only their own non-allocated leads
-        #     query = """
-        #         SELECT
-        #             od.*,
-        #             od.display_order,
-        #             sm."stage_name",
-        #             em."employee_name" AS assigned_to_name,
-        #             COALESCE(od."business_name", od."opportunity_title") AS business_name,
-        #             sup."supplier_company_name" AS supplier_name
-        #         FROM "StreemLyne_MT"."Opportunity_Details" od
-        #         LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"    = sm."stage_id"
-        #         LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
-        #         LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
-        #         WHERE od."tenant_id" = :tenant_id
-        #           AND od."service_id" = :service_id
-        #           AND od."opportunity_owner_employee_id" = :employee_id
-        #           AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
-        #     """
-        #     params = {'tenant_id': tenant_id, 'service_id': service_id, 'employee_id': employee_id}
 
         if exclude_stage:
             query += ' AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") != LOWER(:exclude_stage))'
@@ -267,14 +244,13 @@ def get_leads():
     finally:
         session.close()
 
-
 @crm_bp.route('/leads/<int:opportunity_id>', methods=['GET'])
 @token_required
 @tenant_from_jwt
 def get_lead_detail(opportunity_id):
     session = SessionLocal()
     try:
-        tenant_id = g.tenant_id
+        tenant_id = str(g.tenant_id)  # ✅ CHANGED: Cast to string
 
         sql = """
             SELECT
@@ -341,7 +317,7 @@ def update_lead(opportunity_id):
         }
         session = SessionLocal()
         try:
-            tenant_id = g.tenant_id
+            tenant_id = str(g.tenant_id)  # ✅ CHANGED: Cast to string
             data = request.get_json() or {}
             fields = {k: v for k, v in data.items() if k in ALLOWED}
             if not fields:
@@ -420,7 +396,7 @@ def delete_lead(opportunity_id):
 def search_all_leads():
     session = SessionLocal()
     try:
-        tenant_id     = g.tenant_id
+        tenant_id     = str(g.tenant_id)  # ✅ CHANGED: Cast to string
         q             = request.args.get('q', '').strip()
         service_param = request.args.get('service', 'utilities')
         service_id    = 2 if service_param.strip().lower() == 'water' else 1
@@ -467,7 +443,7 @@ def search_all_leads():
 def get_leads_performance():
     session = SessionLocal()
     try:
-        tenant_id     = g.tenant_id
+        tenant_id     = str(g.tenant_id)  
         current_user  = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id    = 2 if service_param.strip().lower() == 'water' else 1
@@ -542,7 +518,7 @@ def get_leads_stats_by_employee():
     logger = logging.getLogger(__name__)
 
     try:
-        tenant_id    = g.tenant_id
+        tenant_id    = str(g.tenant_id)  # ✅ CHANGED: Cast to string
         current_user = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id    = 2 if service_param.strip().lower() == 'water' else 1
@@ -589,7 +565,6 @@ def get_leads_stats_by_employee():
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({'error': str(e), 'stats': []}), 500
-
 
 @crm_bp.route('/leads/bulk-delete', methods=['POST'])
 @require_tenant
@@ -647,9 +622,11 @@ def recalculate_lead_display_order(session, tenant_id, employee_id=None):
     
     Args:
         session: SQLAlchemy session
-        tenant_id: Tenant ID
+        tenant_id: Tenant ID (will be cast to string)
         employee_id: Optional - recalculate only for this employee
     """
+    tenant_id = str(tenant_id)  
+    
     if employee_id:
         # Recalculate only for this specific employee
         session.execute(text("""
@@ -699,7 +676,7 @@ def import_leads():
     """
     session = SessionLocal()
     try:
-        tenant_id     = g.tenant_id
+        tenant_id     = str(g.tenant_id)  # ✅ CHANGED: Cast to string
         service_param = request.args.get('service', 'electricity')
         service_id    = 2 if (service_param or '').strip().lower() == 'water' else 1
  
@@ -778,7 +755,6 @@ def import_leads():
                         'successful': 0, 'failed': 1, 'errors': [str(e)]}), 500
     finally:
         session.close()
-
 
 @crm_bp.route('/leads/import/template', methods=['GET'])
 def download_leads_template():
@@ -863,7 +839,7 @@ def get_leads_by_customer_type():
 def get_allocated_leads():
     session = SessionLocal()
     try:
-        tenant_id     = g.tenant_id
+        tenant_id     = str(g.tenant_id)  # ✅ CHANGED: Cast to string
         current_user  = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id    = 2 if service_param.strip().lower() == 'water' else 1
@@ -898,7 +874,6 @@ def get_allocated_leads():
         try: session.close()
         except Exception: pass
 
-
 @crm_bp.route('/leads/archives', methods=['GET'])
 @token_required
 @tenant_from_jwt
@@ -915,7 +890,7 @@ def leads_callback(opportunity_id):
 
     session = SessionLocal()
     try:
-        tenant_id = g.tenant_id
+        tenant_id = str(g.tenant_id)
         data      = request.get_json(force=True, silent=True) or {}
         status    = data.get('status')
 
@@ -1057,14 +1032,13 @@ def leads_callback(opportunity_id):
         try: session.close()
         except Exception: pass
 
-
 @crm_bp.route('/leads/priced', methods=['GET'])
 @token_required
 @tenant_from_jwt
 def get_priced_leads():
     session = SessionLocal()
     try:
-        tenant_id     = g.tenant_id
+        tenant_id     = str(g.tenant_id)  # ✅ CHANGED: Cast to string
         current_user  = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id    = 2 if service_param.strip().lower() == 'water' else 1
@@ -1108,7 +1082,6 @@ def get_priced_leads():
     finally:
         try: session.close()
         except Exception: pass
-
 
 # ========================================
 # CLIENT ROUTES
