@@ -1170,6 +1170,9 @@ class LeadRepository:
         Returns:
             Dictionary with success status and recalculated count
         """
+        # ✅ CRITICAL FIX: Cast tenant_id to string
+        tenant_id = str(tenant_id)
+        
         try:
             # Get all leads for this employee ordered by creation
             get_leads_query = '''
@@ -1527,6 +1530,9 @@ class LeadRepository:
         """
         import logging
         logger = logging.getLogger(__name__)
+        
+        # ✅ CRITICAL FIX: Cast tenant_id to string immediately
+        tenant_id = str(tenant_id)
         
         logger.info('bulk_delete_leads START: tenant=%s, count=%d', tenant_id, len(opportunity_ids))
         
