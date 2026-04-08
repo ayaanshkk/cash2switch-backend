@@ -886,6 +886,11 @@ def leads_callback(opportunity_id):
         tenant_id = str(g.tenant_id)
         data      = request.get_json(force=True, silent=True) or {}
         status    = data.get('status')
+        notes     = data.get('notes', '')
+        callback_date = data.get('callback_date')
+        called_date = data.get('called_date')
+        is_sold = data.get('is_sold')
+        stage_id = data.get('stage_id')
 
         if not status:
             return jsonify({'error': 'Status is required'}), 400
@@ -911,10 +916,7 @@ def leads_callback(opportunity_id):
         if status not in STATUS_CFG:
             return jsonify({'error': f'Invalid status: {status}'}), 400
 
-        cfg      = STATUS_CFG[status]
-        notes    = data.get('notes', '')
-        is_sold  = data.get('is_sold')
-        stage_id = data.get('stage_id')
+        cfg = STATUS_CFG[status]
 
         if cfg['requires_notes'] and not (notes or '').strip():
             return jsonify({'error': 'Notes are required for this status'}), 400
@@ -923,6 +925,7 @@ def leads_callback(opportunity_id):
         if status == 'Already Renewed' and not data.get('renewed_by'):
             return jsonify({'error': 'Please select if renewed by customer or agent'}), 400
 
+        # Find the lead
         lead = session.execute(text("""
             SELECT opportunity_id FROM "StreemLyne_MT"."Opportunity_Details"
             WHERE tenant_id = :t
@@ -935,12 +938,11 @@ def leads_callback(opportunity_id):
 
         real_id = lead['opportunity_id']
 
-        # ✅ NEW: Handle "Converted" with assignment
+        # Handle "Converted" with assignment
         if status == 'Converted' and data.get('assigned_to'):
             new_employee_id = data.get('assigned_to')
             current_employee_id = request.current_user.employee_id if hasattr(request.current_user, 'employee_id') else None
             
-            # Update assignment and set is_allocated flag
             session.execute(text("""
                 UPDATE "StreemLyne_MT"."Opportunity_Details"
                 SET opportunity_owner_employee_id = :new_emp,
@@ -955,7 +957,18 @@ def leads_callback(opportunity_id):
                 'current_emp': current_employee_id,
                 'id': real_id,
                 't': tenant_id,
-                'stage_id': stage_id or 16  # 16 = Converted stage_id
+                'stage_id': stage_id or 16
+            })
+            
+            # ✅ LOG HISTORY FOR CONVERTED
+            session.execute(text("""
+                INSERT INTO "StreemLyne_MT"."Opportunity_Interactions" 
+                (opportunity_id, interaction_type, notes, created_at)
+                VALUES (:opp_id, :itype, :notes, NOW())
+            """), {
+                'opp_id': real_id,
+                'itype': 'Converted',
+                'notes': f'[Converted] {notes}' if notes else '[Converted] Lead marked as converted'
             })
             
             session.commit()
@@ -966,6 +979,7 @@ def leads_callback(opportunity_id):
                 'allocated': new_employee_id != current_employee_id
             }), 200
 
+        # Handle deletions (Lost, Lost COT, etc.)
         if cfg['deletes_record']:
             if not stage_id:
                 s = session.execute(text(
@@ -973,22 +987,52 @@ def leads_callback(opportunity_id):
                     "WHERE LOWER(stage_name) = :n LIMIT 1"
                 ), {'n': status.lower()}).mappings().first()
                 stage_id = s['stage_id'] if s else 5
+            
             session.execute(text(
                 'UPDATE "StreemLyne_MT"."Opportunity_Details" SET stage_id = :s '
                 'WHERE opportunity_id = :id AND tenant_id = :t'
             ), {'s': stage_id, 'id': real_id, 't': tenant_id})
+            
+            # ✅ LOG HISTORY FOR DELETED RECORDS
+            formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
+            session.execute(text("""
+                INSERT INTO "StreemLyne_MT"."Opportunity_Interactions" 
+                (opportunity_id, interaction_type, contact_date, reminder_date, notes, created_at)
+                VALUES (:opp_id, :itype, :contact_date, :reminder_date, :notes, NOW())
+            """), {
+                'opp_id': real_id,
+                'itype': status,
+                'contact_date': called_date if called_date else None,
+                'reminder_date': callback_date if callback_date else None,
+                'notes': formatted_notes
+            })
+            
             session.commit()
             return jsonify({'success': True, 'moved_to_recycle_bin': True,
                             'message': f'Moved to recycle bin ({status})'}), 200
 
+        # Handle "Priced" with no sale
         if status == 'Priced' and is_sold is False:
             session.execute(text(
                 'UPDATE "StreemLyne_MT"."Opportunity_Details" SET stage_id = :s '
                 'WHERE opportunity_id = :id AND tenant_id = :t'
             ), {'s': stage_id or 4, 'id': real_id, 't': tenant_id})
+            
+            # ✅ LOG HISTORY FOR PRICED
+            session.execute(text("""
+                INSERT INTO "StreemLyne_MT"."Opportunity_Interactions" 
+                (opportunity_id, interaction_type, notes, created_at)
+                VALUES (:opp_id, :itype, :notes, NOW())
+            """), {
+                'opp_id': real_id,
+                'itype': 'Priced',
+                'notes': f'[Priced] {notes}' if notes else '[Priced] Moved to priced page'
+            })
+            
             session.commit()
             return jsonify({'success': True, 'moved_to_priced': True}), 200
 
+        # Handle "End Date Changed" and "Already Renewed"
         new_end = data.get('new_end_date')
         if new_end and status in ('End Date Changed', 'Already Renewed'):
             session.execute(text(
@@ -1008,11 +1052,26 @@ def leads_callback(opportunity_id):
                     'WHERE opportunity_id = :id AND tenant_id = :t'
                 ), {'s': sup['supplier_id'], 'id': real_id, 't': tenant_id})
 
+        # Update stage_id
         if stage_id:
             session.execute(text(
                 'UPDATE "StreemLyne_MT"."Opportunity_Details" SET stage_id = :s '
                 'WHERE opportunity_id = :id AND tenant_id = :t'
             ), {'s': stage_id, 'id': real_id, 't': tenant_id})
+
+        # ✅ CREATE HISTORY INTERACTION (CRITICAL FIX)
+        formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
+        session.execute(text("""
+            INSERT INTO "StreemLyne_MT"."Opportunity_Interactions" 
+            (opportunity_id, interaction_type, contact_date, reminder_date, notes, created_at)
+            VALUES (:opp_id, :itype, :contact_date, :reminder_date, :notes, NOW())
+        """), {
+            'opp_id': real_id,
+            'itype': status,
+            'contact_date': called_date if called_date else None,
+            'reminder_date': callback_date if callback_date else None,
+            'notes': formatted_notes
+        })
 
         session.commit()
         return jsonify({'success': True, 'message': 'Callback saved successfully', 'status': status}), 200
@@ -1227,3 +1286,100 @@ def debug_tenant_lookup(tenant_id):
     except Exception as e:
         import traceback
         return {'success': False, 'error': str(e), 'traceback': traceback.format_exc()}, 500
+    
+@crm_bp.route('/leads/<int:opportunity_id>/history', methods=['GET', 'OPTIONS'])
+@token_required
+@tenant_from_jwt
+def get_lead_history(opportunity_id):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        tenant_id = str(g.tenant_id)
+
+        # Find the actual opportunity_id
+        lead = session.execute(text("""
+            SELECT opportunity_id FROM "StreemLyne_MT"."Opportunity_Details"
+            WHERE tenant_id = :t
+            AND (tenant_lead_id = :id OR opportunity_id = :id)
+            LIMIT 1
+        """), {'t': tenant_id, 'id': opportunity_id}).mappings().first()
+
+        if not lead:
+            return jsonify({'error': 'Lead not found'}), 404
+
+        real_id = lead['opportunity_id']
+
+        # Fetch interactions
+        interactions = session.execute(text("""
+            SELECT 
+                interaction_id,
+                interaction_type,
+                contact_date,
+                reminder_date,
+                notes,
+                created_at
+            FROM "StreemLyne_MT"."Opportunity_Interactions"
+            WHERE opportunity_id = :opp_id
+            ORDER BY created_at DESC
+        """), {'opp_id': real_id}).mappings().all()
+
+        return jsonify({
+            'interactions': [{
+                'interaction_id': i['interaction_id'],
+                'interaction_type': i['interaction_type'] or 'Unknown',
+                'contact_date': i['contact_date'].isoformat() if i['contact_date'] else None,
+                'reminder_date': i['reminder_date'].isoformat() if i['reminder_date'] else None,
+                'notes': i['notes'],
+                'created_at': i['created_at'].isoformat() if i['created_at'] else None
+            } for i in interactions]
+        }), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@crm_bp.route('/leads/<int:opportunity_id>/history/<int:interaction_id>', methods=['DELETE', 'OPTIONS'])
+@token_required
+@tenant_from_jwt
+def delete_lead_interaction(opportunity_id, interaction_id):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        tenant_id = str(g.tenant_id)
+
+        # Verify lead exists and belongs to tenant
+        lead = session.execute(text("""
+            SELECT opportunity_id FROM "StreemLyne_MT"."Opportunity_Details"
+            WHERE tenant_id = :t
+            AND (tenant_lead_id = :id OR opportunity_id = :id)
+            LIMIT 1
+        """), {'t': tenant_id, 'id': opportunity_id}).mappings().first()
+
+        if not lead:
+            return jsonify({'error': 'Lead not found'}), 404
+
+        # Delete interaction
+        session.execute(text("""
+            DELETE FROM "StreemLyne_MT"."Opportunity_Interactions"
+            WHERE interaction_id = :int_id
+            AND opportunity_id = :opp_id
+        """), {'int_id': interaction_id, 'opp_id': lead['opportunity_id']})
+
+        session.commit()
+        return jsonify({'success': True, 'message': 'Interaction deleted successfully'}), 200
+
+    except Exception as e:
+        session.rollback()
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()

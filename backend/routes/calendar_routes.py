@@ -24,7 +24,7 @@ def after_request(response):
 @token_required
 @tenant_from_jwt
 def get_renewals_calendar():
-    """Get all renewals for calendar view - FIXED VERSION"""
+    """Get all renewals for calendar view - FIXED VERSION with CAST"""
     
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -61,7 +61,6 @@ def get_renewals_calendar():
             employee_filter = f"AND pd.assigned_employee_id = {current_user.employee_id}"
             callback_employee_filter = f"AND pd2.assigned_employee_id = {current_user.employee_id}"
         
-        # PART 1: Get contract end dates
         contract_query = text(f'''
             SELECT 
                 cm.client_id,
@@ -88,14 +87,13 @@ def get_renewals_calendar():
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
             LEFT JOIN "StreemLyne_MT"."Services_Master" srv ON ecm.service_id = srv.service_id
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON pd.assigned_employee_id = em.employee_id
-            WHERE cm.tenant_id = :tenant_id
+            WHERE cm.tenant_id = CAST(:tenant_id AS VARCHAR)
             AND cm.client_company_name != '[IMPORTED LEADS]'
             AND ecm.contract_end_date IS NOT NULL
             AND (pd.status IS NULL OR LOWER(pd.status) NOT IN ('priced', 'lost'))
             {employee_filter}
         ''')
         
-        # PART 2: Get callback dates
         callback_query = text(f'''
             SELECT 
                 cm.client_id,
@@ -125,7 +123,7 @@ def get_renewals_calendar():
             LEFT JOIN "StreemLyne_MT"."Services_Master" srv ON ecm.service_id = srv.service_id
             LEFT JOIN "StreemLyne_MT"."Project_Details" pd2 ON cm.client_id = pd2.client_id
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em2 ON pd2.assigned_employee_id = em2.employee_id
-            WHERE cm.tenant_id = :tenant_id
+            WHERE cm.tenant_id = CAST(:tenant_id AS VARCHAR)
             AND cm.client_company_name != '[IMPORTED LEADS]'
             AND ci.reminder_date IS NOT NULL
             AND ci.reminder_date >= CURRENT_DATE
@@ -135,19 +133,17 @@ def get_renewals_calendar():
         ''')
         
         logging.info(f"📊 Executing contract query")
-        callback_result = session.execute(callback_query, {'tenant_id': tenant_id})
-        contracts = [dict(row._mapping) for row in callback_result]
+        contract_result = session.execute(contract_query, {'tenant_id': str(tenant_id)})
+        contracts = [dict(row._mapping) for row in contract_result]
         logging.info(f"✅ Found {len(contracts)} contract renewals")
         
         logging.info(f"📊 Executing callback query")
-        callback_result = session.execute(callback_query, {'tenant_id': tenant_id})
+        callback_result = session.execute(callback_query, {'tenant_id': str(tenant_id)})
         callbacks = [dict(row._mapping) for row in callback_result]
         logging.info(f"✅ Found {len(callbacks)} callbacks")
         
-        # Transform to calendar events
         events = []
         
-        # Add contract end date events
         for renewal in contracts:
             business_name = renewal.get('name') or renewal.get('contact') or 'Unknown'
             
@@ -177,7 +173,6 @@ def get_renewals_calendar():
             }
             events.append(event)
         
-        # Add callback events (deduplicate by client_id)
         seen_clients = set()
         for callback in callbacks:
             client_id = callback['client_id']
@@ -187,7 +182,6 @@ def get_renewals_calendar():
             seen_clients.add(client_id)
             
             business_name = callback.get('name') or callback.get('contact') or 'Unknown'
-
             interaction_status = callback.get('interaction_status') or 'Callback'
                         
             event = {
@@ -233,7 +227,6 @@ def get_renewals_calendar():
         }), 500
     finally:
         session.close()
-
 
 @calendar_bp.route('/contracts', methods=['GET', 'OPTIONS'])
 @token_required
@@ -372,7 +365,7 @@ def get_clients():
 @token_required
 @tenant_from_jwt
 def get_employees():
-    """Get all employees for assignment - FIXED VERSION"""
+    """Get all employees for assignment - FIXED VERSION with CAST"""
     
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -397,11 +390,11 @@ def get_employees():
             FROM "StreemLyne_MT"."Employee_Master" em
             LEFT JOIN "StreemLyne_MT"."Designation_Master" dm 
                 ON em.employee_designation_id = dm.designation_id
-            WHERE em.tenant_id = :tenant_id
+            WHERE em.tenant_id = CAST(:tenant_id AS VARCHAR)
             ORDER BY employee_name
         ''')
         
-        result = session.execute(query, {'tenant_id': tenant_id})
+        result = session.execute(query, {'tenant_id': str(tenant_id)})
         employees = [dict(row._mapping) for row in result]
         
         logging.info(f"✅ Found {len(employees)} employees for tenant_id {tenant_id}")
@@ -425,7 +418,7 @@ def get_employees():
 @token_required
 @tenant_from_jwt
 def get_leads_calendar():
-    """Get leads callbacks and contract end dates for calendar view"""
+    """Get leads callbacks and contract end dates for calendar view - FIXED"""
     
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -455,7 +448,6 @@ def get_leads_calendar():
             emp_filter = f"AND od.opportunity_owner_employee_id = {current_user.employee_id}"
             cb_emp_filter = f"AND od.opportunity_owner_employee_id = {current_user.employee_id}"
 
-        # Part 1: Contract end dates from leads
         contract_query = text(f'''
             SELECT
                 od.opportunity_id,
@@ -471,12 +463,11 @@ def get_leads_calendar():
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON od.supplier_id = sm.supplier_id
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
             LEFT JOIN "StreemLyne_MT"."Stage_Master" stg ON od.stage_id = stg.stage_id
-            WHERE od.tenant_id = :tenant_id
+            WHERE od.tenant_id = CAST(:tenant_id AS VARCHAR)
             AND od.end_date IS NOT NULL
             {emp_filter}
         ''')
 
-        # Part 2: Callback dates from lead interactions
         callback_query = text(f'''
             SELECT
                 od.opportunity_id,
@@ -498,17 +489,17 @@ def get_leads_calendar():
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON od.supplier_id = sm.supplier_id
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
             LEFT JOIN "StreemLyne_MT"."Stage_Master" stg ON od.stage_id = stg.stage_id
-            WHERE cm.tenant_id = :tenant_id
+            WHERE cm.tenant_id = CAST(:tenant_id AS VARCHAR)
             AND ci.reminder_date IS NOT NULL
             AND ci.reminder_date >= CURRENT_DATE
             {cb_emp_filter}
             ORDER BY od.opportunity_id, ci.reminder_date DESC
         ''')
 
-        contract_result = session.execute(contract_query, {'tenant_id': tenant_id, 'service': service})
+        contract_result = session.execute(contract_query, {'tenant_id': str(tenant_id), 'service': service})
         contracts = [dict(row._mapping) for row in contract_result]
 
-        callback_result = session.execute(callback_query, {'tenant_id': tenant_id, 'service': service})
+        callback_result = session.execute(callback_query, {'tenant_id': str(tenant_id), 'service': service})
         callbacks = [dict(row._mapping) for row in callback_result]
 
         events = []
@@ -517,7 +508,7 @@ def get_leads_calendar():
             name = lead.get('name') or 'Unknown'
             events.append({
                 'id': f"lead-contract-{lead['opportunity_id']}",
-                'customer_id': lead['opportunity_id'],  # ← no Tenant_Leads needed
+                'customer_id': lead['opportunity_id'],
                 'opportunity_id': lead['opportunity_id'],
                 'type': 'contract_end',
                 'title': f"{name} - Contract End",
@@ -544,7 +535,7 @@ def get_leads_calendar():
             interaction_status = cb.get('interaction_status') or 'Callback'
             events.append({
                 'id': f"lead-callback-{oid}",
-                'customer_id': oid,  # ← no Tenant_Leads needed
+                'customer_id': oid,
                 'opportunity_id': oid,
                 'type': 'callback',
                 'title': f"{name} - {interaction_status}",
