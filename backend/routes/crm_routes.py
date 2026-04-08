@@ -4,6 +4,9 @@ CRM Routes Blueprint — uses SessionLocal (same connection as renewals).
 All raw SQL queries use SQLAlchemy text() via SessionLocal so leads and
 renewals always hit the same database connection.
 """
+from datetime import datetime
+
+from backend.models import Client_Interactions, Client_Master
 from flask import Blueprint, request, g, jsonify
 from functools import wraps
 from sqlalchemy import text
@@ -58,6 +61,92 @@ def _rows_to_list(rows):
         return []
     return [{k: _serial(v) for k, v in dict(row).items()} for row in rows]
 
+def log_lead_field_change(session, opportunity_id: int, field_name: str, old_value, new_value, tenant_id: str):
+    """
+    Log a field change to Client_Interactions with old → new format
+    ✅ Auto-creates client_id if missing
+    """
+    def format_value(val):
+        if val is None or val == '':
+            return "—"
+        if isinstance(val, (int, float)):
+            return str(val)
+        if isinstance(val, datetime):
+            return val.strftime('%d/%m/%Y')
+        if hasattr(val, 'isoformat'):
+            return val.strftime('%d/%m/%Y')
+        return str(val)
+    
+    old_formatted = format_value(old_value)
+    new_formatted = format_value(new_value)
+    
+    if old_formatted == new_formatted:
+        return
+    
+    change_note = f"Changed {field_name}: '{old_formatted}' → '{new_formatted}'"
+    
+    # ✅ Ensure client_id exists (creates if missing)
+    try:
+        client_id = ensure_lead_client_id(session, opportunity_id, tenant_id)
+    except Exception as e:
+        logger.error(f"Failed to ensure client_id for lead {opportunity_id}: {e}")
+        return
+    
+    interaction = Client_Interactions(
+        client_id=client_id,
+        contact_date=datetime.utcnow().date(),
+        contact_method=1,
+        notes=change_note,
+        next_steps='Field Updated',
+        created_at=datetime.utcnow()
+    )
+    session.add(interaction)
+
+def ensure_lead_client_id(session, opportunity_id: int, tenant_id: str) -> int:
+    """
+    Ensure a lead has a client_id (creates one if missing)
+    Returns: client_id
+    """
+    lead = session.execute(text("""
+        SELECT client_id FROM "StreemLyne_MT"."Opportunity_Details"
+        WHERE opportunity_id = :opp_id
+    """), {'opp_id': opportunity_id}).mappings().first()
+    
+    if lead and lead['client_id']:
+        return lead['client_id']
+    
+    lead_data = session.execute(text("""
+        SELECT business_name, contact_person, tel_number, email, opportunity_owner_employee_id
+        FROM "StreemLyne_MT"."Opportunity_Details"
+        WHERE opportunity_id = :opp_id
+    """), {'opp_id': opportunity_id}).mappings().first()
+    
+    if not lead_data:
+        raise ValueError(f"Lead {opportunity_id} not found")
+    
+    # Create Client_Master record
+    client = Client_Master(
+        tenant_id=int(tenant_id),
+        assigned_employee_id=lead_data.get('opportunity_owner_employee_id'),
+        client_company_name=lead_data.get('business_name') or '[IMPORTED LEADS]',
+        client_contact_name=lead_data.get('contact_person') or '',
+        client_phone=lead_data.get('tel_number') or '',
+        client_email=lead_data.get('email') or '',
+        default_currency_id=1,
+        created_at=datetime.utcnow()
+    )
+    session.add(client)
+    session.flush()
+    
+    # Link back to opportunity
+    session.execute(text("""
+        UPDATE "StreemLyne_MT"."Opportunity_Details"
+        SET client_id = :client_id
+        WHERE opportunity_id = :opp_id
+    """), {'client_id': client.client_id, 'opp_id': opportunity_id})
+    
+    session.flush()
+    return client.client_id
 
 def tenant_from_jwt(f):
     """Set g.tenant_id (as int) from request.current_user.tenant_id."""
@@ -315,25 +404,128 @@ def update_lead(opportunity_id):
             'charity_ltd_company_number','partner_details',
             'meter_ref','uplift','comments','document_details',
         }
+        
+        # Field name mappings for logging
+        FIELD_DISPLAY_NAMES = {
+            'business_name': 'Trading Name',
+            'contact_person': 'Client Name',
+            'tel_number': 'Tel Number',
+            'mobile_no': 'Mobile Number',
+            'email': 'Email',
+            'position': 'Position',
+            'company_number': 'Company Number',
+            'date_of_birth': 'Date of Birth',
+            'mpan_mpr': 'MPAN Top',
+            'mpan_bottom': 'MPAN Bottom',
+            'supplier_id': 'New Supplier',
+            'annual_usage': 'Annual Usage',
+            'start_date': 'Start Date',
+            'end_date': 'Contract End',
+            'payment_type': 'Payment Type',
+            'term_sold': 'Term Sold',
+            'net_notch': 'Net Notch',
+            'comms_paid': 'Comms Paid',
+            'aggregator': 'Aggregator',
+            'site_name': 'Site Name',
+            'month_sold': 'Month Sold',
+            'house_name': 'House Name',
+            'house_number': 'House Number',
+            'door_number': 'Door Number',
+            'address': 'Street',
+            'town': 'Town',
+            'county': 'County',
+            'postcode': 'Post Code',
+            'stand_charge': 'Standing Charge',
+            'rate_1': 'Rate 1',
+            'rate_2': 'Rate 2',
+            'rate_3': 'Rate 3',
+            'night_charge': 'Night Charge',
+            'eve_weekend_charge': 'Eve/Weekend Charge',
+            'other_charges_1': 'Other Charges 1',
+            'other_charges_2': 'Other Charges 2',
+            'other_charges_3': 'Other Charges 3',
+            'bank_name': 'Bank Name',
+            'bank_account_number': 'Account Number',
+            'bank_sort_code': 'Sort Code',
+            'charity_ltd_company_number': 'Charity/Ltd Company Number',
+            'partner_details': 'Partner Details',
+            'meter_ref': 'Meter Ref',
+            'uplift': 'Uplift',
+            'comments': 'Comments',
+        }
+        
         session = SessionLocal()
         try:
-            tenant_id = str(g.tenant_id)  # ✅ CHANGED: Cast to string
+            tenant_id = str(g.tenant_id)
             data = request.get_json() or {}
             fields = {k: v for k, v in data.items() if k in ALLOWED}
+            
             if not fields:
                 return jsonify({'error': 'No valid fields provided'}), 400
 
-            id_row = session.execute(text("""
-                SELECT opportunity_id FROM "StreemLyne_MT"."Opportunity_Details"
+            # Get current lead data
+            current = session.execute(text("""
+                SELECT * FROM "StreemLyne_MT"."Opportunity_Details"
                 WHERE tenant_id = :t
                 AND (tenant_lead_id = :id OR opportunity_id = :id)
                 LIMIT 1
             """), {'t': tenant_id, 'id': opportunity_id}).mappings().first()
 
-            if not id_row:
+            if not current:
                 return jsonify({'error': 'Lead not found'}), 404
 
-            real_id = id_row['opportunity_id']
+            real_id = current['opportunity_id']
+            
+            # ✅ Track changes for supplier_id with name resolution
+            if 'supplier_id' in fields:
+                old_supp_id = current.get('supplier_id')
+                new_supp_id = fields['supplier_id']
+                
+                if old_supp_id != new_supp_id:
+                    old_supp = session.execute(text(
+                        'SELECT supplier_company_name FROM "StreemLyne_MT"."Supplier_Master" WHERE supplier_id = :id'
+                    ), {'id': old_supp_id}).mappings().first() if old_supp_id else None
+                    
+                    new_supp = session.execute(text(
+                        'SELECT supplier_company_name FROM "StreemLyne_MT"."Supplier_Master" WHERE supplier_id = :id'
+                    ), {'id': new_supp_id}).mappings().first() if new_supp_id else None
+                    
+                    old_name = old_supp['supplier_company_name'] if old_supp else "—"
+                    new_name = new_supp['supplier_company_name'] if new_supp else "—"
+                    
+                    log_lead_field_change(session, real_id, 'New Supplier', old_name, new_name)
+            
+            # ✅ Track assignment changes with employee names
+            if 'opportunity_owner_employee_id' in fields:
+                old_emp_id = current.get('opportunity_owner_employee_id')
+                new_emp_id = fields['opportunity_owner_employee_id']
+                
+                if old_emp_id != new_emp_id:
+                    old_emp = session.execute(text(
+                        'SELECT employee_name FROM "StreemLyne_MT"."Employee_Master" WHERE employee_id = :id'
+                    ), {'id': old_emp_id}).mappings().first() if old_emp_id else None
+                    
+                    new_emp = session.execute(text(
+                        'SELECT employee_name FROM "StreemLyne_MT"."Employee_Master" WHERE employee_id = :id'
+                    ), {'id': new_emp_id}).mappings().first() if new_emp_id else None
+                    
+                    old_name = old_emp['employee_name'] if old_emp else "Unassigned"
+                    new_name = new_emp['employee_name'] if new_emp else "Unassigned"
+                    
+                    log_lead_field_change(session, real_id, 'Assigned To', old_name, new_name)
+            
+            # ✅ Track all other field changes
+            for field, new_value in fields.items():
+                if field in ['supplier_id', 'opportunity_owner_employee_id']:
+                    continue  # Already handled above
+                
+                display_name = FIELD_DISPLAY_NAMES.get(field, field)
+                old_value = current.get(field)
+                
+                if old_value != new_value:
+                    log_lead_field_change(session, real_id, display_name, old_value, new_value)
+
+            # Apply updates
             set_clause = ', '.join(f'"{k}" = :{k}' for k in fields)
             params = {**fields, 'real_id': real_id, 'tenant_id': tenant_id}
 
@@ -342,8 +534,10 @@ def update_lead(opportunity_id):
                 f'SET {set_clause} '
                 f'WHERE opportunity_id = :real_id AND tenant_id = :tenant_id'
             ), params)
+            
             session.commit()
 
+            # Return updated lead
             updated = session.execute(text("""
                 SELECT od.*, sm.stage_name,
                        em.employee_name AS assigned_to_name,
@@ -367,7 +561,6 @@ def update_lead(opportunity_id):
             except Exception: pass
 
     return crm_controller.update_lead(opportunity_id)
-
 
 @crm_bp.route('/leads/<int:opportunity_id>/status', methods=['PATCH'])
 @token_required
@@ -993,19 +1186,24 @@ def leads_callback(opportunity_id):
                 'WHERE opportunity_id = :id AND tenant_id = :t'
             ), {'s': stage_id, 'id': real_id, 't': tenant_id})
             
-            # ✅ LOG HISTORY FOR DELETED RECORDS
-            formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
-            session.execute(text("""
-                INSERT INTO "StreemLyne_MT"."Opportunity_Interactions" 
-                (opportunity_id, interaction_type, contact_date, reminder_date, notes, created_at)
-                VALUES (:opp_id, :itype, :contact_date, :reminder_date, :notes, NOW())
-            """), {
-                'opp_id': real_id,
-                'itype': status,
-                'contact_date': called_date if called_date else None,
-                'reminder_date': callback_date if callback_date else None,
-                'notes': formatted_notes
-            })
+            client_row = session.execute(text("""
+                SELECT client_id FROM "StreemLyne_MT"."Opportunity_Details"
+                WHERE opportunity_id = :opp_id
+            """), {'opp_id': real_id}).mappings().first()
+
+            if client_row and client_row['client_id']:
+                formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
+                
+                interaction = Client_Interactions(
+                    client_id=client_row['client_id'],
+                    contact_date=datetime.strptime(called_date, '%Y-%m-%d').date() if called_date else datetime.utcnow().date(),
+                    contact_method=1,  # System/internal
+                    notes=formatted_notes,
+                    next_steps=status,  # ✅ Status becomes next_steps (for filtering in history)
+                    reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
+                    created_at=datetime.utcnow()
+                )
+                session.add(interaction)
             
             session.commit()
             return jsonify({'success': True, 'moved_to_recycle_bin': True,
@@ -1298,9 +1496,9 @@ def get_lead_history(opportunity_id):
     try:
         tenant_id = str(g.tenant_id)
 
-        # Find the actual opportunity_id
+        # ✅ Get client_id from opportunity_id
         lead = session.execute(text("""
-            SELECT opportunity_id FROM "StreemLyne_MT"."Opportunity_Details"
+            SELECT opportunity_id, client_id FROM "StreemLyne_MT"."Opportunity_Details"
             WHERE tenant_id = :t
             AND (tenant_lead_id = :id OR opportunity_id = :id)
             LIMIT 1
@@ -1310,25 +1508,34 @@ def get_lead_history(opportunity_id):
             return jsonify({'error': 'Lead not found'}), 404
 
         real_id = lead['opportunity_id']
+        client_id = lead['client_id']
 
-        # Fetch interactions
+        if not client_id:
+            # No client_id = no interactions yet
+            return jsonify({'interactions': []}), 200
+
+        # ✅ Fetch from Client_Interactions (same table as renewals)
         interactions = session.execute(text("""
             SELECT 
                 interaction_id,
-                interaction_type,
+                CASE 
+                    WHEN next_steps = 'Field Updated' THEN 'Field Updated'
+                    WHEN next_steps = 'Assignment' THEN 'Assignment'
+                    ELSE COALESCE(next_steps, 'Note')
+                END as interaction_type,
                 contact_date,
                 reminder_date,
                 notes,
                 created_at
-            FROM "StreemLyne_MT"."Opportunity_Interactions"
-            WHERE opportunity_id = :opp_id
+            FROM "StreemLyne_MT"."Client_Interactions"
+            WHERE client_id = :client_id
             ORDER BY created_at DESC
-        """), {'opp_id': real_id}).mappings().all()
+        """), {'client_id': client_id}).mappings().all()
 
         return jsonify({
             'interactions': [{
                 'interaction_id': i['interaction_id'],
-                'interaction_type': i['interaction_type'] or 'Unknown',
+                'interaction_type': i['interaction_type'] or 'Note',
                 'contact_date': i['contact_date'].isoformat() if i['contact_date'] else None,
                 'reminder_date': i['reminder_date'].isoformat() if i['reminder_date'] else None,
                 'notes': i['notes'],
@@ -1343,7 +1550,6 @@ def get_lead_history(opportunity_id):
     finally:
         session.close()
 
-
 @crm_bp.route('/leads/<int:opportunity_id>/history/<int:interaction_id>', methods=['DELETE', 'OPTIONS'])
 @token_required
 @tenant_from_jwt
@@ -1355,23 +1561,21 @@ def delete_lead_interaction(opportunity_id, interaction_id):
     try:
         tenant_id = str(g.tenant_id)
 
-        # Verify lead exists and belongs to tenant
         lead = session.execute(text("""
-            SELECT opportunity_id FROM "StreemLyne_MT"."Opportunity_Details"
+            SELECT opportunity_id, client_id FROM "StreemLyne_MT"."Opportunity_Details"
             WHERE tenant_id = :t
             AND (tenant_lead_id = :id OR opportunity_id = :id)
             LIMIT 1
         """), {'t': tenant_id, 'id': opportunity_id}).mappings().first()
 
-        if not lead:
+        if not lead or not lead['client_id']:
             return jsonify({'error': 'Lead not found'}), 404
-
-        # Delete interaction
+        
         session.execute(text("""
-            DELETE FROM "StreemLyne_MT"."Opportunity_Interactions"
+            DELETE FROM "StreemLyne_MT"."Client_Interactions"
             WHERE interaction_id = :int_id
-            AND opportunity_id = :opp_id
-        """), {'int_id': interaction_id, 'opp_id': lead['opportunity_id']})
+            AND client_id = :client_id
+        """), {'int_id': interaction_id, 'client_id': lead['client_id']})
 
         session.commit()
         return jsonify({'success': True, 'message': 'Interaction deleted successfully'}), 200
