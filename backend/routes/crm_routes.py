@@ -493,7 +493,7 @@ def update_lead(opportunity_id):
                     old_name = old_supp['supplier_company_name'] if old_supp else "—"
                     new_name = new_supp['supplier_company_name'] if new_supp else "—"
                     
-                    log_lead_field_change(session, real_id, 'New Supplier', old_name, new_name)
+                    log_lead_field_change(session, real_id, 'New Supplier', old_name, new_name, tenant_id)
             
             # ✅ Track assignment changes with employee names
             if 'opportunity_owner_employee_id' in fields:
@@ -512,7 +512,7 @@ def update_lead(opportunity_id):
                     old_name = old_emp['employee_name'] if old_emp else "Unassigned"
                     new_name = new_emp['employee_name'] if new_emp else "Unassigned"
                     
-                    log_lead_field_change(session, real_id, 'Assigned To', old_name, new_name)
+                    log_lead_field_change(session, real_id, 'Assigned To', old_name, new_name, tenant_id)
             
             # ✅ Track all other field changes
             for field, new_value in fields.items():
@@ -523,7 +523,7 @@ def update_lead(opportunity_id):
                 old_value = current.get(field)
                 
                 if old_value != new_value:
-                    log_lead_field_change(session, real_id, display_name, old_value, new_value)
+                    log_lead_field_change(session, real_id, display_name, old_value, new_value, tenant_id)
 
             # Apply updates
             set_clause = ', '.join(f'"{k}" = :{k}' for k in fields)
