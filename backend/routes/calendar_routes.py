@@ -7,6 +7,7 @@ from flask import Blueprint, g, jsonify, request
 from backend.routes.auth_helpers import token_required
 from backend.routes.crm_routes import tenant_from_jwt
 from backend.crm.repositories.tenant_repository import TenantRepository
+from backend.crm.utils.role_helpers import is_crm_leads_admin_role
 import logging
 
 calendar_bp = Blueprint('calendar', __name__, url_prefix='/api/calendar')
@@ -230,6 +231,165 @@ def get_renewals_calendar():
             'success': False,
             'error': 'Failed to fetch calendar',
             'message': str(e)
+        }), 500
+    finally:
+        session.close()
+
+@calendar_bp.route('/leads', methods=['GET', 'OPTIONS'])
+@token_required
+@tenant_from_jwt
+def get_leads_calendar():
+    """Get callback-only lead calendar events from Opportunity_Details."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    from backend.db import SessionLocal
+    from sqlalchemy import text
+
+    session = SessionLocal()
+    try:
+        tenant_id = g.tenant_id
+        current_user = request.current_user
+
+        # Keep service mapping consistent with existing CRM leads endpoints.
+        service_param = (request.args.get('service') or 'utilities').strip().lower()
+        service_id = 2 if service_param == 'water' else 1
+
+        user_role = getattr(current_user, 'role', None)
+        is_admin = is_crm_leads_admin_role(user_role)
+        current_employee_id = getattr(current_user, 'employee_id', None)
+        filter_employee_id = request.args.get('employee_id', type=int)
+
+        if is_admin and filter_employee_id:
+            employee_filter = "AND od.\"opportunity_owner_employee_id\" = :employee_id"
+            query_params = {'tenant_id': tenant_id, 'service_id': service_id, 'employee_id': filter_employee_id}
+        elif is_admin:
+            employee_filter = ""
+            query_params = {'tenant_id': tenant_id, 'service_id': service_id}
+        elif current_employee_id:
+            employee_filter = "AND od.\"opportunity_owner_employee_id\" = :employee_id"
+            query_params = {'tenant_id': tenant_id, 'service_id': service_id, 'employee_id': current_employee_id}
+        else:
+            # Non-admin users without employee mapping cannot see tenant-wide lead callbacks.
+            return jsonify({'success': True, 'data': [], 'count': 0}), 200
+
+        logging.info(
+            "📅 leads calendar: tenant=%s service=%s service_id=%s is_admin=%s employee_filter=%s",
+            tenant_id,
+            service_param,
+            service_id,
+            is_admin,
+            query_params.get('employee_id'),
+        )
+
+        query = text(f'''
+            WITH latest_ci AS (
+                SELECT
+                    ci."client_id",
+                    ci."reminder_date",
+                    ci."next_steps",
+                    ci."notes",
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ci."client_id"
+                        ORDER BY ci."reminder_date" DESC NULLS LAST, ci."contact_date" DESC NULLS LAST
+                    ) AS rn
+                FROM "StreemLyne_MT"."Client_Interactions" ci
+                WHERE ci."reminder_date" IS NOT NULL
+            )
+            SELECT
+                od."opportunity_id",
+                od."tenant_lead_id",
+                COALESCE(NULLIF(TRIM(od."business_name"), ''), NULLIF(TRIM(od."opportunity_title"), ''), 'Unknown') AS name,
+                od."contact_person",
+                od."tel_number",
+                od."email",
+                od."postcode",
+                od."address",
+                od."mpan_mpr",
+                od."start_date",
+                od."end_date",
+                sm."stage_name",
+                em."employee_name" AS assigned_to,
+                srv."service_title",
+                sup."supplier_company_name" AS supplier,
+                lci."reminder_date" AS ci_reminder_date,
+                lci."next_steps" AS ci_next_steps,
+                lci."notes" AS ci_notes
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm
+                ON od."client_id" = cm."client_id"
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm
+                ON od."stage_id" = sm."stage_id"
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em
+                ON od."opportunity_owner_employee_id" = em."employee_id"
+            LEFT JOIN "StreemLyne_MT"."Services_Master" srv
+                ON od."service_id" = srv."service_id"
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup
+                ON od."supplier_id" = sup."supplier_id"
+            LEFT JOIN latest_ci lci
+                ON lci."client_id" = od."client_id"
+               AND lci.rn = 1
+            WHERE (od."tenant_id" = :tenant_id OR (od."client_id" IS NOT NULL AND cm."tenant_id" = :tenant_id))
+              AND od."service_id" = :service_id
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM "StreemLyne_MT"."Project_Details" pd
+                    WHERE pd."opportunity_id" = od."opportunity_id"
+                )
+              AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") NOT IN ('priced', 'lost'))
+              AND lci."reminder_date" IS NOT NULL
+              AND lci."reminder_date" >= CURRENT_DATE
+              {employee_filter}
+            ORDER BY lci."reminder_date" ASC
+        ''')
+
+        rows = session.execute(query, query_params)
+        lead_rows = [dict(row._mapping) for row in rows]
+
+        events = []
+        for lead in lead_rows:
+            callback_date = lead.get('ci_reminder_date')
+            if callback_date is None:
+                continue
+
+            callback_type = lead.get('ci_next_steps') or 'Callback'
+            notes = lead.get('ci_notes')
+            lead_name = lead.get('name') or 'Unknown'
+            open_id = lead.get('tenant_lead_id') or lead.get('opportunity_id')
+
+            events.append({
+                'id': f"lead-callback-{lead.get('opportunity_id')}",
+                'customer_id': open_id,
+                'type': 'callback',
+                'title': f"{lead_name} - {callback_type}",
+                'name': lead_name,
+                'mpan': lead.get('mpan_mpr'),
+                'supplier': lead.get('supplier'),
+                'contract_start_date': str(lead['start_date']) if lead.get('start_date') else None,
+                'contract_end_date': str(lead['end_date']) if lead.get('end_date') else None,
+                'reminder_date': str(callback_date),
+                'address': lead.get('address'),
+                'postcode': lead.get('postcode'),
+                'contact': lead.get('contact_person'),
+                'email': lead.get('email'),
+                'phone': str(lead.get('tel_number')) if lead.get('tel_number') is not None else None,
+                'service_title': lead.get('service_title') or service_param.title(),
+                'rates': None,
+                'notes': notes,
+                'display_date': str(callback_date),
+                'display_type': callback_type,
+                'status': lead.get('stage_name') or 'Active',
+                'assigned_to': lead.get('assigned_to'),
+            })
+
+        return jsonify({'success': True, 'data': events, 'count': len(events)}), 200
+
+    except Exception as e:
+        logging.exception("❌ Error fetching leads calendar")
+        return jsonify({
+            'success': False,
+            'error': 'Failed to fetch leads calendar',
+            'message': str(e),
         }), 500
     finally:
         session.close()
