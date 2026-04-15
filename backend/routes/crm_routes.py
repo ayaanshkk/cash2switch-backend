@@ -862,7 +862,7 @@ def import_leads():
     """
     session = SessionLocal()
     try:
-        tenant_id     = str(g.tenant_id)  # ✅ CHANGED: Cast to string
+        tenant_id     = str(g.tenant_id)  
         service_param = request.args.get('service', 'electricity')
         service_id    = 2 if (service_param or '').strip().lower() == 'water' else 1
  
@@ -903,7 +903,6 @@ def import_leads():
  
         inserted = confirm_result.get('inserted', 0)
         
-        # ✅ CRITICAL: Force is_allocated = FALSE for newly imported leads
         if inserted > 0:
             try:
                 # Update all recently created leads by this employee
@@ -954,33 +953,31 @@ def download_leads_template():
         ws = wb.active
         ws.title = "Leads Import"
         
-        # ✅ Headers match what preview_lead_import expects (case-insensitive)
         headers = [
-            'Business Name',      # Matches 'business name'
-            'Contact Person',     # Matches 'contact person'  
-            'Tel Number',         # Matches 'tel number' ✓
+            'Business Name',      
+            'Contact Person',       
+            'Tel Number',         
             'Email',
             'MPAN_MPR',
-            'Start Date',         # Matches 'start date' ✓
-            'End Date',           # Matches 'end date' ✓
+            'Start Date',         
+            'End Date',           
             'Annual Usage',
             'Address',
             'Site Address'
         ]
         ws.append(headers)
         
-        # ✅ Example row with VALID data that will pass all validation checks
         ws.append([
-            'Acme Corp',           # Business Name ✓
-            'John Doe',            # Contact Person ✓
-            '02071234567',         # Tel Number ✓ (UK format, 11 digits)
-            'john@acme.com',       # Email
-            '1234567890123',       # MPAN_MPR (13 digits)
-            '01/01/2024',          # Start Date ✓ (DD/MM/YYYY UK format)
-            '31/12/2024',          # End Date ✓ (DD/MM/YYYY UK format)
-            '50000',               # Annual Usage
-            '123 Main St, London', # Address
-            '456 Business Park, London'  # Site Address
+            'Acme Corp',          
+            'John Doe',            
+            '02071234567',         
+            'john@acme.com',       
+            '1234567890123',       
+            '01/01/2024',          
+            '31/12/2024',          
+            '50000',               
+            '123 Main St, London', 
+            '456 Business Park, London'  
         ])
         
         # Style the header row
@@ -988,7 +985,6 @@ def download_leads_template():
             cell.font = Font(bold=True, color="FFFFFF")
             cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
         
-        # Auto-adjust column widths for better readability
         for col in ws.columns:
             max_length = 0
             column = col[0].column_letter
@@ -1025,7 +1021,7 @@ def get_leads_by_customer_type():
 def get_allocated_leads():
     session = SessionLocal()
     try:
-        tenant_id     = str(g.tenant_id)  # ✅ CHANGED: Cast to string
+        tenant_id     = str(g.tenant_id)
         current_user  = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id    = 2 if service_param.strip().lower() == 'water' else 1

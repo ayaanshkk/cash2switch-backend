@@ -16,6 +16,7 @@ Routes:
 from backend.db import SessionLocal
 from sqlalchemy import text
 from flask import Blueprint, request, jsonify, g
+from datetime import datetime
 import logging
 
 logger = logging.getLogger(__name__)
@@ -27,10 +28,11 @@ cleansing_bp = Blueprint("cleansing", __name__)
 def _get_tenant_id():
     """Pull tenant_id from Flask g (set by tenant_from_jwt) or request.current_user."""
     if hasattr(g, "tenant_id") and g.tenant_id:
-        return g.tenant_id
+        return str(g.tenant_id)  # ✅ CRITICAL FIX: Cast to string
     user = getattr(request, "current_user", None)
     if user:
-        return getattr(user, "tenant_id", None) or getattr(user, "Tenant_ID", None)
+        tid = getattr(user, "tenant_id", None) or getattr(user, "Tenant_ID", None)
+        return str(tid) if tid else None  # ✅ CRITICAL FIX: Cast to string
     return None
 
 
@@ -55,10 +57,9 @@ def register_get_cleansing(blueprint, token_required_decorator, tenant_from_jwt_
         from flask import g
         session = SessionLocal()
         try:
-            tenant_id = g.tenant_id
+            tenant_id = str(g.tenant_id)  
             records = []
 
-            # ✅ Fetch leads with Invalid Number or Incorrect Supplier
             lead_rows = session.execute(text("""
                 SELECT
                     od.opportunity_id AS id,
@@ -121,7 +122,7 @@ def register_get_cleansing(blueprint, token_required_decorator, tenant_from_jwt_
                     .outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id)
                     .outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id)
                     .filter(
-                        Client_Master.tenant_id == tenant_id,
+                        Client_Master.tenant_id == int(tenant_id),  # ✅ CRITICAL FIX: Cast to int for ORM
                         Client_Master.is_deleted == True,
                         Client_Master.deleted_reason.in_(['Invalid Number', 'Incorrect Supplier'])
                     )
@@ -155,8 +156,7 @@ def register_get_cleansing(blueprint, token_required_decorator, tenant_from_jwt_
                     records.append(record)
 
             except Exception as ec_err:
-                import logging
-                logging.getLogger(__name__).warning(f'Could not load energy clients for cleansing: {ec_err}')
+                logger.warning(f'Could not load energy clients for cleansing: {ec_err}')
 
             # Sort by flagged_at descending
             records.sort(key=lambda x: x.get('flagged_at') or '', reverse=True)
@@ -203,7 +203,7 @@ def register_lead_cleanse(crm_bp, token_required, tenant_from_jwt):
         from backend.crm.supabase_client import get_supabase_client
 
         try:
-            tenant_id = _get_tenant_id()
+            tenant_id = _get_tenant_id()  # Already returns string
             if not tenant_id:
                 return jsonify({"error": "Missing tenant"}), 401
 
@@ -362,7 +362,7 @@ def register_energy_client_cleanse(client_interaction_bp, token_required):
                 Client_Master.deleted_reason.in_(CLEANSING_STATUSES),
             )
             if tenant_id:
-                query = query.filter(Client_Master.tenant_id == tenant_id)
+                query = query.filter(Client_Master.tenant_id == int(tenant_id))  
 
             client = query.first()
             if not client:
@@ -370,7 +370,6 @@ def register_energy_client_cleanse(client_interaction_bp, token_required):
 
             # ── DELETE ──────────────────────────────────────────────────────────
             if action == "delete":
-                # Hard delete — remove interaction history first to avoid FK issues
                 from backend.models import Client_Interactions
                 session.query(Client_Interactions).filter(
                     Client_Interactions.client_id == client_id
@@ -385,17 +384,13 @@ def register_energy_client_cleanse(client_interaction_bp, token_required):
                 if not notes:
                     return jsonify({"error": "Notes cannot be empty"}), 400
 
-                db.execute_update(
-                    """
-                    UPDATE "StreemLyne_MT"."Opportunity_Details"
-                    SET notes = CASE
-                          WHEN notes IS NULL OR notes = '' THEN %s
-                          ELSE notes || E'\n' || %s
-                        END
-                    WHERE opportunity_id = %s AND tenant_id = %s
-                    """,
-                    (notes, notes, real_id, tenant_id),
-                )
+                # ✅ FIX: Update client.deleted_notes instead of using undefined db/real_id
+                if client.deleted_notes:
+                    client.deleted_notes = client.deleted_notes + "\n" + notes
+                else:
+                    client.deleted_notes = notes
+                
+                session.commit()
                 return jsonify({"success": True, "message": "Note added"}), 200
 
             # ── FIX ─────────────────────────────────────────────────────────────
