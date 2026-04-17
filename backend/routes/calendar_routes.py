@@ -97,42 +97,57 @@ def get_renewals_calendar():
         ''')
         
         # PART 2: Get callback dates
+        # Use latest interaction row per client (not max reminder date) so callback date edits
+        # are reflected immediately even when moved earlier.
         callback_query = text(f'''
-            SELECT 
+            WITH latest_ci AS (
+                SELECT
+                    ci.client_id,
+                    ci.reminder_date,
+                    ci.next_steps,
+                    ci.notes,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ci.client_id
+                        ORDER BY ci.interaction_id DESC, ci.created_at DESC NULLS LAST
+                    ) AS rn
+                FROM "StreemLyne_MT"."Client_Interactions" ci
+            )
+            SELECT
                 cm.client_id,
                 COALESCE(NULLIF(TRIM(cm.client_company_name), ''), cm.client_contact_name, 'Unknown') as name,
                 ecm.mpan_number as mpan,
                 sm.supplier_company_name as supplier,
                 ecm.contract_end_date,
                 ecm.contract_start_date,
-                ci.reminder_date as callback_date,
-                ci.next_steps as interaction_status,
+                lci.reminder_date as callback_date,
+                lci.next_steps as interaction_status,
                 cm.address,
                 cm.post_code as postcode,
                 cm.client_contact_name as contact,
                 cm.client_email as email,
                 cm.client_phone as phone,
-                ci.notes as callback_notes,
+                lci.notes as callback_notes,
                 srv.service_title,
                 ecm.unit_rate as rates,
                 pd2.status as status,
                 em2.employee_name as assigned_to,
                 'callback' as event_type
-            FROM "StreemLyne_MT"."Client_Interactions" ci
-            INNER JOIN "StreemLyne_MT"."Client_Master" cm ON ci.client_id = cm.client_id
+            FROM latest_ci lci
+            INNER JOIN "StreemLyne_MT"."Client_Master" cm ON lci.client_id = cm.client_id
             LEFT JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
             LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
             LEFT JOIN "StreemLyne_MT"."Services_Master" srv ON ecm.service_id = srv.service_id
             LEFT JOIN "StreemLyne_MT"."Project_Details" pd2 ON cm.client_id = pd2.client_id
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em2 ON pd2.assigned_employee_id = em2.employee_id
-            WHERE cm.tenant_id = :tenant_id
+            WHERE lci.rn = 1
+            AND cm.tenant_id = :tenant_id
             AND cm.client_company_name != '[IMPORTED LEADS]'
-            AND ci.reminder_date IS NOT NULL
-            AND ci.reminder_date >= CURRENT_DATE
+            AND lci.reminder_date IS NOT NULL
+            AND lci.reminder_date >= CURRENT_DATE
             AND (pd2.status IS NULL OR LOWER(pd2.status) NOT IN ('priced', 'lost'))
             {callback_employee_filter}
-            ORDER BY cm.client_id, ci.reminder_date DESC
+            ORDER BY cm.client_id
         ''')
         
         logging.info(f"📊 Executing contract query")
@@ -291,10 +306,9 @@ def get_leads_calendar():
                     ci."notes",
                     ROW_NUMBER() OVER (
                         PARTITION BY ci."client_id"
-                        ORDER BY ci."reminder_date" DESC NULLS LAST, ci."contact_date" DESC NULLS LAST
+                        ORDER BY ci."interaction_id" DESC, ci."created_at" DESC NULLS LAST
                     ) AS rn
                 FROM "StreemLyne_MT"."Client_Interactions" ci
-                WHERE ci."reminder_date" IS NOT NULL
             )
             SELECT
                 od."opportunity_id",

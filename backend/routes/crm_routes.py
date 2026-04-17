@@ -785,6 +785,106 @@ def get_leads_stats_by_employee():
         logger.error('❌ Error in stats-by-employee: %s', str(e))
         return jsonify({'error': str(e)}), 500
 
+
+@crm_bp.route('/leads/stats-by-employee-detailed', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_leads_stats_by_employee_detailed():
+    """
+    GET /api/crm/leads/stats-by-employee-detailed
+    Per-employee lead counts split by CRM stage (same scope as stats-by-employee).
+    Optional query: employee_id (admins only) to inspect one person.
+    Non-admins always receive only their own employee_id row.
+    """
+    from backend.crm.supabase_client import get_supabase_client
+
+    try:
+        tenant_id = g.tenant_id
+        service_param = request.args.get('service', 'utilities')
+        service_id = 2 if service_param.strip().lower() == 'water' else 1
+
+        current_user = request.current_user
+        role_name = getattr(current_user, 'role', None)
+        admin_user = is_crm_leads_admin_role(role_name)
+        my_emp_id = getattr(current_user, 'employee_id', None)
+
+        only_employee_id = request.args.get('employee_id', type=int)
+        if not admin_user:
+            if my_emp_id is None:
+                return jsonify({'employees': []}), 200
+            only_employee_id = my_emp_id
+
+        db = get_supabase_client()
+
+        base_where = '''
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm
+                ON od."client_id" = cm."client_id"
+            JOIN "StreemLyne_MT"."Employee_Master" em
+                ON od."opportunity_owner_employee_id" = em."employee_id"
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm
+                ON od."stage_id" = sm."stage_id"
+            WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
+            AND od."service_id" = %s
+            AND od."opportunity_owner_employee_id" IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1
+                FROM "StreemLyne_MT"."Project_Details" pd
+                WHERE pd."opportunity_id" = od."opportunity_id"
+            )
+        '''
+        params = [tenant_id, tenant_id, service_id]
+
+        if only_employee_id:
+            base_where += ' AND od."opportunity_owner_employee_id" = %s'
+            params.append(only_employee_id)
+
+        query = f'''
+            SELECT
+                em."employee_id",
+                em."employee_name",
+                COALESCE(sm."stage_name", 'Unknown') AS stage_name,
+                COUNT(od."opportunity_id")::bigint AS cnt
+            {base_where}
+            GROUP BY em."employee_id", em."employee_name", COALESCE(sm."stage_name", 'Unknown')
+            HAVING COUNT(od."opportunity_id") > 0
+            ORDER BY em."employee_name" ASC, cnt DESC
+        '''
+
+        rows = db.execute_query(query, tuple(params))
+
+        grouped = {}
+        for r in rows or []:
+            eid = r.get('employee_id')
+            if eid is None:
+                continue
+            if eid not in grouped:
+                grouped[eid] = {
+                    'employee_id': eid,
+                    'employee_name': r.get('employee_name') or '—',
+                    'total': 0,
+                    'by_stage': [],
+                }
+            c = int(r.get('cnt') or r.get('count') or 0)
+            grouped[eid]['by_stage'].append({
+                'stage_name': r.get('stage_name') or 'Unknown',
+                'count': c,
+            })
+            grouped[eid]['total'] += c
+
+        for v in grouped.values():
+            v['by_stage'].sort(key=lambda x: -x['count'])
+
+        employees = sorted(grouped.values(), key=lambda x: -x['total'])
+
+        return jsonify({'employees': employees}), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 @crm_bp.route('/leads/bulk-delete', methods=['POST'])
 @require_tenant
 def bulk_delete_leads():
@@ -1650,7 +1750,12 @@ def get_cleansing():
         import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-@crm_bp.route('/leads/<int:opportunity_id>/callback', methods=['POST', 'OPTIONS'])
+@crm_bp.route('/leads/<int:opportunity_id>/callback', methods=['OPTIONS'])
+def leads_callback_options(opportunity_id):
+    return jsonify({}), 200
+
+
+@crm_bp.route('/leads/<int:opportunity_id>/callback', methods=['POST'], provide_automatic_options=False)
 @token_required
 @tenant_from_jwt
 def leads_callback(opportunity_id):
@@ -1659,10 +1764,8 @@ def leads_callback(opportunity_id):
     Save a callback/status update for a lead.
     Updates stage_id on Opportunity_Details based on status.
     """
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
- 
     from backend.crm.supabase_client import get_supabase_client
+    from datetime import datetime
  
     try:
         tenant_id = g.tenant_id
@@ -1730,7 +1833,7 @@ def leads_callback(opportunity_id):
  
         # ── Verify lead belongs to tenant and resolve real opportunity_id ────────
         lead = db.execute_query('''
-            SELECT opportunity_id, stage_id
+            SELECT opportunity_id, stage_id, client_id
             FROM "StreemLyne_MT"."Opportunity_Details"
             WHERE tenant_id = %s
             AND ("tenant_lead_id" = %s OR opportunity_id = %s)
@@ -1742,6 +1845,35 @@ def leads_callback(opportunity_id):
  
         # Use the resolved real opportunity_id for all subsequent DB operations
         real_id = lead['opportunity_id']
+        lead_client_id = lead.get('client_id')
+
+        def _parse_date(value):
+            if not value:
+                return None
+            try:
+                return datetime.strptime(str(value)[:10], '%Y-%m-%d').date()
+            except Exception:
+                return None
+
+        def _save_interaction():
+            # Calendar and lead history read from Client_Interactions.
+            # Persist every callback/status update here so date changes reflect immediately.
+            if not lead_client_id:
+                logger.warning(
+                    'leads_callback: skipping interaction insert (no client_id) for opportunity_id=%s',
+                    real_id
+                )
+                return
+
+            reminder_dt = _parse_date(callback_date)
+            contact_dt = _parse_date(called_date) or datetime.utcnow().date()
+            formatted_notes = f"[{status}] {notes}".strip() if notes else f"[{status}]"
+
+            db.execute_update('''
+                INSERT INTO "StreemLyne_MT"."Client_Interactions"
+                    ("client_id", "contact_date", "contact_method", "reminder_date", "notes", "next_steps", "created_at")
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            ''', (lead_client_id, contact_dt, 1, reminder_dt, formatted_notes, status))
  
         # ── Handle recycle bin statuses ────────────────────────────────────────
         if cfg['deletes_record']:
@@ -1759,7 +1891,8 @@ def leads_callback(opportunity_id):
                 SET stage_id = %s
                 WHERE opportunity_id = %s AND tenant_id = %s
             ''', (lost_stage_id, real_id, tenant_id))
- 
+            _save_interaction()
+
             return jsonify({
                 'success': True,
                 'message': f'Moved to recycle bin ({status})',
@@ -1773,7 +1906,8 @@ def leads_callback(opportunity_id):
                 SET stage_id = %s
                 WHERE opportunity_id = %s AND tenant_id = %s
             ''', (stage_id or 4, real_id, tenant_id))
- 
+            _save_interaction()
+
             return jsonify({
                 'success': True,
                 'message': 'Moved to Priced page',
@@ -1809,7 +1943,9 @@ def leads_callback(opportunity_id):
                 SET stage_id = %s
                 WHERE opportunity_id = %s AND tenant_id = %s
             ''', (stage_id, real_id, tenant_id))
- 
+
+        _save_interaction()
+
         logger.info('leads_callback: saved status=%s for real_id=%s (url_id=%s)', status, real_id, opportunity_id)
  
         return jsonify({

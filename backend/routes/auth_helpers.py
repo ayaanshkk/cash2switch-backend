@@ -16,7 +16,8 @@ def token_required(f):
     def decorated(*args, **kwargs):
         # Handle OPTIONS requests
         if request.method == 'OPTIONS':
-            return f(*args, **kwargs)
+            # Preflight requests should never require auth context.
+            return jsonify({}), 200
         
         local_session = SessionLocal()
         try:
