@@ -9,7 +9,7 @@ from flask import Blueprint, request, jsonify, current_app
 from datetime import datetime, timedelta
 from sqlalchemy import and_, text
 from backend.models import Client_Interactions, Client_Master, Energy_Contract_Master, Project_Details, Supplier_Master
-from backend.db import SessionLocal
+from backend.db import SessionLocal, safe_add_with_sequence_retry
 from backend.routes.auth_routes import token_required
  
 client_interaction_bp = Blueprint('client_interactions', __name__)
@@ -132,15 +132,17 @@ def add_callback(client_id):
                     project.status = status
  
                 formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
-                session.add(Client_Interactions(
-                    client_id=client_id,
-                    contact_date=datetime.utcnow().date(),
-                    contact_method=1,
-                    reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
-                    notes=formatted_notes,
-                    next_steps=status,
-                    created_at=datetime.utcnow()
-                ))
+                safe_add_with_sequence_retry(
+                    session,
+                    Client_Interactions(
+                        client_id=client_id,
+                        contact_date=datetime.utcnow().date(),
+                        contact_method=1,
+                        reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
+                        notes=formatted_notes,
+                        next_steps=status,
+                        created_at=datetime.utcnow()
+                    ))
  
                 session.commit()
  
@@ -296,15 +298,18 @@ def add_callback(client_id):
  
         # ── Create interaction record ──────────────────────────────────────────
         formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
-        session.add(Client_Interactions(
-            client_id=client_id,
-            contact_date=datetime.utcnow().date(),
-            contact_method=1,
-            reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
-            notes=formatted_notes,
-            next_steps=status,
-            created_at=datetime.utcnow()
-        ))
+        safe_add_with_sequence_retry(
+            session,
+            Client_Interactions(
+                client_id=client_id,
+                contact_date=datetime.utcnow().date(),
+                contact_method=1,
+                reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
+                notes=formatted_notes,
+                next_steps=status,
+                created_at=datetime.utcnow()
+            )
+        )
  
         session.commit()
         print(f"✅ Callback saved for client {client_id}, status: {status}")
@@ -481,14 +486,16 @@ def energy_client_cleanse_action(client_id):
             project.status = 'Active'
  
         fix_notes = f"[Cleansing Fix] {notes}" if notes else "[Cleansing Fix] Record corrected and restored"
-        session.add(Client_Interactions(
-            client_id=client_id,
-            contact_date=datetime.utcnow().date(),
-            contact_method=1,
-            notes=fix_notes,
-            next_steps='Restored',
-            created_at=datetime.utcnow(),
-        ))
+        safe_add_with_sequence_retry(
+            session,
+            Client_Interactions(
+                client_id=client_id,
+                contact_date=datetime.utcnow().date(),
+                contact_method=1,
+                notes=fix_notes,
+                next_steps='Restored',
+                created_at=datetime.utcnow(),
+            ))
  
         session.commit()
         print(f"✅ Client {client_id} fixed and restored to Renewals")
