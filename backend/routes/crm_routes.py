@@ -5,10 +5,22 @@ Defines API endpoints for CRM module
 """
 from flask import Blueprint, request, g, jsonify, current_app
 from functools import wraps
+from datetime import datetime, timedelta
 from backend.crm.controllers.crm_controller import CRMController
 from backend.crm.middleware.tenant_middleware import require_tenant
 from backend.crm.utils.role_helpers import is_crm_leads_admin_role
 from .auth_helpers import token_required
+from ..dummy_local_dashboard_data import (
+    dummy_leads_by_stage,
+    dummy_leads_list,
+    dummy_leads_period_breakdown,
+    dummy_leads_salesperson_breakdown,
+    dummy_leads_stage_breakdown,
+    dummy_leads_stats,
+    dummy_leads_staff_performance,
+    dummy_leads_supplier_breakdown,
+    local_demo_dashboard_enabled,
+)
 # Lightweight helper: attach tenant_id from decoded JWT to `g` (no new auth logic)
 def tenant_from_jwt(f):
     """Set g.tenant_id from request.current_user.tenant_id (returns 401 if missing).
@@ -34,6 +46,73 @@ crm_bp = Blueprint('crm', __name__, url_prefix='/api/crm')
 
 # Initialize controller
 crm_controller = CRMController()
+
+OFFSHORE_ROLE_ID = 5
+
+
+def _staff_period_bounds(period: str):
+    now = datetime.now()
+    key = (period or "daily").strip().lower()
+    if key == "weekly":
+        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=7)
+        multiplier = 7
+    elif key == "monthly":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if start.month == 12:
+            end = start.replace(year=start.year + 1, month=1)
+        else:
+            end = start.replace(month=start.month + 1)
+        multiplier = 30
+    else:
+        key = "daily"
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        multiplier = 1
+    return key, start, end, multiplier
+
+
+def _resolve_opportunity_ts_expr(db) -> str:
+    rows = db.execute_query(
+        '''
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'StreemLyne_MT'
+              AND table_name = 'Opportunity_Details'
+        '''
+    )
+    columns = {str((r or {}).get('column_name') or '').strip().lower() for r in (rows or [])}
+    if 'updated_at' in columns:
+        return 'od."updated_at"'
+    if 'modified_at' in columns:
+        return 'od."modified_at"'
+    if 'created_at' in columns:
+        return 'od."created_at"'
+    return 'NOW()'
+
+
+def _safe_float(v):
+    try:
+        if v is None:
+            return 0.0
+        return float(v)
+    except Exception:
+        try:
+            txt = str(v).replace(",", "").strip()
+            return float(txt) if txt else 0.0
+        except Exception:
+            return 0.0
+
+
+def _lead_stage_bucket(stage_name: str) -> str:
+    s = (stage_name or "").strip().lower()
+    if s in ("converted", "already renewed", "renewed", "renewed directly"):
+        return "converted"
+    if s in ("lost", "lost cot", "invalid number", "meter de-energised"):
+        return "lost"
+    if s in ("callback", "not answered", "broker in place", "email only", "complaint", "incorrect supplier", "priced", "end date changed"):
+        return "in_progress"
+    return "not_contacted"
 
 # ========================================
 # LEAD ROUTES
@@ -62,6 +141,13 @@ def get_leads():
             'crm.get_leads start tenant=%s user_id=%s employee_id=%s is_admin=%s role=%s service=%s exclude_stage=%s',
             tenant_id, user_id, employee_id, admin_user, normalized_role, service_param, exclude_stage
         )
+
+        if local_demo_dashboard_enabled():
+            scoped_employee_id = request.args.get('employee_id', type=int) if admin_user else employee_id
+            rows = dummy_leads_list(scoped_employee_id)
+            if exclude_stage:
+                rows = [r for r in rows if (r.get('stage_name') or '').strip().lower() != exclude_stage.strip().lower()]
+            return jsonify(rows), 200
 
         filters = {
             'service_id': service_id,
@@ -617,6 +703,480 @@ def search_all_leads():
         import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+@crm_bp.route('/leads/stats', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_leads_stats():
+    from backend.crm.supabase_client import get_supabase_client
+
+    try:
+        tenant_id = g.tenant_id
+        service_param = request.args.get('service', 'utilities')
+        service_id = 2 if service_param.strip().lower() == 'water' else 1
+
+        current_user = request.current_user
+        role_name = getattr(current_user, 'role', None)
+        admin_user = is_crm_leads_admin_role(role_name)
+        my_emp_id = getattr(current_user, 'employee_id', None)
+        requested_employee_id = request.args.get('employee_id', type=int)
+        employee_id = requested_employee_id if admin_user else my_emp_id
+
+        if local_demo_dashboard_enabled():
+            return jsonify(dummy_leads_stats(employee_id)), 200
+
+        db = get_supabase_client()
+        base_sql = '''
+            SELECT
+                od."opportunity_id",
+                od."created_at",
+                od."end_date",
+                od."annual_usage",
+                COALESCE(sm."stage_name", 'Unknown') AS stage_name
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
+            WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
+              AND od."service_id" = %s
+              AND NOT EXISTS (
+                SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd
+                WHERE pd."opportunity_id" = od."opportunity_id"
+              )
+              {employee_filter}
+        '''
+        params = [tenant_id, tenant_id, service_id]
+        if employee_id:
+            sql = base_sql.format(employee_filter=' AND od."opportunity_owner_employee_id" = %s')
+            params.append(employee_id)
+        else:
+            sql = base_sql.format(employee_filter='')
+
+        rows = db.execute_query(sql, tuple(params)) or []
+        today = datetime.utcnow().date()
+        last_30 = today - timedelta(days=30)
+
+        converted_leads = 0
+        in_progress = 0
+        lost_leads = 0
+        new_leads = 0
+        leads_30_60 = 0
+        leads_61_90 = 0
+        leads_91_180 = 0
+        not_due = 0
+        total_annual_usage = 0.0
+        recent_30d = 0
+        stage_breakdown = {}
+
+        for r in rows:
+            stage_name = r.get('stage_name') or 'Unknown'
+            bucket = _lead_stage_bucket(stage_name)
+            if bucket == "converted":
+                converted_leads += 1
+            elif bucket == "in_progress":
+                in_progress += 1
+            elif bucket == "lost":
+                lost_leads += 1
+            else:
+                new_leads += 1
+
+            stage_breakdown[stage_name] = stage_breakdown.get(stage_name, 0) + 1
+            total_annual_usage += _safe_float(r.get('annual_usage'))
+
+            created_at = r.get('created_at')
+            if created_at and hasattr(created_at, 'date') and created_at.date() >= last_30:
+                recent_30d += 1
+
+            end_date = r.get('end_date')
+            if end_date:
+                d = end_date if not hasattr(end_date, 'date') else end_date.date()
+                days = (d - today).days
+                if 30 <= days <= 60:
+                    leads_30_60 += 1
+                elif 61 <= days <= 90:
+                    leads_61_90 += 1
+                elif 91 <= days <= 180:
+                    leads_91_180 += 1
+                elif days >= 365:
+                    not_due += 1
+
+        total_leads = len(rows)
+        active_leads = max(0, total_leads - lost_leads)
+        conversion_rate = round((converted_leads / total_leads) * 100, 1) if total_leads else 0
+
+        return jsonify({
+            'total_leads': total_leads,
+            'active_leads': active_leads,
+            'converted_leads': converted_leads,
+            'new_leads': new_leads,
+            'in_progress': in_progress,
+            'lost_leads': lost_leads,
+            'conversion_rate': conversion_rate,
+            'total_value': 0,
+            'recent_leads_30d': recent_30d,
+            'allocated_leads': 0,
+            'unallocated_leads': total_leads,
+            'stage_breakdown': stage_breakdown,
+            'leads_30_60_days': leads_30_60,
+            'leads_61_90_days': leads_61_90,
+            'leads_91_180_days': leads_91_180,
+            'not_due_leads': not_due,
+            'total_annual_usage': total_annual_usage,
+        }), 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@crm_bp.route('/leads/stage-breakdown', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_leads_stage_breakdown():
+    from backend.crm.supabase_client import get_supabase_client
+    try:
+        tenant_id = g.tenant_id
+        service_param = request.args.get('service', 'utilities')
+        service_id = 2 if service_param.strip().lower() == 'water' else 1
+        current_user = request.current_user
+        admin_user = is_crm_leads_admin_role(getattr(current_user, 'role', None))
+        employee_id = request.args.get('employee_id', type=int) if admin_user else getattr(current_user, 'employee_id', None)
+
+        if local_demo_dashboard_enabled():
+            return jsonify(dummy_leads_stage_breakdown(employee_id)), 200
+
+        db = get_supabase_client()
+        sql = '''
+            SELECT COALESCE(sm."stage_name", 'Unknown') AS stage_name, COUNT(od."opportunity_id")::bigint AS count
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
+            WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
+              AND od."service_id" = %s
+              AND NOT EXISTS (SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd WHERE pd."opportunity_id" = od."opportunity_id")
+              {employee_filter}
+            GROUP BY COALESCE(sm."stage_name", 'Unknown')
+            ORDER BY count DESC
+        '''
+        params = [tenant_id, tenant_id, service_id]
+        if employee_id:
+            sql = sql.format(employee_filter=' AND od."opportunity_owner_employee_id" = %s')
+            params.append(employee_id)
+        else:
+            sql = sql.format(employee_filter='')
+        rows = db.execute_query(sql, tuple(params)) or []
+        return jsonify([
+            {'stage_id': i + 1, 'stage_name': r.get('stage_name') or 'Unknown', 'count': int(r.get('count') or 0), 'total_value': 0}
+            for i, r in enumerate(rows)
+        ]), 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@crm_bp.route('/leads/supplier-breakdown', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_leads_supplier_breakdown():
+    from backend.crm.supabase_client import get_supabase_client
+    try:
+        tenant_id = g.tenant_id
+        service_param = request.args.get('service', 'utilities')
+        service_id = 2 if service_param.strip().lower() == 'water' else 1
+        current_user = request.current_user
+        admin_user = is_crm_leads_admin_role(getattr(current_user, 'role', None))
+        employee_id = request.args.get('employee_id', type=int) if admin_user else getattr(current_user, 'employee_id', None)
+
+        if local_demo_dashboard_enabled():
+            return jsonify(dummy_leads_supplier_breakdown(employee_id)), 200
+
+        db = get_supabase_client()
+        sql = '''
+            SELECT COALESCE(sup."supplier_company_name", 'Unknown') AS supplier_name, COUNT(od."opportunity_id")::bigint AS lead_count
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id" = sup."supplier_id"
+            WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
+              AND od."service_id" = %s
+              AND NOT EXISTS (SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd WHERE pd."opportunity_id" = od."opportunity_id")
+              {employee_filter}
+            GROUP BY COALESCE(sup."supplier_company_name", 'Unknown')
+            ORDER BY lead_count DESC
+        '''
+        params = [tenant_id, tenant_id, service_id]
+        if employee_id:
+            sql = sql.format(employee_filter=' AND od."opportunity_owner_employee_id" = %s')
+            params.append(employee_id)
+        else:
+            sql = sql.format(employee_filter='')
+        rows = db.execute_query(sql, tuple(params)) or []
+        return jsonify([
+            {'supplier_name': r.get('supplier_name') or 'Unknown', 'lead_count': int(r.get('lead_count') or 0), 'total_value': 0}
+            for r in rows
+        ]), 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@crm_bp.route('/leads/salesperson-breakdown', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_leads_salesperson_breakdown():
+    from backend.crm.supabase_client import get_supabase_client
+    try:
+        tenant_id = g.tenant_id
+        service_param = request.args.get('service', 'utilities')
+        service_id = 2 if service_param.strip().lower() == 'water' else 1
+        current_user = request.current_user
+        admin_user = is_crm_leads_admin_role(getattr(current_user, 'role', None))
+        if not admin_user:
+            return jsonify([]), 200
+        if local_demo_dashboard_enabled():
+            return jsonify(dummy_leads_salesperson_breakdown()), 200
+        db = get_supabase_client()
+        rows = db.execute_query('''
+            SELECT em."employee_id", em."employee_name", COALESCE(sm."stage_name", 'Unknown') AS stage_name, COUNT(od."opportunity_id")::bigint AS cnt
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
+            JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
+            WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
+              AND od."service_id" = %s
+              AND NOT EXISTS (SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd WHERE pd."opportunity_id" = od."opportunity_id")
+            GROUP BY em."employee_id", em."employee_name", COALESCE(sm."stage_name", 'Unknown')
+            ORDER BY em."employee_name" ASC
+        ''', (tenant_id, tenant_id, service_id)) or []
+
+        grouped = {}
+        for r in rows:
+            eid = r.get('employee_id')
+            if eid not in grouped:
+                grouped[eid] = {
+                    'employee_id': eid,
+                    'employee_name': r.get('employee_name') or 'Unknown',
+                    'total_leads': 0,
+                    'converted_count': 0,
+                    'in_progress_count': 0,
+                    'not_contacted_count': 0,
+                    'lost_count': 0,
+                    'conversion_rate': 0,
+                    'total_value': 0,
+                }
+            c = int(r.get('cnt') or 0)
+            grouped[eid]['total_leads'] += c
+            bucket = _lead_stage_bucket(r.get('stage_name') or '')
+            if bucket == "converted":
+                grouped[eid]['converted_count'] += c
+            elif bucket == "in_progress":
+                grouped[eid]['in_progress_count'] += c
+            elif bucket == "lost":
+                grouped[eid]['lost_count'] += c
+            else:
+                grouped[eid]['not_contacted_count'] += c
+
+        out = []
+        for v in grouped.values():
+            total = v['total_leads'] or 0
+            v['conversion_rate'] = round((v['converted_count'] / total) * 100, 1) if total else 0
+            out.append(v)
+        out.sort(key=lambda x: x['total_leads'], reverse=True)
+        return jsonify(out), 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@crm_bp.route('/leads/by-stage', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_leads_by_stage():
+    from backend.crm.supabase_client import get_supabase_client
+    try:
+        tenant_id = g.tenant_id
+        stage = (request.args.get('stage') or '').strip().lower()
+        service_param = request.args.get('service', 'utilities')
+        service_id = 2 if service_param.strip().lower() == 'water' else 1
+        current_user = request.current_user
+        admin_user = is_crm_leads_admin_role(getattr(current_user, 'role', None))
+        employee_id = request.args.get('employee_id', type=int) if admin_user else getattr(current_user, 'employee_id', None)
+
+        if local_demo_dashboard_enabled():
+            return jsonify(dummy_leads_by_stage(stage, employee_id)), 200
+
+        db = get_supabase_client()
+
+        stage_filter_sql = ''
+        stage_params = []
+        if stage == 'in_progress':
+            stage_filter_sql = " AND LOWER(COALESCE(sm.\"stage_name\", '')) IN ('callback','not answered','broker in place','email only','complaint','incorrect supplier','priced','end date changed')"
+        elif stage == 'lost':
+            stage_filter_sql = " AND LOWER(COALESCE(sm.\"stage_name\", '')) IN ('lost','lost cot','invalid number','meter de-energised')"
+        elif stage:
+            stage_filter_sql = " AND LOWER(COALESCE(sm.\"stage_name\", '')) = %s"
+            stage_params.append(stage)
+
+        sql = f'''
+            SELECT
+                od."opportunity_id",
+                COALESCE(od."business_name", od."opportunity_title") AS business_name,
+                od."contact_person",
+                od."tel_number",
+                od."email",
+                COALESCE(sm."stage_name", 'Unknown') AS stage_name,
+                COALESCE(em."employee_name", 'Unassigned') AS assigned_to_name,
+                od."opportunity_owner_employee_id" AS assigned_to_id,
+                od."created_at",
+                od."annual_usage",
+                CASE WHEN od."service_id" = 2 THEN 'water' ELSE 'utilities' END AS service_name,
+                od."end_date"
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
+            WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
+              AND od."service_id" = %s
+              AND NOT EXISTS (SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd WHERE pd."opportunity_id" = od."opportunity_id")
+              {employee_filter}
+              {stage_filter_sql}
+            ORDER BY od."created_at" DESC
+        '''
+        params = [tenant_id, tenant_id, service_id]
+        if employee_id:
+            sql = sql.format(employee_filter=' AND od."opportunity_owner_employee_id" = %s')
+            params.append(employee_id)
+        else:
+            sql = sql.format(employee_filter='')
+        params.extend(stage_params)
+        rows = db.execute_query(sql, tuple(params)) or []
+
+        today = datetime.utcnow().date()
+        leads = []
+        for r in rows:
+            end_date = r.get('end_date')
+            end_d = end_date.date() if hasattr(end_date, 'date') else end_date
+            days = (end_d - today).days if end_d else None
+            leads.append({
+                'opportunity_id': r.get('opportunity_id'),
+                'business_name': r.get('business_name'),
+                'contact_person': r.get('contact_person'),
+                'tel_number': str(r.get('tel_number') or ''),
+                'email': r.get('email'),
+                'stage_name': r.get('stage_name') or 'Unknown',
+                'opportunity_value': 0,
+                'assigned_to_name': r.get('assigned_to_name') or 'Unassigned',
+                'assigned_to_id': r.get('assigned_to_id'),
+                'created_at': r.get('created_at').isoformat() if r.get('created_at') and hasattr(r.get('created_at'), 'isoformat') else None,
+                'annual_usage': _safe_float(r.get('annual_usage')),
+                'service_name': r.get('service_name') or 'utilities',
+                'end_date': end_d.isoformat() if end_d and hasattr(end_d, 'isoformat') else None,
+                'days_until_due': days,
+            })
+        return jsonify({'leads': leads}), 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@crm_bp.route('/leads/period-breakdown', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_leads_period_breakdown():
+    from backend.crm.supabase_client import get_supabase_client
+    try:
+        tenant_id = g.tenant_id
+        period = (request.args.get('period') or '').strip().lower()
+        service_param = request.args.get('service', 'utilities')
+        service_id = 2 if service_param.strip().lower() == 'water' else 1
+        current_user = request.current_user
+        admin_user = is_crm_leads_admin_role(getattr(current_user, 'role', None))
+        employee_id = request.args.get('employee_id', type=int) if admin_user else getattr(current_user, 'employee_id', None)
+
+        if local_demo_dashboard_enabled():
+            return jsonify(dummy_leads_period_breakdown(period, employee_id)), 200
+
+        db = get_supabase_client()
+
+        sql = '''
+            SELECT
+                od."opportunity_id",
+                COALESCE(od."business_name", od."opportunity_title") AS business_name,
+                od."contact_person",
+                od."tel_number",
+                od."email",
+                COALESCE(sm."stage_name", 'Unknown') AS stage_name,
+                COALESCE(em."employee_name", 'Unassigned') AS assigned_to_name,
+                od."opportunity_owner_employee_id" AS assigned_to_id,
+                od."created_at",
+                od."annual_usage",
+                od."end_date",
+                CASE WHEN od."service_id" = 2 THEN 'water' ELSE 'utilities' END AS service_name
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
+            WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
+              AND od."service_id" = %s
+              AND NOT EXISTS (SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd WHERE pd."opportunity_id" = od."opportunity_id")
+              {employee_filter}
+            ORDER BY od."created_at" DESC
+        '''
+        params = [tenant_id, tenant_id, service_id]
+        if employee_id:
+            sql = sql.format(employee_filter=' AND od."opportunity_owner_employee_id" = %s')
+            params.append(employee_id)
+        else:
+            sql = sql.format(employee_filter='')
+        rows = db.execute_query(sql, tuple(params)) or []
+
+        today = datetime.utcnow().date()
+        leads = []
+        for r in rows:
+            end_date = r.get('end_date')
+            end_d = end_date.date() if hasattr(end_date, 'date') else end_date
+            days = (end_d - today).days if end_d else None
+
+            include = False
+            if period == '30-60':
+                include = days is not None and 30 <= days <= 60
+            elif period == '61-90':
+                include = days is not None and 61 <= days <= 90
+            elif period == '91-180':
+                include = days is not None and 91 <= days <= 180
+            elif period == 'not-due':
+                include = days is not None and days >= 365
+            else:
+                include = True
+
+            if not include:
+                continue
+
+            leads.append({
+                'opportunity_id': r.get('opportunity_id'),
+                'business_name': r.get('business_name'),
+                'contact_person': r.get('contact_person'),
+                'tel_number': str(r.get('tel_number') or ''),
+                'email': r.get('email'),
+                'stage_name': r.get('stage_name') or 'Unknown',
+                'opportunity_value': 0,
+                'assigned_to_name': r.get('assigned_to_name') or 'Unassigned',
+                'assigned_to_id': r.get('assigned_to_id'),
+                'created_at': r.get('created_at').isoformat() if r.get('created_at') and hasattr(r.get('created_at'), 'isoformat') else None,
+                'annual_usage': _safe_float(r.get('annual_usage')),
+                'service_name': r.get('service_name') or 'utilities',
+                'end_date': end_d.isoformat() if end_d and hasattr(end_d, 'isoformat') else None,
+                'days_until_due': days,
+            })
+
+        return jsonify({'period': period, 'leads': leads}), 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 @crm_bp.route('/leads/performance', methods=['GET'])
 @token_required
 @tenant_from_jwt
@@ -717,7 +1277,180 @@ def get_leads_performance():
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
- 
+
+@crm_bp.route('/leads/staff-performance', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_leads_staff_performance():
+    """
+    GET /api/crm/leads/staff-performance
+    Team performance split by employee with period-aware goals.
+    Goals:
+      - standard staff: 100 leads/day
+      - offshore role_id=5: 180 leads/day
+    Query params:
+      - period: daily|weekly|monthly
+      - service: utilities|water
+      - employee_id: optional (admins only)
+    """
+    from backend.crm.supabase_client import get_supabase_client
+
+    try:
+        tenant_id = g.tenant_id
+        service_param = request.args.get('service', 'utilities')
+        service_id = 2 if service_param.strip().lower() == 'water' else 1
+        period, start_dt, end_dt, goal_multiplier = _staff_period_bounds(request.args.get('period', 'daily'))
+
+        current_user = request.current_user
+        role_name = getattr(current_user, 'role', None)
+        admin_user = is_crm_leads_admin_role(role_name)
+        my_emp_id = getattr(current_user, 'employee_id', None)
+        only_employee_id = request.args.get('employee_id', type=int)
+
+        if not admin_user:
+            if my_emp_id is None:
+                return jsonify([]), 200
+            only_employee_id = my_emp_id
+
+        if local_demo_dashboard_enabled():
+            return jsonify(dummy_leads_staff_performance(period, only_employee_id)), 200
+
+        db = get_supabase_client()
+        ts_expr = _resolve_opportunity_ts_expr(db)
+
+        base_sql = f'''
+            SELECT
+                em."employee_id",
+                em."employee_name",
+                COALESCE(sm."stage_name", 'Unknown') AS stage_name,
+                COUNT(od."opportunity_id")::bigint AS cnt,
+                CASE
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM "StreemLyne_MT"."User_Master" um
+                        INNER JOIN "StreemLyne_MT"."User_Role_Mapping" urm
+                            ON urm."user_id" = um."user_id"
+                        WHERE um."employee_id" = em."employee_id"
+                          AND urm."role_id" = {OFFSHORE_ROLE_ID}
+                    ) THEN 1 ELSE 0
+                END AS is_offshore
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm
+                ON od."client_id" = cm."client_id"
+            JOIN "StreemLyne_MT"."Employee_Master" em
+                ON od."opportunity_owner_employee_id" = em."employee_id"
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm
+                ON od."stage_id" = sm."stage_id"
+            WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
+              AND em."tenant_id" = %s
+              AND od."service_id" = %s
+              AND od."opportunity_owner_employee_id" IS NOT NULL
+              AND {ts_expr} >= %s
+              AND {ts_expr} < %s
+              AND NOT EXISTS (
+                SELECT 1
+                FROM "StreemLyne_MT"."Project_Details" pd
+                WHERE pd."opportunity_id" = od."opportunity_id"
+              )
+              {{employee_filter}}
+            GROUP BY em."employee_id", em."employee_name", COALESCE(sm."stage_name", 'Unknown'), is_offshore
+            ORDER BY em."employee_name" ASC
+        '''
+        params = [tenant_id, tenant_id, tenant_id, service_id, start_dt, end_dt]
+        if only_employee_id:
+            sql = base_sql.format(employee_filter=' AND od."opportunity_owner_employee_id" = %s')
+            params.append(only_employee_id)
+        else:
+            sql = base_sql.format(employee_filter='')
+
+        rows = db.execute_query(sql, tuple(params))
+
+        employees = {}
+        for r in (rows or []):
+            eid = r.get('employee_id')
+            if eid is None:
+                continue
+
+            if eid not in employees:
+                employees[eid] = {
+                    'employee_id': eid,
+                    'employee_name': r.get('employee_name') or 'Unknown',
+                    'role_id': OFFSHORE_ROLE_ID if int(r.get('is_offshore') or 0) == 1 else None,
+                    'converted_count': 0,
+                    'in_progress_count': 0,
+                    'not_contacted_count': 0,
+                    'lost_count': 0,
+                    'renewed_count': 0,
+                    'renewed_directly_count': 0,
+                    'end_date_changed_count': 0,
+                    'priced_count': 0,
+                    'total_contacts': 0,
+                }
+
+            stage = str((r or {}).get('stage_name') or '').strip().lower()
+            count = int((r or {}).get('cnt') or 0)
+            employees[eid]['total_contacts'] += count
+
+            if stage == 'converted':
+                employees[eid]['converted_count'] += count
+            elif stage in ('already renewed', 'renewed'):
+                employees[eid]['converted_count'] += count
+                employees[eid]['renewed_count'] += count
+            elif stage == 'renewed directly':
+                employees[eid]['converted_count'] += count
+                employees[eid]['renewed_directly_count'] += count
+            elif stage == 'end date changed':
+                employees[eid]['end_date_changed_count'] += count
+            elif stage == 'priced':
+                employees[eid]['priced_count'] += count
+                employees[eid]['in_progress_count'] += count
+            elif stage in ('callback', 'not answered', 'broker in place', 'email only', 'complaint', 'incorrect supplier'):
+                employees[eid]['in_progress_count'] += count
+            elif stage in ('lost', 'lost cot', 'invalid number', 'meter de-energised'):
+                employees[eid]['lost_count'] += count
+            else:
+                employees[eid]['not_contacted_count'] += count
+
+        output = []
+        for emp in employees.values():
+            total = emp['total_contacts'] or 0
+            converted = emp['converted_count'] or 0
+            conversion_rate = round((converted / total) * 100) if total > 0 else 0
+            daily_target = 180 if emp.get('role_id') == OFFSHORE_ROLE_ID else 100
+            goal_target = daily_target * goal_multiplier
+            goal_achieved = total
+            goal_progress_pct = round((goal_achieved / goal_target) * 100, 1) if goal_target > 0 else 0
+
+            output.append({
+                'employee_id': emp['employee_id'],
+                'employee_name': emp['employee_name'],
+                'role_id': emp.get('role_id'),
+                'total_contacts': total,
+                'converted_count': converted,
+                'renewed_count': converted,
+                'in_progress_count': emp['in_progress_count'],
+                'not_contacted_count': emp['not_contacted_count'],
+                'lost_count': emp['lost_count'],
+                'renewed_directly_count': emp['renewed_directly_count'],
+                'end_date_changed_count': emp['end_date_changed_count'],
+                'priced_count': emp['priced_count'],
+                'conversion_rate': conversion_rate,
+                'goal_target': goal_target,
+                'goal_achieved': goal_achieved,
+                'goal_progress_pct': min(100, max(0, goal_progress_pct)),
+                'goal_hit': goal_achieved >= goal_target,
+                'period': period,
+            })
+
+        output.sort(key=lambda x: x['employee_name'].lower())
+        return jsonify(output), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 @crm_bp.route('/leads/stats-by-employee', methods=['GET'])
 @token_required
 @tenant_from_jwt

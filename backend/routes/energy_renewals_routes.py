@@ -30,6 +30,50 @@ def _misc_col2_sql_float():
     trimmed = func.replace(func.trim(cast(Project_Details.Misc_Col2, String)), ",", "")
     return cast(func.nullif(trimmed, ""), Float)
 
+
+def _period_bounds(period: str):
+    now = datetime.now()
+    key = (period or "daily").strip().lower()
+    if key == "weekly":
+        start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=7)
+        multiplier = 7
+    elif key == "monthly":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if start.month == 12:
+            end = start.replace(year=start.year + 1, month=1)
+        else:
+            end = start.replace(month=start.month + 1)
+        multiplier = 30
+    else:
+        key = "daily"
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        multiplier = 1
+    return key, start, end, multiplier
+
+
+def _resolve_project_timestamp_expr(session):
+    """Pick the best timestamp column available in Project_Details for period filters."""
+    rows = session.execute(
+        text(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'StreemLyne_MT'
+              AND table_name = 'Project_Details'
+            """
+        )
+    ).fetchall()
+    columns = {r[0] for r in rows}
+    if "updated_at" in columns:
+        return 'pd."updated_at"'
+    if "modified_at" in columns:
+        return 'pd."modified_at"'
+    if "created_at" in columns:
+        return 'pd."created_at"'
+    return "NOW()"
+
 @renewals_bp.route("/energy-renewals", methods=["GET"])
 @token_required
 def get_renewals():
@@ -818,7 +862,8 @@ def get_renewal_performance():
 @token_required
 def get_staff_status_counts():
     if local_demo_dashboard_enabled():
-        return jsonify(dummy_staff_status_counts()), 200
+        period = request.args.get('period', 'daily')
+        return jsonify(dummy_staff_status_counts(period)), 200
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
@@ -826,9 +871,11 @@ def get_staff_status_counts():
             return jsonify({'error': 'Tenant not found'}), 400
 
         employee_id = request.args.get('employee_id', type=int)
+        period, start_dt, end_dt, goal_multiplier = _period_bounds(request.args.get('period', 'daily'))
+        ts_expr = _resolve_project_timestamp_expr(session)
 
         # Exclude offshore / leads-only users (CRM role_id 5) from renewals team performance
-        base_sql = """
+        base_sql = f"""
             SELECT
                 em.employee_id,
                 em.employee_name,
@@ -843,6 +890,8 @@ def get_staff_status_counts():
                 ON pd.project_id = ecm.project_id
             WHERE cm.tenant_id = :tenant_id
             AND em.tenant_id = :tenant_id
+            AND {ts_expr} >= :start_dt
+            AND {ts_expr} < :end_dt
             AND NOT EXISTS (
                 SELECT 1
                 FROM "StreemLyne_MT"."User_Master" um_r5
@@ -856,7 +905,11 @@ def get_staff_status_counts():
             ORDER BY em.employee_name
         """
 
-        params = {"tenant_id": tenant_id}
+        params = {
+            "tenant_id": tenant_id,
+            "start_dt": start_dt,
+            "end_dt": end_dt,
+        }
         if employee_id:
             sql = base_sql.format(employee_filter="AND em.employee_id = :employee_id")
             params["employee_id"] = employee_id
@@ -908,11 +961,15 @@ def get_staff_status_counts():
         for emp in employees.values():
             total = emp['total'] or 1
             rate = round((emp['renewed'] / total) * 100)
+            goal_target = 25 * goal_multiplier
+            goal_achieved = emp['renewed']
+            goal_progress_pct = round((goal_achieved / goal_target) * 100, 1) if goal_target > 0 else 0
             output.append({
                 'employee_id': emp['employee_id'],
                 'employee_name': emp['employee_name'],
                 'total_contacts': emp['total'],
                 'renewed_count': emp['renewed'],
+                'converted_count': emp['renewed'],
                 'in_progress_count': emp['in_progress'],
                 'not_contacted_count': emp['not_contacted'],
                 'lost_count': emp['lost'],
@@ -920,6 +977,11 @@ def get_staff_status_counts():
                 'end_date_changed_count': emp['end_date_changed'],
                 'priced_count': emp['priced'],
                 'conversion_rate': rate,
+                'goal_target': goal_target,
+                'goal_achieved': goal_achieved,
+                'goal_progress_pct': min(100, max(0, goal_progress_pct)),
+                'goal_hit': goal_achieved >= goal_target,
+                'period': period,
             })
 
         return jsonify(output), 200
