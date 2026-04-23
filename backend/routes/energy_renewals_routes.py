@@ -216,6 +216,7 @@ def get_renewal_stats():
         total_renewals_61_90_days = 0
         total_renewals_90_plus_days = 0
         expired_contracts = 0
+        not_due_contracts = 0
         total_revenue_at_risk = 0
         total_aq = 0
         contacted_count = 0
@@ -242,6 +243,8 @@ def get_renewal_stats():
                 total_renewals_61_90_days += 1
             elif 91 <= days_until_renewal <= 180:
                 total_renewals_90_plus_days += 1
+            elif days_until_renewal >= 365:
+                not_due_contracts += 1
 
             ur = safe_float(contract.unit_rate)
             if ur and aq:
@@ -269,6 +272,7 @@ def get_renewal_stats():
             'total_renewals_61_90_days': total_renewals_61_90_days,
             'total_renewals_90_plus_days': total_renewals_90_plus_days,
             'expired_contracts': expired_contracts,
+            'not_due_contracts': not_due_contracts,
             'total_revenue_at_risk': total_revenue_at_risk,
             'total_aq': total_aq,
             'contacted_count': contacted_count,
@@ -394,6 +398,9 @@ def get_period_breakdown():
         elif period == '91-180':
             start_date = today + timedelta(days=91)
             end_date = today + timedelta(days=180)
+        elif period == 'not-due':
+            start_date = today + timedelta(days=365)
+            end_date = today + timedelta(days=365 * 20)
         else:
             return jsonify({'error': 'Invalid period parameter'}), 400
 

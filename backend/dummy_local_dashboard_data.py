@@ -81,6 +81,7 @@ def dummy_renewal_stats() -> dict[str, Any]:
         "total_renewals_61_90_days": 80,
         "total_renewals_90_plus_days": 184,
         "expired_contracts": 14,
+        "not_due_contracts": 1267,
         "total_revenue_at_risk": 52072000,
         "total_aq": 125000000,
         "contacted_count": 293,
@@ -180,6 +181,26 @@ def dummy_period_breakdown(period: str | None) -> dict[str, Any]:
                 "mpan_number": "0090102345678901",
                 "annual_usage": 67000.0,
                 "estimated_revenue": 18900.0,
+                "assigned_to": "Jordan Lee",
+                "status": "Pending",
+            }
+        ]
+    elif period == "not-due":
+        start_date = today + timedelta(days=365)
+        end_date = today + timedelta(days=365 * 20)
+        renewals = [
+            {
+                "client_id": 9301,
+                "business_name": "Long Term Holdings Ltd",
+                "contact_person": "Jamie Long",
+                "phone": "07123000001",
+                "email": "jamie@longterm.test",
+                "supplier_name": "EDF Energy",
+                "contract_end_date": _iso(today + timedelta(days=420)),
+                "days_until_expiry": 420,
+                "mpan_number": "0093012345678901",
+                "annual_usage": 48000.0,
+                "estimated_revenue": 10080.0,
                 "assigned_to": "Jordan Lee",
                 "status": "Pending",
             }
