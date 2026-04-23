@@ -166,7 +166,15 @@ def get_leads():
 
         db = get_supabase_client()
 
-        query = '''
+        project_exclusion_sql = '''
+            AND NOT EXISTS (
+                SELECT 1
+                FROM "StreemLyne_MT"."Project_Details" pd
+                WHERE pd."opportunity_id" = od."opportunity_id"
+            )
+        '''
+
+        query = f'''
             SELECT
                 od."opportunity_id",
                 od."tenant_lead_id",
@@ -204,11 +212,7 @@ def get_leads():
                 ON od."client_id" = cm."client_id"
             WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
             AND od."service_id" = %s
-            AND NOT EXISTS (
-                SELECT 1
-                FROM "StreemLyne_MT"."Project_Details" pd
-                WHERE pd."opportunity_id" = od."opportunity_id"
-            )
+            {project_exclusion_sql}
         '''
         params = [tenant_id, tenant_id, service_id]
 
@@ -226,6 +230,19 @@ def get_leads():
         query += ' ORDER BY od."created_at" DESC'
 
         rows = db.execute_query(query, tuple(params))
+
+        # Fallback: some tenants have Project_Details rows for all opportunities,
+        # which makes the strict exclusion return zero leads.
+        if not (rows or []):
+            fallback_query = query.replace(project_exclusion_sql, "")
+            rows = db.execute_query(fallback_query, tuple(params))
+            current_app.logger.warning(
+                'crm.get_leads fallback_without_project_exclusion tenant=%s service_id=%s is_admin=%s rows=%s',
+                tenant_id,
+                service_id,
+                admin_user,
+                len(rows or []),
+            )
 
         if admin_user and not (rows or []):
             try:
