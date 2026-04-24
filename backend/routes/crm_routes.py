@@ -1172,7 +1172,6 @@ def leads_callback(opportunity_id):
                 'stage_id': stage_id or 16
             })
             
-            # ✅ LOG HISTORY FOR CONVERTED
             log_interaction(
                 'Converted',
                 f'[Converted] {notes}' if notes else '[Converted] Lead marked as converted',
@@ -1203,7 +1202,6 @@ def leads_callback(opportunity_id):
                 'WHERE opportunity_id = :id AND tenant_id = :t'
             ), {'s': stage_id, 'id': real_id, 't': tenant_id})
             
-            # ✅ LOG HISTORY FOR DELETED RECORDS
             formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
             log_interaction(
                 status,
@@ -1225,7 +1223,6 @@ def leads_callback(opportunity_id):
                 'WHERE opportunity_id = :id AND tenant_id = :t'
             ), {'s': stage_id or 4, 'id': real_id, 't': tenant_id})
             
-            # ✅ LOG HISTORY FOR PRICED
             log_interaction(
                 'Priced',
                 f'[Priced] {notes}' if notes else '[Priced] Moved to priced page',
@@ -1236,7 +1233,7 @@ def leads_callback(opportunity_id):
             return jsonify({'success': True, 'moved_to_priced': True}), 200
 
         # ──────────────────────────────────────────────────────────────────
-        # Handle "End Date Changed" and "Already Renewed"
+        # ✅ Handle "End Date Changed" and "Already Renewed" - UPDATE end_date
         # ──────────────────────────────────────────────────────────────────
         new_end = data.get('new_end_date')
         if new_end and status in ('End Date Changed', 'Already Renewed'):
@@ -1244,6 +1241,14 @@ def leads_callback(opportunity_id):
                 'UPDATE "StreemLyne_MT"."Opportunity_Details" SET end_date = :d '
                 'WHERE opportunity_id = :id AND tenant_id = :t'
             ), {'d': new_end, 'id': real_id, 't': tenant_id})
+            
+            # ✅ Log the end date change
+            log_lead_field_change(session, real_id, 'Contract End', 
+                                  session.execute(text(
+                                      'SELECT end_date FROM "StreemLyne_MT"."Opportunity_Details" '
+                                      'WHERE opportunity_id = :id'
+                                  ), {'id': real_id}).scalar(), 
+                                  new_end, tenant_id)
 
         new_supplier = (data.get('new_supplier') or '').strip()
         if new_supplier:
@@ -1278,7 +1283,27 @@ def leads_callback(opportunity_id):
         )
 
         session.commit()
-        return jsonify({'success': True, 'message': 'Callback saved successfully', 'status': status}), 200
+        
+        # ✅ CRITICAL FIX: Return the updated lead data
+        updated_lead = session.execute(text("""
+            SELECT od.*, sm.stage_name,
+                   em.employee_name AS assigned_to_name,
+                   COALESCE(od.business_name, od.opportunity_title) AS business_name,
+                   sup.supplier_company_name AS supplier_name
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od.stage_id   = sm.stage_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od.opportunity_owner_employee_id = em.employee_id
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od.supplier_id = sup.supplier_id
+            WHERE od.opportunity_id = :id AND od.tenant_id = :t
+            LIMIT 1
+        """), {'id': real_id, 't': tenant_id}).mappings().first()
+        
+        return jsonify({
+            'success': True, 
+            'message': 'Callback saved successfully', 
+            'status': status,
+            'lead': {k: _serial(v) for k, v in dict(updated_lead).items()} if updated_lead else None
+        }), 200
 
     except Exception as e:
         session.rollback()

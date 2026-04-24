@@ -279,7 +279,7 @@ class CRMController:
             if not user:
                 return jsonify({'success': False, 'error': 'Authentication required'}), 401
 
-            tenant_id = g.tenant_id
+            tenant_id = str(g.tenant_id)  # ✅ CRITICAL FIX: Cast to string
             payload = request.get_json()
             if not payload:
                 return jsonify({'success': False, 'error': 'Request body required'}), 400
@@ -308,16 +308,54 @@ class CRMController:
                         SELECT opportunity_owner_employee_id 
                         FROM "StreemLyne_MT"."Opportunity_Details"
                         WHERE opportunity_id = :id AND tenant_id = :tid
-                    """), {'id': lead_id, 'tid': tenant_id}).fetchone()
+                    """), {'id': lead_id, 'tid': tenant_id}).fetchone()  # ✅ tid is now a string
                     
                     if result and result[0]:
                         old_employee_ids.add(result[0])
                 
-                # Perform the assignment using the service
-                result = self.crm_service.assign_leads(tenant_id, lead_ids, employee_id)
-                
-                if not result.get('success'):
-                    return jsonify(result), 400
+                # ✅ PERFORM THE ASSIGNMENT DIRECTLY (bypass service layer to avoid type issues)
+                for lead_id in lead_ids:
+                    # Update assignment
+                    session.execute(text("""
+                        UPDATE "StreemLyne_MT"."Opportunity_Details"
+                        SET opportunity_owner_employee_id = :emp_id,
+                            is_allocated = CASE 
+                                WHEN :emp_id IS NOT NULL THEN TRUE 
+                                ELSE FALSE 
+                            END
+                        WHERE opportunity_id = :id AND tenant_id = :tid
+                    """), {'emp_id': employee_id, 'id': lead_id, 'tid': tenant_id})
+                    
+                    # ✅ Log assignment in history
+                    if assignment_notes:
+                        from backend.routes.crm_routes import ensure_lead_client_id
+                        from backend.models import Client_Interactions
+                        from datetime import datetime
+                        
+                        try:
+                            client_id = ensure_lead_client_id(session, lead_id, tenant_id)
+                            
+                            # Get employee name
+                            employee_name = "Unassigned"
+                            if employee_id:
+                                emp = session.execute(text("""
+                                    SELECT employee_name FROM "StreemLyne_MT"."Employee_Master"
+                                    WHERE employee_id = :id
+                                """), {'id': employee_id}).mappings().first()
+                                if emp:
+                                    employee_name = emp['employee_name']
+                            
+                            interaction = Client_Interactions(
+                                client_id=client_id,
+                                contact_date=datetime.utcnow().date(),
+                                contact_method=1,
+                                notes=f"[Assignment] Assigned to {employee_name}: {assignment_notes}",
+                                next_steps='Assignment',
+                                created_at=datetime.utcnow()
+                            )
+                            session.add(interaction)
+                        except Exception as e:
+                            logger.error(f'❌ Error logging assignment history: {e}')
                 
                 # ✅ Recalculate display_order for all affected employees
                 from backend.routes.crm_routes import recalculate_lead_display_order
@@ -337,13 +375,15 @@ class CRMController:
                 
                 return jsonify({
                     'success': True,
-                    'assigned_count': result.get('updated', 0),
-                    'message': f"Assigned {result.get('updated', 0)} lead(s) successfully"
+                    'assigned_count': len(lead_ids),
+                    'message': f"Assigned {len(lead_ids)} lead(s) successfully"
                 }), 200
                 
             except Exception as e:
                 session.rollback()
                 logger.error(f"❌ Error in assign_leads: {e}")
+                import traceback
+                traceback.print_exc()
                 raise
             finally:
                 session.close()
