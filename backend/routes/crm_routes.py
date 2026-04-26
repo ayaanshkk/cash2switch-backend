@@ -6,6 +6,7 @@ Defines API endpoints for CRM module
 from flask import Blueprint, request, g, jsonify, current_app
 from functools import wraps
 from datetime import datetime, timedelta
+import re
 from backend.crm.controllers.crm_controller import CRMController
 from backend.crm.middleware.tenant_middleware import require_tenant
 from backend.crm.utils.role_helpers import is_crm_leads_admin_role
@@ -413,6 +414,138 @@ def get_lead_detail(opportunity_id):
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
+
+
+def _resolve_lead_client_id(db, tenant_id, opportunity_id):
+    """Resolve lead by tenant_lead_id or opportunity_id; return (real_opportunity_id, client_id) or (None, None)."""
+    lead = db.execute_query(
+        '''
+        SELECT opportunity_id, client_id
+        FROM "StreemLyne_MT"."Opportunity_Details"
+        WHERE tenant_id = %s
+          AND ("tenant_lead_id" = %s OR opportunity_id = %s)
+        LIMIT 1
+        ''',
+        (tenant_id, opportunity_id, opportunity_id),
+        fetch_one=True,
+    )
+    if not lead:
+        return None, None
+    return lead.get('opportunity_id'), lead.get('client_id')
+
+
+@crm_bp.route('/leads/<int:opportunity_id>/history', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_lead_history(opportunity_id):
+    """
+    GET /api/crm/leads/<id>/history
+    Returns Client_Interactions for the lead's client (same id resolution as lead detail).
+    Response: { "interactions": [ { interaction_id, interaction_type, notes, ... } ] }
+    """
+    from backend.crm.supabase_client import get_supabase_client
+
+    try:
+        tenant_id = g.tenant_id
+        db = get_supabase_client()
+        _real_id, client_id = _resolve_lead_client_id(db, tenant_id, opportunity_id)
+
+        if _real_id is None:
+            return jsonify({'error': 'Lead not found'}), 404
+
+        if not client_id:
+            return jsonify({'interactions': []}), 200
+
+        rows = db.execute_query(
+            '''
+            SELECT interaction_id, client_id, contact_date, contact_method,
+                   notes, next_steps, reminder_date, created_at
+            FROM "StreemLyne_MT"."Client_Interactions"
+            WHERE client_id = %s
+            ORDER BY created_at DESC NULLS LAST, interaction_id DESC
+            ''',
+            (client_id,),
+            fetch_one=False,
+        ) or []
+
+        def _serial(v):
+            if v is None:
+                return None
+            if hasattr(v, 'isoformat'):
+                return v.isoformat()
+            return v
+
+        interactions = []
+        for row in rows:
+            notes = row.get('notes') or ''
+            m = re.match(r'^\[([^\]]+)\]', notes.strip())
+            interaction_type = (row.get('next_steps') or '').strip() or (m.group(1) if m else 'Note')
+            interactions.append({
+                'interaction_id': row.get('interaction_id'),
+                'interaction_type': interaction_type,
+                'contact_date': _serial(row.get('contact_date')),
+                'reminder_date': _serial(row.get('reminder_date')),
+                'notes': notes,
+                'created_at': _serial(row.get('created_at')),
+            })
+
+        return jsonify({'interactions': interactions}), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@crm_bp.route('/leads/<int:opportunity_id>/history/<int:interaction_id>', methods=['DELETE'])
+@token_required
+@tenant_from_jwt
+def delete_lead_history(opportunity_id, interaction_id):
+    """
+    DELETE /api/crm/leads/<id>/history/<interaction_id>
+    Removes an interaction only if it belongs to this tenant's lead client.
+    """
+    from backend.crm.supabase_client import get_supabase_client
+
+    try:
+        tenant_id = g.tenant_id
+        db = get_supabase_client()
+        _real_id, client_id = _resolve_lead_client_id(db, tenant_id, opportunity_id)
+
+        if _real_id is None:
+            return jsonify({'error': 'Lead not found'}), 404
+
+        if not client_id:
+            return jsonify({'error': 'No client for this lead'}), 400
+
+        row = db.execute_query(
+            '''
+            SELECT interaction_id
+            FROM "StreemLyne_MT"."Client_Interactions"
+            WHERE interaction_id = %s AND client_id = %s
+            LIMIT 1
+            ''',
+            (interaction_id, client_id),
+            fetch_one=True,
+        )
+        if not row:
+            return jsonify({'error': 'Interaction not found'}), 404
+
+        db.execute_update(
+            '''
+            DELETE FROM "StreemLyne_MT"."Client_Interactions"
+            WHERE interaction_id = %s AND client_id = %s
+            ''',
+            (interaction_id, client_id),
+        )
+
+        return jsonify({'success': True}), 200
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
 
 @crm_bp.route('/leads', methods=['POST'])
 @token_required
@@ -2580,6 +2713,22 @@ def leads_callback(opportunity_id):
             return jsonify({'error': 'Please select if renewed by customer or agent'}), 400
  
         db = get_supabase_client()
+
+        stage_row = db.execute_query(
+            'SELECT "stage_id" FROM "StreemLyne_MT"."Stage_Master" '
+            'WHERE LOWER("stage_name") = LOWER(%s) LIMIT 1',
+            (status,),
+            fetch_one=True
+        )
+        if stage_row and stage_row.get('stage_id') is not None:
+            stage_id = stage_row.get('stage_id')
+        elif stage_id is not None:
+            try:
+                stage_id = int(stage_id)
+            except (TypeError, ValueError):
+                return jsonify({'error': 'Invalid stage_id'}), 400
+        else:
+            return jsonify({'error': f'Stage not found for status: {status}'}), 400
  
         # ── Verify lead belongs to tenant and resolve real opportunity_id ────────
         lead = db.execute_query('''
