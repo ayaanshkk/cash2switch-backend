@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Calendar Routes - FIXED VERSION with Customer Details Sync
-Syncs with renewals page AND customer details page (callbacks)
 """
 from flask import Blueprint, g, jsonify, request
 from backend.routes.auth_helpers import token_required
@@ -241,7 +240,11 @@ def get_renewals_calendar():
 def get_leads_calendar():
     """
     Get callback events from Leads (Opportunity_Details)
-    ✅ FIXED: Shows all future callbacks, not just the latest one
+    ✅ CRITICAL FIXES:
+    1. Excludes soft-deleted leads (cm.is_deleted = TRUE)
+    2. Excludes ALL recycle bin statuses (Lost, Lost COT, Invalid Number, Meter De-energised, Complaint, Incorrect Supplier)
+    3. Gets only LATEST callback per lead (prevents stale entries)
+    4. Removes 'Complaint' from active callback list
     """
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -279,8 +282,29 @@ def get_leads_calendar():
             tenant_id, service_param, service_id, is_admin, query_params.get('employee_id')
         )
 
-        # ✅ FIXED: Get ALL callbacks for each lead, not just the latest one
+        # ✅ CRITICAL FIXES:
+        # 1. Exclude soft-deleted leads (cm.is_deleted = TRUE)
+        # 2. Exclude ALL recycle bin statuses (Lost, Lost COT, Invalid Number, Meter De-energised, Complaint, Incorrect Supplier)
+        # 3. Get only LATEST callback per lead (prevents duplicate/stale entries)
+        # 4. Remove 'Complaint' from active callback list
         query = text(f'''
+            WITH latest_callbacks AS (
+                SELECT
+                    ci."client_id",
+                    ci."reminder_date",
+                    ci."next_steps",
+                    ci."notes",
+                    ci."interaction_id",
+                    ci."contact_date",
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ci."client_id" 
+                        ORDER BY ci."reminder_date" DESC, ci."created_at" DESC
+                    ) as rn
+                FROM "StreemLyne_MT"."Client_Interactions" ci
+                WHERE ci."reminder_date" IS NOT NULL
+                  AND ci."reminder_date" >= CURRENT_DATE
+                  AND ci."next_steps" IN ('Callback', 'Not Answered', 'Broker in Place', 'Already Renewed', 'End Date Changed', 'Email Only')
+            )
             SELECT
                 od."opportunity_id",
                 od."tenant_lead_id",
@@ -297,13 +321,13 @@ def get_leads_calendar():
                 em."employee_name" AS assigned_to,
                 srv."service_title",
                 sup."supplier_company_name" AS supplier,
-                ci."reminder_date" AS callback_date,
-                ci."next_steps" AS callback_status,
-                ci."notes" AS callback_notes,
-                ci."interaction_id",
-                ci."contact_date" AS called_date
+                lc."reminder_date" AS callback_date,
+                lc."next_steps" AS callback_status,
+                lc."notes" AS callback_notes,
+                lc."interaction_id",
+                lc."contact_date" AS called_date
             FROM "StreemLyne_MT"."Opportunity_Details" od
-            LEFT JOIN "StreemLyne_MT"."Client_Master" cm
+            INNER JOIN "StreemLyne_MT"."Client_Master" cm
                 ON od."client_id" = cm."client_id"
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm
                 ON od."stage_id" = sm."stage_id"
@@ -313,27 +337,32 @@ def get_leads_calendar():
                 ON od."service_id" = srv."service_id"
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup
                 ON od."supplier_id" = sup."supplier_id"
-            INNER JOIN "StreemLyne_MT"."Client_Interactions" ci
-                ON ci."client_id" = od."client_id"
-            WHERE (od."tenant_id" = CAST(:tenant_id AS VARCHAR) OR (od."client_id" IS NOT NULL AND cm."tenant_id" = CAST(:tenant_id AS VARCHAR)))
+            INNER JOIN latest_callbacks lc
+                ON lc."client_id" = od."client_id"
+                AND lc.rn = 1
+            WHERE cm."tenant_id" = CAST(:tenant_id AS VARCHAR)
               AND od."service_id" = :service_id
+              AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
               AND NOT EXISTS (
                     SELECT 1
                     FROM "StreemLyne_MT"."Project_Details" pd
                     WHERE pd."opportunity_id" = od."opportunity_id"
                 )
-              AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") NOT IN ('priced', 'lost'))
-              AND ci."reminder_date" IS NOT NULL
-              AND ci."reminder_date" >= CURRENT_DATE
-              AND ci."next_steps" IN ('Callback', 'Not Answered', 'Broker in Place', 'Already Renewed', 'End Date Changed', 'Email Only', 'Complaint')
+              AND (
+                  sm."stage_name" IS NULL 
+                  OR LOWER(sm."stage_name") NOT IN (
+                      'priced', 'lost', 'lost cot', 'invalid number', 
+                      'meter de-energised', 'complaint', 'incorrect supplier'
+                  )
+              )
               {employee_filter}
-            ORDER BY ci."reminder_date" ASC, od."opportunity_id" ASC
+            ORDER BY lc."reminder_date" ASC, od."opportunity_id" ASC
         ''')
 
         rows = session.execute(query, query_params)
         lead_rows = [dict(row._mapping) for row in rows]
 
-        logging.info(f"✅ Found {len(lead_rows)} lead callbacks")
+        logging.info(f"✅ Found {len(lead_rows)} lead callbacks (latest per client, excluding deleted/lost)")
 
         events = []
         for lead in lead_rows:

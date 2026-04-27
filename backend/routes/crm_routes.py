@@ -248,6 +248,7 @@ def get_leads():
                     AND od."tenant_id" = :tenant_id
                     AND od."service_id" = :service_id
                     AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
+                    AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
                 WHERE em."tenant_id" = :tenant_id
                 GROUP BY em."employee_id", em."employee_name"
                 ORDER BY em."employee_name"
@@ -1069,7 +1070,7 @@ def get_archived_leads():
 def leads_callback(opportunity_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
-
+ 
     session = SessionLocal()
     try:
         tenant_id = str(g.tenant_id)
@@ -1080,10 +1081,13 @@ def leads_callback(opportunity_id):
         called_date = data.get('called_date')
         is_sold = data.get('is_sold')
         stage_id = data.get('stage_id')
-
+ 
+        logger.info(f"📥 Callback for lead {opportunity_id} — status: {status}")
+ 
         if not status:
             return jsonify({'error': 'Status is required'}), 400
-
+ 
+        # ✅ CHANGED: Incorrect Supplier now deletes to Cleansing
         STATUS_CFG = {
             "Callback":           {"deletes_record": False, "requires_notes": False, "requires_sold": False},
             "Not Answered":       {"deletes_record": False, "requires_notes": False, "requires_sold": False},
@@ -1095,25 +1099,25 @@ def leads_callback(opportunity_id):
             "Meter De-energised": {"deletes_record": True,  "requires_notes": False, "requires_sold": False},
             "Broker in Place":    {"deletes_record": False, "requires_notes": False, "requires_sold": False},
             "End Date Changed":   {"deletes_record": False, "requires_notes": False, "requires_sold": False},
-            "Complaint":          {"deletes_record": False, "requires_notes": True,  "requires_sold": False},
+            "Complaint":          {"deletes_record": True,  "requires_notes": True,  "requires_sold": False},
             "Email Only":         {"deletes_record": False, "requires_notes": False, "requires_sold": False},
             "Renewed Directly":   {"deletes_record": False, "requires_notes": True,  "requires_sold": False},
-            "Incorrect Supplier": {"deletes_record": False, "requires_notes": True,  "requires_sold": False},
+            "Incorrect Supplier": {"deletes_record": True,  "requires_notes": True,  "requires_sold": False},
             "Converted":          {"deletes_record": False, "requires_notes": False, "requires_sold": False},
         }
-
+ 
         if status not in STATUS_CFG:
             return jsonify({'error': f'Invalid status: {status}'}), 400
-
+ 
         cfg = STATUS_CFG[status]
-
+ 
         if cfg['requires_notes'] and not (notes or '').strip():
             return jsonify({'error': 'Notes are required for this status'}), 400
         if cfg['requires_sold'] and is_sold is None:
             return jsonify({'error': 'Please select if the contract was sold'}), 400
         if status == 'Already Renewed' and not data.get('renewed_by'):
             return jsonify({'error': 'Please select if renewed by customer or agent'}), 400
-
+ 
         # Find the lead
         lead = session.execute(text("""
             SELECT opportunity_id, client_id FROM "StreemLyne_MT"."Opportunity_Details"
@@ -1121,33 +1125,104 @@ def leads_callback(opportunity_id):
             AND (tenant_lead_id = :id OR opportunity_id = :id)
             LIMIT 1
         """), {'t': tenant_id, 'id': opportunity_id}).mappings().first()
-
+ 
         if not lead:
             return jsonify({'error': 'Lead not found'}), 404
-
+ 
         real_id = lead['opportunity_id']
         client_id = lead['client_id']
         
         # ✅ Ensure client_id exists for interaction logging
         if not client_id:
             client_id = ensure_lead_client_id(session, real_id, tenant_id)
-
+ 
         # ──────────────────────────────────────────────────────────────────
-        # ✅ HELPER: Log interaction to Client_Interactions
+        # ✅ CRITICAL FIX: DELETE ALL OLD CALLBACKS BEFORE CREATING NEW ONE
         # ──────────────────────────────────────────────────────────────────
-        def log_interaction(interaction_type, note_text, callback_dt=None, contact_dt=None):
-            """Helper to log interactions to Client_Interactions table"""
-            interaction = Client_Interactions(
-                client_id=client_id,
-                contact_date=datetime.strptime(contact_dt, '%Y-%m-%d').date() if contact_dt else datetime.utcnow().date(),
-                contact_method=1,
-                notes=note_text,
-                next_steps=interaction_type,
-                reminder_date=datetime.strptime(callback_dt, '%Y-%m-%d').date() if callback_dt else None,
-                created_at=datetime.utcnow()
-            )
-            session.add(interaction)
-
+        if status in ['Callback', 'Not Answered', 'Broker in Place', 'Email Only', 'End Date Changed', 'Already Renewed']:
+            deleted_count = session.execute(text("""
+                DELETE FROM "StreemLyne_MT"."Client_Interactions"
+                WHERE client_id = :client_id
+                AND next_steps IN ('Callback', 'Not Answered', 'Broker in Place', 'Email Only', 'End Date Changed', 'Already Renewed')
+                AND reminder_date IS NOT NULL
+                AND reminder_date >= CURRENT_DATE
+            """), {'client_id': client_id}).rowcount
+            
+            session.flush()
+            logger.info(f"🗑️ Deleted {deleted_count} old callback entries for client {client_id} before creating new {status}")
+ 
+        # ──────────────────────────────────────────────────────────────────
+        # ✅ SOFT-DELETE: Cleansing OR Recycle Bin (mirrors renewals pattern)
+        # ──────────────────────────────────────────────────────────────────
+        if cfg['deletes_record']:
+            try:
+                CLEANSING_STATUSES = {"Invalid Number", "Incorrect Supplier"}
+                is_cleansing = status in CLEANSING_STATUSES
+                
+                client_master = session.query(Client_Master).filter_by(client_id=client_id).first()
+                if not client_master:
+                    return jsonify({'error': 'Customer not found'}), 404
+                
+                client_master.is_deleted = True
+                client_master.deleted_at = datetime.utcnow()
+                client_master.deleted_reason = status
+                if hasattr(client_master, 'is_cleansing'):
+                    client_master.is_cleansing = is_cleansing
+ 
+                # Update stage_id
+                if not stage_id:
+                    s = session.execute(text(
+                        "SELECT stage_id FROM \"StreemLyne_MT\".\"Stage_Master\" "
+                        "WHERE LOWER(stage_name) = :n LIMIT 1"
+                    ), {'n': status.lower()}).mappings().first()
+                    stage_id = s['stage_id'] if s else 5
+                
+                session.execute(text(
+                    'UPDATE "StreemLyne_MT"."Opportunity_Details" SET stage_id = :s '
+                    'WHERE opportunity_id = :id AND tenant_id = :t'
+                ), {'s': stage_id, 'id': real_id, 't': tenant_id})
+                
+                # Log the deletion interaction using safe_add
+                formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
+                from backend.db import safe_add_with_sequence_retry
+                safe_add_with_sequence_retry(
+                    session,
+                    Client_Interactions(
+                        client_id=client_id,
+                        contact_date=datetime.strptime(called_date, '%Y-%m-%d').date() if called_date else datetime.utcnow().date(),
+                        contact_method=1,
+                        reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
+                        notes=formatted_notes,
+                        next_steps=status,
+                        created_at=datetime.utcnow()
+                    ))
+                
+                session.commit()
+                
+                if is_cleansing:
+                    logger.info(f"✅ Moved lead {real_id} to Cleansing ({status})")
+                    return jsonify({
+                        'success': True,
+                        'message': f'Moved to Cleansing ({status})',
+                        'moved_to_cleansing': True,
+                        'moved_to_recycle_bin': False,
+                    }), 200
+                else:
+                    logger.info(f"✅ Moved lead {real_id} to recycle bin ({status})")
+                    return jsonify({
+                        'success': True,
+                        'message': f'Moved to recycle bin ({status})',
+                        'moved_to_cleansing': False,
+                        'moved_to_recycle_bin': True,
+                    }), 200
+                
+            except Exception as e:
+                session.rollback()
+                logger.error(f"❌ Error moving lead {real_id} to cleansing/recycle bin: {e}")
+                import traceback
+                traceback.print_exc()
+                return jsonify({'error': f'Failed to move record: {str(e)}'}), 500
+ 
         # ──────────────────────────────────────────────────────────────────
         # Handle "Converted" with assignment
         # ──────────────────────────────────────────────────────────────────
@@ -1172,11 +1247,17 @@ def leads_callback(opportunity_id):
                 'stage_id': stage_id or 16
             })
             
-            log_interaction(
-                'Converted',
-                f'[Converted] {notes}' if notes else '[Converted] Lead marked as converted',
-                contact_dt=called_date
-            )
+            from backend.db import safe_add_with_sequence_retry
+            safe_add_with_sequence_retry(
+                session,
+                Client_Interactions(
+                    client_id=client_id,
+                    contact_date=datetime.strptime(called_date, '%Y-%m-%d').date() if called_date else datetime.utcnow().date(),
+                    contact_method=1,
+                    notes=f'[Converted] {notes}' if notes else '[Converted] Lead marked as converted',
+                    next_steps='Converted',
+                    created_at=datetime.utcnow()
+                ))
             
             session.commit()
             
@@ -1185,35 +1266,7 @@ def leads_callback(opportunity_id):
                 'message': 'Lead converted and assigned',
                 'allocated': new_employee_id != current_employee_id
             }), 200
-
-        # ──────────────────────────────────────────────────────────────────
-        # Handle deletions (Lost, Lost COT, etc.)
-        # ──────────────────────────────────────────────────────────────────
-        if cfg['deletes_record']:
-            if not stage_id:
-                s = session.execute(text(
-                    "SELECT stage_id FROM \"StreemLyne_MT\".\"Stage_Master\" "
-                    "WHERE LOWER(stage_name) = :n LIMIT 1"
-                ), {'n': status.lower()}).mappings().first()
-                stage_id = s['stage_id'] if s else 5
-            
-            session.execute(text(
-                'UPDATE "StreemLyne_MT"."Opportunity_Details" SET stage_id = :s '
-                'WHERE opportunity_id = :id AND tenant_id = :t'
-            ), {'s': stage_id, 'id': real_id, 't': tenant_id})
-            
-            formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
-            log_interaction(
-                status,
-                formatted_notes,
-                callback_dt=callback_date,
-                contact_dt=called_date
-            )
-            
-            session.commit()
-            return jsonify({'success': True, 'moved_to_recycle_bin': True,
-                            'message': f'Moved to recycle bin ({status})'}), 200
-
+ 
         # ──────────────────────────────────────────────────────────────────
         # Handle "Priced" with no sale
         # ──────────────────────────────────────────────────────────────────
@@ -1223,17 +1276,23 @@ def leads_callback(opportunity_id):
                 'WHERE opportunity_id = :id AND tenant_id = :t'
             ), {'s': stage_id or 4, 'id': real_id, 't': tenant_id})
             
-            log_interaction(
-                'Priced',
-                f'[Priced] {notes}' if notes else '[Priced] Moved to priced page',
-                contact_dt=called_date
-            )
+            from backend.db import safe_add_with_sequence_retry
+            safe_add_with_sequence_retry(
+                session,
+                Client_Interactions(
+                    client_id=client_id,
+                    contact_date=datetime.strptime(called_date, '%Y-%m-%d').date() if called_date else datetime.utcnow().date(),
+                    contact_method=1,
+                    notes=f'[Priced] {notes}' if notes else '[Priced] Moved to priced page',
+                    next_steps='Priced',
+                    created_at=datetime.utcnow()
+                ))
             
             session.commit()
             return jsonify({'success': True, 'moved_to_priced': True}), 200
-
+ 
         # ──────────────────────────────────────────────────────────────────
-        # ✅ Handle "End Date Changed" and "Already Renewed" - UPDATE end_date
+        # Handle "End Date Changed" and "Already Renewed" - UPDATE end_date
         # ──────────────────────────────────────────────────────────────────
         new_end = data.get('new_end_date')
         if new_end and status in ('End Date Changed', 'Already Renewed'):
@@ -1242,14 +1301,14 @@ def leads_callback(opportunity_id):
                 'WHERE opportunity_id = :id AND tenant_id = :t'
             ), {'d': new_end, 'id': real_id, 't': tenant_id})
             
-            # ✅ Log the end date change
+            # Log the end date change
             log_lead_field_change(session, real_id, 'Contract End', 
                                   session.execute(text(
                                       'SELECT end_date FROM "StreemLyne_MT"."Opportunity_Details" '
                                       'WHERE opportunity_id = :id'
                                   ), {'id': real_id}).scalar(), 
                                   new_end, tenant_id)
-
+ 
         new_supplier = (data.get('new_supplier') or '').strip()
         if new_supplier:
             from backend.models import Supplier_Master
@@ -1261,30 +1320,36 @@ def leads_callback(opportunity_id):
                     'UPDATE "StreemLyne_MT"."Opportunity_Details" SET supplier_id = :s '
                     'WHERE opportunity_id = :id AND tenant_id = :t'
                 ), {'s': sup.supplier_id, 'id': real_id, 't': tenant_id})
-
-        # ──────────────────────────────────────────────────────────────────
+ 
         # Update stage_id
-        # ──────────────────────────────────────────────────────────────────
         if stage_id:
             session.execute(text(
                 'UPDATE "StreemLyne_MT"."Opportunity_Details" SET stage_id = :s '
                 'WHERE opportunity_id = :id AND tenant_id = :t'
             ), {'s': stage_id, 'id': real_id, 't': tenant_id})
-
+ 
         # ──────────────────────────────────────────────────────────────────
-        # ✅ CREATE HISTORY INTERACTION (All other statuses)
+        # CREATE NEW HISTORY INTERACTION (All other statuses)
         # ──────────────────────────────────────────────────────────────────
         formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
-        log_interaction(
-            status,
-            formatted_notes,
-            callback_dt=callback_date,
-            contact_dt=called_date
-        )
-
+        from backend.db import safe_add_with_sequence_retry
+        safe_add_with_sequence_retry(
+            session,
+            Client_Interactions(
+                client_id=client_id,
+                contact_date=datetime.strptime(called_date, '%Y-%m-%d').date() if called_date else datetime.utcnow().date(),
+                contact_method=1,
+                reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
+                notes=formatted_notes,
+                next_steps=status,
+                created_at=datetime.utcnow()
+            ))
+ 
         session.commit()
         
-        # ✅ CRITICAL FIX: Return the updated lead data
+        logger.info(f"✅ Callback saved for lead {real_id}, status: {status}")
+        
+        # Return the updated lead data
         updated_lead = session.execute(text("""
             SELECT od.*, sm.stage_name,
                    em.employee_name AS assigned_to_name,
@@ -1304,10 +1369,11 @@ def leads_callback(opportunity_id):
             'status': status,
             'lead': {k: _serial(v) for k, v in dict(updated_lead).items()} if updated_lead else None
         }), 200
-
+ 
     except Exception as e:
         session.rollback()
         import traceback; traceback.print_exc()
+        logger.error(f"❌ Error saving callback for lead {opportunity_id}: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         try: session.close()
