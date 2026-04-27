@@ -235,6 +235,8 @@ def get_leads():
         # ================================================================
         # 2. TEAM STATS QUERY - ✅ FIXED: tenant_id as string
         # ================================================================
+        team_stats_rows = []
+        
         if is_admin:
             # Admin: Show ALL employees in tenant with their lead counts (including 0)
             team_stats_rows = session.execute(text("""
@@ -248,28 +250,13 @@ def get_leads():
                     AND od."tenant_id" = :tenant_id
                     AND od."service_id" = :service_id
                     AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
+                LEFT JOIN "StreemLyne_MT"."Client_Master" cm
+                    ON od."client_id" = cm."client_id"
                     AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
                 WHERE em."tenant_id" = :tenant_id
                 GROUP BY em."employee_id", em."employee_name"
                 ORDER BY em."employee_name"
-            """), {'tenant_id': tenant_id, 'service_id': service_id}).mappings().all()  
-        else:
-            # Non-admin: Show only own stats
-            team_stats_rows = session.execute(text("""
-                SELECT 
-                    em."employee_id",
-                    em."employee_name",
-                    COUNT(od."opportunity_id") as lead_count
-                FROM "StreemLyne_MT"."Employee_Master" em
-                LEFT JOIN "StreemLyne_MT"."Opportunity_Details" od 
-                    ON em."employee_id" = od."opportunity_owner_employee_id"
-                    AND od."tenant_id" = :tenant_id
-                    AND od."service_id" = :service_id
-                    AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
-                WHERE em."employee_id" = :employee_id
-                GROUP BY em."employee_id", em."employee_name"
-            """), {'tenant_id': tenant_id, 'service_id': service_id, 'employee_id': employee_id}).mappings().all()
-
+            """), {'tenant_id': tenant_id, 'service_id': service_id}).mappings().all()
         team_stats = [
             {
                 'employee_id': row['employee_id'],
@@ -1125,31 +1112,38 @@ def leads_callback(opportunity_id):
             AND (tenant_lead_id = :id OR opportunity_id = :id)
             LIMIT 1
         """), {'t': tenant_id, 'id': opportunity_id}).mappings().first()
- 
+
         if not lead:
             return jsonify({'error': 'Lead not found'}), 404
- 
+
         real_id = lead['opportunity_id']
         client_id = lead['client_id']
-        
-        # ✅ Ensure client_id exists for interaction logging
+
+        # ✅ Always ensure client_id exists (needed for interactions + soft-delete)
         if not client_id:
-            client_id = ensure_lead_client_id(session, real_id, tenant_id)
+            try:
+                client_id = ensure_lead_client_id(session, real_id, tenant_id)
+                session.flush()
+                logger.info(f"✅ Created client_id={client_id} for lead {real_id}")
+            except Exception as e:
+                logger.error(f"❌ ensure_lead_client_id failed for lead {real_id}: {e}")
+                session.rollback()
+                return jsonify({'error': f'Failed to create client record: {str(e)}'}), 500
  
-        # ──────────────────────────────────────────────────────────────────
-        # ✅ CRITICAL FIX: DELETE ALL OLD CALLBACKS BEFORE CREATING NEW ONE
-        # ──────────────────────────────────────────────────────────────────
-        if status in ['Callback', 'Not Answered', 'Broker in Place', 'Email Only', 'End Date Changed', 'Already Renewed']:
+        # ✅✅✅ CRITICAL FIX: DELETE ALL OLD CALLBACKS FOR THIS LEAD (removes stale calendar entries)
+        CALLBACK_STATUSES = ['Callback', 'Not Answered', 'Broker in Place', 'Email Only', 'End Date Changed', 'Already Renewed', 'Voicemail']
+        
+        if status in CALLBACK_STATUSES:
+            # Delete ALL previous callback-type interactions for this client (not just future ones)
             deleted_count = session.execute(text("""
                 DELETE FROM "StreemLyne_MT"."Client_Interactions"
                 WHERE client_id = :client_id
-                AND next_steps IN ('Callback', 'Not Answered', 'Broker in Place', 'Email Only', 'End Date Changed', 'Already Renewed')
+                AND next_steps IN ('Callback', 'Not Answered', 'Broker in Place', 'Email Only', 'End Date Changed', 'Already Renewed', 'Voicemail')
                 AND reminder_date IS NOT NULL
-                AND reminder_date >= CURRENT_DATE
             """), {'client_id': client_id}).rowcount
             
-            session.flush()
-            logger.info(f"🗑️ Deleted {deleted_count} old callback entries for client {client_id} before creating new {status}")
+            session.commit()  # ✅ CRITICAL: Commit deletion immediately
+            logger.warning(f"🗑️ Deleted {deleted_count} old callback entries for client_id={client_id} before creating new {status}")
  
         # ──────────────────────────────────────────────────────────────────
         # ✅ SOFT-DELETE: Cleansing OR Recycle Bin (mirrors renewals pattern)
@@ -1158,31 +1152,44 @@ def leads_callback(opportunity_id):
             try:
                 CLEANSING_STATUSES = {"Invalid Number", "Incorrect Supplier"}
                 is_cleansing = status in CLEANSING_STATUSES
-                
+
+                # ✅ Ensure client_id exists before soft-deleting
+                if not client_id:
+                    try:
+                        client_id = ensure_lead_client_id(session, real_id, tenant_id)
+                        session.flush()
+                    except Exception as e:
+                        logger.error(f"❌ Could not ensure client_id for lead {real_id}: {e}")
+                        return jsonify({'error': f'Could not create client record: {str(e)}'}), 500
+
                 client_master = session.query(Client_Master).filter_by(client_id=client_id).first()
+
                 if not client_master:
-                    return jsonify({'error': 'Customer not found'}), 404
-                
+                    logger.error(f"❌ Client_Master not found for client_id={client_id}, lead={real_id}")
+                    return jsonify({'error': 'Customer record not found — could not move to bin/cleansing'}), 404
+
+                # Soft delete
                 client_master.is_deleted = True
                 client_master.deleted_at = datetime.utcnow()
                 client_master.deleted_reason = status
                 if hasattr(client_master, 'is_cleansing'):
                     client_master.is_cleansing = is_cleansing
- 
-                # Update stage_id
+
+                # Resolve stage_id
                 if not stage_id:
                     s = session.execute(text(
-                        "SELECT stage_id FROM \"StreemLyne_MT\".\"Stage_Master\" "
-                        "WHERE LOWER(stage_name) = :n LIMIT 1"
+                        'SELECT stage_id FROM "StreemLyne_MT"."Stage_Master" '
+                        'WHERE LOWER(stage_name) = :n LIMIT 1'
                     ), {'n': status.lower()}).mappings().first()
-                    stage_id = s['stage_id'] if s else 5
-                
-                session.execute(text(
-                    'UPDATE "StreemLyne_MT"."Opportunity_Details" SET stage_id = :s '
-                    'WHERE opportunity_id = :id AND tenant_id = :t'
-                ), {'s': stage_id, 'id': real_id, 't': tenant_id})
-                
-                # Log the deletion interaction using safe_add
+                    stage_id = s['stage_id'] if s else None
+
+                if stage_id:
+                    session.execute(text(
+                        'UPDATE "StreemLyne_MT"."Opportunity_Details" SET stage_id = :s '
+                        'WHERE opportunity_id = :id AND tenant_id = :t'
+                    ), {'s': stage_id, 'id': real_id, 't': tenant_id})
+
+                # Log interaction
                 formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
                 from backend.db import safe_add_with_sequence_retry
                 safe_add_with_sequence_retry(
@@ -1196,11 +1203,11 @@ def leads_callback(opportunity_id):
                         next_steps=status,
                         created_at=datetime.utcnow()
                     ))
-                
+
                 session.commit()
-                
+
                 if is_cleansing:
-                    logger.info(f"✅ Moved lead {real_id} to Cleansing ({status})")
+                    logger.info(f"✅ Lead {real_id} moved to Cleansing ({status})")
                     return jsonify({
                         'success': True,
                         'message': f'Moved to Cleansing ({status})',
@@ -1208,17 +1215,17 @@ def leads_callback(opportunity_id):
                         'moved_to_recycle_bin': False,
                     }), 200
                 else:
-                    logger.info(f"✅ Moved lead {real_id} to recycle bin ({status})")
+                    logger.info(f"✅ Lead {real_id} moved to Recycle Bin ({status})")
                     return jsonify({
                         'success': True,
                         'message': f'Moved to recycle bin ({status})',
                         'moved_to_cleansing': False,
                         'moved_to_recycle_bin': True,
                     }), 200
-                
+
             except Exception as e:
                 session.rollback()
-                logger.error(f"❌ Error moving lead {real_id} to cleansing/recycle bin: {e}")
+                logger.error(f"❌ Error during soft-delete for lead {real_id}: {e}")
                 import traceback
                 traceback.print_exc()
                 return jsonify({'error': f'Failed to move record: {str(e)}'}), 500
