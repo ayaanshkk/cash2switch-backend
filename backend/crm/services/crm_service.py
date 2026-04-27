@@ -568,7 +568,21 @@ class CRMService:
         Returns:
             Dictionary with recycle bin data
         """
-        leads = self.lead_repo.get_leads_recycle_bin(tenant_id)
+        # ✅ CRITICAL: Convert tenant_id to string for VARCHAR column
+        tenant_id_str = str(tenant_id)
+        
+        # Get service_id from request args if available
+        from flask import request
+        service_param = request.args.get('service', 'utilities') if request else 'utilities'
+        service_id = 2 if service_param.strip().lower() == 'water' else 1
+        
+        logger.info('🔍 get_recycle_bin (SERVICE): tenant_id=%s (str), service_id=%s', tenant_id_str, service_id)
+        
+        # ✅ Pass STRING tenant_id to repository
+        leads = self.lead_repo.get_leads_recycle_bin(tenant_id_str, service_id)
+        
+        logger.info('🔍 get_recycle_bin (SERVICE): returning %d leads', len(leads))
+        
         return {
             'success': True,
             'data': leads,

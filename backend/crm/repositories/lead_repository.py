@@ -600,58 +600,142 @@ class LeadRepository:
 
         return {'inserted': inserted, 'skipped': skipped, 'errors': errors}
 
-    def update_lead_status(self, tenant_id: int, opportunity_id: int, stage_id: int) -> Optional[Dict[str, Any]]:
+    def update_lead_status(self, tenant_id: int, opportunity_id: int, stage_id: int) -> bool:
         """
-        Update lead status (stage_id) with tenant isolation.
+        Update the status (stage_id) of a lead.
+        When stage becomes 'Lost', sets deleted_at timestamp for soft-delete.
         
         Args:
             tenant_id: Tenant identifier
-            opportunity_id: Opportunity identifier
-            stage_id: New stage ID to set
+            opportunity_id: Opportunity ID
+            stage_id: New stage ID
         
         Returns:
-            Dict with updated opportunity_id and stage_id, or None if not found/not owned
+            True if update successful, False otherwise
         """
+        # ✅ CRITICAL FIX: Cast tenant_id to STRING for VARCHAR column
+        tenant_id_str = str(tenant_id)
+        
         try:
-            # Optional: get stage_name for logging
-            stage_query = 'SELECT "stage_name" FROM "StreemLyne_MT"."Stage_Master" WHERE "stage_id" = %s'
+            # Get stage name to check if it's 'Lost'
+            stage_query = '''
+                SELECT "stage_name" 
+                FROM "StreemLyne_MT"."Stage_Master" 
+                WHERE "stage_id" = %s
+            '''
             stage_result = self.db.execute_query(stage_query, (stage_id,), fetch_one=True)
-            stage_name = stage_result.get('stage_name') if stage_result else None
-
-            # Allow update for: tenant_id match OR linked to client in our tenant (renewals with null tenant_id)
-            query = """
+            stage_name = stage_result.get('stage_name', '').lower() if stage_result else ''
+            
+            is_lost_stage = 'lost' in stage_name
+            
+            # ✅ FIXED: Removed updated_at column (doesn't exist in Opportunity_Details)
+            query = '''
                 UPDATE "StreemLyne_MT"."Opportunity_Details"
                 SET "stage_id" = %s
                 WHERE "opportunity_id" = %s
-                AND ("tenant_id" = %s
-                     OR ("tenant_id" IS NULL AND "client_id" IN (
-                         SELECT "client_id" FROM "StreemLyne_MT"."Client_Master" WHERE "tenant_id" = %s
-                     )))
-            """
-            updated_count = self.db.execute_update(query, (stage_id, opportunity_id, tenant_id, tenant_id))
-            if updated_count and updated_count > 0:
-                logger.info('Updated lead %s to stage %s (stage_name=%s) for tenant %s',
-                           opportunity_id, stage_id, stage_name, tenant_id)
-                return {"opportunity_id": opportunity_id, "stage_id": stage_id}
-
-            logger.warning('Lead %s not found or not owned by tenant %s', opportunity_id, tenant_id)
-            return None
+                AND "tenant_id" = %s
+            '''
+            
+            # ✅ Pass STRING tenant_id
+            updated_count = self.db.execute_update(query, (stage_id, opportunity_id, tenant_id_str))
+            
+            if updated_count == 0:
+                logger.warning('update_lead_status: no rows updated for opportunity_id=%s, tenant=%s', 
+                            opportunity_id, tenant_id_str)
+                return False
+            
+            # ✅ If stage is 'Lost', soft-delete the associated client
+            if is_lost_stage:
+                # Get client_id for this opportunity
+                client_query = '''
+                    SELECT "client_id" 
+                    FROM "StreemLyne_MT"."Opportunity_Details"
+                    WHERE "opportunity_id" = %s AND "tenant_id" = %s
+                '''
+                client_result = self.db.execute_query(
+                    client_query, 
+                    (opportunity_id, tenant_id_str),
+                    fetch_one=True
+                )
+                
+                if client_result and client_result.get('client_id'):
+                    client_id = client_result['client_id']
+                    
+                    # Soft-delete the client
+                    delete_query = '''
+                        UPDATE "StreemLyne_MT"."Client_Master"
+                        SET "is_deleted" = TRUE,
+                            "is_cleansing" = FALSE,
+                            "deleted_at" = CURRENT_TIMESTAMP,
+                            "deleted_reason" = %s
+                        WHERE "client_id" = %s
+                        AND "tenant_id" = %s
+                    '''
+                    self.db.execute_update(
+                        delete_query, 
+                        (stage_name.title(), client_id, tenant_id_str)
+                    )
+                    
+                    logger.info('✅ Soft-deleted client_id=%s with reason=%s', client_id, stage_name)
+            
+            # ✅ If stage is NOT 'Lost', restore the client (un-delete)
+            else:
+                # Get client_id for this opportunity
+                client_query = '''
+                    SELECT "client_id" 
+                    FROM "StreemLyne_MT"."Opportunity_Details"
+                    WHERE "opportunity_id" = %s AND "tenant_id" = %s
+                '''
+                client_result = self.db.execute_query(
+                    client_query, 
+                    (opportunity_id, tenant_id_str),
+                    fetch_one=True
+                )
+                
+                if client_result and client_result.get('client_id'):
+                    client_id = client_result['client_id']
+                    
+                    # Restore the client (un-delete)
+                    restore_query = '''
+                        UPDATE "StreemLyne_MT"."Client_Master"
+                        SET "is_deleted" = FALSE,
+                            "is_cleansing" = FALSE,
+                            "deleted_at" = NULL,
+                            "deleted_reason" = NULL
+                        WHERE "client_id" = %s
+                        AND "tenant_id" = %s
+                    '''
+                    self.db.execute_update(
+                        restore_query, 
+                        (client_id, tenant_id_str)
+                    )
+                    
+                    logger.info('✅ Restored (un-deleted) client_id=%s', client_id)
+            
+            return True
+            
         except Exception as e:
-            logger.exception('Error updating lead status: %s', e)
-            return None
+            logger.error('Error updating lead status: %s', e)
+            return False
     
-    def get_leads_recycle_bin(self, tenant_id: int, service_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def get_leads_recycle_bin(self, tenant_id, service_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Get all soft-deleted leads (recycle bin) for a tenant.
         ✅ SHOWS ONLY DELETED LEADS (Client_Master.is_deleted = TRUE, is_cleansing = FALSE/NULL)
         
         Args:
-            tenant_id: Tenant identifier
+            tenant_id: Tenant identifier (will be converted to string)
             service_id: Optional service filter
         
         Returns:
             List of soft-deleted leads (Lost, Lost COT, Complaint, Meter De-energised)
         """
+        # ✅ CRITICAL: Ensure tenant_id is a STRING for VARCHAR column
+        tenant_id_str = str(tenant_id)
+        
+        logger.info('🔍 get_leads_recycle_bin START: tenant_id=%s (type=str), service_id=%s', 
+                    tenant_id_str, service_id)
+        
         query = '''
             SELECT
                 od."opportunity_id",
@@ -680,17 +764,26 @@ class LeadRepository:
             AND (cm."is_cleansing" = FALSE OR cm."is_cleansing" IS NULL)
         '''
         
-        params = [tenant_id]
+        params = [tenant_id_str]  # ✅ STRING tenant_id
+        
         if service_id is not None:
             query += ' AND od."service_id" = %s'
             params.append(service_id)
         
         query += ' ORDER BY cm."deleted_at" DESC'
 
+        logger.info('🔍 Executing query with params: %s', params)
+
         try:
             rows = self.db.execute_query(query, tuple(params))
+            
+            logger.info('🔍 Query returned %d rows', len(rows) if rows else 0)
+            
             if not rows:
+                logger.warning('⚠️ get_leads_recycle_bin: no deleted leads found for tenant=%s', tenant_id_str)
                 return []
+            
+            logger.info('✅ get_leads_recycle_bin: found %d deleted leads for tenant=%s', len(rows), tenant_id_str)
             
             out = []
             for r in rows:
@@ -712,9 +805,12 @@ class LeadRepository:
                     'supplier_name': r.get('supplier_name'),
                     'assigned_to_name': r.get('assigned_to_name'),
                 })
+            
+            logger.info('✅ Returning %d formatted lead records', len(out))
             return out
+            
         except Exception as e:
-            logger.exception('get_leads_recycle_bin failed for tenant=%s: %s', tenant_id, e)
+            logger.exception('❌ get_leads_recycle_bin failed for tenant=%s: %s', tenant_id_str, e)
             return []
     
     def delete_expired_lost_leads(self, tenant_id: int, days: int = 30) -> int:
