@@ -153,6 +153,7 @@ class LeadRepository:
     def get_lead_by_id(self, tenant_id: int, opportunity_id: int, service_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """
         Get a specific lead by ID (with tenant isolation)
+        ✅ EXCLUDES SOFT-DELETED LEADS
         
         Args:
             tenant_id: Tenant identifier
@@ -167,10 +168,12 @@ class LeadRepository:
                 sm."stage_name",
                 um."user_name" as assigned_to_name
             FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
             LEFT JOIN "StreemLyne_MT"."User_Master" um ON od."opportunity_owner_employee_id" = um."user_id"
             WHERE od."tenant_id" = %s
             AND od."opportunity_id" = %s
+            AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
             LIMIT 1
         """
         params = [tenant_id, opportunity_id]
@@ -639,35 +642,50 @@ class LeadRepository:
     
     def get_leads_recycle_bin(self, tenant_id: int, service_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """
-        Get all Lost leads (recycle bin) for a tenant.
+        Get all soft-deleted leads (recycle bin) for a tenant.
+        ✅ SHOWS ONLY DELETED LEADS (Client_Master.is_deleted = TRUE, is_cleansing = FALSE/NULL)
         
         Args:
             tenant_id: Tenant identifier
+            service_id: Optional service filter
         
         Returns:
-            List of lost/deleted leads
+            List of soft-deleted leads (Lost, Lost COT, Complaint, Meter De-energised)
         """
         query = '''
             SELECT
                 od."opportunity_id",
+                od."tenant_lead_id",
                 COALESCE(od."business_name", od."opportunity_title") AS business_name,
                 od."contact_person",
+                od."tel_number",
+                od."email",
                 od."mpan_mpr",
                 od."service_id",
                 sm."stage_name",
+                cm."deleted_reason",
+                cm."deleted_at",
                 od."start_date",
-                od."tel_number",
-                od."email"
+                od."end_date",
+                od."annual_usage",
+                sup."supplier_company_name" AS supplier_name,
+                em."employee_name" AS assigned_to_name
             FROM "StreemLyne_MT"."Opportunity_Details" od
+            INNER JOIN "StreemLyne_MT"."Client_Master" cm ON od."client_id" = cm."client_id"
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
-            WHERE od."tenant_id" = %s
-            AND sm."stage_name" = 'Lost'
-            ORDER BY od."created_at" DESC
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id" = sup."supplier_id"
+            WHERE cm."tenant_id" = %s
+            AND cm."is_deleted" = TRUE
+            AND (cm."is_cleansing" = FALSE OR cm."is_cleansing" IS NULL)
         '''
+        
         params = [tenant_id]
         if service_id is not None:
-            query = query.replace("ORDER BY", "AND od.\"service_id\" = %s\n            ORDER BY")
+            query += ' AND od."service_id" = %s'
             params.append(service_id)
+        
+        query += ' ORDER BY cm."deleted_at" DESC'
 
         try:
             rows = self.db.execute_query(query, tuple(params))
@@ -678,14 +696,21 @@ class LeadRepository:
             for r in rows:
                 out.append({
                     'opportunity_id': r.get('opportunity_id'),
+                    'tenant_lead_id': r.get('tenant_lead_id'),
                     'business_name': r.get('business_name'),
                     'contact_person': r.get('contact_person'),
+                    'tel_number': r.get('tel_number'),
+                    'email': r.get('email'),
                     'mpan_mpr': r.get('mpan_mpr'),
                     'service_id': r.get('service_id'),
                     'stage_name': r.get('stage_name'),
-                    'start_date': r.get('start_date'),
-                    'tel_number': r.get('tel_number'),
-                    'email': r.get('email'),
+                    'deleted_reason': r.get('deleted_reason'),
+                    'deleted_at': r.get('deleted_at').isoformat() if r.get('deleted_at') else None,
+                    'start_date': r.get('start_date').isoformat() if r.get('start_date') else None,
+                    'end_date': r.get('end_date').isoformat() if r.get('end_date') else None,
+                    'annual_usage': r.get('annual_usage'),
+                    'supplier_name': r.get('supplier_name'),
+                    'assigned_to_name': r.get('assigned_to_name'),
                 })
             return out
         except Exception as e:
@@ -1089,6 +1114,7 @@ class LeadRepository:
             LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od."stage_id" = sm."stage_id"
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od."opportunity_owner_employee_id" = em."employee_id"
             WHERE cm."tenant_id" = %s
+            AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
             AND NOT EXISTS (
                 SELECT 1
                 FROM "StreemLyne_MT"."Project_Details" pd
@@ -1221,12 +1247,13 @@ class LeadRepository:
     def get_leads_list(self, tenant_id: int, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """
         Return a minimal, tenant-scoped list of leads (read-only projection).
+        ✅ EXCLUDES SOFT-DELETED LEADS (Client_Master.is_deleted = TRUE)
         """
         query = '''
             SELECT
                 od."opportunity_id",
                 od."tenant_lead_id",
-                od."display_id",  -- ✅ ADDED
+                od."display_id",
                 COALESCE(od."business_name", cm."client_company_name", od."opportunity_title") AS business_name,
                 COALESCE(od."contact_person", cm."client_contact_name") AS contact_person,
                 COALESCE(od."tel_number", cm."client_phone") AS tel_number,
@@ -1256,13 +1283,14 @@ class LeadRepository:
             LEFT JOIN "StreemLyne_MT"."Client_Master"   cm  ON od."client_id"                     = cm."client_id"
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"                   = sup."supplier_id"
             WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
+            AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
             AND NOT EXISTS (
                 SELECT 1
                 FROM "StreemLyne_MT"."Project_Details" pd
                 WHERE pd.opportunity_id = od.opportunity_id
             )
         '''
- 
+        
         params = [tenant_id, tenant_id]
  
         if filters and isinstance(filters, dict):
@@ -1364,6 +1392,7 @@ class LeadRepository:
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em 
                 ON od.opportunity_owner_employee_id = em.employee_id
             WHERE od.stage_id = 8
+            AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
             AND cm.tenant_id = %s
             ORDER BY od.created_at DESC
         """

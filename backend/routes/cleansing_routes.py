@@ -77,18 +77,20 @@ def register_get_cleansing(blueprint, token_required_decorator, tenant_from_jwt_
                     od.annual_usage,
                     od.start_date,
                     od.end_date,
-                    sm.stage_name AS cleansing_reason,
-                    od.created_at AS flagged_at,
+                    cm.deleted_reason AS cleansing_reason,
+                    cm.deleted_at AS flagged_at,
                     od.notes,
                     od.opportunity_owner_employee_id AS assigned_to_id,
                     em.employee_name AS assigned_to_name
                 FROM "StreemLyne_MT"."Opportunity_Details" od
-                LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
+                INNER JOIN "StreemLyne_MT"."Client_Master" cm ON od.client_id = cm.client_id
                 LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od.supplier_id = sup.supplier_id
                 LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
-                WHERE od.tenant_id = :tenant_id
-                  AND sm.stage_name IN ('Invalid Number', 'Incorrect Supplier')
-                ORDER BY od.created_at DESC
+                WHERE cm.tenant_id = :tenant_id
+                  AND cm.is_deleted = TRUE
+                  AND cm.deleted_reason IN ('Invalid Number', 'Incorrect Supplier')
+                  AND (cm.is_cleansing = TRUE OR cm.is_cleansing IS NULL)
+                ORDER BY cm.deleted_at DESC
             """), {'tenant_id': tenant_id}).mappings().all()
 
             # ✅ Process leads - keep original values, don't use _serial

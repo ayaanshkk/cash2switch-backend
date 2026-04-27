@@ -280,6 +280,7 @@ def get_leads():
                 COALESCE(od."business_name", od."opportunity_title") AS business_name,
                 sup."supplier_company_name" AS supplier_name
             FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master"   cm  ON od."client_id"   = cm."client_id"
             LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"    = sm."stage_id"
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"  = sup."supplier_id"
@@ -287,6 +288,7 @@ def get_leads():
             AND od."service_id" = :service_id
             AND od."opportunity_owner_employee_id" = :employee_id
             AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
+            AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
         """
         params = {'tenant_id': tenant_id, 'service_id': service_id, 'employee_id': employee_id}
 
@@ -327,7 +329,7 @@ def get_leads():
 def get_lead_detail(opportunity_id):
     session = SessionLocal()
     try:
-        tenant_id = str(g.tenant_id)  # ✅ CHANGED: Cast to string
+        tenant_id = str(g.tenant_id)
 
         sql = """
             SELECT
@@ -337,10 +339,12 @@ def get_lead_detail(opportunity_id):
                 COALESCE(od.business_name, od.opportunity_title) AS business_name,
                 sup.supplier_company_name AS supplier_name
             FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master"   cm  ON od.client_id   = cm.client_id
             LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od.stage_id   = sm.stage_id
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od.opportunity_owner_employee_id = em.employee_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od.supplier_id = sup.supplier_id
             WHERE od.tenant_id = :tenant_id
+            AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
         """
 
         row = session.execute(
@@ -577,7 +581,7 @@ def delete_lead(opportunity_id):
 def search_all_leads():
     session = SessionLocal()
     try:
-        tenant_id     = str(g.tenant_id)  # ✅ CHANGED: Cast to string
+        tenant_id     = str(g.tenant_id)
         q             = request.args.get('q', '').strip()
         service_param = request.args.get('service', 'utilities')
         service_id    = 2 if service_param.strip().lower() == 'water' else 1
@@ -592,11 +596,13 @@ def search_all_leads():
                    COALESCE(od.business_name, od.opportunity_title) AS business_name,
                    sup.supplier_company_name AS supplier_name
             FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master"   cm  ON od.client_id   = cm.client_id
             LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od.stage_id   = sm.stage_id
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od.opportunity_owner_employee_id = em.employee_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od.supplier_id = sup.supplier_id
             WHERE od.tenant_id  = :tenant_id
             AND   od.service_id = :service_id
+            AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
             AND (
                 COALESCE(od.business_name, od.opportunity_title) ILIKE :q
                 OR od.contact_person ILIKE :q
@@ -1025,6 +1031,7 @@ def get_allocated_leads():
                    COALESCE(od.business_name, od.opportunity_title) AS business_name,
                    sup.supplier_company_name AS supplier_name
             FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master"   cm  ON od.client_id   = cm.client_id
             LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od.stage_id   = sm.stage_id
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od.opportunity_owner_employee_id = em.employee_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od.supplier_id = sup.supplier_id
@@ -1032,6 +1039,7 @@ def get_allocated_leads():
             AND   od.service_id = :service_id
             AND   od.opportunity_owner_employee_id = :employee_id
             AND   od.is_allocated = TRUE
+            AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
             ORDER BY od.created_at DESC
         """), {'tenant_id': tenant_id, 'service_id': service_id, 'employee_id': employee_id}).mappings().all()
 
@@ -1172,10 +1180,19 @@ def leads_callback(opportunity_id):
                 client_master.is_deleted = True
                 client_master.deleted_at = datetime.utcnow()
                 client_master.deleted_reason = status
+                
+                # ✅ CRITICAL: Set is_cleansing flag (mirrors renewals)
                 if hasattr(client_master, 'is_cleansing'):
                     client_master.is_cleansing = is_cleansing
+                else:
+                    # Fallback: use raw SQL if attribute doesn't exist
+                    session.execute(text("""
+                        UPDATE "StreemLyne_MT"."Client_Master"
+                        SET is_cleansing = :is_cleansing
+                        WHERE client_id = :client_id
+                    """), {'is_cleansing': is_cleansing, 'client_id': client_id})
 
-                # Resolve stage_id
+                # Resolve stage_id for the status
                 if not stage_id:
                     s = session.execute(text(
                         'SELECT stage_id FROM "StreemLyne_MT"."Stage_Master" '
@@ -1183,6 +1200,7 @@ def leads_callback(opportunity_id):
                     ), {'n': status.lower()}).mappings().first()
                     stage_id = s['stage_id'] if s else None
 
+                # ✅ Update stage on Opportunity_Details (not Project_Details for leads)
                 if stage_id:
                     session.execute(text(
                         'UPDATE "StreemLyne_MT"."Opportunity_Details" SET stage_id = :s '
@@ -1392,7 +1410,7 @@ def leads_callback(opportunity_id):
 def get_priced_leads():
     session = SessionLocal()
     try:
-        tenant_id     = str(g.tenant_id)  # ✅ CHANGED: Cast to string
+        tenant_id     = str(g.tenant_id)
         current_user  = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id    = 2 if service_param.strip().lower() == 'water' else 1
@@ -1407,12 +1425,14 @@ def get_priced_leads():
                    COALESCE(od.business_name, od.opportunity_title) AS business_name,
                    sup.supplier_company_name AS supplier_name
             FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Client_Master"   cm  ON od.client_id   = cm.client_id
             LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od.stage_id   = sm.stage_id
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od.opportunity_owner_employee_id = em.employee_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od.supplier_id = sup.supplier_id
             WHERE od.tenant_id  = :tenant_id
             AND   od.service_id = :service_id
             AND   LOWER(sm.stage_name) = 'priced'
+            AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
         """
         params = {'tenant_id': tenant_id, 'service_id': service_id}
 
