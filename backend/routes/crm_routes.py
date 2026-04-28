@@ -1377,22 +1377,27 @@ def leads_callback(opportunity_id):
         # Return the updated lead data
         updated_lead = session.execute(text("""
             SELECT od.*, sm.stage_name,
-                   em.employee_name AS assigned_to_name,
-                   COALESCE(od.business_name, od.opportunity_title) AS business_name,
-                   sup.supplier_company_name AS supplier_name
+                em.employee_name AS assigned_to_name,
+                COALESCE(od.business_name, od.opportunity_title) AS business_name,
+                sup.supplier_company_name AS supplier_name
             FROM "StreemLyne_MT"."Opportunity_Details" od
-            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od.stage_id   = sm.stage_id
-            LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od.opportunity_owner_employee_id = em.employee_id
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od.supplier_id = sup.supplier_id
             WHERE od.opportunity_id = :id AND od.tenant_id = :t
             LIMIT 1
         """), {'id': real_id, 't': tenant_id}).mappings().first()
-        
+
+        # ✅ Force the correct stage_name from the status parameter
+        lead_data = {k: _serial(v) for k, v in dict(updated_lead).items()} if updated_lead else {}
+        lead_data['stage_name'] = status  # ✅ Override with the correct status
+        lead_data['stage_id'] = stage_id  # ✅ Override with the correct stage_id
+
         return jsonify({
             'success': True, 
             'message': 'Callback saved successfully', 
             'status': status,
-            'lead': {k: _serial(v) for k, v in dict(updated_lead).items()} if updated_lead else None
+            'lead': lead_data
         }), 200
  
     except Exception as e:
