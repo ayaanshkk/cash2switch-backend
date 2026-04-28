@@ -587,7 +587,7 @@ class CRMService:
             'success': True,
             'data': leads,
             'count': len(leads)
-        }q
+        }
     
     def delete_expired_lost_leads(self, tenant_id: int, days: int = 30) -> Dict[str, Any]:
         """
