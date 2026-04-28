@@ -1,8 +1,8 @@
 # backend/routes/energy_renewals_routes.py
 
 from flask import Blueprint, jsonify, request, current_app
-from datetime import datetime, timedelta
-from sqlalchemy import text, func, case, and_, cast, Float, String
+from datetime import datetime, timedelta, date
+from sqlalchemy import text, func, case, and_, cast, Float, String, exists
 from ..numeric_parse import safe_float
 from ..models import (
     Client_Master, Project_Details, Energy_Contract_Master,
@@ -23,6 +23,17 @@ from ..dummy_local_dashboard_data import (
 )
 
 renewals_bp = Blueprint("renewals", __name__)
+
+
+def _as_calendar_date(val):
+    """Database may return date or datetime — subtracting datetime from date raises TypeError."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    return val
 
 
 def _misc_col2_sql_float():
@@ -47,8 +58,10 @@ def _period_bounds(period: str):
         multiplier = 30
     else:
         key = "daily"
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = start + timedelta(days=1)
+        # Project_Details timestamps rarely fall in a single calendar day; a 1-day window
+        # makes team performance / staff charts look empty. Use a rolling 14-day window.
+        end = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        start = (now - timedelta(days=13)).replace(hour=0, minute=0, second=0, microsecond=0)
         multiplier = 1
     return key, start, end, multiplier
 
@@ -192,16 +205,19 @@ def get_renewal_stats():
         employee_id = request.args.get('employee_id', type=int)
         today = datetime.utcnow().date()
 
+        # Select only columns used below. Loading full Energy_Contract_Master rows can fail when
+        # DB types diverge from the ORM (e.g. varchar stored in Numeric-typed columns → psycopg "Unknown PG numeric type: 1043").
         base_query = session.query(
-            Client_Master,
-            Project_Details,
-            Energy_Contract_Master,
+            Project_Details.Misc_Col2,
+            Project_Details.status,
+            Energy_Contract_Master.contract_end_date,
+            cast(Energy_Contract_Master.unit_rate, String),
         ).join(
-            Project_Details, Client_Master.client_id == Project_Details.client_id
+            Client_Master, Client_Master.client_id == Project_Details.client_id
         ).join(
             Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
         ).filter(
-            Client_Master.tenant_id == tenant_id,
+            cast(Client_Master.tenant_id, String) == str(tenant_id),
             Energy_Contract_Master.contract_end_date.isnot(None)
         )
 
@@ -224,9 +240,9 @@ def get_renewal_stats():
         renewed_count = 0
         lost_count = 0
 
-        for client, project, contract in all_results:
-            end_date = contract.contract_end_date
-            aq = safe_float(project.Misc_Col2)
+        for misc_col2, status_raw, end_raw, unit_rate_raw in all_results:
+            end_date = _as_calendar_date(end_raw)
+            aq = safe_float(misc_col2)
             if aq:
                 total_aq += aq
 
@@ -237,26 +253,27 @@ def get_renewal_stats():
 
             if days_until_renewal < 0:
                 expired_contracts += 1
-            elif 30 <= days_until_renewal <= 60:
+            # Buckets align with dashboard cards: "Due in 30/60/90 days" (0–30, 31–60, 61–90).
+            elif 0 <= days_until_renewal <= 30:
                 total_renewals_30_60_days += 1
-            elif 61 <= days_until_renewal <= 90:
+            elif 31 <= days_until_renewal <= 60:
                 total_renewals_61_90_days += 1
-            elif 91 <= days_until_renewal <= 180:
+            elif 61 <= days_until_renewal <= 90:
                 total_renewals_90_plus_days += 1
             elif days_until_renewal >= 365:
                 not_due_contracts += 1
 
-            ur = safe_float(contract.unit_rate)
+            ur = safe_float(unit_rate_raw)
             if ur and aq:
                 annual_cost = (ur * aq) / 100
                 total_revenue_at_risk += annual_cost
 
-            status = project.status
+            status = status_raw
             if status:
-                status_lower = status.lower()
+                status_lower = str(status).strip().lower()
                 if status_lower in ['called', 'callback', 'contacted']:
                     contacted_count += 1
-                elif status_lower in ['not_answered', 'not contacted']:
+                elif status_lower in ('not_answered', 'not answered', 'not contacted'):
                     not_contacted_count += 1
                 elif status_lower in ['priced', 'renewed', 'already renewed', 'end date changed']:
                     renewed_count += 1
@@ -790,16 +807,17 @@ def get_renewal_performance():
         else:
             employee_id = request.args.get('employee_id', type=int)
 
-        base_query = session.query(
-            Project_Details,
-            Energy_Contract_Master,
-        ).join(
-            Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
-        ).join(
+        # Avoid loading Energy_Contract_Master ORM rows (varchar-as-numeric causes psycopg 1043).
+        base_query = session.query(Project_Details).join(
             Client_Master, Project_Details.client_id == Client_Master.client_id
         ).filter(
-            Client_Master.tenant_id == tenant_id,
-            Energy_Contract_Master.contract_end_date.isnot(None)
+            cast(Client_Master.tenant_id, String) == str(tenant_id),
+            exists().where(
+                and_(
+                    Energy_Contract_Master.project_id == Project_Details.project_id,
+                    Energy_Contract_Master.contract_end_date.isnot(None),
+                )
+            ),
         )
 
         if employee_id:
@@ -817,7 +835,7 @@ def get_renewal_performance():
         end_date_changed_count = 0
         priced_count = 0
 
-        for project, contract in all_results:
+        for project in all_results:
             status = project.status
 
             if status:
@@ -907,7 +925,7 @@ def get_staff_status_counts():
                     AND urm_r5.role_id = 5
                 WHERE um_r5.employee_id = em.employee_id
             )
-            {employee_filter}
+            {{employee_filter}}
             GROUP BY em.employee_id, em.employee_name, pd.status
             ORDER BY em.employee_name
         """

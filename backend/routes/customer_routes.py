@@ -8,13 +8,17 @@ Multi-table system integrating:
 - Client_Interactions: Callback tracking
 """
 
+from types import SimpleNamespace
+
 from flask import Blueprint, request, jsonify, current_app
 from .auth_helpers import token_required
-from backend.crm.utils.role_helpers import is_admin_user
+from backend.crm.utils.role_helpers import is_admin_user, is_crm_leads_admin_role
 from datetime import datetime
-from sqlalchemy import and_, or_, func, text 
+from sqlalchemy import and_, or_, func, text, cast, Float, String
 from sqlalchemy.orm import aliased
 from ..db import SessionLocal
+from ..numeric_parse import safe_float
+from ..dummy_local_dashboard_data import dummy_employees_list, local_demo_dashboard_enabled
 
 # ✅ Import all models directly from backend.models
 from backend.models import (
@@ -30,7 +34,57 @@ from backend.models import (
 )
 
 energy_customer_bp = Blueprint('energy_customers', __name__)
- 
+
+
+def _renewals_clients_see_entire_tenant(user) -> bool:
+    """Align list visibility with Team Overview: admins see all assignments in tenant."""
+    jwt_role = getattr(user, 'role', None)
+    if is_crm_leads_admin_role(jwt_role):
+        return True
+    return bool(is_admin_user(user))
+
+
+def _energy_contract_proxy_from_ecm_tuple(ecm_flat):
+    """
+    Stand-in for Energy_Contract_Master without loading full ORM rows (varchar vs Numeric in DB).
+
+    ecm_flat order matches the 20 scalar columns selected from ``ecm_cast`` in ``get_energy_customers``:
+    id, project_id, service_id, supplier_id, start, end, mpan, mpan_bottom, terms, aggregator,
+    payment, old_supplier, unit_rate_s, standing_charge_s, rate_1_s..rate_3_s, net_notch_s, comms_paid_s, term_sold_s.
+    """
+    if not ecm_flat or ecm_flat[0] is None:
+        return None
+
+    def sf(i):
+        return safe_float(ecm_flat[i])
+
+    return SimpleNamespace(
+        energy_contract_master_id=ecm_flat[0],
+        project_id=ecm_flat[1],
+        supplier_id=ecm_flat[3],
+        contract_start_date=ecm_flat[4],
+        contract_end_date=ecm_flat[5],
+        mpan_number=ecm_flat[6],
+        mpan_bottom=ecm_flat[7],
+        terms_of_sale=ecm_flat[8],
+        aggregator=ecm_flat[9],
+        payment_type=ecm_flat[10],
+        old_supplier_id=ecm_flat[11],
+        unit_rate=sf(12),
+        standing_charge=sf(13),
+        rate_1=sf(14),
+        rate_2=sf(15),
+        rate_3=sf(16),
+        net_notch=sf(17),
+        comms_paid=sf(18),
+        term_sold=sf(19),
+    )
+
+
+# Must match the scalar column count from ecm_cast in get_energy_customers
+_ECM_SELECT_LEN = 20
+
+
 # ==========================================
 # HELPER FUNCTIONS
 # ==========================================
@@ -194,13 +248,65 @@ def get_energy_customers():
  
         if not tenant_id:
             return jsonify({'error': 'Tenant not found for user'}), 400
- 
-        _service_id = None
-        service_param = request.args.get('service')
-        if service_param and isinstance(service_param, str):
-            svc = service_param.strip().lower()
-            _service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
- 
+
+        see_all_tenant_clients = _renewals_clients_see_entire_tenant(user)
+        if getattr(user, 'employee_id', None) is None and not see_all_tenant_clients:
+            return jsonify({'error': 'User has no employee_id; cannot load renewals assignments'}), 400
+
+        # Align with /energy-clients/stats-by-employee and recycle-bin (utilities = 1, water = 2, gas = 3).
+        service_param = request.args.get('service') or 'utilities'
+        svc = service_param.strip().lower() if isinstance(service_param, str) else 'utilities'
+        service_id_map = {'utilities': 1, 'water': 2, 'gas': 3, 'electricity': 1}
+        _service_id = service_id_map.get(svc, 1)
+
+        _nm = Energy_Contract_Master
+        _ecm_sq = (
+            session.query(
+                _nm.energy_contract_master_id,
+                _nm.project_id,
+                _nm.service_id,
+                _nm.supplier_id,
+                _nm.contract_start_date,
+                _nm.contract_end_date,
+                _nm.mpan_number,
+                _nm.mpan_bottom,
+                _nm.terms_of_sale,
+                _nm.aggregator,
+                _nm.payment_type,
+                _nm.old_supplier_id,
+                cast(_nm.unit_rate, String).label("unit_rate_s"),
+                cast(_nm.standing_charge, String).label("standing_charge_s"),
+                cast(_nm.rate_1, String).label("rate_1_s"),
+                cast(_nm.rate_2, String).label("rate_2_s"),
+                cast(_nm.rate_3, String).label("rate_3_s"),
+                cast(_nm.net_notch, String).label("net_notch_s"),
+                cast(_nm.comms_paid, String).label("comms_paid_s"),
+                cast(_nm.term_sold, String).label("term_sold_s"),
+            ).subquery("ecm_cast")
+        )
+        _ecm_cols = (
+            _ecm_sq.c.energy_contract_master_id,
+            _ecm_sq.c.project_id,
+            _ecm_sq.c.service_id,
+            _ecm_sq.c.supplier_id,
+            _ecm_sq.c.contract_start_date,
+            _ecm_sq.c.contract_end_date,
+            _ecm_sq.c.mpan_number,
+            _ecm_sq.c.mpan_bottom,
+            _ecm_sq.c.terms_of_sale,
+            _ecm_sq.c.aggregator,
+            _ecm_sq.c.payment_type,
+            _ecm_sq.c.old_supplier_id,
+            _ecm_sq.c.unit_rate_s,
+            _ecm_sq.c.standing_charge_s,
+            _ecm_sq.c.rate_1_s,
+            _ecm_sq.c.rate_2_s,
+            _ecm_sq.c.rate_3_s,
+            _ecm_sq.c.net_notch_s,
+            _ecm_sq.c.comms_paid_s,
+            _ecm_sq.c.term_sold_s,
+        )
+
         latest_sq = (
             session.query(
                 Client_Interactions.client_id,
@@ -215,7 +321,7 @@ def get_energy_customers():
         query = session.query(
             Client_Master,
             Project_Details,
-            Energy_Contract_Master,
+            *_ecm_cols,
             LatestInteraction,
             Supplier_Master,
             Employee_Master,
@@ -223,8 +329,11 @@ def get_energy_customers():
             Project_Details,
             Client_Master.client_id == Project_Details.client_id
         ).outerjoin(
-            Energy_Contract_Master,
-            Project_Details.project_id == Energy_Contract_Master.project_id
+            _ecm_sq,
+            and_(
+                Project_Details.project_id == _ecm_sq.c.project_id,
+                _ecm_sq.c.service_id == _service_id,
+            ),
         ).outerjoin(
             latest_sq,
             Client_Master.client_id == latest_sq.c.client_id
@@ -233,17 +342,20 @@ def get_energy_customers():
             LatestInteraction.interaction_id == latest_sq.c.max_id
         ).outerjoin(
             Supplier_Master,
-            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
+            _ecm_sq.c.supplier_id == Supplier_Master.supplier_id
         ).outerjoin(
             Employee_Master,
             Project_Details.assigned_employee_id == Employee_Master.employee_id
         ).filter(
             and_(
-                Client_Master.tenant_id == tenant_id,
+                cast(Client_Master.tenant_id, String) == str(tenant_id),
                 Client_Master.is_deleted == False,
                 Client_Master.is_archived == False,
-                # ✅ CRITICAL: Only show contacts assigned to THIS user
-                Project_Details.assigned_employee_id == user.employee_id,
+                *(
+                    ()
+                    if see_all_tenant_clients
+                    else (Project_Details.assigned_employee_id == user.employee_id,)
+                ),
                 # ✅ CRITICAL: Only show NON-ALLOCATED contacts (not reassigned)
                 or_(
                     Client_Master.is_allocated == False,
@@ -253,37 +365,55 @@ def get_energy_customers():
                     Project_Details.status == None,
                     ~func.lower(Project_Details.status).in_(['priced', 'lost', 'lost_cot', 'lost cot'])
                 ),
-                *([Energy_Contract_Master.service_id == _service_id] if _service_id is not None else [])
             )
         ).order_by(Client_Master.created_at.desc())
  
         results = query.all()
  
-        client_ids = list(set([client.client_id for client, *_ in results]))
+        client_ids = list(set(r[0].client_id for r in results))
         assignment_notes_map = {}
         if client_ids:
             try:
-                assignment_notes_result = session.execute(text("""
-                    SELECT DISTINCT ON (client_id) client_id, notes
-                    FROM "StreemLyne_MT"."Client_Interactions"
-                    WHERE client_id = ANY(:client_ids) AND next_steps = 'Assignment'
-                    ORDER BY client_id, created_at DESC
-                """), {'client_ids': client_ids})
-                for row in assignment_notes_result:
-                    if row.notes:
-                        parts = row.notes.split(' - ', 1)
-                        assignment_notes_map[row.client_id] = parts[1] if len(parts) > 1 else row.notes
+                notes_rows = (
+                    session.query(Client_Interactions)
+                    .filter(
+                        Client_Interactions.client_id.in_(client_ids),
+                        Client_Interactions.next_steps == 'Assignment',
+                    )
+                    .order_by(
+                        Client_Interactions.client_id,
+                        Client_Interactions.created_at.desc().nullslast(),
+                    )
+                    .all()
+                )
+                seen_nid = set()
+                for nrow in notes_rows:
+                    cid = nrow.client_id
+                    if cid in seen_nid:
+                        continue
+                    seen_nid.add(cid)
+                    if nrow.notes:
+                        parts = nrow.notes.split(' - ', 1)
+                        assignment_notes_map[cid] = parts[1] if len(parts) > 1 else nrow.notes
             except Exception as notes_error:
-                print(f"⚠️ Error loading assignment notes: {notes_error}")
+                current_app.logger.warning("assignment notes skipped: %s", notes_error)
  
         customers = []
         seen_clients = set()
  
-        for client, project, contract, interaction, supplier, employee in results:
+        n = _ECM_SELECT_LEN
+        for row in results:
+            client = row[0]
+            project = row[1]
+            ecm_flat = row[2 : 2 + n]
+            interaction = row[2 + n]
+            supplier = row[3 + n]
+            employee = row[4 + n]
             if client.tenant_client_id in seen_clients:
                 continue
             seen_clients.add(client.tenant_client_id)
- 
+
+            contract = _energy_contract_proxy_from_ecm_tuple(ecm_flat)
             customer_data = build_customer_response(
                 client, project, contract, None, interaction, supplier, employee
             )
@@ -946,12 +1076,22 @@ def get_energy_customer_stats():
             .all()
         )
         
-        # Total annual usage
-        total_usage = session.query(func.sum(Project_Details.Misc_Col2)).join(
-            Client_Master
-        ).filter(
-            Client_Master.tenant_id == tenant_id
-        ).scalar() or 0
+        # Total annual usage (Misc_Col2 may be varchar in DB)
+        misc_sq = cast(
+            func.nullif(
+                func.replace(func.trim(cast(Project_Details.Misc_Col2, String)), ",", ""),
+                "",
+            ),
+            Float,
+        )
+        total_usage = (
+            session.query(func.sum(misc_sq))
+            .select_from(Project_Details)
+            .join(Client_Master, Project_Details.client_id == Client_Master.client_id)
+            .filter(Client_Master.tenant_id == tenant_id)
+            .scalar()
+            or 0
+        )
         
         stats = {
             'total': total,
@@ -1025,6 +1165,8 @@ def get_stages():
 @token_required
 def get_employees():
     """Get all employees for assignment"""
+    if local_demo_dashboard_enabled():
+        return jsonify(dummy_employees_list()), 200
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
