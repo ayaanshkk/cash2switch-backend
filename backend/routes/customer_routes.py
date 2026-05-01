@@ -8,13 +8,17 @@ Multi-table system integrating:
 - Client_Interactions: Callback tracking
 """
 
+from types import SimpleNamespace
+
 from flask import Blueprint, request, jsonify, current_app
 from .auth_helpers import token_required
-from backend.crm.utils.role_helpers import is_admin_user
+from backend.crm.utils.role_helpers import is_admin_user, is_crm_leads_admin_role
 from datetime import datetime
-from sqlalchemy import and_, or_, func, text 
+from sqlalchemy import and_, or_, func, text, cast, Float, String
 from sqlalchemy.orm import aliased
 from ..db import SessionLocal
+from ..numeric_parse import safe_float
+from ..dummy_local_dashboard_data import dummy_employees_list, local_demo_dashboard_enabled
 
 # ✅ Import all models directly from backend.models
 from backend.models import (
@@ -30,7 +34,57 @@ from backend.models import (
 )
 
 energy_customer_bp = Blueprint('energy_customers', __name__)
- 
+
+
+def _renewals_clients_see_entire_tenant(user) -> bool:
+    """Align list visibility with Team Overview: admins see all assignments in tenant."""
+    jwt_role = getattr(user, 'role', None)
+    if is_crm_leads_admin_role(jwt_role):
+        return True
+    return bool(is_admin_user(user))
+
+
+def _energy_contract_proxy_from_ecm_tuple(ecm_flat):
+    """
+    Stand-in for Energy_Contract_Master without loading full ORM rows (varchar vs Numeric in DB).
+
+    ecm_flat order matches the 20 scalar columns selected from ``ecm_cast`` in ``get_energy_customers``:
+    id, project_id, service_id, supplier_id, start, end, mpan, mpan_bottom, terms, aggregator,
+    payment, old_supplier, unit_rate_s, standing_charge_s, rate_1_s..rate_3_s, net_notch_s, comms_paid_s, term_sold_s.
+    """
+    if not ecm_flat or ecm_flat[0] is None:
+        return None
+
+    def sf(i):
+        return safe_float(ecm_flat[i])
+
+    return SimpleNamespace(
+        energy_contract_master_id=ecm_flat[0],
+        project_id=ecm_flat[1],
+        supplier_id=ecm_flat[3],
+        contract_start_date=ecm_flat[4],
+        contract_end_date=ecm_flat[5],
+        mpan_number=ecm_flat[6],
+        mpan_bottom=ecm_flat[7],
+        terms_of_sale=ecm_flat[8],
+        aggregator=ecm_flat[9],
+        payment_type=ecm_flat[10],
+        old_supplier_id=ecm_flat[11],
+        unit_rate=sf(12),
+        standing_charge=sf(13),
+        rate_1=sf(14),
+        rate_2=sf(15),
+        rate_3=sf(16),
+        net_notch=sf(17),
+        comms_paid=sf(18),
+        term_sold=sf(19),
+    )
+
+
+# Must match the scalar column count from ecm_cast in get_energy_customers
+_ECM_SELECT_LEN = 20
+
+
 # ==========================================
 # HELPER FUNCTIONS
 # ==========================================
@@ -113,7 +167,7 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'end_date': safe_date_to_iso(contract.contract_end_date if contract else None),
         'unit_rate': float(contract.unit_rate) if contract and contract.unit_rate else None,
         'terms_of_sale': contract.terms_of_sale if contract else None,
-        'standing_charge': contract.standing_charge if contract and hasattr(contract, 'standing_charge') else None,
+        'standing_charge': float(contract.standing_charge) if contract and hasattr(contract, 'standing_charge') and contract.standing_charge else None,
         'aggregator': getattr(contract, 'aggregator', None) if contract else None,
         'rate_1': float(contract.rate_1) if contract and hasattr(contract, 'rate_1') and contract.rate_1 else None,
         'payment_type': getattr(contract, 'payment_type', None) if contract else None,
@@ -177,43 +231,6 @@ def get_user_role_name(user, session):
         current_app.logger.error(f"Error getting user role: {e}")
         return None
 
-
-def log_field_change(session, client_id: int, field_name: str, old_value, new_value, changed_by_employee_id: int = None):
-    """
-    Log a field change to the interaction history with old → new format
-    """
-    # Format values for display
-    def format_value(val):
-        if val is None or val == '':
-            return "—"
-        if isinstance(val, (int, float)):
-            return str(val)
-        if isinstance(val, datetime):
-            return val.strftime('%d/%m/%Y')
-        if hasattr(val, 'isoformat'):  # date objects
-            return val.strftime('%d/%m/%Y')
-        return str(val)
-    
-    old_formatted = format_value(old_value)
-    new_formatted = format_value(new_value)
-    
-    # Skip logging if values are actually the same
-    if old_formatted == new_formatted:
-        return
-    
-    # Create change note with old → new format
-    change_note = f"Changed {field_name}: '{old_formatted}' → '{new_formatted}'"
-    
-    # Add to Client_Interactions with special next_steps marker
-    session.add(Client_Interactions(
-        client_id=client_id,
-        contact_date=datetime.utcnow().date(),
-        contact_method=1,  # System/internal
-        notes=change_note,
-        next_steps='Field Updated',  # ✅ This is how frontend identifies it
-        created_at=datetime.utcnow()
-    ))
-
 # ==========================================
 # GET ALL CUSTOMERS
 # ==========================================
@@ -231,13 +248,65 @@ def get_energy_customers():
  
         if not tenant_id:
             return jsonify({'error': 'Tenant not found for user'}), 400
- 
-        _service_id = None
-        service_param = request.args.get('service')
-        if service_param and isinstance(service_param, str):
-            svc = service_param.strip().lower()
-            _service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
- 
+
+        see_all_tenant_clients = _renewals_clients_see_entire_tenant(user)
+        if getattr(user, 'employee_id', None) is None and not see_all_tenant_clients:
+            return jsonify({'error': 'User has no employee_id; cannot load renewals assignments'}), 400
+
+        # Align with /energy-clients/stats-by-employee and recycle-bin (utilities = 1, water = 2, gas = 3).
+        service_param = request.args.get('service') or 'utilities'
+        svc = service_param.strip().lower() if isinstance(service_param, str) else 'utilities'
+        service_id_map = {'utilities': 1, 'water': 2, 'gas': 3, 'electricity': 1}
+        _service_id = service_id_map.get(svc, 1)
+
+        _nm = Energy_Contract_Master
+        _ecm_sq = (
+            session.query(
+                _nm.energy_contract_master_id,
+                _nm.project_id,
+                _nm.service_id,
+                _nm.supplier_id,
+                _nm.contract_start_date,
+                _nm.contract_end_date,
+                _nm.mpan_number,
+                _nm.mpan_bottom,
+                _nm.terms_of_sale,
+                _nm.aggregator,
+                _nm.payment_type,
+                _nm.old_supplier_id,
+                cast(_nm.unit_rate, String).label("unit_rate_s"),
+                cast(_nm.standing_charge, String).label("standing_charge_s"),
+                cast(_nm.rate_1, String).label("rate_1_s"),
+                cast(_nm.rate_2, String).label("rate_2_s"),
+                cast(_nm.rate_3, String).label("rate_3_s"),
+                cast(_nm.net_notch, String).label("net_notch_s"),
+                cast(_nm.comms_paid, String).label("comms_paid_s"),
+                cast(_nm.term_sold, String).label("term_sold_s"),
+            ).subquery("ecm_cast")
+        )
+        _ecm_cols = (
+            _ecm_sq.c.energy_contract_master_id,
+            _ecm_sq.c.project_id,
+            _ecm_sq.c.service_id,
+            _ecm_sq.c.supplier_id,
+            _ecm_sq.c.contract_start_date,
+            _ecm_sq.c.contract_end_date,
+            _ecm_sq.c.mpan_number,
+            _ecm_sq.c.mpan_bottom,
+            _ecm_sq.c.terms_of_sale,
+            _ecm_sq.c.aggregator,
+            _ecm_sq.c.payment_type,
+            _ecm_sq.c.old_supplier_id,
+            _ecm_sq.c.unit_rate_s,
+            _ecm_sq.c.standing_charge_s,
+            _ecm_sq.c.rate_1_s,
+            _ecm_sq.c.rate_2_s,
+            _ecm_sq.c.rate_3_s,
+            _ecm_sq.c.net_notch_s,
+            _ecm_sq.c.comms_paid_s,
+            _ecm_sq.c.term_sold_s,
+        )
+
         latest_sq = (
             session.query(
                 Client_Interactions.client_id,
@@ -252,7 +321,7 @@ def get_energy_customers():
         query = session.query(
             Client_Master,
             Project_Details,
-            Energy_Contract_Master,
+            *_ecm_cols,
             LatestInteraction,
             Supplier_Master,
             Employee_Master,
@@ -260,8 +329,11 @@ def get_energy_customers():
             Project_Details,
             Client_Master.client_id == Project_Details.client_id
         ).outerjoin(
-            Energy_Contract_Master,
-            Project_Details.project_id == Energy_Contract_Master.project_id
+            _ecm_sq,
+            and_(
+                Project_Details.project_id == _ecm_sq.c.project_id,
+                _ecm_sq.c.service_id == _service_id,
+            ),
         ).outerjoin(
             latest_sq,
             Client_Master.client_id == latest_sq.c.client_id
@@ -270,17 +342,20 @@ def get_energy_customers():
             LatestInteraction.interaction_id == latest_sq.c.max_id
         ).outerjoin(
             Supplier_Master,
-            Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
+            _ecm_sq.c.supplier_id == Supplier_Master.supplier_id
         ).outerjoin(
             Employee_Master,
             Project_Details.assigned_employee_id == Employee_Master.employee_id
         ).filter(
             and_(
-                Client_Master.tenant_id == tenant_id,
+                cast(Client_Master.tenant_id, String) == str(tenant_id),
                 Client_Master.is_deleted == False,
                 Client_Master.is_archived == False,
-                # ✅ CRITICAL: Only show contacts assigned to THIS user
-                Project_Details.assigned_employee_id == user.employee_id,
+                *(
+                    ()
+                    if see_all_tenant_clients
+                    else (Project_Details.assigned_employee_id == user.employee_id,)
+                ),
                 # ✅ CRITICAL: Only show NON-ALLOCATED contacts (not reassigned)
                 or_(
                     Client_Master.is_allocated == False,
@@ -290,37 +365,55 @@ def get_energy_customers():
                     Project_Details.status == None,
                     ~func.lower(Project_Details.status).in_(['priced', 'lost', 'lost_cot', 'lost cot'])
                 ),
-                *([Energy_Contract_Master.service_id == _service_id] if _service_id is not None else [])
             )
         ).order_by(Client_Master.created_at.desc())
  
         results = query.all()
  
-        client_ids = list(set([client.client_id for client, *_ in results]))
+        client_ids = list(set(r[0].client_id for r in results))
         assignment_notes_map = {}
         if client_ids:
             try:
-                assignment_notes_result = session.execute(text("""
-                    SELECT DISTINCT ON (client_id) client_id, notes
-                    FROM "StreemLyne_MT"."Client_Interactions"
-                    WHERE client_id = ANY(:client_ids) AND next_steps = 'Assignment'
-                    ORDER BY client_id, created_at DESC
-                """), {'client_ids': client_ids})
-                for row in assignment_notes_result:
-                    if row.notes:
-                        parts = row.notes.split(' - ', 1)
-                        assignment_notes_map[row.client_id] = parts[1] if len(parts) > 1 else row.notes
+                notes_rows = (
+                    session.query(Client_Interactions)
+                    .filter(
+                        Client_Interactions.client_id.in_(client_ids),
+                        Client_Interactions.next_steps == 'Assignment',
+                    )
+                    .order_by(
+                        Client_Interactions.client_id,
+                        Client_Interactions.created_at.desc().nullslast(),
+                    )
+                    .all()
+                )
+                seen_nid = set()
+                for nrow in notes_rows:
+                    cid = nrow.client_id
+                    if cid in seen_nid:
+                        continue
+                    seen_nid.add(cid)
+                    if nrow.notes:
+                        parts = nrow.notes.split(' - ', 1)
+                        assignment_notes_map[cid] = parts[1] if len(parts) > 1 else nrow.notes
             except Exception as notes_error:
-                print(f"⚠️ Error loading assignment notes: {notes_error}")
+                current_app.logger.warning("assignment notes skipped: %s", notes_error)
  
         customers = []
         seen_clients = set()
  
-        for client, project, contract, interaction, supplier, employee in results:
+        n = _ECM_SELECT_LEN
+        for row in results:
+            client = row[0]
+            project = row[1]
+            ecm_flat = row[2 : 2 + n]
+            interaction = row[2 + n]
+            supplier = row[3 + n]
+            employee = row[4 + n]
             if client.tenant_client_id in seen_clients:
                 continue
             seen_clients.add(client.tenant_client_id)
- 
+
+            contract = _energy_contract_proxy_from_ecm_tuple(ecm_flat)
             customer_data = build_customer_response(
                 client, project, contract, None, interaction, supplier, employee
             )
@@ -560,6 +653,16 @@ def update_energy_customer(client_id):
         print(f"   Data: {data}")
         print(f"   User: {request.current_user.employee_id}")
         
+        # ✅ CHECK DATABASE BEFORE ANY CHANGES
+        check_query = session.execute(text("""
+            SELECT cm.assigned_employee_id, pd.assigned_employee_id, cm.is_allocated
+            FROM "StreemLyne_MT"."Client_Master" cm
+            LEFT JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
+            WHERE cm.client_id = :cid
+        """), {'cid': client_id}).fetchone()
+        print(f"   DB BEFORE: client_assigned={check_query[0]}, project_assigned={check_query[1]}, is_allocated={check_query[2]}")
+        print(f"{'='*60}\n")
+        print(f"🔧 UPDATE REQUEST for client {client_id}: {data}")
         tenant_id = get_tenant_id_from_user(request.current_user)
  
         client = session.query(Client_Master).filter_by(
@@ -572,77 +675,35 @@ def update_energy_customer(client_id):
         # Resolve actual client_id for downstream use
         client_id = client.client_id
  
-        # ✅ Get current employee ID for change logging
-        current_employee_id = request.current_user.employee_id if hasattr(request.current_user, 'employee_id') else None
-        
-        # ✅ TRACK CHANGES - Client_Master fields
-        CLIENT_FIELDS = {
-            'business_name': ('client_company_name', 'Trading Name'),
-            'contact_person': ('client_contact_name', 'Client Name'),
-            'phone': ('client_phone', 'Tel Number'),
-            'mobile_no': ('client_mobile', 'Mobile Number'),
-            'email': ('client_email', 'Email'),
-            'address': ('address', 'Street'),
-            'post_code': ('post_code', 'Post Code'),
-            'website': ('client_website', 'Website'),
-            'position': ('position', 'Position'),
-            'company_number': ('company_number', 'Company Number'),
-            'date_of_birth': ('date_of_birth', 'Date of Birth'),
-            'bank_name': ('bank_name', 'Bank Name'),
-            'bank_account_number': ('account_number', 'Account Number'),
-            'bank_sort_code': ('sort_code', 'Sort Code'),
-            'charity_ltd_company_number': ('charity_ltd_company_number', 'Charity/Ltd Company Number'),
-            'partner_details': ('partner_details', 'Partner Details'),
-        }
-        
-        # Update Client_Master fields WITH CHANGE TRACKING
-        for api_field, (db_field, display_name) in CLIENT_FIELDS.items():
-            if api_field in data:
-                old_value = getattr(client, db_field, None)
-                new_value = data[api_field]
-                
-                if old_value != new_value:
-                    log_field_change(session, client_id, display_name, old_value, new_value, current_employee_id)
-                    setattr(client, db_field, new_value)
+        # Update Client_Master fields
+        for field, col in [('business_name', 'client_company_name'), ('contact_person', 'client_contact_name'),
+                            ('phone', 'client_phone'), ('mobile_no', 'client_mobile'),
+                            ('email', 'client_email'), ('address', 'address'),
+                            ('post_code', 'post_code'), ('website', 'client_website')]:
+            if field in data:
+                setattr(client, col, data[field])
 
         # Update Project_Details
         project = session.query(Project_Details).filter_by(client_id=client_id).first()
         if project:
-            # ✅ TRACK CHANGES - Project_Details fields
-            PROJECT_FIELDS = {
-                'site_address': ('address', 'Site Address'),
-                'annual_usage': ('Misc_Col2', 'Annual Usage'),
-                'site_name': ('site_name', 'Site Name'),
-                'month_sold': ('month_sold', 'Month Sold'),
-                'house_name': ('house_name', 'House Name'),
-                'house_number': ('house_number', 'House Number'),
-                'door_number': ('door_number', 'Door Number'),
-                'town': ('town', 'Town'),
-                'county': ('county', 'County'),
-            }
-            
-            for api_field, (db_field, display_name) in PROJECT_FIELDS.items():
-                if api_field in data:
-                    old_value = getattr(project, db_field, None)
-                    new_value = data[api_field]
-                    
-                    if old_value != new_value:
-                        log_field_change(session, client_id, display_name, old_value, new_value, current_employee_id)
-                        setattr(project, db_field, new_value)
+            for field, col in [('site_address', 'address'), ('annual_usage', 'Misc_Col2'),
+                                ('site_name', 'site_name'), ('month_sold', 'month_sold'),
+                                ('house_name', 'house_name'), ('house_number', 'house_number'),
+                                ('door_number', 'door_number'), ('town', 'town'), ('county', 'county')]:
+                if field in data:
+                    setattr(project, col, data[field])
 
-            # ✅ Status tracking
+            # ✅ Status now on Project_Details
             if 'status' in data:
                 status_value = data['status']
-                new_status = None if status_value in ['None', 'null', '', None] else status_value
-                old_status = project.status
-                
-                if old_status != new_status:
-                    log_field_change(session, client_id, 'Status', old_status, new_status, current_employee_id)
-                    project.status = new_status
+                project.status = None if status_value in ['None', 'null', '', None] else status_value
 
-            # ✅ Assignment tracking (SEPARATE from change tracking)
+            # ✅ CRITICAL: Handle assignment SEPARATELY - query fresh data
             if 'assigned_to_id' in data:
+                # Flush any pending changes FIRST
                 session.flush()
+                
+                # ✅ RE-QUERY to get fresh assignment data from DB
                 fresh_project = session.query(Project_Details).filter_by(client_id=client_id).first()
                 old_assigned_to = fresh_project.assigned_employee_id
                 new_assigned_to = data['assigned_to_id']
@@ -653,16 +714,6 @@ def update_energy_customer(client_id):
                 print(f"   Old: {old_assigned_to}")
                 print(f"   New: {new_assigned_to}")
                 print(f"   Current user: {current_user_employee_id}")
-                
-                # Track assignment change with employee names
-                if old_assigned_to != new_assigned_to:
-                    old_emp = session.query(Employee_Master).filter_by(employee_id=old_assigned_to).first() if old_assigned_to else None
-                    new_emp = session.query(Employee_Master).filter_by(employee_id=new_assigned_to).first() if new_assigned_to else None
-                    
-                    old_name = old_emp.employee_name if old_emp else "Unassigned"
-                    new_name = new_emp.employee_name if new_emp else "Unassigned"
-                    
-                    log_field_change(session, client_id, 'Assigned To', old_name, new_name, current_employee_id)
                 
                 # Update assignment on BOTH tables
                 project.assigned_employee_id = new_assigned_to
@@ -707,105 +758,16 @@ def update_energy_customer(client_id):
             new_assigned_to = None
             assignment_notes = None
  
-        # ✅ Update Energy_Contract_Master WITH CHANGE TRACKING
+        # Update Energy_Contract_Master
         if project:
             contract = session.query(Energy_Contract_Master).filter_by(
                 project_id=project.project_id
             ).first()
             if contract:
-                # MPAN changes
-                if 'mpan_mpr' in data or 'mpan_top' in data:
-                    new_mpan = data.get('mpan_mpr') or data.get('mpan_top')
-                    if contract.mpan_number != new_mpan:
-                        log_field_change(session, client_id, 'MPAN Top', contract.mpan_number, new_mpan, current_employee_id)
-                        contract.mpan_number = new_mpan
-                
-                if 'mpan_bottom' in data and contract.mpan_bottom != data['mpan_bottom']:
-                    log_field_change(session, client_id, 'MPAN Bottom', contract.mpan_bottom, data['mpan_bottom'], current_employee_id)
-                    contract.mpan_bottom = data['mpan_bottom']
-                
-                # Supplier changes - show names not IDs
-                if 'supplier_id' in data:
-                    new_supplier_id = data['supplier_id']
-                    if contract.supplier_id != new_supplier_id:
-                        old_supp = session.query(Supplier_Master).filter_by(supplier_id=contract.supplier_id).first() if contract.supplier_id else None
-                        new_supp = session.query(Supplier_Master).filter_by(supplier_id=new_supplier_id).first() if new_supplier_id else None
-                        
-                        old_name = old_supp.supplier_company_name if old_supp else "—"
-                        new_name = new_supp.supplier_company_name if new_supp else "—"
-                        
-                        log_field_change(session, client_id, 'New Supplier', old_name, new_name, current_employee_id)
-                        contract.supplier_id = new_supplier_id
-                
-                if 'old_supplier_id' in data:
-                    val = data['old_supplier_id']
-                    new_old_supplier_id = None if (val is None or val == 0) else val
-                    
-                    if contract.old_supplier_id != new_old_supplier_id:
-                        old_supp = session.query(Supplier_Master).filter_by(supplier_id=contract.old_supplier_id).first() if contract.old_supplier_id else None
-                        new_supp = session.query(Supplier_Master).filter_by(supplier_id=new_old_supplier_id).first() if new_old_supplier_id else None
-                        
-                        old_name = old_supp.supplier_company_name if old_supp else "—"
-                        new_name = new_supp.supplier_company_name if new_supp else "—"
-                        
-                        log_field_change(session, client_id, 'Old Supplier', old_name, new_name, current_employee_id)
-                        contract.old_supplier_id = new_old_supplier_id
-                
-                # Standing charge
-                if 'standing_charge' in data:
-                    new_sc = str(data['standing_charge']) if data['standing_charge'] else None
-                    if contract.standing_charge != new_sc:
-                        log_field_change(session, client_id, 'Standing Charge', contract.standing_charge, new_sc, current_employee_id)
-                        contract.standing_charge = new_sc
-                
-                # Contract dates
-                if 'start_date' in data and data['start_date']:
-                    new_start = datetime.fromisoformat(data['start_date'].replace('Z', '')).date() if isinstance(data['start_date'], str) else data['start_date']
-                    if contract.contract_start_date != new_start:
-                        log_field_change(session, client_id, 'Start Date', contract.contract_start_date, new_start, current_employee_id)
-                        contract.contract_start_date = new_start
-                
-                if 'end_date' in data and data['end_date']:
-                    new_end = datetime.fromisoformat(data['end_date'].replace('Z', '')).date() if isinstance(data['end_date'], str) else data['end_date']
-                    if contract.contract_end_date != new_end:
-                        log_field_change(session, client_id, 'Contract End', contract.contract_end_date, new_end, current_employee_id)
-                        contract.contract_end_date = new_end
-                
-                # Rates and charges
-                if 'unit_rate' in data and data['unit_rate'] is not None:
-                    if contract.unit_rate != data['unit_rate']:
-                        log_field_change(session, client_id, 'Rate 1', contract.unit_rate, data['unit_rate'], current_employee_id)
-                        contract.unit_rate = data['unit_rate']
-                
-                if 'rate_2' in data and contract.rate_2 != data.get('rate_2'):
-                    log_field_change(session, client_id, 'Rate 2', contract.rate_2, data['rate_2'], current_employee_id)
-                    contract.rate_2 = data['rate_2']
-                
-                if 'rate_3' in data and contract.rate_3 != data.get('rate_3'):
-                    log_field_change(session, client_id, 'Rate 3', contract.rate_3, data['rate_3'], current_employee_id)
-                    contract.rate_3 = data['rate_3']
-                
-                if 'net_notch' in data and contract.net_notch != data.get('net_notch'):
-                    log_field_change(session, client_id, 'Net Notch', contract.net_notch, data['net_notch'], current_employee_id)
-                    contract.net_notch = data['net_notch']
-                
-                if 'term_sold' in data and contract.term_sold != data.get('term_sold'):
-                    log_field_change(session, client_id, 'Term Sold', contract.term_sold, data['term_sold'], current_employee_id)
-                    contract.term_sold = data['term_sold']
-                
-                if 'comms_paid' in data and contract.comms_paid != data.get('comms_paid'):
-                    log_field_change(session, client_id, 'Comms Paid', contract.comms_paid, data['comms_paid'], current_employee_id)
-                    contract.comms_paid = data['comms_paid']
-                
-                if 'terms_of_sale' in data and contract.terms_of_sale != data.get('terms_of_sale'):
-                    log_field_change(session, client_id, 'Terms of Sale', contract.terms_of_sale, data['terms_of_sale'], current_employee_id)
-                    contract.terms_of_sale = data['terms_of_sale']
-                
-                if 'payment_type' in data and contract.payment_type != data.get('payment_type'):
-                    log_field_change(session, client_id, 'Payment Type', contract.payment_type, data['payment_type'], current_employee_id)
-                    contract.payment_type = data['payment_type']
-                
-                # Handle new supplier by name
+                if 'mpan_mpr' in data: contract.mpan_number = data['mpan_mpr']
+                if 'mpan_top' in data: contract.mpan_number = data['mpan_top']
+                if 'mpan_bottom' in data: contract.mpan_bottom = data['mpan_bottom']
+                if 'supplier_id' in data: contract.supplier_id = data['supplier_id']
                 if 'new_supplier' in data and data['new_supplier']:
                     new_supplier_name = data['new_supplier'].strip()
                     matched = session.query(Supplier_Master).filter(
@@ -814,9 +776,6 @@ def update_energy_customer(client_id):
                     if matched:
                         if contract.supplier_id and contract.supplier_id != matched.supplier_id:
                             contract.old_supplier_id = contract.supplier_id
-                            log_field_change(session, client_id, 'New Supplier', 
-                                           session.query(Supplier_Master).filter_by(supplier_id=contract.supplier_id).first().supplier_company_name if contract.supplier_id else "—",
-                                           matched.supplier_company_name, current_employee_id)
                         contract.supplier_id = matched.supplier_id
                     else:
                         new_sup = Supplier_Master(
@@ -828,12 +787,25 @@ def update_energy_customer(client_id):
                         session.add(new_sup)
                         session.flush()
                         contract.old_supplier_id = contract.supplier_id
-                        log_field_change(session, client_id, 'New Supplier', "—", new_supplier_name, current_employee_id)
                         contract.supplier_id = new_sup.supplier_id
-                
+                if 'old_supplier_id' in data:
+                    val = data['old_supplier_id']
+                    contract.old_supplier_id = None if (val is None or val == 0) else val
+                if 'start_date' in data and data['start_date']:
+                    contract.contract_start_date = datetime.fromisoformat(
+                        data['start_date'].replace('Z', '')
+                    ).date() if isinstance(data['start_date'], str) else data['start_date']
+                if 'end_date' in data and data['end_date']:
+                    contract.contract_end_date = datetime.fromisoformat(
+                        data['end_date'].replace('Z', '')
+                    ).date() if isinstance(data['end_date'], str) else data['end_date']
+                if 'unit_rate' in data and data['unit_rate'] is not None:
+                    contract.unit_rate = data['unit_rate']
+                if 'terms_of_sale' in data: contract.terms_of_sale = data['terms_of_sale']
+                if 'payment_type' in data: contract.payment_type = data['payment_type']
                 contract.updated_at = datetime.utcnow()
  
-        # Create assignment interaction if assignment changed (SEPARATE from field change tracking)
+        # Create assignment interaction if assignment changed
         if 'assigned_to_id' in data and old_assigned_to != new_assigned_to:
             emp = session.query(Employee_Master).filter_by(employee_id=new_assigned_to).first() if new_assigned_to else None
             emp_name = emp.employee_name if emp else "Unassigned"
@@ -845,7 +817,7 @@ def update_energy_customer(client_id):
                 contact_date=datetime.utcnow().date(),
                 contact_method=1,
                 notes=note,
-                next_steps="Assignment",  # ✅ Keep only this
+                next_steps="Assignment",
                 created_at=datetime.utcnow()
             ))
  
@@ -1104,12 +1076,22 @@ def get_energy_customer_stats():
             .all()
         )
         
-        # Total annual usage
-        total_usage = session.query(func.sum(Project_Details.Misc_Col2)).join(
-            Client_Master
-        ).filter(
-            Client_Master.tenant_id == tenant_id
-        ).scalar() or 0
+        # Total annual usage (Misc_Col2 may be varchar in DB)
+        misc_sq = cast(
+            func.nullif(
+                func.replace(func.trim(cast(Project_Details.Misc_Col2, String)), ",", ""),
+                "",
+            ),
+            Float,
+        )
+        total_usage = (
+            session.query(func.sum(misc_sq))
+            .select_from(Project_Details)
+            .join(Client_Master, Project_Details.client_id == Client_Master.client_id)
+            .filter(Client_Master.tenant_id == tenant_id)
+            .scalar()
+            or 0
+        )
         
         stats = {
             'total': total,
@@ -1183,6 +1165,8 @@ def get_stages():
 @token_required
 def get_employees():
     """Get all employees for assignment"""
+    if local_demo_dashboard_enabled():
+        return jsonify(dummy_employees_list()), 200
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
@@ -1457,7 +1441,7 @@ def get_priced_customers():
         service_param = request.args.get('service')
         if service_param:
             svc = service_param.strip().lower()
-            _service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
+            _service_id = 2 if svc == 'water' else (1 if svc in ('electricity', 'utilities') else None)
  
         salesperson_param = request.args.get('salesperson')
  
@@ -1584,52 +1568,36 @@ def get_stats_by_employee():
 def get_recycle_bin():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
-
+ 
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
         user = request.current_user
         if not tenant_id:
             return jsonify({'error': 'Tenant not found for user'}), 400
-
+ 
         service_param = request.args.get('service', 'utilities')
         service_id = {'utilities': 1, 'water': 2, 'gas': 3}.get(service_param.strip().lower(), 1)
-        salesperson_param = request.args.get('salesperson')
-
+ 
         query = session.query(
             Client_Master, Project_Details, Energy_Contract_Master,
             Supplier_Master, Employee_Master
         ).join(Project_Details, Client_Master.client_id == Project_Details.client_id
         ).outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
         ).outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
-        ).outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id
+        ).outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id  # ✅ Changed
         ).filter(and_(
             Client_Master.tenant_id == tenant_id,
-            Client_Master.is_deleted == True,  # ✅ SOFT DELETED
+            Client_Master.is_deleted == True,
             *([Energy_Contract_Master.service_id == service_id] if service_id is not None else [])
-        ))
-
-        # ✅ Admin sees all (with optional salesperson filter); non-admin sees only their own
-        user_role = get_user_role_name(user, session)
-        is_admin = user_role in ['Platform Admin', 'Tenant Super Admin']
-
-        if is_admin:
-            if salesperson_param and salesperson_param != "All":
-                try:
-                    query = query.filter(
-                        Project_Details.assigned_employee_id == int(salesperson_param)
-                    )
-                except ValueError:
-                    pass
-        else:
-            query = query.filter(
-                Project_Details.assigned_employee_id == user.employee_id
-            )
-
-        results = query.order_by(Client_Master.deleted_at.desc()).all()
+        )).filter(
+            Project_Details.assigned_employee_id == user.employee_id  # ✅ Changed
+        ).order_by(Client_Master.deleted_at.desc())
+ 
+        results = query.all()
         customers = []
         seen_clients = set()
-
+ 
         for client, project, contract, supplier, employee in results:
             if client.client_id in seen_clients:
                 continue
@@ -1641,9 +1609,9 @@ def get_recycle_bin():
             customer_data['deleted_at'] = client.deleted_at.isoformat() if client.deleted_at else None
             customer_data['deleted_reason'] = client.deleted_reason
             customers.append(customer_data)
-
+ 
         return jsonify(customers), 200
-
+ 
     except Exception as e:
         current_app.logger.exception(f"❌ Error fetching recycle bin: {e}")
         return jsonify({'error': 'Failed to fetch recycle bin'}), 500
@@ -1661,9 +1629,9 @@ def restore_customer(client_id):
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
         client = (
-            session.query(Client_Master).filter_by(display_order=client_id, tenant_id=tenant_id, is_deleted=True).first() or
-            session.query(Client_Master).filter_by(tenant_client_id=client_id, tenant_id=tenant_id, is_deleted=True).first() or
-            session.query(Client_Master).filter_by(client_id=client_id, tenant_id=tenant_id, is_deleted=True).first()
+            session.query(Client_Master).filter_by(display_order=client_id, tenant_id=tenant_id).first() or
+            session.query(Client_Master).filter_by(tenant_client_id=client_id, tenant_id=tenant_id).first() or
+            session.query(Client_Master).filter_by(client_id=client_id, tenant_id=tenant_id).first()
         )
         if client and not client.is_deleted:
             client = None
@@ -1798,11 +1766,10 @@ def get_archived_customers():
         ).join(Project_Details, Client_Master.client_id == Project_Details.client_id
         ).outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
         ).outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
-        ).outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id
+        ).outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id  # ✅ Changed
         ).filter(and_(
             Client_Master.tenant_id == tenant_id,
-            Client_Master.is_archived == True,  # ✅ ARCHIVED (not deleted)
-            Client_Master.is_deleted == False,   # ✅ NOT DELETED
+            Client_Master.is_archived == True,
             *([Energy_Contract_Master.service_id == service_id] if service_id is not None else [])
         ))
  
@@ -1813,13 +1780,13 @@ def get_archived_customers():
             if salesperson_param and salesperson_param != "All":
                 try:
                     query = query.filter(
-                        Project_Details.assigned_employee_id == int(salesperson_param)
+                        Project_Details.assigned_employee_id == int(salesperson_param)  # ✅ Changed
                     )
                 except ValueError:
                     pass
         else:
             query = query.filter(
-                Project_Details.assigned_employee_id == user.employee_id
+                Project_Details.assigned_employee_id == user.employee_id  # ✅ Changed
             )
  
         results = query.order_by(Energy_Contract_Master.contract_end_date.desc()).all()
@@ -2219,8 +2186,3 @@ def get_allocated_contacts():
         return jsonify({'error': 'Failed to fetch allocated contacts'}), 500
     finally:
         session.close()
-
-from backend.routes.cleansing_routes import register_energy_client_cleanse
-
-# Register energy client cleansing route
-register_energy_client_cleanse(energy_customer_bp, token_required)

@@ -4,6 +4,7 @@ Calendar Routes - FIXED VERSION with Customer Details Sync
 Syncs with renewals page AND customer details page (callbacks)
 """
 from flask import Blueprint, g, jsonify, request
+from datetime import datetime
 from backend.routes.auth_helpers import token_required
 from backend.routes.crm_routes import tenant_from_jwt
 from backend.crm.repositories.tenant_repository import TenantRepository
@@ -91,8 +92,9 @@ def get_renewals_calendar():
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON pd.assigned_employee_id = em.employee_id
             WHERE cm.tenant_id = :tenant_id
             AND cm.client_company_name != '[IMPORTED LEADS]'
+            AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
             AND ecm.contract_end_date IS NOT NULL
-            AND (pd.status IS NULL OR LOWER(pd.status) NOT IN ('priced', 'lost'))
+            AND (pd.status IS NULL OR LOWER(pd.status) NOT IN ('priced', 'lost', 'lost cot'))
             {employee_filter}
         ''')
         
@@ -106,9 +108,10 @@ def get_renewals_calendar():
                     ci.notes,
                     ROW_NUMBER() OVER (
                         PARTITION BY ci.client_id
-                        ORDER BY ci.interaction_id DESC, ci.created_at DESC NULLS LAST
+                        ORDER BY ci.created_at DESC NULLS LAST, ci.interaction_id DESC
                     ) AS rn
                 FROM "StreemLyne_MT"."Client_Interactions" ci
+                WHERE ci.reminder_date IS NOT NULL
             )
             SELECT
                 cm.client_id,
@@ -141,9 +144,9 @@ def get_renewals_calendar():
             WHERE lci.rn = 1
             AND cm.tenant_id = :tenant_id
             AND cm.client_company_name != '[IMPORTED LEADS]'
+            AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
             AND lci.reminder_date IS NOT NULL
-            AND lci.reminder_date >= CURRENT_DATE
-            AND (pd2.status IS NULL OR LOWER(pd2.status) NOT IN ('priced', 'lost'))
+            AND (pd2.status IS NULL OR LOWER(pd2.status) NOT IN ('priced', 'lost', 'lost cot'))
             {callback_employee_filter}
             ORDER BY cm.client_id
         ''')
@@ -225,6 +228,7 @@ def get_renewals_calendar():
                 'notes': callback.get('callback_notes'),
                 'display_date': str(callback['callback_date']),
                 'display_type': interaction_status,
+                'is_overdue': callback.get('callback_date') is not None and str(callback.get('callback_date')) < str(datetime.utcnow().date()),
                 'status': callback.get('status') or 'Active',
                 'assigned_to': callback.get('assigned_to'),
             }
@@ -252,7 +256,11 @@ def get_renewals_calendar():
 @token_required
 @tenant_from_jwt
 def get_leads_calendar():
-    """Get callback-only lead calendar events from Opportunity_Details."""
+    """Get lead callback events from Opportunity_Details.
+
+    Leads calendar intentionally shows callback dates only. Contract end dates
+    belong on the renewals calendar.
+    """
     if request.method == 'OPTIONS':
         return jsonify({}), 200
 
@@ -304,9 +312,10 @@ def get_leads_calendar():
                     ci."notes",
                     ROW_NUMBER() OVER (
                         PARTITION BY ci."client_id"
-                        ORDER BY ci."interaction_id" DESC, ci."created_at" DESC NULLS LAST
+                        ORDER BY ci."created_at" DESC NULLS LAST, ci."interaction_id" DESC
                     ) AS rn
                 FROM "StreemLyne_MT"."Client_Interactions" ci
+                WHERE ci."reminder_date" IS NOT NULL
             )
             SELECT
                 od."opportunity_id",
@@ -343,14 +352,14 @@ def get_leads_calendar():
                AND lci.rn = 1
             WHERE (od."tenant_id" = :tenant_id OR (od."client_id" IS NOT NULL AND cm."tenant_id" = :tenant_id))
               AND od."service_id" = :service_id
+              AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
+              AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") NOT IN ('lost', 'lost cot'))
               AND NOT EXISTS (
                     SELECT 1
                     FROM "StreemLyne_MT"."Project_Details" pd
                     WHERE pd."opportunity_id" = od."opportunity_id"
                 )
-              AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") NOT IN ('priced', 'lost'))
               AND lci."reminder_date" IS NOT NULL
-              AND lci."reminder_date" >= CURRENT_DATE
               {employee_filter}
             ORDER BY lci."reminder_date" ASC
         ''')
@@ -367,7 +376,7 @@ def get_leads_calendar():
             callback_type = lead.get('ci_next_steps') or 'Callback'
             notes = lead.get('ci_notes')
             lead_name = lead.get('name') or 'Unknown'
-            open_id = lead.get('tenant_lead_id') or lead.get('opportunity_id')
+            open_id = lead.get('opportunity_id')
 
             events.append({
                 'id': f"lead-callback-{lead.get('opportunity_id')}",
@@ -390,6 +399,7 @@ def get_leads_calendar():
                 'notes': notes,
                 'display_date': str(callback_date),
                 'display_type': callback_type,
+                'is_overdue': str(callback_date) < str(datetime.utcnow().date()),
                 'status': lead.get('stage_name') or 'Active',
                 'assigned_to': lead.get('assigned_to'),
             })

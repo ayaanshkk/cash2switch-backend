@@ -106,6 +106,20 @@ def add_callback(client_id):
  
         if date_required and not callback_date:
             return jsonify({'error': 'Callback date is required for this status'}), 400
+
+        if callback_date:
+            deleted_count = session.execute(text("""
+                DELETE FROM "StreemLyne_MT"."Client_Interactions"
+                WHERE client_id = :client_id
+                AND reminder_date IS NOT NULL
+            """), {'client_id': client_id}).rowcount
+            current_app.logger.warning(
+                "Deleted %s old scheduled callback rows for renewal client_id=%s before saving %s on %s",
+                deleted_count,
+                client_id,
+                status,
+                callback_date,
+            )
  
         # ── Soft delete: Cleansing OR Recycle Bin ─────────────────────────────
         if config["deletes_record"]:
