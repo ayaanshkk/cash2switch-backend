@@ -7,6 +7,8 @@ from flask import Blueprint, request, g, jsonify, current_app
 from functools import wraps
 from datetime import datetime, timedelta
 import re
+from sqlalchemy import text
+from backend.db import SessionLocal
 from backend.crm.controllers.crm_controller import CRMController
 from backend.crm.middleware.tenant_middleware import require_tenant
 from backend.crm.utils.role_helpers import is_crm_leads_admin_role
@@ -2497,6 +2499,408 @@ def get_priced():
         500: Internal server error
     """
     return crm_controller.get_priced()
+
+
+def _priced_stage_id(session, stage_name: str):
+    row = session.execute(text("""
+        SELECT stage_id
+        FROM "StreemLyne_MT"."Stage_Master"
+        WHERE LOWER(stage_name) = LOWER(:stage_name)
+        LIMIT 1
+    """), {'stage_name': stage_name}).mappings().first()
+    return row['stage_id'] if row else None
+
+
+def _priced_lead(session, opportunity_id: int, tenant_id):
+    return session.execute(text("""
+        SELECT od.*, COALESCE(od.business_name, od.opportunity_title) AS resolved_business_name
+        FROM "StreemLyne_MT"."Opportunity_Details" od
+        LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
+        LEFT JOIN "StreemLyne_MT"."Client_Master" cm ON od.client_id = cm.client_id
+        WHERE od.tenant_id = :tenant_id
+          AND (od.opportunity_id = :id OR od.tenant_lead_id = :id)
+          AND LOWER(COALESCE(sm.stage_name, '')) = 'priced'
+          AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
+        ORDER BY CASE WHEN od.opportunity_id = :id THEN 0 ELSE 1 END
+        LIMIT 1
+    """), {'tenant_id': tenant_id, 'id': opportunity_id}).mappings().first()
+
+
+def _insert_priced_interaction(session, client_id: int, status: str, notes: str):
+    session.execute(text("""
+        INSERT INTO "StreemLyne_MT"."Client_Interactions"
+            (client_id, contact_date, contact_method, notes, next_steps, created_at)
+        VALUES (:client_id, CURRENT_DATE, 1, :notes, :status, :created_at)
+    """), {
+        'client_id': client_id,
+        'notes': notes,
+        'status': status,
+        'created_at': datetime.utcnow(),
+    })
+
+
+@crm_bp.route('/priced/leads/<int:opportunity_id>/accept', methods=['POST', 'OPTIONS'])
+@token_required
+@tenant_from_jwt
+def accept_priced_lead(opportunity_id):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        tenant_id = g.tenant_id
+        lead = _priced_lead(session, opportunity_id, tenant_id)
+        if not lead:
+            return jsonify({'error': 'Priced lead not found'}), 404
+
+        real_id = lead['opportunity_id']
+        assigned_employee_id = lead.get('opportunity_owner_employee_id')
+        client_id = lead.get('client_id')
+        if not client_id:
+            from backend.models import Client_Master
+            client = Client_Master(
+                tenant_id=int(tenant_id),
+                assigned_employee_id=assigned_employee_id,
+                client_company_name=lead.get('resolved_business_name') or '[IMPORTED LEADS]',
+                client_contact_name=lead.get('contact_person') or '',
+                client_phone=lead.get('tel_number') or '',
+                client_email=lead.get('email') or '',
+                default_currency_id=1,
+                created_at=datetime.utcnow()
+            )
+            session.add(client)
+            session.flush()
+            client_id = client.client_id
+
+        business_name = lead.get('resolved_business_name') or 'Unknown'
+        now = datetime.utcnow()
+
+        session.execute(text("""
+            UPDATE "StreemLyne_MT"."Client_Master"
+            SET assigned_employee_id = :assigned_employee_id,
+                client_company_name = COALESCE(NULLIF(:business_name, ''), client_company_name),
+                client_contact_name = COALESCE(NULLIF(:contact_person, ''), client_contact_name),
+                client_phone = COALESCE(NULLIF(:tel_number, ''), client_phone),
+                client_mobile = COALESCE(NULLIF(:mobile_no, ''), client_mobile),
+                client_email = COALESCE(NULLIF(:email, ''), client_email),
+                address = COALESCE(NULLIF(:address, ''), address),
+                post_code = COALESCE(NULLIF(:postcode, ''), post_code),
+                is_deleted = FALSE,
+                deleted_at = NULL,
+                deleted_reason = NULL,
+                is_archived = FALSE,
+                is_allocated = FALSE
+            WHERE client_id = :client_id AND tenant_id = :tenant_id
+        """), {
+            'assigned_employee_id': assigned_employee_id,
+            'business_name': business_name,
+            'contact_person': lead.get('contact_person') or '',
+            'tel_number': lead.get('tel_number') or '',
+            'mobile_no': lead.get('mobile_no') or '',
+            'email': lead.get('email') or '',
+            'address': lead.get('address') or '',
+            'postcode': lead.get('postcode') or '',
+            'client_id': client_id,
+            'tenant_id': tenant_id,
+        })
+
+        project = session.execute(text("""
+            SELECT project_id
+            FROM "StreemLyne_MT"."Project_Details"
+            WHERE opportunity_id = :opportunity_id OR client_id = :client_id
+            ORDER BY CASE WHEN opportunity_id = :opportunity_id THEN 0 ELSE 1 END
+            LIMIT 1
+        """), {'opportunity_id': real_id, 'client_id': client_id}).mappings().first()
+
+        if project:
+            project_id = project['project_id']
+            session.execute(text("""
+                UPDATE "StreemLyne_MT"."Project_Details"
+                SET client_id = :client_id,
+                    opportunity_id = :opportunity_id,
+                    project_title = COALESCE(NULLIF(:business_name, ''), project_title),
+                    start_date = COALESCE(:start_date, start_date),
+                    end_date = COALESCE(:end_date, end_date),
+                    address = COALESCE(NULLIF(:address, ''), address),
+                    "Misc_Col2" = COALESCE(:annual_usage, "Misc_Col2"),
+                    assigned_employee_id = :assigned_employee_id,
+                    status = NULL,
+                    updated_at = :now
+                WHERE project_id = :project_id
+            """), {
+                'client_id': client_id,
+                'opportunity_id': real_id,
+                'business_name': business_name,
+                'start_date': lead.get('start_date'),
+                'end_date': lead.get('end_date'),
+                'address': lead.get('address') or '',
+                'annual_usage': lead.get('annual_usage'),
+                'assigned_employee_id': assigned_employee_id,
+                'now': now,
+                'project_id': project_id,
+            })
+        else:
+            project_id = session.execute(text("""
+                INSERT INTO "StreemLyne_MT"."Project_Details"
+                    (client_id, opportunity_id, project_title, project_description, start_date, end_date,
+                     employee_id, created_at, updated_at, address, "Misc_Col2", assigned_employee_id, status)
+                VALUES
+                    (:client_id, :opportunity_id, :business_name, 'Converted priced lead',
+                     :start_date, :end_date, :employee_id, :now, :now, :address, :annual_usage,
+                     :assigned_employee_id, NULL)
+                RETURNING project_id
+            """), {
+                'client_id': client_id,
+                'opportunity_id': real_id,
+                'business_name': business_name,
+                'start_date': lead.get('start_date'),
+                'end_date': lead.get('end_date'),
+                'employee_id': getattr(request.current_user, 'employee_id', None),
+                'now': now,
+                'address': lead.get('address') or '',
+                'annual_usage': lead.get('annual_usage'),
+                'assigned_employee_id': assigned_employee_id,
+            }).scalar()
+
+        contract_params = {
+            'project_id': project_id,
+            'employee_id': getattr(request.current_user, 'employee_id', None),
+            'supplier_id': lead.get('supplier_id'),
+            'contract_start_date': lead.get('start_date'),
+            'contract_end_date': lead.get('end_date'),
+            'service_id': lead.get('service_id') or 1,
+            'unit_rate': lead.get('rate_1') or 0,
+            'currency_id': lead.get('currency_id') or 1,
+            'now': now,
+            'mpan_number': lead.get('mpan_mpr') or '',
+            'mpan_bottom': lead.get('mpan_bottom') or '',
+            'standing_charge': str(lead.get('stand_charge')) if lead.get('stand_charge') is not None else None,
+            'rate_1': lead.get('rate_1'),
+            'rate_2': lead.get('rate_2'),
+            'rate_3': lead.get('rate_3'),
+            'net_notch': lead.get('net_notch'),
+            'payment_type': lead.get('payment_type'),
+        }
+
+        contract = session.execute(text("""
+            SELECT energy_contract_master_id
+            FROM "StreemLyne_MT"."Energy_Contract_Master"
+            WHERE project_id = :project_id
+            LIMIT 1
+        """), {'project_id': project_id}).mappings().first()
+
+        if contract:
+            session.execute(text("""
+                UPDATE "StreemLyne_MT"."Energy_Contract_Master"
+                SET supplier_id = COALESCE(:supplier_id, supplier_id),
+                    contract_start_date = COALESCE(:contract_start_date, contract_start_date),
+                    contract_end_date = COALESCE(:contract_end_date, contract_end_date),
+                    service_id = COALESCE(:service_id, service_id),
+                    unit_rate = COALESCE(:unit_rate, unit_rate),
+                    currency_id = COALESCE(:currency_id, currency_id),
+                    updated_at = :now,
+                    mpan_number = COALESCE(NULLIF(:mpan_number, ''), mpan_number),
+                    mpan_bottom = COALESCE(NULLIF(:mpan_bottom, ''), mpan_bottom),
+                    standing_charge = COALESCE(:standing_charge, standing_charge),
+                    rate_1 = COALESCE(:rate_1, rate_1),
+                    rate_2 = COALESCE(:rate_2, rate_2),
+                    rate_3 = COALESCE(:rate_3, rate_3),
+                    net_notch = COALESCE(:net_notch, net_notch),
+                    payment_type = COALESCE(:payment_type, payment_type)
+                WHERE energy_contract_master_id = :contract_id
+            """), {**contract_params, 'contract_id': contract['energy_contract_master_id']})
+        else:
+            session.execute(text("""
+                INSERT INTO "StreemLyne_MT"."Energy_Contract_Master"
+                    (project_id, employee_id, supplier_id, contract_start_date, contract_end_date,
+                     terms_of_sale, service_id, unit_rate, currency_id, created_at, updated_at,
+                     mpan_number, mpan_bottom, standing_charge, rate_1, rate_2, rate_3, net_notch, payment_type)
+                VALUES
+                    (:project_id, :employee_id, :supplier_id, :contract_start_date, :contract_end_date,
+                     '', :service_id, :unit_rate, :currency_id, :now, :now,
+                     :mpan_number, :mpan_bottom, :standing_charge, :rate_1, :rate_2, :rate_3, :net_notch, :payment_type)
+            """), contract_params)
+
+        converted_stage_id = _priced_stage_id(session, 'Converted') or _priced_stage_id(session, 'Won')
+        if converted_stage_id:
+            session.execute(text("""
+                UPDATE "StreemLyne_MT"."Opportunity_Details"
+                SET stage_id = :stage_id, client_id = :client_id
+                WHERE opportunity_id = :opportunity_id AND tenant_id = :tenant_id
+            """), {
+                'stage_id': converted_stage_id,
+                'client_id': client_id,
+                'opportunity_id': real_id,
+                'tenant_id': tenant_id,
+            })
+
+        _insert_priced_interaction(session, client_id, 'Priced Accepted', '[Priced Accepted] Customer onboarded from priced leads')
+        session.commit()
+        return jsonify({'success': True, 'message': 'Lead moved to renewals', 'client_id': client_id}), 200
+    except Exception as e:
+        session.rollback()
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@crm_bp.route('/priced/leads/<int:opportunity_id>/reject', methods=['POST', 'OPTIONS'])
+@token_required
+@tenant_from_jwt
+def reject_priced_lead(opportunity_id):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        tenant_id = g.tenant_id
+        lead = _priced_lead(session, opportunity_id, tenant_id)
+        if not lead:
+            return jsonify({'error': 'Priced lead not found'}), 404
+
+        real_id = lead['opportunity_id']
+        client_id = lead.get('client_id')
+        if not client_id:
+            from backend.models import Client_Master
+            client = Client_Master(
+                tenant_id=int(tenant_id),
+                assigned_employee_id=lead.get('opportunity_owner_employee_id'),
+                client_company_name=lead.get('resolved_business_name') or '[IMPORTED LEADS]',
+                client_contact_name=lead.get('contact_person') or '',
+                client_phone=lead.get('tel_number') or '',
+                client_email=lead.get('email') or '',
+                default_currency_id=1,
+                created_at=datetime.utcnow()
+            )
+            session.add(client)
+            session.flush()
+            client_id = client.client_id
+
+        lost_stage_id = _priced_stage_id(session, 'Lost')
+        session.execute(text("""
+            UPDATE "StreemLyne_MT"."Client_Master"
+            SET is_deleted = TRUE, deleted_at = :now, deleted_reason = 'Lost'
+            WHERE client_id = :client_id AND tenant_id = :tenant_id
+        """), {'now': datetime.utcnow(), 'client_id': client_id, 'tenant_id': tenant_id})
+
+        if lost_stage_id:
+            session.execute(text("""
+                UPDATE "StreemLyne_MT"."Opportunity_Details"
+                SET stage_id = :stage_id, client_id = :client_id
+                WHERE opportunity_id = :opportunity_id AND tenant_id = :tenant_id
+            """), {
+                'stage_id': lost_stage_id,
+                'client_id': client_id,
+                'opportunity_id': real_id,
+                'tenant_id': tenant_id,
+            })
+
+        _insert_priced_interaction(session, client_id, 'Lost', '[Lost] Rejected from priced leads')
+        session.commit()
+        return jsonify({'success': True, 'message': 'Lead moved to lost'}), 200
+    except Exception as e:
+        session.rollback()
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@crm_bp.route('/priced/renewals/<int:client_id>/accept', methods=['POST', 'OPTIONS'])
+@token_required
+@tenant_from_jwt
+def accept_priced_renewal(client_id):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        tenant_id = g.tenant_id
+        row = session.execute(text("""
+            SELECT cm.client_id, pd.project_id, pd.assigned_employee_id
+            FROM "StreemLyne_MT"."Client_Master" cm
+            JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
+            WHERE cm.client_id = :client_id
+              AND cm.tenant_id = :tenant_id
+              AND LOWER(COALESCE(pd.status, '')) = 'priced'
+            LIMIT 1
+        """), {'client_id': client_id, 'tenant_id': tenant_id}).mappings().first()
+        if not row:
+            return jsonify({'error': 'Priced renewal not found'}), 404
+
+        session.execute(text("""
+            UPDATE "StreemLyne_MT"."Client_Master"
+            SET is_deleted = FALSE,
+                deleted_at = NULL,
+                deleted_reason = NULL,
+                is_archived = FALSE,
+                is_allocated = FALSE,
+                assigned_employee_id = :assigned_employee_id
+            WHERE client_id = :client_id AND tenant_id = :tenant_id
+        """), {
+            'assigned_employee_id': row['assigned_employee_id'],
+            'client_id': client_id,
+            'tenant_id': tenant_id,
+        })
+        session.execute(text("""
+            UPDATE "StreemLyne_MT"."Project_Details"
+            SET status = NULL, updated_at = :now
+            WHERE project_id = :project_id
+        """), {'now': datetime.utcnow(), 'project_id': row['project_id']})
+        _insert_priced_interaction(session, client_id, 'Priced Accepted', '[Priced Accepted] Customer onboarded from priced renewals')
+        session.commit()
+        return jsonify({'success': True, 'message': 'Renewal moved to renewals'}), 200
+    except Exception as e:
+        session.rollback()
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@crm_bp.route('/priced/renewals/<int:client_id>/reject', methods=['POST', 'OPTIONS'])
+@token_required
+@tenant_from_jwt
+def reject_priced_renewal(client_id):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        tenant_id = g.tenant_id
+        row = session.execute(text("""
+            SELECT cm.client_id, pd.project_id
+            FROM "StreemLyne_MT"."Client_Master" cm
+            JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
+            WHERE cm.client_id = :client_id
+              AND cm.tenant_id = :tenant_id
+              AND LOWER(COALESCE(pd.status, '')) = 'priced'
+            LIMIT 1
+        """), {'client_id': client_id, 'tenant_id': tenant_id}).mappings().first()
+        if not row:
+            return jsonify({'error': 'Priced renewal not found'}), 404
+
+        session.execute(text("""
+            UPDATE "StreemLyne_MT"."Client_Master"
+            SET is_deleted = TRUE, deleted_at = :now, deleted_reason = 'Lost'
+            WHERE client_id = :client_id AND tenant_id = :tenant_id
+        """), {'now': datetime.utcnow(), 'client_id': client_id, 'tenant_id': tenant_id})
+        session.execute(text("""
+            UPDATE "StreemLyne_MT"."Project_Details"
+            SET status = 'Lost', updated_at = :now
+            WHERE project_id = :project_id
+        """), {'now': datetime.utcnow(), 'project_id': row['project_id']})
+        _insert_priced_interaction(session, client_id, 'Lost', '[Lost] Rejected from priced renewals')
+        session.commit()
+        return jsonify({'success': True, 'message': 'Renewal moved to lost'}), 200
+    except Exception as e:
+        session.rollback()
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
 
 @crm_bp.route('/cleansing', methods=['GET'])
 @token_required

@@ -1441,7 +1441,7 @@ def get_priced_customers():
         service_param = request.args.get('service')
         if service_param:
             svc = service_param.strip().lower()
-            _service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
+            _service_id = 2 if svc == 'water' else (1 if svc in ('electricity', 'utilities') else None)
  
         salesperson_param = request.args.get('salesperson')
  
