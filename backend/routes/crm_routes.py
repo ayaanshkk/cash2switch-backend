@@ -1999,7 +1999,8 @@ def leads_callback(opportunity_id):
         callback_date = data.get('callback_date')
         called_date = data.get('called_date')
         is_sold = data.get('is_sold')
-        stage_id = data.get('stage_id')
+        # ✅ DON'T use stage_id from frontend - we'll look it up ourselves
+        # stage_id = data.get('stage_id')  # IGNORE THIS
  
         logger.info(f"📥 Callback for lead {opportunity_id} — status: {status}")
  
@@ -2028,7 +2029,24 @@ def leads_callback(opportunity_id):
         if status not in STATUS_CFG:
             return jsonify({'error': f'Invalid status: {status}'}), 400
 
+        # ✅ CRITICAL FIX: ALWAYS look up stage_id from database based on status
         stage_lookup_status = 'Converted' if status == 'Won' else status
+        
+        stage_lookup = session.execute(text("""
+            SELECT stage_id, stage_name 
+            FROM "StreemLyne_MT"."Stage_Master" 
+            WHERE LOWER(stage_name) = LOWER(:status)
+            LIMIT 1
+        """), {'status': stage_lookup_status}).mappings().first()
+        
+        if not stage_lookup:
+            logger.error(f"❌ No stage_id found for status '{stage_lookup_status}' in Stage_Master")
+            return jsonify({'error': f'Status not found in database: {status}'}), 400
+        
+        stage_id = stage_lookup['stage_id']
+        actual_stage_name = stage_lookup['stage_name']
+        
+        logger.warning(f"🔍 Status '{status}' → stage_id={stage_id} (DB stage_name='{actual_stage_name}')")
  
         cfg = STATUS_CFG[status]
  
@@ -2096,7 +2114,7 @@ def leads_callback(opportunity_id):
             }).rowcount
             
             session.commit()
-            logger.warning(f"🗑️ Deleted {deleted_count} old callback entries for client_id={client_id} before creating new {status}")
+            logger.warning(f"🗑️ Deleted {deleted_count} old callback entries for client_id={client_id}")
  
         if cfg['deletes_record']:
             try:
@@ -2130,18 +2148,11 @@ def leads_callback(opportunity_id):
                         WHERE client_id = :client_id
                     """), {'is_cleansing': is_cleansing, 'client_id': client_id})
 
-                if not stage_id:
-                    s = session.execute(text(
-                        'SELECT stage_id FROM "StreemLyne_MT"."Stage_Master" '
-                        'WHERE LOWER(stage_name) = :n LIMIT 1'
-                    ), {'n': stage_lookup_status.lower()}).mappings().first()
-                    stage_id = s['stage_id'] if s else None
-
-                if stage_id:
-                    session.execute(text(
-                        'UPDATE "StreemLyne_MT"."Opportunity_Details" SET stage_id = :s '
-                        'WHERE opportunity_id = :id AND tenant_id = :t'
-                    ), {'s': stage_id, 'id': real_id, 't': tenant_id})
+                # ✅ Update stage_id (already looked up above)
+                session.execute(text(
+                    'UPDATE "StreemLyne_MT"."Opportunity_Details" SET stage_id = :s '
+                    'WHERE opportunity_id = :id AND tenant_id = :t'
+                ), {'s': stage_id, 'id': real_id, 't': tenant_id})
 
                 formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
                 from backend.db import safe_add_with_sequence_retry
@@ -2166,6 +2177,10 @@ def leads_callback(opportunity_id):
                         'message': f'Moved to Cleansing ({status})',
                         'moved_to_cleansing': True,
                         'moved_to_recycle_bin': False,
+                        'lead': {
+                            'stage_id': stage_id,
+                            'stage_name': actual_stage_name
+                        }
                     }), 200
                 else:
                     logger.info(f"✅ Lead {real_id} moved to Recycle Bin ({status})")
@@ -2174,6 +2189,10 @@ def leads_callback(opportunity_id):
                         'message': f'Moved to recycle bin ({status})',
                         'moved_to_cleansing': False,
                         'moved_to_recycle_bin': True,
+                        'lead': {
+                            'stage_id': stage_id,
+                            'stage_name': actual_stage_name
+                        }
                     }), 200
 
             except Exception as e:
@@ -2187,6 +2206,7 @@ def leads_callback(opportunity_id):
             new_employee_id = data.get('assigned_to')
             current_employee_id = request.current_user.employee_id if hasattr(request.current_user, 'employee_id') else None
             
+            # ✅ Use the looked-up stage_id
             session.execute(text("""
                 UPDATE "StreemLyne_MT"."Opportunity_Details"
                 SET opportunity_owner_employee_id = :new_emp,
@@ -2201,7 +2221,7 @@ def leads_callback(opportunity_id):
                 'current_emp': current_employee_id,
                 'id': real_id,
                 't': tenant_id,
-                'stage_id': stage_id or 16
+                'stage_id': stage_id  # ✅ Use looked-up stage_id
             })
             
             from backend.db import safe_add_with_sequence_retry
@@ -2221,14 +2241,19 @@ def leads_callback(opportunity_id):
             return jsonify({
                 'success': True, 
                 'message': 'Lead converted and assigned',
-                'allocated': new_employee_id != current_employee_id
+                'allocated': new_employee_id != current_employee_id,
+                'lead': {
+                    'stage_id': stage_id,
+                    'stage_name': actual_stage_name
+                }
             }), 200
  
         if status == 'Priced' and is_sold is False:
+            # ✅ Use the looked-up stage_id
             session.execute(text(
                 'UPDATE "StreemLyne_MT"."Opportunity_Details" SET stage_id = :s '
                 'WHERE opportunity_id = :id AND tenant_id = :t'
-            ), {'s': stage_id or 4, 'id': real_id, 't': tenant_id})
+            ), {'s': stage_id, 'id': real_id, 't': tenant_id})  # ✅ Use looked-up stage_id
             
             from backend.db import safe_add_with_sequence_retry
             safe_add_with_sequence_retry(
@@ -2243,7 +2268,14 @@ def leads_callback(opportunity_id):
                 ))
             
             session.commit()
-            return jsonify({'success': True, 'moved_to_priced': True}), 200
+            return jsonify({
+                'success': True, 
+                'moved_to_priced': True,
+                'lead': {
+                    'stage_id': stage_id,
+                    'stage_name': actual_stage_name
+                }
+            }), 200
  
         new_end = data.get('new_end_date')
         if new_end and status in ('End Date Changed', 'Already Renewed'):
@@ -2271,11 +2303,13 @@ def leads_callback(opportunity_id):
                     'WHERE opportunity_id = :id AND tenant_id = :t'
                 ), {'s': sup.supplier_id, 'id': real_id, 't': tenant_id})
  
-        if stage_id:
-            session.execute(text(
-                'UPDATE "StreemLyne_MT"."Opportunity_Details" SET stage_id = :s '
-                'WHERE opportunity_id = :id AND tenant_id = :t'
-            ), {'s': stage_id, 'id': real_id, 't': tenant_id})
+        # ✅ ALWAYS update stage_id in database (already looked up at the top)
+        session.execute(text(
+            'UPDATE "StreemLyne_MT"."Opportunity_Details" SET stage_id = :s '
+            'WHERE opportunity_id = :id AND tenant_id = :t'
+        ), {'s': stage_id, 'id': real_id, 't': tenant_id})
+        
+        logger.warning(f"✅ Updated lead {real_id} to stage_id={stage_id} ({actual_stage_name})")
  
         formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
         from backend.db import safe_add_with_sequence_retry
@@ -2295,6 +2329,7 @@ def leads_callback(opportunity_id):
         
         logger.info(f"✅ Callback saved for lead {real_id}, status: {status}")
         
+        # ✅ CRITICAL FIX: Return the ACTUAL stage_name from database
         updated_lead = session.execute(text("""
             SELECT od.*, sm.stage_name,
                 em.employee_name AS assigned_to_name,
@@ -2309,15 +2344,19 @@ def leads_callback(opportunity_id):
         """), {'id': real_id, 't': tenant_id}).mappings().first()
 
         lead_data = {k: _serial(v) for k, v in dict(updated_lead).items()} if updated_lead else {}
-        lead_data['stage_name'] = status
+
+        # ✅ CRITICAL: Use the actual_stage_name we looked up (source of truth)
+        lead_data['stage_name'] = actual_stage_name
         lead_data['stage_id'] = stage_id
         lead_data['reminder_date'] = callback_date
+
+        logger.warning(f"📤 Returning lead with stage_name='{lead_data.get('stage_name')}', stage_id={lead_data.get('stage_id')}")
 
         return jsonify({
             'success': True, 
             'message': 'Callback saved successfully', 
             'status': status,
-            'lead': lead_data
+            'lead': lead_data  # ✅ Frontend expects this nested structure
         }), 200
  
     except Exception as e:
