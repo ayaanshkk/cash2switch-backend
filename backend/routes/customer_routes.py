@@ -958,6 +958,85 @@ def delete_energy_customer(client_id):
     finally:
         session.close()
 
+
+@energy_customer_bp.route('/energy-clients/drafts', methods=['DELETE', 'OPTIONS'])
+@token_required
+def delete_draft_energy_customers():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+
+        data = request.get_json(silent=True) or {}
+        raw_ids = data.get('client_ids') or []
+        try:
+            client_ids = sorted({int(client_id) for client_id in raw_ids})
+        except (TypeError, ValueError):
+            return jsonify({'error': 'client_ids must be a list of numbers'}), 400
+
+        if not client_ids:
+            return jsonify({'error': 'client_ids are required'}), 400
+
+        deleted_ids = []
+        skipped_ids = []
+
+        for client_id in client_ids:
+            client = session.query(Client_Master).filter(
+                Client_Master.client_id == client_id,
+                Client_Master.tenant_id == tenant_id
+            ).first()
+
+            if not client:
+                skipped_ids.append(client_id)
+                continue
+
+            projects = session.query(Project_Details).filter(
+                Project_Details.client_id == client.client_id
+            ).all()
+
+            client_assigned = bool(getattr(client, 'assigned_employee_id', None))
+            project_assigned = any(bool(getattr(project, 'assigned_employee_id', None)) for project in projects)
+            if client_assigned or project_assigned:
+                skipped_ids.append(client_id)
+                continue
+
+            project_ids = [project.project_id for project in projects]
+            if project_ids:
+                session.query(Energy_Contract_Master).filter(
+                    Energy_Contract_Master.project_id.in_(project_ids)
+                ).delete(synchronize_session=False)
+
+            session.query(Client_Interactions).filter(
+                Client_Interactions.client_id == client.client_id
+            ).delete(synchronize_session=False)
+
+            session.query(Project_Details).filter(
+                Project_Details.client_id == client.client_id
+            ).delete(synchronize_session=False)
+
+            session.delete(client)
+            deleted_ids.append(client_id)
+
+        session.commit()
+
+        return jsonify({
+            'success': True,
+            'deleted_count': len(deleted_ids),
+            'deleted_ids': deleted_ids,
+            'skipped_ids': skipped_ids,
+            'message': f'Deleted {len(deleted_ids)} draft renewals'
+        }), 200
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"Error deleting draft energy customers: {e}")
+        return jsonify({'error': f'Failed to delete draft renewals: {str(e)}'}), 500
+    finally:
+        session.close()
+
 # ==========================================
 # SEARCH CUSTOMERS
 # ==========================================

@@ -7,7 +7,7 @@ from flask import Blueprint, request, g, jsonify, current_app
 from functools import wraps
 from datetime import datetime, timedelta
 import re
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 from backend.db import SessionLocal
 from backend.crm.controllers.crm_controller import CRMController
 from backend.crm.middleware.tenant_middleware import require_tenant
@@ -741,6 +741,60 @@ def delete_lead(opportunity_id):
         500: Internal server error
     """
     return crm_controller.delete_lead(opportunity_id)
+
+
+@crm_bp.route('/leads/drafts', methods=['DELETE', 'OPTIONS'])
+@token_required
+@tenant_from_jwt
+def delete_draft_leads():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        tenant_id = str(g.tenant_id)
+        data = request.get_json(silent=True) or {}
+        raw_ids = data.get('lead_ids') or []
+
+        try:
+            lead_ids = sorted({int(lead_id) for lead_id in raw_ids})
+        except (TypeError, ValueError):
+            return jsonify({'error': 'lead_ids must be a list of numbers'}), 400
+
+        if not lead_ids:
+            return jsonify({'error': 'lead_ids are required'}), 400
+
+        stmt = text("""
+            DELETE FROM "StreemLyne_MT"."Opportunity_Details"
+            WHERE tenant_id = :tenant_id
+              AND opportunity_id IN :lead_ids
+              AND opportunity_owner_employee_id IS NULL
+            RETURNING opportunity_id
+        """).bindparams(bindparam('lead_ids', expanding=True))
+
+        deleted_rows = session.execute(stmt, {
+            'tenant_id': tenant_id,
+            'lead_ids': lead_ids
+        }).fetchall()
+        session.commit()
+
+        deleted_ids = [int(row[0]) for row in deleted_rows]
+        skipped_ids = [lead_id for lead_id in lead_ids if lead_id not in deleted_ids]
+
+        return jsonify({
+            'success': True,
+            'deleted_count': len(deleted_ids),
+            'deleted_ids': deleted_ids,
+            'skipped_ids': skipped_ids,
+            'message': f'Deleted {len(deleted_ids)} draft leads'
+        }), 200
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception("Error deleting draft leads")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
 
 @crm_bp.route('/leads/search-all', methods=['GET'])
 @token_required

@@ -306,12 +306,13 @@ def import_energy_customers():
         employee_id = request.current_user.employee_id
 
         # GET ASSIGNED EMPLOYEE ID FROM FORM DATA
+        is_draft_import = str(request.form.get('is_draft', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
         assigned_employee_id = request.form.get('assigned_employee_id', type=int)
-        opportunity_owner_id = assigned_employee_id if assigned_employee_id else employee_id
+        opportunity_owner_id = None if is_draft_import else (assigned_employee_id if assigned_employee_id else employee_id)
         
         # Get employee name for success message
         assigned_employee_name = None
-        if assigned_employee_id:
+        if assigned_employee_id and not is_draft_import:
             assigned_employee = session.query(Employee_Master).filter_by(
                 employee_id=assigned_employee_id,
                 tenant_id=tenant_id
@@ -326,7 +327,7 @@ def import_energy_customers():
         print(f"{'='*60}")
         print(f"   Tenant ID: {tenant_id}")
         print(f"   Uploaded by: Employee ID {employee_id}")
-        print(f"   Assigned to: {assigned_employee_name or 'Uploader'} (ID: {opportunity_owner_id})")
+        print(f"   Assigned to: {assigned_employee_name or ('Draft' if is_draft_import else 'Uploader')} (ID: {opportunity_owner_id})")
         print(f"{'='*60}\n")
 
         # Service filter
@@ -1112,7 +1113,8 @@ def import_energy_customers():
             'errors': errors[:50],
             'duplicate_report': duplicate_report,  # ✅ Make sure this line exists!
             'assigned_to': assigned_employee_name,
-            'assigned_employee_id': assigned_employee_id
+            'assigned_employee_id': opportunity_owner_id,
+            'is_draft': is_draft_import,
         }), 200
         
     except Exception as e:
@@ -1399,14 +1401,15 @@ def import_leads():
         return jsonify({'error': 'Tenant not found for user'}), 400
  
     employee_id = request.current_user.employee_id
+    is_draft_import = str(request.form.get('is_draft', '')).strip().lower() in {'1', 'true', 'yes', 'on'}
     assigned_employee_id = request.form.get('assigned_employee_id', type=int)
-    opportunity_owner_id = assigned_employee_id if assigned_employee_id else employee_id
+    opportunity_owner_id = None if is_draft_import else (assigned_employee_id if assigned_employee_id else employee_id)
  
     # Get assigned employee name for response
     assigned_employee_name = None
     session = SessionLocal()
     try:
-        if assigned_employee_id:
+        if assigned_employee_id and not is_draft_import:
             ae = session.query(Employee_Master).filter_by(
                 employee_id=assigned_employee_id,
                 tenant_id=tenant_id
@@ -1742,7 +1745,8 @@ def import_leads():
             'errors': errors[:50],
             'duplicate_report': duplicate_report,
             'assigned_to': assigned_employee_name,
-            'assigned_employee_id': assigned_employee_id,
+            'assigned_employee_id': opportunity_owner_id,
+            'is_draft': is_draft_import,
         }), 200
  
     except Exception as e:
