@@ -107,19 +107,19 @@ def add_callback(client_id):
         if date_required and not callback_date:
             return jsonify({'error': 'Callback date is required for this status'}), 400
 
-        if callback_date:
-            deleted_count = session.execute(text("""
-                DELETE FROM "StreemLyne_MT"."Client_Interactions"
-                WHERE client_id = :client_id
-                AND reminder_date IS NOT NULL
-            """), {'client_id': client_id}).rowcount
-            current_app.logger.warning(
-                "Deleted %s old scheduled callback rows for renewal client_id=%s before saving %s on %s",
-                deleted_count,
-                client_id,
-                status,
-                callback_date,
-            )
+        # if callback_date:
+        #     deleted_count = session.execute(text("""
+        #         DELETE FROM "StreemLyne_MT"."Client_Interactions"
+        #         WHERE client_id = :client_id
+        #         AND reminder_date IS NOT NULL
+        #     """), {'client_id': client_id}).rowcount
+        #     current_app.logger.warning(
+        #         "Deleted %s old scheduled callback rows for renewal client_id=%s before saving %s on %s",
+        #         deleted_count,
+        #         client_id,
+        #         status,
+        #         callback_date,
+        #     )
  
         # ── Soft delete: Cleansing OR Recycle Bin ─────────────────────────────
         if config["deletes_record"]:
@@ -201,6 +201,11 @@ def add_callback(client_id):
  
                 if not contract:
                     return jsonify({'error': 'Contract not found'}), 404
+
+                # ✅ FIX: Also update Project_Details address when new_address is provided
+                project = session.query(Project_Details).filter_by(client_id=client_id).first()
+                
+
  
                 if new_end_date_str:
                     new_end_date = datetime.strptime(new_end_date_str, '%Y-%m-%d').date()
@@ -235,11 +240,14 @@ def add_callback(client_id):
                     contract.updated_at = datetime.utcnow()
                     session.flush()
                     changes_made.append(f"Supplier: {old_supplier_name} → {new_supplier}")
- 
+        
                 if new_address and new_address.strip():
                     client.address = new_address.strip()
+                    # ✅ FIX: Also update Project_Details address
+                    if project:
+                        project.address = new_address.strip()
                     changes_made.append("Address updated")
- 
+
                 session.flush()
  
                 if changes_made:

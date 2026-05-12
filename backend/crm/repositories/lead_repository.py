@@ -840,54 +840,41 @@ class LeadRepository:
             return 0
 
     def delete_lead(self, opportunity_id: int, tenant_id: int) -> bool:
-        """
-        Delete a lead/opportunity and recalculate display_ids for the affected employee
-        
-        Args:
-            opportunity_id: Opportunity identifier
-            tenant_id: Tenant identifier
-        
-        Returns:
-            True if deleted successfully
-        """
+        """Delete a lead by opportunity_id."""
         try:
-            # ✅ Get the employee who owned this lead before deleting
+            # ✅ Cast and trim
+            tenant_id = str(tenant_id).strip()
+            
             get_employee_query = '''
-                SELECT "opportunity_owner_employee_id"
+                SELECT "opportunity_owner_employee_id",
+                    COALESCE("business_name", "opportunity_title") as name
                 FROM "StreemLyne_MT"."Opportunity_Details"
-                WHERE "tenant_id" = %s AND "opportunity_id" = %s
+                WHERE TRIM("tenant_id") = %s 
+                AND "opportunity_id" = %s
             '''
             
-            employee_result = self.db.execute_query(
+            lead = self.db.execute_query(
                 get_employee_query, 
                 (tenant_id, opportunity_id), 
                 fetch_one=True
             )
             
-            employee_id = employee_result.get('opportunity_owner_employee_id') if employee_result else None
+            if not lead:
+                logger.warning('delete_lead: No lead %s for tenant %s', opportunity_id, tenant_id)
+                return False
             
-            # Delete the lead
-            query = """
+            employee_id = lead.get('opportunity_owner_employee_id')
+            
+            delete_query = '''
                 DELETE FROM "StreemLyne_MT"."Opportunity_Details"
-                WHERE "tenant_id" = %s
+                WHERE TRIM("tenant_id") = %s
                 AND "opportunity_id" = %s
-            """
+            '''
             
-            rows_affected = self.db.execute_delete(query, (tenant_id, opportunity_id))
+            rows_affected = self.db.execute_delete(delete_query, (tenant_id, opportunity_id))
             
-            # ✅ Recalculate display_ids for the affected employee
             if rows_affected > 0 and employee_id:
-                result = self.recalculate_display_ids_for_employee(tenant_id, employee_id)
-                if result.get('success'):
-                    logger.info(
-                        '✅ Recalculated %d display_ids for employee %s after delete',
-                        result.get('recalculated_count', 0), employee_id
-                    )
-                else:
-                    logger.warning(
-                        '⚠️ Failed to recalculate display_ids for employee %s: %s',
-                        employee_id, result.get('error')
-                    )
+                self.recalculate_display_ids_for_employee(tenant_id, employee_id)
             
             return rows_affected > 0
             
@@ -1345,6 +1332,9 @@ class LeadRepository:
         Return a minimal, tenant-scoped list of leads (read-only projection).
         ✅ EXCLUDES SOFT-DELETED LEADS (Client_Master.is_deleted = TRUE)
         """
+        # Cast to string if VARCHAR
+        tenant_id = str(tenant_id)
+        
         query = '''
             SELECT
                 od."opportunity_id",
@@ -1374,11 +1364,11 @@ class LeadRepository:
                 od."postcode",
                 od."mobile_no"
             FROM "StreemLyne_MT"."Opportunity_Details" od
-            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id"                      = sm."stage_id"
+            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON od."stage_id" = sm."stage_id"
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON od."opportunity_owner_employee_id" = em."employee_id"
-            LEFT JOIN "StreemLyne_MT"."Client_Master"   cm  ON od."client_id"                     = cm."client_id"
-            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id"                   = sup."supplier_id"
-            WHERE (od."tenant_id" = %s OR (od."client_id" IS NOT NULL AND cm."tenant_id" = %s))
+            LEFT JOIN "StreemLyne_MT"."Client_Master"   cm  ON od."client_id" = cm."client_id"
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od."supplier_id" = sup."supplier_id"
+            WHERE od."tenant_id" = %s
             AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
             AND NOT EXISTS (
                 SELECT 1
@@ -1387,25 +1377,25 @@ class LeadRepository:
             )
         '''
         
-        params = [tenant_id, tenant_id]
- 
+        params = [tenant_id]
+        
         if filters and isinstance(filters, dict):
             if filters.get('stage_id'):
                 query += ' AND od."stage_id" = %s'
                 params.append(int(filters['stage_id']))
- 
+    
             if filters.get('stage'):
                 query += ' AND sm."stage_name" = %s'
                 params.append(filters['stage'])
- 
+    
             if filters.get('exclude_stage'):
                 query += ' AND (sm."stage_name" IS NULL OR sm."stage_name" != %s)'
                 params.append(filters['exclude_stage'])
- 
+    
             if filters.get('service_id') is not None:
                 query += ' AND od."service_id" = %s'
                 params.append(int(filters['service_id']))
- 
+    
             if filters.get('assigned_to') is not None:
                 query += ' AND od."opportunity_owner_employee_id" = %s'
                 params.append(int(filters['assigned_to']))
@@ -1414,45 +1404,44 @@ class LeadRepository:
                 query += ' AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)'
 
         query += ' ORDER BY od."created_at" DESC'
- 
+    
         try:
             rows = self.db.execute_query(query, tuple(params))
             if not rows:
                 return []
- 
+    
             out = []
             for r in rows:
                 def _iso(v):
                     return v.isoformat() if getattr(v, 'isoformat', None) else (v or None)
- 
+    
                 out.append({
-                    'opportunity_id':                r.get('opportunity_id'),
-                    'tenant_lead_id':                r.get('tenant_lead_id'),
-                    'display_id':                    r.get('display_id'),
-                    'business_name':                 r.get('business_name'),
-                    'contact_person':                r.get('contact_person'),
-                    'tel_number':                    str(r.get('tel_number')).replace('.0', '') if r.get('tel_number') else None,
-                    'mobile_no':                     r.get('mobile_no'),
-                    'email':                         r.get('email'),
-                    'mpan_mpr':                      r.get('mpan_mpr'),
-                    'mpan_bottom':                   r.get('mpan_bottom'),
-                    'start_date':                    _iso(r.get('start_date')),
-                    'end_date':                      _iso(r.get('end_date')),
-                    'service_id':                    r.get('service_id'),
-                    'stage_id':                      r.get('stage_id'),
-                    'stage_name':                    r.get('stage_name'),
+                    'opportunity_id': r.get('opportunity_id'),
+                    'tenant_lead_id': r.get('tenant_lead_id'),
+                    'display_id': r.get('display_id'),
+                    'business_name': r.get('business_name'),
+                    'contact_person': r.get('contact_person'),
+                    'tel_number': str(r.get('tel_number')).replace('.0', '') if r.get('tel_number') else None,
+                    'mobile_no': r.get('mobile_no'),
+                    'email': r.get('email'),
+                    'mpan_mpr': r.get('mpan_mpr'),
+                    'mpan_bottom': r.get('mpan_bottom'),
+                    'start_date': _iso(r.get('start_date')),
+                    'end_date': _iso(r.get('end_date')),
+                    'service_id': r.get('service_id'),
+                    'stage_id': r.get('stage_id'),
+                    'stage_name': r.get('stage_name'),
                     'opportunity_owner_employee_id': r.get('opportunity_owner_employee_id'),
-                    'assigned_to_name':              r.get('assigned_to_name'),
-                    'created_at':                    _iso(r.get('created_at')),
-                    # ✅ New fields from ALTER TABLE migration
-                    'supplier_id':                   r.get('supplier_id'),
-                    'supplier_name':                 r.get('supplier_name'),
-                    'annual_usage':                  r.get('annual_usage'),
-                    'stand_charge':                  r.get('stand_charge'),
-                    'rate_1':                        r.get('rate_1'),
-                    'net_notch':                     r.get('net_notch'),
-                    'payment_type':                  r.get('payment_type'),
-                    'postcode':                      r.get('postcode'),
+                    'assigned_to_name': r.get('assigned_to_name'),
+                    'created_at': _iso(r.get('created_at')),
+                    'supplier_id': r.get('supplier_id'),
+                    'supplier_name': r.get('supplier_name'),
+                    'annual_usage': r.get('annual_usage'),
+                    'stand_charge': r.get('stand_charge'),
+                    'rate_1': r.get('rate_1'),
+                    'net_notch': r.get('net_notch'),
+                    'payment_type': r.get('payment_type'),
+                    'postcode': r.get('postcode'),
                 })
             return out
         except Exception as e:
@@ -1644,22 +1633,15 @@ class LeadRepository:
 
     def bulk_delete_leads(self, tenant_id: int, opportunity_ids: List[int]) -> Dict[str, Any]:
         """
-        Bulk delete multiple leads and recalculate display_ids for affected employees.
-        
-        Args:
-            tenant_id: Tenant identifier
-            opportunity_ids: List of opportunity IDs to delete
-        
-        Returns:
-            Dictionary with deleted count, total_requested, and errors list
+        Bulk delete multiple leads by opportunity_id.
         """
         import logging
         logger = logging.getLogger(__name__)
         
-        # ✅ CRITICAL FIX: Cast tenant_id to string immediately
-        tenant_id = str(tenant_id)
+        # ✅ CRITICAL: Cast to string AND strip whitespace
+        tenant_id = str(tenant_id).strip()
         
-        logger.info('bulk_delete_leads START: tenant=%s, count=%d', tenant_id, len(opportunity_ids))
+        logger.warning('🔥 bulk_delete_leads START: tenant=%s, IDs=%s', tenant_id, opportunity_ids)
         
         if not opportunity_ids:
             return {
@@ -1670,87 +1652,106 @@ class LeadRepository:
             }
 
         try:
-            # ✅ Track which employees owned these leads
-            logger.info('Step 1: Finding affected employees...')
-            track_employees_query = '''
-                SELECT DISTINCT "opportunity_owner_employee_id"
+            # ✅ Check what actually exists in database
+            logger.warning('🔍 Checking database for matching leads...')
+            
+            verify_query = '''
+                SELECT 
+                    "opportunity_id", 
+                    "tenant_id",
+                    "opportunity_owner_employee_id",
+                    COALESCE("business_name", "opportunity_title") as name
                 FROM "StreemLyne_MT"."Opportunity_Details"
-                WHERE "tenant_id" = %s 
+                WHERE TRIM("tenant_id") = %s
                 AND "opportunity_id" = ANY(%s)
-                AND "opportunity_owner_employee_id" IS NOT NULL
             '''
             
-            employees_result = self.db.execute_query(
-                track_employees_query, 
-                (tenant_id, opportunity_ids)
-            )
+            logger.warning('🔍 Query params: tenant_id=%s, opportunity_ids=%s', tenant_id, opportunity_ids)
+            
+            found_leads = self.db.execute_query(verify_query, (tenant_id, opportunity_ids))
+            
+            logger.warning('🔍 Found %d matching leads', len(found_leads) if found_leads else 0)
+            
+            if found_leads:
+                for lead in found_leads:
+                    logger.warning('  → Lead: id=%s, tenant=%s, name=%s', 
+                                lead.get('opportunity_id'),
+                                lead.get('tenant_id'),
+                                lead.get('name'))
+            
+            if not found_leads or len(found_leads) == 0:
+                # ✅ Extra debug: Check if tenant has ANY leads
+                logger.warning('❌ No matching leads found. Checking if tenant has any leads...')
+                
+                count_query = '''
+                    SELECT COUNT(*) as total
+                    FROM "StreemLyne_MT"."Opportunity_Details"
+                    WHERE TRIM("tenant_id") = %s
+                '''
+                count_result = self.db.execute_query(count_query, (tenant_id,), fetch_one=True)
+                total_leads = count_result.get('total', 0) if count_result else 0
+                
+                logger.warning('Total leads for tenant %s: %d', tenant_id, total_leads)
+                
+                # Check if these IDs exist for ANY tenant
+                any_tenant_query = '''
+                    SELECT "opportunity_id", TRIM("tenant_id") as tenant_id
+                    FROM "StreemLyne_MT"."Opportunity_Details"
+                    WHERE "opportunity_id" = ANY(%s)
+                '''
+                any_tenant_result = self.db.execute_query(any_tenant_query, (opportunity_ids,))
+                
+                if any_tenant_result:
+                    logger.warning('These IDs exist but for different tenants:')
+                    for row in any_tenant_result:
+                        logger.warning('  → ID %s belongs to tenant %s', 
+                                    row.get('opportunity_id'),
+                                    row.get('tenant_id'))
+                else:
+                    logger.warning('These IDs do not exist in the database at all')
+                
+                return {
+                    'success': False,
+                    'error': 'No matching leads found',
+                    'deleted': 0,
+                    'total_requested': len(opportunity_ids),
+                    'errors': [f'No leads found with IDs: {opportunity_ids} for tenant {tenant_id}']
+                }
+            
+            # Extract employee IDs for recalculation
             affected_employee_ids = {
                 row.get('opportunity_owner_employee_id') 
-                for row in employees_result 
+                for row in found_leads
                 if row.get('opportunity_owner_employee_id')
             }
             
-            logger.info('Affected employees: %s', affected_employee_ids)
+            real_opportunity_ids = [lead['opportunity_id'] for lead in found_leads]
             
-            # Verify all leads belong to tenant before deleting
-            logger.info('Step 2: Verifying ownership...')
-            verify_query = '''
-                SELECT COUNT(*) as cnt 
-                FROM "StreemLyne_MT"."Opportunity_Details"
-                WHERE "tenant_id" = %s AND "opportunity_id" = ANY(%s)
-            '''
-            verify_result = self.db.execute_query(
-                verify_query, 
-                (tenant_id, opportunity_ids), 
-                fetch_one=True
-            )
-            verified_count = verify_result.get('cnt', 0) if verify_result else 0
+            logger.warning('🔥 Proceeding to delete %d leads', len(real_opportunity_ids))
             
-            logger.info('Verified: %d out of %d requested', verified_count, len(opportunity_ids))
-            
-            errors = []
-            if verified_count != len(opportunity_ids):
-                error_msg = f'{len(opportunity_ids) - verified_count} lead(s) not found or not owned by tenant'
-                logger.warning(error_msg)
-                errors.append(error_msg)
-            
-            # ✅ Perform bulk delete
-            logger.info('Step 3: Executing DELETE query...')
+            # ✅ Perform delete with TRIM on tenant_id
             delete_query = '''
                 DELETE FROM "StreemLyne_MT"."Opportunity_Details"
-                WHERE "tenant_id" = %s AND "opportunity_id" = ANY(%s)
+                WHERE TRIM("tenant_id") = %s 
+                AND "opportunity_id" = ANY(%s)
             '''
             
-            deleted_count = self.db.execute_delete(delete_query, (tenant_id, opportunity_ids))
-            logger.info('Deleted %d leads', deleted_count)
+            deleted_count = self.db.execute_delete(delete_query, (tenant_id, real_opportunity_ids))
+            logger.warning('✅ Deleted %d leads', deleted_count)
             
-            # ✅ Recalculate display_ids for all affected employees
-            logger.info('Step 4: Recalculating display_ids for %d employees...', len(affected_employee_ids))
-            recalc_errors = []
+            # ✅ Recalculate display_ids
             for employee_id in affected_employee_ids:
-                logger.info('Recalculating for employee %s...', employee_id)
                 result = self.recalculate_display_ids_for_employee(tenant_id, employee_id)
                 if result.get('success'):
-                    logger.info(
-                        '✅ Recalculated %d display_ids for employee %s',
-                        result.get('recalculated_count', 0), employee_id
-                    )
-                else:
-                    error_msg = f'Failed to recalculate display_ids for employee {employee_id}'
-                    logger.warning('⚠️ %s: %s', error_msg, result.get('error'))
-                    recalc_errors.append(error_msg)
-            
-            if recalc_errors:
-                errors.extend(recalc_errors)
-            
-            logger.info('bulk_delete_leads COMPLETE: deleted=%d, errors=%d', deleted_count, len(errors))
+                    logger.info('✅ Recalculated display_ids for employee %s', employee_id)
             
             return {
                 'success': True,
                 'deleted': deleted_count,
                 'total_requested': len(opportunity_ids),
-                'errors': errors,
-                'affected_employees': len(affected_employee_ids)
+                'errors': [],
+                'affected_employees': len(affected_employee_ids),
+                'message': f'Successfully deleted {deleted_count} lead(s)'
             }
             
         except Exception as e:

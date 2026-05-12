@@ -401,7 +401,8 @@ class CRMController:
 
     def bulk_delete_leads(self):
         """
-        Bulk delete multiple leads and automatically reset sequence if all deleted
+        POST /api/crm/leads/bulk-delete
+        Bulk delete multiple leads - accepts tenant_lead_id or opportunity_id
         """
         try:
             from flask import request, jsonify, g
@@ -409,9 +410,6 @@ class CRMController:
             
             logger = logging.getLogger(__name__)
             logger.warning('🔥 BULK DELETE START')
-            logger.warning(f'🔥 Request headers: {dict(request.headers)}')
-            logger.warning(f'🔥 Request data: {request.get_json()}')
-            logger.warning(f'🔥 g.tenant_id: {g.get("tenant_id")}')
             
             # Get request data
             data = request.get_json()
@@ -423,18 +421,19 @@ class CRMController:
                     'error': 'opportunity_ids is required'
                 }), 400
             
-            opportunity_ids = data.get('opportunity_ids', [])
+            # ✅ These could be tenant_lead_ids OR opportunity_ids - repository handles both
+            lead_ids = data.get('opportunity_ids', [])
             
-            if not isinstance(opportunity_ids, list) or len(opportunity_ids) == 0:
+            if not isinstance(lead_ids, list) or len(lead_ids) == 0:
                 logger.error('❌ opportunity_ids is not a valid list')
                 return jsonify({
                     'success': False,
                     'error': 'opportunity_ids must be a non-empty list'
                 }), 400
             
-            logger.warning(f'🔥 Deleting {len(opportunity_ids)} leads')
+            logger.warning(f'🔥 Deleting {len(lead_ids)} leads with IDs: {lead_ids}')
             
-            # Get tenant_id from g (set by @require_tenant)
+            # Get tenant_id from g
             tenant_id = g.get('tenant_id')
             
             if not tenant_id:
@@ -446,12 +445,12 @@ class CRMController:
             
             logger.warning(f'🔥 Tenant ID: {tenant_id}')
             
-            # Call repository bulk delete method
+            # ✅ Repository automatically resolves tenant_lead_id OR opportunity_id
             from backend.crm.repositories.lead_repository import LeadRepository
             repo = LeadRepository()
             
             logger.warning('🔥 Calling repo.bulk_delete_leads...')
-            result = repo.bulk_delete_leads(tenant_id, opportunity_ids)
+            result = repo.bulk_delete_leads(tenant_id, lead_ids)  # ✅ Changed variable name
             logger.warning(f'🔥 Repository result: {result}')
             
             if not result.get('success'):

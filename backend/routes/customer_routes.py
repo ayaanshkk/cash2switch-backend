@@ -769,6 +769,11 @@ def update_energy_customer(client_id):
                 project_id=project.project_id
             ).first()
             if contract:
+                # ✅ CAPTURE OLD VALUES BEFORE ANY UPDATES
+                old_net_notch = contract.net_notch
+                old_aggregator = contract.aggregator
+                
+                # Now do all the updates
                 if 'mpan_mpr' in data: contract.mpan_number = data['mpan_mpr']
                 if 'mpan_top' in data: contract.mpan_number = data['mpan_top']
                 if 'mpan_bottom' in data: contract.mpan_bottom = data['mpan_bottom']
@@ -806,8 +811,21 @@ def update_energy_customer(client_id):
                     ).date() if isinstance(data['end_date'], str) else data['end_date']
                 if 'unit_rate' in data and data['unit_rate'] is not None:
                     contract.unit_rate = data['unit_rate']
+                if 'rate_1' in data and data['rate_1'] is not None:
+                    contract.unit_rate = data['rate_1']  # rate_1 maps to unit_rate
+                
+                # ✅ FIX: Add rate_2, rate_3, net_notch saving
+                if 'rate_2' in data and data['rate_2'] is not None:
+                    contract.rate_2 = data['rate_2']
+                if 'rate_3' in data and data['rate_3'] is not None:
+                    contract.rate_3 = data['rate_3']
+                if 'net_notch' in data and data['net_notch'] is not None:
+                    contract.net_notch = data['net_notch']
+                if 'comms_paid' in data and data['comms_paid'] is not None:
+                    contract.comms_paid = data['comms_paid']
                 if 'terms_of_sale' in data: contract.terms_of_sale = data['terms_of_sale']
                 if 'payment_type' in data: contract.payment_type = data['payment_type']
+                if 'aggregator' in data: contract.aggregator = data['aggregator']
                 contract.updated_at = datetime.utcnow()
  
         # Create assignment interaction if assignment changed
@@ -828,24 +846,44 @@ def update_energy_customer(client_id):
  
         # Handle callback_date / interaction_notes
         if data.get('callback_date') or data.get('interaction_notes'):
-            row = session.execute(text("""
-                SELECT interaction_id FROM "StreemLyne_MT"."Client_Interactions"
-                WHERE client_id = :cid ORDER BY created_at DESC LIMIT 1
-            """), {'cid': client_id}).fetchone()
-            if row:
-                session.execute(text("""
-                    UPDATE "StreemLyne_MT"."Client_Interactions"
-                    SET reminder_date = :rd, notes = COALESCE(:n, notes), contact_date = CURRENT_DATE
-                    WHERE interaction_id = :iid
-                """), {'rd': data.get('callback_date'), 'n': data.get('interaction_notes'), 'iid': row[0]})
-            else:
-                session.execute(text("""
-                    INSERT INTO "StreemLyne_MT"."Client_Interactions"
-                    (client_id, contact_date, contact_method, notes, reminder_date, created_at)
-                    VALUES (:cid, CURRENT_DATE, 1, :n, :rd, :ca)
-                """), {'cid': client_id, 'n': data.get('interaction_notes', ''),
-                       'rd': data.get('callback_date'), 'ca': datetime.utcnow()})
- 
+            session.execute(text("""
+                INSERT INTO "StreemLyne_MT"."Client_Interactions"
+                (client_id, contact_date, contact_method, notes, reminder_date, created_at)
+                VALUES (:cid, CURRENT_DATE, 1, :n, :rd, :ca)
+            """), {
+                'cid': client_id, 
+                'n': data.get('interaction_notes', ''),
+                'rd': data.get('callback_date'), 
+                'ca': datetime.utcnow()
+            })
+        
+        # ✅ FIX: Track field changes in history for renewals
+        # Compare old values (captured before update) with new values
+        changes = []
+        
+        if 'net_notch' in data:
+            new_val = data['net_notch']
+            if old_net_notch != new_val:
+                changes.append(f"Net Notch: {old_net_notch or 'None'} → {new_val}")
+        
+        if 'aggregator' in data:
+            new_val = data['aggregator']
+            if old_aggregator != new_val:
+                changes.append(f"Aggregator: {old_aggregator or 'None'} → {new_val}")
+        
+        # If any fields changed, log it
+        if changes:
+            change_summary = " | ".join(changes)
+            session.execute(text("""
+                INSERT INTO "StreemLyne_MT"."Client_Interactions"
+                (client_id, contact_date, contact_method, notes, next_steps, created_at)
+                VALUES (:cid, CURRENT_DATE, 1, :notes, 'Field Update', :ca)
+            """), {
+                'cid': client_id,
+                'notes': f"[Field Update] {change_summary}",
+                'ca': datetime.utcnow()
+            })
+        
         session.commit()
         session.expire_all()
  

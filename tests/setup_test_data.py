@@ -28,7 +28,7 @@ try:
     cursor.execute("""
         SELECT "client_id", "client_company_name", "tenant_id"
         FROM "StreemLyne_MT"."Client_Master"
-        WHERE "tenant_id" = '1'
+        WHERE "tenant_id" = 2
         LIMIT 5
     """)
     clients = cursor.fetchall()
@@ -89,7 +89,7 @@ try:
     cursor.execute("""
         SELECT "user_id", "user_name", "tenant_id"
         FROM "StreemLyne_MT"."User_Master"
-        WHERE "tenant_id" = '1'
+        WHERE "tenant_id" = 2
         LIMIT 5
     """)
     users = cursor.fetchall()
