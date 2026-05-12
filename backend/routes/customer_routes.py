@@ -152,11 +152,17 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'month_sold': getattr(project, 'month_sold', None) if project else None,
         'house_name': getattr(project, 'house_name', None) if project else None,
         'house_number': getattr(project, 'house_number', None) if project else None,
+        'door_number': getattr(project, 'door_number', None) if project else None,
+        'town': getattr(project, 'town', None) if project else None,
+        'county': getattr(project, 'county', None) if project else None,
+        'project_description': getattr(project, 'project_description', None) if project else None,
  
         # Bank details
         'bank_name': getattr(client, 'bank_name', None),
         'account_number': getattr(client, 'account_number', None),
         'sort_code': getattr(client, 'sort_code', None),
+        'bank_account_number': getattr(client, 'account_number', None),
+        'bank_sort_code': getattr(client, 'sort_code', None),
  
         # From Energy_Contract_Master
         'contract_id': contract.energy_contract_master_id if contract else None,
@@ -176,6 +182,7 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'rate_2': float(contract.rate_2) if contract and hasattr(contract, 'rate_2') and contract.rate_2 else None,
         'rate_3': float(contract.rate_3) if contract and hasattr(contract, 'rate_3') and contract.rate_3 else None,
         'comms_paid': float(contract.comms_paid) if contract and hasattr(contract, 'comms_paid') and contract.comms_paid else None,
+        'document_details': getattr(contract, 'document_details', None) if contract else None,
  
         # From Supplier_Master
         'supplier_id': (supplier.supplier_id if supplier else
@@ -674,14 +681,61 @@ def update_energy_customer(client_id):
 
         # Resolve actual client_id for downstream use
         client_id = client.client_id
+
+        # Snapshot latest interaction BEFORE this request mutates history (for append-only updates)
+        prev_hist = (
+            session.query(Client_Interactions)
+            .filter(Client_Interactions.client_id == client_id)
+            .order_by(Client_Interactions.interaction_id.desc())
+            .first()
+        )
+        prev_notes_hist = (prev_hist.notes or "") if prev_hist else ""
+        prev_reminder_hist = (
+            prev_hist.reminder_date.isoformat()[:10]
+            if prev_hist and prev_hist.reminder_date
+            else None
+        )
  
         # Update Client_Master fields
-        for field, col in [('business_name', 'client_company_name'), ('contact_person', 'client_contact_name'),
-                            ('phone', 'client_phone'), ('mobile_no', 'client_mobile'),
-                            ('email', 'client_email'), ('address', 'address'),
-                            ('post_code', 'post_code'), ('website', 'client_website')]:
+        for field, col in [
+            ('business_name', 'client_company_name'),
+            ('contact_person', 'client_contact_name'),
+            ('phone', 'client_phone'),
+            ('mobile_no', 'client_mobile'),
+            ('email', 'client_email'),
+            ('address', 'address'),
+            ('post_code', 'post_code'),
+            ('website', 'client_website'),
+            ('position', 'position'),
+            ('company_number', 'company_number'),
+            ('charity_ltd_company_number', 'charity_ltd_company_number'),
+            ('partner_details', 'partner_details'),
+            ('bank_name', 'bank_name'),
+        ]:
             if field in data:
                 setattr(client, col, data[field])
+
+        if 'bank_account_number' in data:
+            client.account_number = data['bank_account_number']
+        elif 'account_number' in data:
+            client.account_number = data['account_number']
+
+        if 'bank_sort_code' in data:
+            client.sort_code = data['bank_sort_code']
+        elif 'sort_code' in data:
+            client.sort_code = data['sort_code']
+
+        if 'date_of_birth' in data:
+            dob = data['date_of_birth']
+            if not dob:
+                client.date_of_birth = None
+            else:
+                if isinstance(dob, str):
+                    client.date_of_birth = datetime.fromisoformat(
+                        dob.replace('Z', '').split('T')[0]
+                    ).date()
+                else:
+                    client.date_of_birth = dob
 
         # Update Project_Details
         project = session.query(Project_Details).filter_by(client_id=client_id).first()
@@ -689,7 +743,8 @@ def update_energy_customer(client_id):
             for field, col in [('site_address', 'address'), ('annual_usage', 'Misc_Col2'),
                                 ('site_name', 'site_name'), ('month_sold', 'month_sold'),
                                 ('house_name', 'house_name'), ('house_number', 'house_number'),
-                                ('door_number', 'door_number'), ('town', 'town'), ('county', 'county')]:
+                                ('door_number', 'door_number'), ('town', 'town'), ('county', 'county'),
+                                ('project_description', 'project_description')]:
                 if field in data:
                     setattr(project, col, data[field])
 
@@ -801,8 +856,29 @@ def update_energy_customer(client_id):
                     ).date() if isinstance(data['end_date'], str) else data['end_date']
                 if 'unit_rate' in data and data['unit_rate'] is not None:
                     contract.unit_rate = data['unit_rate']
-                if 'terms_of_sale' in data: contract.terms_of_sale = data['terms_of_sale']
-                if 'payment_type' in data: contract.payment_type = data['payment_type']
+                if 'terms_of_sale' in data:
+                    contract.terms_of_sale = data['terms_of_sale']
+                if 'payment_type' in data:
+                    contract.payment_type = data['payment_type']
+                if 'rate_1' in data and hasattr(contract, 'rate_1'):
+                    contract.rate_1 = data['rate_1']
+                if 'rate_2' in data and hasattr(contract, 'rate_2'):
+                    contract.rate_2 = data['rate_2']
+                if 'rate_3' in data and hasattr(contract, 'rate_3'):
+                    contract.rate_3 = data['rate_3']
+                if 'net_notch' in data and hasattr(contract, 'net_notch'):
+                    contract.net_notch = data['net_notch']
+                if 'term_sold' in data and hasattr(contract, 'term_sold'):
+                    contract.term_sold = data['term_sold']
+                if 'comms_paid' in data and hasattr(contract, 'comms_paid'):
+                    contract.comms_paid = data['comms_paid']
+                if 'aggregator' in data and hasattr(contract, 'aggregator'):
+                    contract.aggregator = data['aggregator']
+                if 'standing_charge' in data and hasattr(contract, 'standing_charge'):
+                    sc = data['standing_charge']
+                    contract.standing_charge = None if sc is None else str(sc).strip()
+                if 'document_details' in data and hasattr(contract, 'document_details'):
+                    contract.document_details = data['document_details']
                 contract.updated_at = datetime.utcnow()
  
         # Create assignment interaction if assignment changed
@@ -821,25 +897,33 @@ def update_energy_customer(client_id):
                 created_at=datetime.utcnow()
             ))
  
-        # Handle callback_date / interaction_notes
-        if data.get('callback_date') or data.get('interaction_notes'):
-            row = session.execute(text("""
-                SELECT interaction_id FROM "StreemLyne_MT"."Client_Interactions"
-                WHERE client_id = :cid ORDER BY created_at DESC LIMIT 1
-            """), {'cid': client_id}).fetchone()
-            if row:
-                session.execute(text("""
-                    UPDATE "StreemLyne_MT"."Client_Interactions"
-                    SET reminder_date = :rd, notes = COALESCE(:n, notes), contact_date = CURRENT_DATE
-                    WHERE interaction_id = :iid
-                """), {'rd': data.get('callback_date'), 'n': data.get('interaction_notes'), 'iid': row[0]})
-            else:
-                session.execute(text("""
-                    INSERT INTO "StreemLyne_MT"."Client_Interactions"
-                    (client_id, contact_date, contact_method, notes, reminder_date, created_at)
-                    VALUES (:cid, CURRENT_DATE, 1, :n, :rd, :ca)
-                """), {'cid': client_id, 'n': data.get('interaction_notes', ''),
-                       'rd': data.get('callback_date'), 'ca': datetime.utcnow()})
+        # Append-only history for callback_date / interaction_notes (never UPDATE latest row)
+        def _day_only(val):
+            if val is None or val == "":
+                return None
+            s = str(val).replace("Z", "").split("T")[0].strip()
+            return s[:10] if len(s) >= 10 else (s or None)
+
+        new_notes = data.get("interaction_notes")
+        new_rem = _day_only(data.get("callback_date"))
+        notes_changed = (new_notes or "").strip() != prev_notes_hist.strip()
+        rd_changed = new_rem != prev_reminder_hist
+        if notes_changed or rd_changed:
+            note_out = (new_notes or "").strip() if notes_changed else prev_notes_hist.strip()
+            rd_obj = None
+            if new_rem:
+                rd_obj = datetime.fromisoformat(new_rem).date()
+            session.add(
+                Client_Interactions(
+                    client_id=client_id,
+                    contact_date=datetime.utcnow().date(),
+                    contact_method=1,
+                    notes=note_out,
+                    reminder_date=rd_obj,
+                    next_steps="Record update",
+                    created_at=datetime.utcnow(),
+                )
+            )
  
         session.commit()
         session.expire_all()
