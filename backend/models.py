@@ -235,6 +235,8 @@ class Client_Master(Base):
     archived_reason = Column(String(255))
     display_order = Column(Integer, nullable=True)
     is_allocated = Column(Boolean, default=False, nullable=True)
+    is_draft = Column(Boolean, default=False, nullable=True)  # ✅ ADD THIS LINE
+    home_post_code = Column(String(20), nullable=True)  # If you have this field
 
 
 class Project_Details(Base):
@@ -381,6 +383,7 @@ class Opportunity_Details(Base):
     
     # ── Assignment tracking (mirrors Client_Master.is_allocated behavior) ───
     is_allocated = Column(Boolean, default=False, nullable=True)  # ✅ Required
+    is_draft = Column(Boolean, default=False, nullable=True)
     notes = Column(Text, nullable=True)
 
 

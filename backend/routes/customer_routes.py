@@ -19,6 +19,7 @@ from sqlalchemy.orm import aliased
 from ..db import SessionLocal
 from ..numeric_parse import safe_float
 from ..dummy_local_dashboard_data import dummy_employees_list, local_demo_dashboard_enabled
+from backend.crm.utils.display_order_helpers import recalculate_display_order
 
 # ✅ Import all models directly from backend.models
 from backend.models import (
@@ -351,12 +352,15 @@ def get_energy_customers():
                 cast(Client_Master.tenant_id, String) == str(tenant_id),
                 Client_Master.is_deleted == False,
                 Client_Master.is_archived == False,
+                or_(  # ✅ Fixed: use or_() instead of |
+                    Client_Master.is_draft == False,
+                    Client_Master.is_draft == None
+                ),
                 *(
                     ()
                     if see_all_tenant_clients
                     else (Project_Details.assigned_employee_id == user.employee_id,)
                 ),
-                # ✅ CRITICAL: Only show NON-ALLOCATED contacts (not reassigned)
                 or_(
                     Client_Master.is_allocated == False,
                     Client_Master.is_allocated == None
@@ -556,6 +560,7 @@ def create_energy_customer():
             client_website=data.get('website', ''),
             default_currency_id=data.get('currency_id', 1),
             is_archived=should_archive,
+            is_draft=True if not assigned_employee_id else False,
             archived_at=datetime.utcnow() if should_archive else None,
             archived_reason=archive_reason,
             created_at=datetime.utcnow()
@@ -727,10 +732,10 @@ def update_energy_customer(client_id):
                 elif old_assigned_to == new_assigned_to:
                     print(f"   ℹ️  No change in assignment")
                 elif new_assigned_to == current_user_employee_id:
-                    client.is_allocated = False
+                    client.is_allocated = False  # ✅ Assigning to SELF
                     print(f"   ✅ Assigned to self - is_allocated = False")
                 else:
-                    client.is_allocated = True
+                    client.is_allocated = True  # ✅ Assigning to SOMEONE ELSE
                     print(f"   ✅ Assigned to someone else ({new_assigned_to}) - is_allocated = True")
             else:
                 project.updated_at = datetime.utcnow()
@@ -955,6 +960,212 @@ def delete_energy_customer(client_id):
         session.rollback()
         current_app.logger.exception(f"❌ Error deleting customer {client_id}: {e}")
         return jsonify({'error': f'Failed to delete customer: {str(e)}'}), 500
+    finally:
+        session.close()
+
+# ==========================================
+# DRAFT RENEWALS ROUTES
+# ==========================================
+
+@energy_customer_bp.route('/energy-clients/drafts', methods=['GET'])
+@token_required
+def get_draft_renewals():
+    """
+    GET /api/crm/energy-clients/drafts
+    Get all unassigned draft renewals (is_draft=TRUE, assigned_employee_id IS NULL)
+    """
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+        
+        service_param = request.args.get('service', 'utilities')
+        service_id = {'utilities': 1, 'water': 2, 'gas': 3}.get(service_param.strip().lower(), 1)
+        
+        # Query with same structure as get_energy_customers
+        _nm = Energy_Contract_Master
+        _ecm_sq = (
+            session.query(
+                _nm.energy_contract_master_id,
+                _nm.project_id,
+                _nm.service_id,
+                _nm.supplier_id,
+                _nm.contract_start_date,
+                _nm.contract_end_date,
+                _nm.mpan_number,
+                _nm.mpan_bottom,
+                _nm.terms_of_sale,
+                _nm.aggregator,
+                _nm.payment_type,
+                _nm.old_supplier_id,
+                cast(_nm.unit_rate, String).label("unit_rate_s"),
+                cast(_nm.standing_charge, String).label("standing_charge_s"),
+                cast(_nm.rate_1, String).label("rate_1_s"),
+                cast(_nm.rate_2, String).label("rate_2_s"),
+                cast(_nm.rate_3, String).label("rate_3_s"),
+                cast(_nm.net_notch, String).label("net_notch_s"),
+                cast(_nm.comms_paid, String).label("comms_paid_s"),
+                cast(_nm.term_sold, String).label("term_sold_s"),
+            ).subquery("ecm_cast")
+        )
+        _ecm_cols = (
+            _ecm_sq.c.energy_contract_master_id,
+            _ecm_sq.c.project_id,
+            _ecm_sq.c.service_id,
+            _ecm_sq.c.supplier_id,
+            _ecm_sq.c.contract_start_date,
+            _ecm_sq.c.contract_end_date,
+            _ecm_sq.c.mpan_number,
+            _ecm_sq.c.mpan_bottom,
+            _ecm_sq.c.terms_of_sale,
+            _ecm_sq.c.aggregator,
+            _ecm_sq.c.payment_type,
+            _ecm_sq.c.old_supplier_id,
+            _ecm_sq.c.unit_rate_s,
+            _ecm_sq.c.standing_charge_s,
+            _ecm_sq.c.rate_1_s,
+            _ecm_sq.c.rate_2_s,
+            _ecm_sq.c.rate_3_s,
+            _ecm_sq.c.net_notch_s,
+            _ecm_sq.c.comms_paid_s,
+            _ecm_sq.c.term_sold_s,
+        )
+        
+        query = session.query(
+            Client_Master,
+            Project_Details,
+            *_ecm_cols,
+            Supplier_Master,
+        ).join(
+            Project_Details,
+            Client_Master.client_id == Project_Details.client_id
+        ).outerjoin(
+            _ecm_sq,
+            and_(
+                Project_Details.project_id == _ecm_sq.c.project_id,
+                _ecm_sq.c.service_id == service_id,
+            ),
+        ).outerjoin(
+            Supplier_Master,
+            _ecm_sq.c.supplier_id == Supplier_Master.supplier_id
+        ).filter(
+            and_(
+                cast(Client_Master.tenant_id, String) == str(tenant_id),
+                Client_Master.is_deleted == False,
+                Client_Master.is_archived == False,
+                Client_Master.is_draft == True,  # ✅ Only drafts
+                Client_Master.assigned_employee_id == None,  # ✅ Unassigned only
+            )
+        ).order_by(Client_Master.created_at.desc())
+        
+        results = query.all()
+        
+        customers = []
+        seen_clients = set()
+        n = _ECM_SELECT_LEN
+        
+        for row in results:
+            client = row[0]
+            project = row[1]
+            ecm_flat = row[2 : 2 + n]
+            supplier = row[2 + n]
+            
+            if client.tenant_client_id in seen_clients:
+                continue
+            seen_clients.add(client.tenant_client_id)
+            
+            contract = _energy_contract_proxy_from_ecm_tuple(ecm_flat)
+            customer_data = build_customer_response(
+                client, project, contract, None, None, supplier, None
+            )
+            customers.append(customer_data)
+        
+        return jsonify(customers), 200
+        
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+@energy_customer_bp.route('/energy-clients/drafts', methods=['DELETE', 'OPTIONS'])
+@token_required
+def delete_draft_energy_customers():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+
+        data = request.get_json(silent=True) or {}
+        raw_ids = data.get('client_ids') or []
+        try:
+            client_ids = sorted({int(client_id) for client_id in raw_ids})
+        except (TypeError, ValueError):
+            return jsonify({'error': 'client_ids must be a list of numbers'}), 400
+
+        if not client_ids:
+            return jsonify({'error': 'client_ids are required'}), 400
+
+        deleted_ids = []
+        skipped_ids = []
+
+        for client_id in client_ids:
+            client = session.query(Client_Master).filter(
+                Client_Master.client_id == client_id,
+                Client_Master.tenant_id == tenant_id,
+                Client_Master.is_draft == True,
+                Client_Master.assigned_employee_id == None
+            ).first()
+
+            if not client:
+                skipped_ids.append(client_id)
+                continue
+
+            projects = session.query(Project_Details).filter(
+                Project_Details.client_id == client.client_id
+            ).all()
+
+            client_assigned = bool(getattr(client, 'assigned_employee_id', None))
+            project_assigned = any(bool(getattr(project, 'assigned_employee_id', None)) for project in projects)
+            if client_assigned or project_assigned:
+                skipped_ids.append(client_id)
+                continue
+
+            project_ids = [project.project_id for project in projects]
+            if project_ids:
+                session.query(Energy_Contract_Master).filter(
+                    Energy_Contract_Master.project_id.in_(project_ids)
+                ).delete(synchronize_session=False)
+
+            session.query(Client_Interactions).filter(
+                Client_Interactions.client_id == client.client_id
+            ).delete(synchronize_session=False)
+
+            session.query(Project_Details).filter(
+                Project_Details.client_id == client.client_id
+            ).delete(synchronize_session=False)
+
+            session.delete(client)
+            deleted_ids.append(client_id)
+
+        session.commit()
+
+        return jsonify({
+            'success': True,
+            'deleted_count': len(deleted_ids),
+            'deleted_ids': deleted_ids,
+            'skipped_ids': skipped_ids,
+            'message': f'Deleted {len(deleted_ids)} draft renewals'
+        }), 200
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"Error deleting draft energy customers: {e}")
+        return jsonify({'error': f'Failed to delete draft renewals: {str(e)}'}), 500
     finally:
         session.close()
 
@@ -1257,6 +1468,9 @@ def bulk_assign_clients():
         if not employee:
             return jsonify({'error': 'Employee not found'}), 404
  
+        # ✅ Get current user's employee_id to determine is_allocated flag
+        current_user_employee_id = request.current_user.employee_id
+        
         old_employee_ids = set()
         updated_count = 0
  
@@ -1268,8 +1482,13 @@ def bulk_assign_clients():
             if client:
                 if client.assigned_employee_id and client.assigned_employee_id != employee_id:
                     old_employee_ids.add(client.assigned_employee_id)
-                    client.is_allocated = True
+                
+                # ✅ CORRECTED LOGIC:
+                # If assigning to self: is_allocated = FALSE (goes to main list)
+                # If assigning to someone else: is_allocated = TRUE (goes to allocated)
+                client.is_allocated = (employee_id != current_user_employee_id)
                 client.assigned_employee_id = employee_id
+                client.is_draft = False
                 updated_count += 1
  
             # ✅ Update Project_Details.assigned_employee_id
@@ -2043,53 +2262,6 @@ def auto_archive_older_contracts(session, tenant_id, business_name, mpan_top, mp
                 current_app.logger.info(f"✅ Recalculated display_order for employee_id={employee_id} after auto-archive")
     
     return False, None
-
-def recalculate_display_order(session, tenant_id, employee_id=None):
-    """
-    Recalculate display_order starting from 1 PER EMPLOYEE.
-    Uses ROW_NUMBER() OVER (PARTITION BY assigned_employee_id ORDER BY created_at)
-    so each salesperson's list always starts at 1.
-    """
-    if employee_id:
-        # Recalculate only for this specific employee
-        session.execute(text("""
-            UPDATE "StreemLyne_MT"."Client_Master" cm
-            SET display_order = sub.rn
-            FROM (
-                SELECT client_id,
-                       ROW_NUMBER() OVER (ORDER BY created_at ASC) AS rn
-                FROM "StreemLyne_MT"."Client_Master"
-                WHERE tenant_id = :tenant_id
-                  AND assigned_employee_id = :employee_id
-                  AND is_deleted = FALSE
-                  AND is_archived = FALSE
-            ) sub
-            WHERE cm.client_id = sub.client_id
-        """), {'tenant_id': tenant_id, 'employee_id': employee_id})
-    else:
-        # Recalculate for ALL employees at once using PARTITION BY
-        session.execute(text("""
-            UPDATE "StreemLyne_MT"."Client_Master" cm
-            SET display_order = sub.rn
-            FROM (
-                SELECT client_id,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY assigned_employee_id
-                           ORDER BY created_at ASC
-                       ) AS rn
-                FROM "StreemLyne_MT"."Client_Master"
-                WHERE tenant_id = :tenant_id
-                  AND is_deleted = FALSE
-                  AND is_archived = FALSE
-            ) sub
-            WHERE cm.client_id = sub.client_id
-        """), {'tenant_id': tenant_id})
-    
-    session.flush()
-    current_app.logger.info(
-        f"✅ Recalculated display_order per-employee "
-        f"(tenant={tenant_id}, employee={employee_id or 'ALL'})"
-    )
 
 @energy_customer_bp.route('/energy-clients/allocated', methods=['GET', 'OPTIONS'])
 @token_required

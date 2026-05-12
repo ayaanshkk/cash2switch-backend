@@ -3,6 +3,8 @@
 CRM Controllers
 Request handling layer for CRM operations
 """
+from pydoc import text
+
 from flask import request, jsonify, g
 from typing import Dict, Any
 from backend.crm.services.crm_service import CRMService
@@ -263,9 +265,7 @@ class CRMController:
     def assign_leads(self) -> tuple:
         """
         PATCH /api/crm/leads/assign
-        Bulk assign leads to an employee. Now allows any authenticated user.
-        Request body: { lead_ids: [...], employee_id: N, assignment_notes?: string }
-        ✅ UPDATED: Recalculates display_order for affected employees
+        Bulk assign leads to an employee.
         """
         try:
             from flask import request, jsonify, g
@@ -279,7 +279,7 @@ class CRMController:
             if not user:
                 return jsonify({'success': False, 'error': 'Authentication required'}), 401
 
-            tenant_id = str(g.tenant_id)  # ✅ CRITICAL FIX: Cast to string
+            tenant_id = str(g.tenant_id)
             payload = request.get_json()
             if not payload:
                 return jsonify({'success': False, 'error': 'Request body required'}), 400
@@ -297,36 +297,39 @@ class CRMController:
             except (ValueError, TypeError):
                 return jsonify({'success': False, 'error': 'employee_id must be a number'}), 400
 
-            # ✅ Track old employees for display_order recalculation
             session = SessionLocal()
-            old_employee_ids = set()
             
             try:
-                # Get old employee IDs before reassignment
-                for lead_id in lead_ids:
-                    result = session.execute(text("""
-                        SELECT opportunity_owner_employee_id 
-                        FROM "StreemLyne_MT"."Opportunity_Details"
-                        WHERE opportunity_id = :id AND tenant_id = :tid
-                    """), {'id': lead_id, 'tid': tenant_id}).fetchone()  # ✅ tid is now a string
-                    
-                    if result and result[0]:
-                        old_employee_ids.add(result[0])
+                # ✅ Get employee name for response
+                employee_name = "Unassigned"
+                if employee_id:
+                    emp_result = session.execute(text("""
+                        SELECT employee_name FROM "StreemLyne_MT"."Employee_Master"
+                        WHERE employee_id = :id AND tenant_id = :tid
+                    """), {'id': employee_id, 'tid': tenant_id}).fetchone()
+                    if emp_result:
+                        employee_name = emp_result[0]
                 
-                # ✅ PERFORM THE ASSIGNMENT DIRECTLY (bypass service layer to avoid type issues)
+                # Determine is_allocated flag
+                current_user_employee_id = user.employee_id
+                is_allocated = (employee_id != current_user_employee_id)
+                
+                # Perform the assignment
                 for lead_id in lead_ids:
-                    # Update assignment
                     session.execute(text("""
                         UPDATE "StreemLyne_MT"."Opportunity_Details"
                         SET opportunity_owner_employee_id = :emp_id,
-                            is_allocated = CASE 
-                                WHEN :emp_id IS NOT NULL THEN TRUE 
-                                ELSE FALSE 
-                            END
+                            is_allocated = :is_allocated,
+                            is_draft = FALSE
                         WHERE opportunity_id = :id AND tenant_id = :tid
-                    """), {'emp_id': employee_id, 'id': lead_id, 'tid': tenant_id})
+                    """), {
+                        'emp_id': employee_id, 
+                        'id': lead_id, 
+                        'tid': tenant_id,
+                        'is_allocated': is_allocated
+                    })
                     
-                    # ✅ Log assignment in history
+                    # Log assignment in history
                     if assignment_notes:
                         from backend.routes.crm_routes import ensure_lead_client_id
                         from backend.models import Client_Interactions
@@ -334,16 +337,6 @@ class CRMController:
                         
                         try:
                             client_id = ensure_lead_client_id(session, lead_id, tenant_id)
-                            
-                            # Get employee name
-                            employee_name = "Unassigned"
-                            if employee_id:
-                                emp = session.execute(text("""
-                                    SELECT employee_name FROM "StreemLyne_MT"."Employee_Master"
-                                    WHERE employee_id = :id
-                                """), {'id': employee_id}).mappings().first()
-                                if emp:
-                                    employee_name = emp['employee_name']
                             
                             interaction = Client_Interactions(
                                 client_id=client_id,
@@ -357,26 +350,14 @@ class CRMController:
                         except Exception as e:
                             logger.error(f'❌ Error logging assignment history: {e}')
                 
-                # ✅ Recalculate display_order for all affected employees
-                from backend.routes.crm_routes import recalculate_lead_display_order
-                
-                # Recalculate for old employees (who lost leads)
-                for old_emp_id in old_employee_ids:
-                    if old_emp_id != employee_id:  # Don't recalculate twice for same employee
-                        recalculate_lead_display_order(session, tenant_id, old_emp_id)
-                        logger.info(f'✅ Recalculated display_order for employee {old_emp_id} after losing leads')
-                
-                # Recalculate for new employee (who gained leads)
-                if employee_id:
-                    recalculate_lead_display_order(session, tenant_id, employee_id)
-                    logger.info(f'✅ Recalculated display_order for employee {employee_id} after gaining leads')
-                
                 session.commit()
                 
                 return jsonify({
                     'success': True,
                     'assigned_count': len(lead_ids),
-                    'message': f"Assigned {len(lead_ids)} lead(s) successfully"
+                    'message': f"Assigned {len(lead_ids)} lead(s) successfully",
+                    'employee_name': employee_name,  # ✅ ADDED
+                    'employee_id': employee_id,      # ✅ ADDED
                 }), 200
                 
             except Exception as e:

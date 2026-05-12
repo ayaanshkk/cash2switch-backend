@@ -37,17 +37,10 @@ if use_sqlite:
 else:
     engine = create_engine(
         DATABASE_URL,
-
-        # Render free tier: keep pool small (max ~25 connections total)
-        pool_size=5,
-        max_overflow=10,
+        pool_size=3,        
+        max_overflow=5,     
         pool_timeout=30,
-
-        # ✅ FIX: was 1800 (30 min). Supabase/Render kill idle connections at
-        # ~5 min. Recycling at 4 min ensures we never hand out a dead connection.
         pool_recycle=240,
-
-        # Validate connection before use — discards dead sockets transparently.
         pool_pre_ping=True,
 
         connect_args={
