@@ -8,7 +8,7 @@ from flask import Blueprint, request, g, jsonify, current_app
 from functools import wraps
 from datetime import datetime, timedelta
 import re
-from sqlalchemy import text, bindparam, string, func
+from sqlalchemy import text, bindparam, func, String
 from backend.db import SessionLocal
 from backend.models import (
     Opportunity_Details, Client_Master, Stage_Master, 
