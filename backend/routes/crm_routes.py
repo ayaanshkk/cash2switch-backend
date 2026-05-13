@@ -30,6 +30,51 @@ from ..dummy_local_dashboard_data import (
     dummy_leads_supplier_breakdown,
     local_demo_dashboard_enabled,
 )
+
+def _iso(v):
+    """Convert datetime/date objects to ISO format strings"""
+    if v is None:
+        return None
+    if hasattr(v, 'isoformat'):
+        return v.isoformat()
+    return v
+
+def _serial(v):
+    """Serialize values for JSON response"""
+    if v is None:
+        return None
+    if hasattr(v, 'isoformat'):
+        return v.isoformat()
+    try:
+        from decimal import Decimal
+        if isinstance(v, Decimal):
+            return float(v)
+    except ImportError:
+        pass
+    return v
+
+def _safe_float(v):
+    try:
+        if v is None:
+            return 0.0
+        return float(v)
+    except Exception:
+        try:
+            txt = str(v).replace(",", "").strip()
+            return float(txt) if txt else 0.0
+        except Exception:
+            return 0.0
+
+def _lead_stage_bucket(stage_name: str) -> str:
+    s = (stage_name or "").strip().lower()
+    if s in ("converted", "already renewed", "renewed", "renewed directly"):
+        return "converted"
+    if s in ("lost", "lost cot", "invalid number", "meter de-energised"):
+        return "lost"
+    if s in ("callback", "not answered", "broker in place", "email only", "complaint", "incorrect supplier", "priced", "end date changed"):
+        return "in_progress"
+    return "not_contacted"
+
 # Lightweight helper: attach tenant_id from decoded JWT to `g` (no new auth logic)
 def tenant_from_jwt(f):
     """Set g.tenant_id from request.current_user.tenant_id (returns 401 if missing).
