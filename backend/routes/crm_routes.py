@@ -795,6 +795,10 @@ def delete_draft_leads():
 @token_required
 @tenant_from_jwt
 def get_draft_leads():
+    """
+    GET /api/crm/leads/drafts
+    Get all unassigned draft leads (is_draft=TRUE, opportunity_owner_employee_id IS NULL)
+    """
     session = SessionLocal()
     try:
         tenant_id = g.tenant_id
@@ -818,7 +822,6 @@ def get_draft_leads():
             .filter(Opportunity_Details.service_id == service_id)
             .filter(Opportunity_Details.is_draft == True)
             .filter(Opportunity_Details.opportunity_owner_employee_id.is_(None))
-            .filter(Opportunity_Details.deleted_at.is_(None))
             .order_by(Opportunity_Details.created_at.desc())
             .all()
         )
@@ -855,7 +858,8 @@ def get_draft_leads():
         return jsonify(results), 200
 
     except Exception as e:
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
