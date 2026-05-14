@@ -961,8 +961,14 @@ def get_leads_stats():
         role_name = getattr(current_user, 'role', None)
         admin_user = is_crm_leads_admin_role(role_name)
         my_emp_id = getattr(current_user, 'employee_id', None)
-        requested_employee_id = request.args.get('employee_id', type=int)
-        employee_id = requested_employee_id if admin_user else my_emp_id
+        
+        # ✅ For non-admins: always use their own employee_id
+        # ✅ For admins: allow ?employee_id=X to view specific user, otherwise show all
+        if not admin_user:
+            employee_id = my_emp_id
+        else:
+            requested_employee_id = request.args.get('employee_id', type=int)
+            employee_id = requested_employee_id  # Can be None (all) or specific employee
 
         if local_demo_dashboard_enabled():
             return jsonify(dummy_leads_stats(employee_id)), 200
@@ -986,6 +992,7 @@ def get_leads_stats():
             .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
         )
 
+        # ✅ Always filter by employee_id for non-admins
         if employee_id:
             query = query.filter(Opportunity_Details.opportunity_owner_employee_id == employee_id)
 
@@ -1061,7 +1068,8 @@ def get_leads_stats():
         }), 200
 
     except Exception as e:
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
@@ -3229,11 +3237,58 @@ def leads_callback(opportunity_id):
             _save_interaction()
             session.commit()
 
-            return jsonify({
-                'success': True,
-                'message': f'Moved to recycle bin ({status})',
-                'moved_to_recycle_bin': True,
-            }), 200
+        if status in ('Invalid Number', 'Incorrect Supplier'):
+            if lead_client_id:
+                client = session.query(Client_Master).filter(
+                    Client_Master.client_id == lead_client_id,
+                    Client_Master.tenant_id == tenant_id
+                ).first()
+                
+                if client:
+                    client.is_deleted = True
+                    client.deleted_at = datetime.utcnow()
+                    client.deleted_reason = status
+                    if hasattr(client, 'is_cleansing'):
+                        client.is_cleansing = True
+                    
+                    session.flush()
+                    logger.info(f'leads_callback: moved lead {real_id} to cleansing ({status})')
+                    
+                    _save_interaction()
+                    session.commit()
+                    
+                    return jsonify({
+                        'success': True,
+                        'message': f'Moved to Cleansing ({status})',
+                        'moved_to_cleansing': True,
+                    }), 200
+
+        # ✅ Handle recycle bin statuses (Lost, Lost COT, Meter De-energised, Complaint)
+        if status in ('Lost', 'Lost COT', 'Meter De-energised', 'Complaint'):
+            if lead_client_id:
+                client = session.query(Client_Master).filter(
+                    Client_Master.client_id == lead_client_id,
+                    Client_Master.tenant_id == tenant_id
+                ).first()
+                
+                if client:
+                    client.is_deleted = True
+                    client.deleted_at = datetime.utcnow()
+                    client.deleted_reason = status
+                    if hasattr(client, 'is_cleansing'):
+                        client.is_cleansing = False
+                    
+                    session.flush()
+                    logger.info(f'leads_callback: moved lead {real_id} to recycle bin ({status})')
+                    
+                    _save_interaction()
+                    session.commit()
+                    
+                    return jsonify({
+                        'success': True,
+                        'message': f'Moved to recycle bin ({status})',
+                        'moved_to_recycle_bin': True,
+                    }), 200
 
         # Handle Priced: not sold
         if status == 'Priced' and is_sold is False:

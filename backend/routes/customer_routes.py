@@ -350,7 +350,7 @@ def get_energy_customers():
         ).filter(
             and_(
                 cast(Client_Master.tenant_id, String) == str(tenant_id),
-                Client_Master.is_deleted == False,
+                Client_Master.is_deleted == False,  # ✅ CRITICAL: Filter out deleted records
                 Client_Master.is_archived == False,
                 or_(  # ✅ Fixed: use or_() instead of |
                     Client_Master.is_draft == False,
@@ -367,7 +367,13 @@ def get_energy_customers():
                 ),
                 or_(
                     Project_Details.status == None,
-                    ~func.lower(Project_Details.status).in_(['priced', 'lost', 'lost_cot', 'lost cot'])
+                    ~func.lower(Project_Details.status).in_([
+                        'priced', 'lost', 'lost_cot', 'lost cot',
+                        'invalid number',  # ✅ Added: Filter out cleansing records
+                        'incorrect supplier',  # ✅ Added: Filter out cleansing records
+                        'meter de-energised',  # ✅ Added: Filter out recycle bin records
+                        'complaint'  # ✅ Added: Filter out recycle bin records
+                    ])
                 ),
             )
         ).order_by(Client_Master.created_at.desc())
