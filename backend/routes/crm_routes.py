@@ -312,15 +312,16 @@ def get_leads():
 def get_lead_detail(opportunity_id):
     """
     GET /api/crm/leads/<id>
-    Accepts both tenant_lead_id (the display ID in the URL) and opportunity_id.
-    Tries tenant_lead_id first, then falls back to opportunity_id.
+    Uses opportunity_id (primary key) as the primary lookup.
+    Pass ?use_display_id=true to use tenant_lead_id instead.
     """
     session = SessionLocal()
     try:
         tenant_id = g.tenant_id
-
-        # Try tenant_lead_id first
-        row = (
+        use_display_id = request.args.get('use_display_id', 'false').lower() == 'true'
+ 
+        # Build base query
+        base_query = (
             session.query(
                 Opportunity_Details,
                 Stage_Master.stage_name,
@@ -332,31 +333,18 @@ def get_lead_detail(opportunity_id):
             .outerjoin(Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id)
             .outerjoin(Supplier_Master, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
             .filter(Opportunity_Details.tenant_id == tenant_id)
-            .filter(Opportunity_Details.tenant_lead_id == opportunity_id)
-            .first()
         )
-
-        # Fallback to opportunity_id
-        if not row:
-            row = (
-                session.query(
-                    Opportunity_Details,
-                    Stage_Master.stage_name,
-                    Employee_Master.employee_name.label('assigned_to_name'),
-                    func.coalesce(Opportunity_Details.business_name, Opportunity_Details.opportunity_title).label('business_name'),
-                    Supplier_Master.supplier_company_name.label('supplier_name')
-                )
-                .outerjoin(Stage_Master, Opportunity_Details.stage_id == Stage_Master.stage_id)
-                .outerjoin(Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id)
-                .outerjoin(Supplier_Master, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
-                .filter(Opportunity_Details.tenant_id == tenant_id)
-                .filter(Opportunity_Details.opportunity_id == opportunity_id)
-                .first()
-            )
-
+ 
+        # Choose filter based on query parameter
+        if use_display_id:
+            row = base_query.filter(Opportunity_Details.tenant_lead_id == opportunity_id).first()
+        else:
+            # DEFAULT: Use opportunity_id (the primary key)
+            row = base_query.filter(Opportunity_Details.opportunity_id == opportunity_id).first()
+ 
         if not row:
             return jsonify({'error': 'Lead not found'}), 404
-
+ 
         od = row[0]
         result = {
             **{k: _serial(getattr(od, k)) for k in od.__table__.columns.keys()},
@@ -367,7 +355,7 @@ def get_lead_detail(opportunity_id):
         }
         
         return jsonify(result), 200
-
+ 
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -400,7 +388,9 @@ def _resolve_lead_client_id(db, tenant_id, opportunity_id):
 def get_lead_history(opportunity_id):
     """
     GET /api/crm/leads/<id>/history
-    Returns Client_Interactions for the lead's client (same id resolution as lead detail).
+    Returns Client_Interactions for the lead's client.
+    Uses opportunity_id (primary key) as the primary lookup.
+    Pass ?use_display_id=true to use tenant_lead_id instead.
     Response: { "interactions": [ { interaction_id, interaction_type, notes, ... } ] }
     """
     session = SessionLocal()
@@ -408,28 +398,32 @@ def get_lead_history(opportunity_id):
         print(f"\n🔍 get_lead_history called for opportunity_id={opportunity_id}")
         
         tenant_id = g.tenant_id
-        print(f"   tenant_id: {tenant_id}")
+        use_display_id = request.args.get('use_display_id', 'false').lower() == 'true'
+        print(f"   tenant_id: {tenant_id}, use_display_id: {use_display_id}")
         
         # Resolve lead
-        lead = (
+        query = (
             session.query(Opportunity_Details.opportunity_id, Opportunity_Details.client_id)
             .filter(Opportunity_Details.tenant_id == tenant_id)
-            .filter(
-                (Opportunity_Details.tenant_lead_id == opportunity_id) | 
-                (Opportunity_Details.opportunity_id == opportunity_id)
-            )
-            .first()
         )
-
+        
+        if use_display_id:
+            query = query.filter(Opportunity_Details.tenant_lead_id == opportunity_id)
+        else:
+            # DEFAULT: Use opportunity_id (the primary key)
+            query = query.filter(Opportunity_Details.opportunity_id == opportunity_id)
+        
+        lead = query.first()
+ 
         if not lead:
             return jsonify({'error': 'Lead not found'}), 404
-
+ 
         client_id = lead.client_id
         if not client_id:
             return jsonify({'interactions': []}), 200
-
+ 
         print(f"   ✅ Fetching interactions for client_id={client_id}")
-
+ 
         # Get interactions
         rows = (
             session.query(Client_Interactions)
@@ -439,7 +433,7 @@ def get_lead_history(opportunity_id):
         )
         
         print(f"   Found {len(rows)} interactions")
-
+ 
         interactions = []
         for ci in rows:
             notes = ci.notes or ''
@@ -454,10 +448,10 @@ def get_lead_history(opportunity_id):
                 'notes': notes,
                 'created_at': _serial(ci.created_at),
             })
-
+ 
         print(f"   ✅ Returning {len(interactions)} interactions")
         return jsonify({'interactions': interactions}), 200
-
+ 
     except Exception as e:
         print(f"   ❌ Exception in get_lead_history: {e}")
         import traceback
@@ -470,28 +464,32 @@ def get_lead_history(opportunity_id):
 @token_required
 @tenant_from_jwt
 def delete_lead_history(opportunity_id, interaction_id):
+    """Same fix applied - use opportunity_id by default"""
     session = SessionLocal()
     try:
         tenant_id = g.tenant_id
-
+        use_display_id = request.args.get('use_display_id', 'false').lower() == 'true'
+ 
         # Resolve lead
-        lead = (
+        query = (
             session.query(Opportunity_Details.opportunity_id, Opportunity_Details.client_id)
             .filter(Opportunity_Details.tenant_id == tenant_id)
-            .filter(
-                (Opportunity_Details.tenant_lead_id == opportunity_id) |
-                (Opportunity_Details.opportunity_id == opportunity_id)
-            )
-            .first()
         )
-
+        
+        if use_display_id:
+            query = query.filter(Opportunity_Details.tenant_lead_id == opportunity_id)
+        else:
+            query = query.filter(Opportunity_Details.opportunity_id == opportunity_id)
+        
+        lead = query.first()
+ 
         if not lead:
             return jsonify({'error': 'Lead not found'}), 404
-
+ 
         client_id = lead.client_id
         if not client_id:
             return jsonify({'error': 'No client for this lead'}), 400
-
+ 
         # Check interaction exists
         interaction = (
             session.query(Client_Interactions)
@@ -499,15 +497,15 @@ def delete_lead_history(opportunity_id, interaction_id):
             .filter(Client_Interactions.client_id == client_id)
             .first()
         )
-
+ 
         if not interaction:
             return jsonify({'error': 'Interaction not found'}), 404
-
+ 
         session.delete(interaction)
         session.commit()
-
+ 
         return jsonify({'success': True}), 200
-
+ 
     except Exception as e:
         session.rollback()
         import traceback; traceback.print_exc()
