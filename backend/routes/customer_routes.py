@@ -1005,6 +1005,223 @@ def delete_energy_customer(client_id):
 # DRAFT RENEWALS ROUTES
 # ==========================================
 
+@energy_customer_bp.route('/import/renewals', methods=['POST'])
+@token_required
+def import_renewals():
+    """
+    POST /import/renewals
+    Import renewals as draft energy clients (always unassigned drafts)
+    """
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+        
+        service_param = request.args.get('service', 'utilities')
+        service_id = {'utilities': 1, 'water': 2, 'gas': 3}.get(service_param.strip().lower(), 1)
+        
+        # Check if file is provided
+        if 'file' not in request.files:
+            return jsonify({
+                'success': False,
+                'message': 'No file provided',
+                'total_rows': 0,
+                'successful': 0,
+                'failed': 1,
+                'errors': ['No file uploaded']
+            }), 400
+
+        file = request.files.get('file')
+        
+        # STEP 1: Clean up existing draft renewals before import
+        try:
+            # Get all draft clients first
+            draft_clients = (
+                session.query(Client_Master)
+                .filter(Client_Master.tenant_id == tenant_id)
+                .filter(Client_Master.is_draft == True)
+                .filter(Client_Master.assigned_employee_id.is_(None))
+                .filter(Client_Master.is_deleted == False)
+                .all()
+            )
+            
+            for client in draft_clients:
+                # Get project IDs for this client
+                project_ids = [p.project_id for p in session.query(Project_Details.project_id).filter(
+                    Project_Details.client_id == client.client_id
+                ).all()]
+                
+                if project_ids:
+                    # Delete contracts
+                    session.query(Energy_Contract_Master).filter(
+                        Energy_Contract_Master.project_id.in_(project_ids)
+                    ).delete(synchronize_session=False)
+                
+                # Delete projects
+                session.query(Project_Details).filter(
+                    Project_Details.client_id == client.client_id
+                ).delete(synchronize_session=False)
+                
+                # Delete interactions
+                session.query(Client_Interactions).filter(
+                    Client_Interactions.client_id == client.client_id
+                ).delete(synchronize_session=False)
+                
+                # Delete client
+                session.delete(client)
+            
+            session.commit()
+            current_app.logger.info(f'Deleted {len(draft_clients)} existing draft renewals before import')
+        except Exception as cleanup_err:
+            current_app.logger.warning(f'Could not clean up draft renewals: {cleanup_err}')
+            session.rollback()
+        
+        # STEP 2: Parse the uploaded file
+        filename = file.filename.lower()
+        
+        if filename.endswith('.csv'):
+            import pandas as pd
+            df = pd.read_csv(file)
+        elif filename.endswith(('.xlsx', '.xls')):
+            import pandas as pd
+            df = pd.read_excel(file)
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Unsupported file format. Please upload CSV or Excel file.',
+                'total_rows': 0,
+                'successful': 0,
+                'failed': 1,
+                'errors': ['Unsupported file format']
+            }), 400
+        
+        # STEP 3: Import each row as a DRAFT renewal
+        imported_count = 0
+        errors = []
+        
+        for idx, row in df.iterrows():
+            try:
+                # Extract data from row
+                business_name = str(row.get('Business Name', '') or row.get('business_name', '') or row.get('Client Name', '') or '').strip()
+                contact_person = str(row.get('Contact Person', '') or row.get('contact_person', '') or '').strip()
+                phone = str(row.get('Tel Number', '') or row.get('tel_number', '') or row.get('Phone', '') or '').strip()
+                email = str(row.get('Email', '') or row.get('email', '') or '').strip()
+                address = str(row.get('Address', '') or row.get('address', '') or '').strip()
+                post_code = str(row.get('Post Code', '') or row.get('postcode', '') or '').strip()
+                
+                mpan_top = str(row.get('MPAN_MPR', '') or row.get('mpan_mpr', '') or row.get('MPAN Top', '') or '').strip()
+                mpan_bottom = str(row.get('MPAN Bottom', '') or row.get('mpan_bottom', '') or '').strip()
+                
+                start_date = row.get('Start Date', None) or row.get('start_date', None)
+                end_date = row.get('End Date', None) or row.get('end_date', None)
+                
+                annual_usage = row.get('Annual Usage', None) or row.get('annual_usage', None)
+                
+                supplier_name = str(row.get('Supplier', '') or row.get('supplier', '') or '').strip()
+                
+                # Skip if no business name or phone
+                if not business_name and not contact_person:
+                    errors.append(f'Row {idx + 2}: Missing business name or contact person')
+                    continue
+                
+                if not phone:
+                    errors.append(f'Row {idx + 2}: Missing phone number')
+                    continue
+                
+                # Find supplier_id
+                supplier_id = None
+                if supplier_name:
+                    supplier = session.query(Supplier_Master).filter(
+                        func.lower(Supplier_Master.supplier_company_name) == supplier_name.lower()
+                    ).first()
+                    if supplier:
+                        supplier_id = supplier.supplier_id
+                
+                # Create Client_Master (ALWAYS as draft, ALWAYS unassigned)
+                new_client = Client_Master(
+                    tenant_id=tenant_id,
+                    assigned_employee_id=None,  # ✅ ALWAYS unassigned for drafts
+                    client_company_name=business_name,
+                    client_contact_name=contact_person,
+                    address=address,
+                    post_code=post_code,
+                    client_phone=phone,
+                    client_email=email,
+                    default_currency_id=1,
+                    is_draft=True,  # ✅ ALWAYS draft
+                    is_deleted=False,
+                    is_archived=False,
+                    created_at=datetime.utcnow()
+                )
+                session.add(new_client)
+                session.flush()
+                
+                # Create Project_Details (also unassigned)
+                project = Project_Details(
+                    client_id=new_client.client_id,
+                    project_title=f"Site - {business_name or 'Unknown'}",
+                    project_description='Imported renewal',
+                    address=address,
+                    Misc_Col2=annual_usage,
+                    employee_id=request.current_user.employee_id,
+                    assigned_employee_id=None,  # ✅ ALWAYS unassigned
+                    status=None,
+                    start_date=start_date,
+                    created_at=datetime.utcnow()
+                )
+                session.add(project)
+                session.flush()
+                
+                # Create Energy_Contract_Master
+                contract = Energy_Contract_Master(
+                    project_id=project.project_id,
+                    employee_id=request.current_user.employee_id,
+                    supplier_id=supplier_id,
+                    mpan_number=mpan_top,
+                    mpan_bottom=mpan_bottom,
+                    contract_start_date=start_date,
+                    contract_end_date=end_date,
+                    unit_rate=0,
+                    currency_id=1,
+                    service_id=service_id,
+                    created_at=datetime.utcnow()
+                )
+                session.add(contract)
+                session.flush()
+                
+                imported_count += 1
+                
+            except Exception as row_error:
+                errors.append(f'Row {idx + 2}: {str(row_error)}')
+                continue
+        
+        session.commit()
+        
+        return jsonify({
+            'success': imported_count > 0,
+            'message': f'Successfully imported {imported_count} draft renewal(s)',
+            'total_rows': len(df),
+            'successful': imported_count,
+            'failed': len(df) - imported_count,
+            'errors': errors[:10]  # Limit to first 10 errors
+        }), 200
+        
+    except Exception as e:
+        session.rollback()
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'message': str(e),
+            'total_rows': 0,
+            'successful': 0,
+            'failed': 1,
+            'errors': [str(e)]
+        }), 500
+    finally:
+        session.close()
+
 @energy_customer_bp.route('/energy-clients/drafts', methods=['GET'])
 @token_required
 def get_draft_renewals():

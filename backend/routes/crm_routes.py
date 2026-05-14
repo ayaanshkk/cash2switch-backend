@@ -748,7 +748,7 @@ def delete_draft_leads():
 
     session = SessionLocal()
     try:
-        tenant_id = str(g.tenant_id)
+        tenant_id = g.tenant_id
         data = request.get_json(silent=True) or {}
         raw_ids = data.get('lead_ids') or []
 
@@ -760,30 +760,28 @@ def delete_draft_leads():
         if not lead_ids:
             return jsonify({'error': 'lead_ids are required'}), 400
 
-        stmt = text("""
-            DELETE FROM "StreemLyne_MT"."Opportunity_Details"
-            WHERE tenant_id = :tenant_id
-              AND opportunity_id IN :lead_ids
-              AND opportunity_owner_employee_id IS NULL
-            RETURNING opportunity_id
-        """).bindparams(bindparam('lead_ids', expanding=True))
+        # Delete draft leads (is_draft=TRUE and no employee assigned)
+        deleted_count = (
+            session.query(Opportunity_Details)
+            .filter(Opportunity_Details.tenant_id == tenant_id)
+            .filter(Opportunity_Details.opportunity_id.in_(lead_ids))
+            .filter(Opportunity_Details.opportunity_owner_employee_id.is_(None))
+            .filter(Opportunity_Details.is_draft == True)
+            .delete(synchronize_session=False)
+        )
 
-        deleted_rows = session.execute(stmt, {
-            'tenant_id': tenant_id,
-            'lead_ids': lead_ids
-        }).fetchall()
         session.commit()
 
-        deleted_ids = [int(row[0]) for row in deleted_rows]
-        skipped_ids = [lead_id for lead_id in lead_ids if lead_id not in deleted_ids]
+        skipped_ids = [lead_id for lead_id in lead_ids if lead_id not in range(deleted_count)]
 
         return jsonify({
             'success': True,
-            'deleted_count': len(deleted_ids),
-            'deleted_ids': deleted_ids,
+            'deleted_count': deleted_count,
+            'deleted_ids': lead_ids[:deleted_count],
             'skipped_ids': skipped_ids,
-            'message': f'Deleted {len(deleted_ids)} draft leads'
+            'message': f'Deleted {deleted_count} draft leads'
         }), 200
+
     except Exception as e:
         session.rollback()
         current_app.logger.exception("Error deleting draft leads")
@@ -1992,21 +1990,8 @@ def import_leads():
     """
     POST /api/crm/leads/import
     Single-step import: accepts file, validates, and imports in one request.
-    Compatible with BulkImportModal component.
-
-    Request:
-      - file: Excel (.xlsx, .xls) or CSV file
-
-    Returns:
-      200: {
-        success: bool,
-        message: str,
-        total_rows: int,
-        successful: int,
-        failed: int,
-        errors: list[str]
-      }
     """
+    session = SessionLocal()
     try:
         tenant_id = g.tenant_id
 
@@ -2028,14 +2013,25 @@ def import_leads():
 
         file = request.files.get('file')
 
-        # Debug
-        print(f"DEBUG: File received - {file.filename if file else 'None'}")
+        # IMPORTANT: Before importing, delete existing draft leads for this tenant and service
+        # This allows re-uploading the same file without duplicates
+        try:
+            deleted_drafts = (
+                session.query(Opportunity_Details)
+                .filter(Opportunity_Details.tenant_id == tenant_id)
+                .filter(Opportunity_Details.service_id == service_id)
+                .filter(Opportunity_Details.is_draft == True)
+                .filter(Opportunity_Details.opportunity_owner_employee_id.is_(None))
+                .delete(synchronize_session=False)
+            )
+            session.commit()
+            current_app.logger.info(f'Deleted {deleted_drafts} existing draft leads before import')
+        except Exception as cleanup_err:
+            current_app.logger.warning(f'Could not clean up drafts before import: {cleanup_err}')
+            session.rollback()
 
         # Step 1: Validate and preview
         preview_result = crm_controller.crm_service.preview_lead_import(tenant_id, file)
-
-        # Debug preview result
-        print(f"DEBUG: Preview result: success={preview_result.get('success')}, valid_rows={preview_result.get('valid_rows')}, total_rows={preview_result.get('total_rows')}")
 
         if not preview_result.get('success'):
             return jsonify({
@@ -2059,22 +2055,15 @@ def import_leads():
                 'errors': preview_result.get('errors', ['No valid data found'])
             }), 400
 
-        # Step 2: Import the validated rows directly
-        # preview_result contains 'rows' with structure: {'row_number', 'data', 'is_valid', 'errors'}
-        # We need to extract only valid rows and their 'data' field
+        # Step 2: Import the validated rows
         all_rows = preview_result.get('rows', [])
         validated_data = [row['data'] for row in all_rows if row.get('is_valid', False)]
 
         created_by = getattr(request.current_user, 'id', None)
 
-        # Debug: print what we're sending
-        print(f"DEBUG: validated_data type={type(validated_data)}, length={len(validated_data) if isinstance(validated_data, list) else 'N/A'}")
-        if validated_data and isinstance(validated_data, list):
-            print(f"DEBUG: First row keys: {list(validated_data[0].keys()) if validated_data else 'empty'}")
-
         confirm_result = crm_controller.crm_service.confirm_lead_import(tenant_id, validated_data, created_by, service_id)
 
-        # Check if confirm returned an error (has 'success':False key)
+        # Check if confirm returned an error
         if 'success' in confirm_result and not confirm_result['success']:
             return jsonify({
                 'success': False,
@@ -2085,7 +2074,7 @@ def import_leads():
                 'errors': [confirm_result.get('error', 'Import failed')]
             }), 400
 
-        # Format response to match BulkImportModal expectations
+        # Format response
         inserted = confirm_result.get('inserted', 0)
         skipped = confirm_result.get('skipped', 0)
 
@@ -2099,6 +2088,7 @@ def import_leads():
         }), 200
 
     except Exception as e:
+        session.rollback()
         import traceback
         traceback.print_exc()
         return jsonify({
@@ -2109,6 +2099,8 @@ def import_leads():
             'failed': 1,
             'errors': [str(e)]
         }), 500
+    finally:
+        session.close()
 
 
 @crm_bp.route('/leads/import/template', methods=['GET'])
