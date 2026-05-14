@@ -553,7 +553,10 @@ def update_lead(opportunity_id):
         try:
             tenant_id = g.tenant_id
             data = request.get_json() or {}
-
+            
+            current_app.logger.info(f"🔧 PATCH /api/crm/leads/{opportunity_id}")
+            current_app.logger.info(f"   Data: {data}")
+ 
             ALLOWED_PATCH_FIELDS = {
                 'stage_id', 'status',
                 'business_name', 'contact_person', 'tel_number', 'mobile_no',
@@ -572,15 +575,15 @@ def update_lead(opportunity_id):
                 'charity_ltd_company_number', 'partner_details',
                 'meter_ref', 'uplift', 'comments', 'document_details',
             }
-
+ 
             update_fields = {
                 k: v for k, v in data.items()
                 if k in ALLOWED_PATCH_FIELDS
             }
-
+ 
             if not update_fields:
                 return jsonify({'error': 'No valid fields provided'}), 400
-
+ 
             # Resolve opportunity_id
             lead = (
                 session.query(Opportunity_Details.opportunity_id, Opportunity_Details.client_id)
@@ -591,20 +594,50 @@ def update_lead(opportunity_id):
                 )
                 .first()
             )
-
+ 
             if not lead:
                 return jsonify({'error': 'Lead not found'}), 404
-
+ 
             real_id = lead.opportunity_id
             client_id = lead.client_id
-
+            
+            current_app.logger.info(f"   Resolved: real_id={real_id}, client_id={client_id}")
+ 
+            # ✅ CAPTURE OLD VALUES BEFORE UPDATE
+            old_lead = session.query(Opportunity_Details).filter(
+                Opportunity_Details.opportunity_id == real_id,
+                Opportunity_Details.tenant_id == tenant_id
+            ).first()
+ 
+            if not old_lead:
+                return jsonify({'error': 'Lead not found'}), 404
+ 
+            # Store old values for comparison - only track fields that might be updated
+            old_values = {}
+            tracked_fields = [
+                'net_notch', 'aggregator', 'rate_1', 'rate_2', 'rate_3',
+                'stand_charge', 'annual_usage', 'comms_paid', 'term_sold',
+                'payment_type', 'supplier_id', 'start_date', 'end_date',
+                'mpan_mpr', 'mpan_bottom', 'business_name', 'contact_person',
+                'tel_number', 'mobile_no', 'email', 'address', 'postcode',
+            ]
+            
+            for field in tracked_fields:
+                if hasattr(old_lead, field):
+                    old_values[field] = getattr(old_lead, field)
+ 
+            current_app.logger.info(f"   Old values captured: {len(old_values)} fields")
+ 
             # Update the lead
             session.query(Opportunity_Details).filter(
                 Opportunity_Details.opportunity_id == real_id,
                 Opportunity_Details.tenant_id == tenant_id
             ).update(update_fields, synchronize_session=False)
-
-            # Log to Client_Interactions if client_id exists
+            
+            session.flush()
+            current_app.logger.info(f"   ✅ Lead updated in database")
+ 
+            # ✅ COMPREHENSIVE FIELD CHANGE TRACKING
             if client_id:
                 field_labels = {
                     'net_notch': 'Net Notch',
@@ -616,27 +649,108 @@ def update_lead(opportunity_id):
                     'annual_usage': 'Annual Usage',
                     'comms_paid': 'Comms Paid',
                     'term_sold': 'Term Sold',
+                    'payment_type': 'Payment Type',
+                    'supplier_id': 'Supplier',
+                    'start_date': 'Start Date',
+                    'end_date': 'End Date',
+                    'mpan_mpr': 'MPAN/MPR',
+                    'mpan_bottom': 'MPAN Bottom',
+                    'business_name': 'Business Name',
+                    'contact_person': 'Contact Person',
+                    'tel_number': 'Phone',
+                    'mobile_no': 'Mobile',
+                    'email': 'Email',
+                    'address': 'Address',
+                    'postcode': 'Postcode',
                 }
                 
                 changes = []
-                for field, label in field_labels.items():
-                    if field in update_fields and update_fields[field] not in [None, '']:
-                        changes.append(f"{label} updated to {update_fields[field]}")
                 
+                # Compare each field
+                for field, label in field_labels.items():
+                    if field in update_fields:
+                        old_val = old_values.get(field)
+                        new_val = update_fields[field]
+                        
+                        # Handle None/empty values
+                        def format_value(val):
+                            if val is None or val == '':
+                                return 'None'
+                            return val
+                        
+                        old_display = format_value(old_val)
+                        new_display = format_value(new_val)
+                        
+                        # Convert to string for comparison
+                        old_str = str(old_display)
+                        new_str = str(new_display)
+                        
+                        # Only log if changed
+                        if old_str != new_str:
+                            try:
+                                # Special handling for supplier_id - show supplier name
+                                if field == 'supplier_id':
+                                    old_supplier_name = 'None'
+                                    new_supplier_name = 'None'
+                                    
+                                    if old_val:
+                                        old_sup = session.query(Supplier_Master).filter_by(supplier_id=old_val).first()
+                                        if old_sup:
+                                            old_supplier_name = old_sup.supplier_company_name
+                                    
+                                    if new_val:
+                                        new_sup = session.query(Supplier_Master).filter_by(supplier_id=new_val).first()
+                                        if new_sup:
+                                            new_supplier_name = new_sup.supplier_company_name
+                                    
+                                    old_display = old_supplier_name
+                                    new_display = new_supplier_name
+                                
+                                # Special handling for dates
+                                elif field in ['start_date', 'end_date']:
+                                    if hasattr(old_val, 'isoformat'):
+                                        old_display = old_val.isoformat()
+                                    if hasattr(new_val, 'isoformat'):
+                                        new_display = new_val.isoformat()
+                                    elif isinstance(new_val, str):
+                                        new_display = new_val
+                                
+                                changes.append(f"{label}: {old_display} → {new_display}")
+                            
+                            except Exception as field_error:
+                                current_app.logger.warning(f"   ⚠️ Error formatting {field}: {field_error}")
+                                # Add simplified change entry
+                                changes.append(f"{label} updated")
+                
+                # Log all changes in one interaction
                 if changes:
                     change_summary = " | ".join(changes)
-                    interaction = Client_Interactions(
-                        client_id=client_id,
-                        contact_date=datetime.utcnow().date(),
-                        contact_method=1,
-                        notes=f"[Field Update] {change_summary}",
-                        next_steps='Field Update',
-                        created_at=datetime.utcnow()
-                    )
-                    session.add(interaction)
-
+                    current_app.logger.info(f"   📝 Logging changes: {change_summary}")
+                    
+                    try:
+                        interaction = Client_Interactions(
+                            client_id=client_id,
+                            contact_date=datetime.utcnow().date(),
+                            contact_method=1,
+                            notes=f"[Field Update] {change_summary}",
+                            next_steps='Field Update',
+                            created_at=datetime.utcnow()
+                        )
+                        session.add(interaction)
+                        session.flush()
+                        current_app.logger.info(f"   ✅ History logged successfully")
+                    except Exception as log_error:
+                        current_app.logger.error(f"   ❌ Error logging history: {log_error}")
+                        # Don't fail the whole update if logging fails
+                        pass
+                else:
+                    current_app.logger.info(f"   ℹ️  No changes detected to log")
+            else:
+                current_app.logger.warning(f"   ⚠️ No client_id - skipping history log")
+ 
             session.commit()
-
+            current_app.logger.info(f"   ✅ Transaction committed")
+ 
             # Fetch updated record
             updated = (
                 session.query(
@@ -653,7 +767,7 @@ def update_lead(opportunity_id):
                 .filter(Opportunity_Details.tenant_id == tenant_id)
                 .first()
             )
-
+ 
             if updated:
                 od = updated[0]
                 result = {
@@ -663,20 +777,22 @@ def update_lead(opportunity_id):
                     'business_name': updated.business_name,
                     'supplier_name': updated.supplier_name,
                 }
+                current_app.logger.info(f"   ✅ PATCH completed successfully")
                 return jsonify(result), 200
-
+ 
             return jsonify({'success': True}), 200
-
+ 
         except Exception as e:
             session.rollback()
-            import traceback; traceback.print_exc()
+            current_app.logger.exception(f"❌ Error in PATCH /api/crm/leads/{opportunity_id}: {e}")
+            import traceback
+            traceback.print_exc()
             return jsonify({'error': str(e)}), 500
         finally:
             session.close()
-
+ 
     # PUT — full update via controller
     return crm_controller.update_lead(opportunity_id)
-
 
 @crm_bp.route('/leads/<int:opportunity_id>/status', methods=['PATCH'])
 @token_required
