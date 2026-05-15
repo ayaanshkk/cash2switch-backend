@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from functools import wraps
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
+from werkzeug.security import generate_password_hash, check_password_hash
 import secrets
 import re
 import jwt
@@ -350,12 +351,12 @@ def login():
 
         # ===== 3. VERIFY PASSWORD (FAIL FAST) =====
         pwd_start = time.time()
-        db_password = row.get('password')
-        if db_password != input_password:
+        db_password_hash = row.get('password')
+        if not check_password_hash(db_password_hash, input_password):
             total_time = time.time() - start_time
             current_app.logger.warning(f"❌ Invalid password for {username} | Total: {total_time*1000:.0f}ms")
             return jsonify({'error': 'Invalid username or password'}), 401
-        
+
         current_app.logger.info(f"✅ Password verified: {(time.time() - pwd_start)*1000:.0f}ms")
 
         # ===== 4. FETCH ROLE (SEPARATE QUERY - ONLY AFTER PASSWORD VERIFIED) =====
@@ -483,6 +484,8 @@ def signup():
         employee_id = emp_row.get('employee_id')
 
         # Insert user
+        password_hash = generate_password_hash(password)
+
         insert_user = text('''
             INSERT INTO "StreemLyne_MT"."User_Master" (employee_id, user_name, password)
             VALUES (:employee_id, :user_name, :password)
@@ -491,7 +494,7 @@ def signup():
         user_row = session.execute(insert_user, {
             'employee_id': employee_id,
             'user_name': username,
-            'password': password
+            'password': password_hash  # Use hashed password
         }).mappings().first()
 
         if not user_row or not user_row.get('user_id'):
@@ -1075,14 +1078,16 @@ def change_password():
         user_id = row.get('user_id')
         
         # ✅ Update password (plain text as per StreemLyne spec)
+        new_password_hash = generate_password_hash(new_password)
+
         update_sql = text('''
             UPDATE "StreemLyne_MT"."User_Master"
             SET password = :password
             WHERE user_id = :user_id
         ''')
-        
+
         session.execute(update_sql, {
-            'password': new_password,
+            'password': new_password_hash,
             'user_id': user_id
         })
         
@@ -1227,6 +1232,8 @@ def create_team_invite():
 
         # 2. Create User_Master row
         # Store invite_token in password field temporarily — team member will replace it
+        password_hash = generate_password_hash(invite_token)
+
         user_row = session.execute(text("""
             INSERT INTO "StreemLyne_MT"."User_Master"
                 (employee_id, user_name, password, invite_token, is_invite_pending)
@@ -1235,7 +1242,7 @@ def create_team_invite():
         """), {
             'employee_id': employee_id,
             'user_name': username,
-            'password': invite_token,  # placeholder until they set real password
+            'password': password_hash,  # hashed placeholder
             'invite_token': invite_token
         }).mappings().first()
 
@@ -1374,6 +1381,8 @@ def accept_invite():
             return jsonify({'error': 'Invite already used. Please log in.'}), 400
 
         # Set real password, clear token, mark invite as complete
+        password_hash = generate_password_hash(password)
+
         session.execute(text("""
             UPDATE "StreemLyne_MT"."User_Master"
             SET password = :password,
@@ -1381,7 +1390,7 @@ def accept_invite():
                 is_invite_pending = FALSE
             WHERE user_id = :user_id
         """), {
-            'password': password,
+            'password': password_hash,
             'user_id': row['user_id']
         })
 
@@ -1500,13 +1509,14 @@ def resend_invite(user_id):
             return jsonify({'error': 'User has already accepted their invite'}), 400
 
         new_token = secrets.token_urlsafe(32)
+        password_hash = generate_password_hash(new_token)  # Hash the new token
 
         session.execute(text("""
             UPDATE "StreemLyne_MT"."User_Master"
-            SET invite_token = :token, password = :token
+            SET invite_token = :token, password = :password_hash
             WHERE user_id = :user_id
-        """), {'token': new_token, 'user_id': user_id})
-
+        """), {'token': new_token, 'password_hash': password_hash, 'user_id': user_id})
+        
         session.commit()
 
         base_url = request.headers.get('Origin', 'https://your-app.vercel.app')
