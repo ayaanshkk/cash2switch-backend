@@ -3,6 +3,8 @@
 CRM Routes Blueprint
 Defines API endpoints for CRM module
 """
+from asyncio.log import logger
+
 from backend import db
 from flask import Blueprint, request, g, jsonify, current_app
 from functools import wraps
@@ -1595,11 +1597,24 @@ def get_leads_performance():
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
 
-        use_current_user = request.args.get('use_current_user', 'false').lower() == 'true'
-        employee_id = None
-        if use_current_user:
-            current_user = request.current_user
-            employee_id = getattr(current_user, 'employee_id', None) or getattr(current_user, 'id', None)
+        current_user = request.current_user
+        role_name = getattr(current_user, 'role', None)
+        admin_user = is_crm_leads_admin_role(role_name)
+        my_emp_id = getattr(current_user, 'employee_id', None)
+        
+        # ✅ For non-admins: always use their own employee_id
+        # ✅ For admins: allow ?employee_id=X to view specific user, otherwise use their own
+        if not admin_user:
+            employee_id = my_emp_id
+        else:
+            requested_employee_id = request.args.get('employee_id', type=int)
+            # If admin didn't specify employee_id, use their own (not all leads)
+            employee_id = requested_employee_id if requested_employee_id else my_emp_id
+
+        current_app.logger.info(
+            f'📊 get_leads_performance: employee_id={employee_id}, my_emp_id={my_emp_id}, '
+            f'is_admin={admin_user}, requested={request.args.get("employee_id")}'
+        )
 
         query = (
             session.query(Stage_Master.stage_name)
@@ -1614,8 +1629,23 @@ def get_leads_performance():
             .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
         )
 
+        # ✅ CRITICAL: Always filter by employee_id (no "show all" option)
         if employee_id:
             query = query.filter(Opportunity_Details.opportunity_owner_employee_id == employee_id)
+        else:
+            # If no employee_id, return empty results (don't show all tenant data)
+            return jsonify({
+                'converted_count': 0,
+                'renewed_count': 0,
+                'renewed_directly_count': 0,
+                'end_date_changed_count': 0,
+                'priced_count': 0,
+                'contacted_count': 0,
+                'not_contacted_count': 0,
+                'lost_count': 0,
+                'success_rate': 0,
+                'total_customers': 0,
+            }), 200
 
         rows = query.all()
 
@@ -1652,6 +1682,11 @@ def get_leads_performance():
         success_rate = round(
             ((converted_count + renewed_count + renewed_directly_count) / total * 100), 1
         ) if total > 0 else 0
+
+        current_app.logger.info(
+            f'✅ Performance for employee_id={employee_id}: total={total}, '
+            f'not_contacted={not_contacted_count}, converted={converted_count}'
+        )
 
         return jsonify({
             'converted_count': converted_count,
@@ -3202,265 +3237,207 @@ def get_cleansing():
     finally:
         session.close()
 
-@crm_bp.route('/leads/<int:opportunity_id>/callback', methods=['OPTIONS'])
-def leads_callback_options(opportunity_id):
-    return jsonify({}), 200
-
-
-@crm_bp.route('/leads/<int:opportunity_id>/callback', methods=['POST'], provide_automatic_options=False)
+@crm_bp.route('/leads/<int:opportunity_id>/callback', methods=['POST', 'OPTIONS'])
 @token_required
 @tenant_from_jwt
 def leads_callback(opportunity_id):
+    """
+    POST /api/crm/leads/<id>/callback
+    Save callback status and notes to history
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
     session = SessionLocal()
+    
     try:
         tenant_id = g.tenant_id
-        data = request.get_json(force=True, silent=True) or {}
-
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.info('leads_callback: opportunity_id=%s tenant=%s data_keys=%s',
-                    opportunity_id, tenant_id, list(data.keys()) if data else 'EMPTY')
-
+        data = request.get_json()
+        
         status = data.get('status')
-        stage_id = data.get('stage_id')
-        notes = data.get('notes', '')
         callback_date = data.get('callback_date')
-        called_date = data.get('called_date')
-        is_sold = data.get('is_sold')
-        new_end_date_str = data.get('new_end_date')
-        renewed_by = data.get('renewed_by')
-        new_supplier = data.get('new_supplier')
-        new_address = data.get('new_address')
-
-        if not status:
-            logger.warning('leads_callback: missing status, raw body=%s', request.get_data(as_text=True)[:200])
-            return jsonify({'error': 'Status is required'}), 400
-
-        status_config = {
-            "Callback": {"requires_date": True, "requires_sold": False, "deletes_record": False, "requires_notes": False},
-            "Not Answered": {"requires_date": True, "requires_sold": False, "deletes_record": False, "requires_notes": False},
-            "Priced": {"requires_date": False, "requires_sold": True, "deletes_record": False, "requires_notes": False},
-            "Lost": {"requires_date": True, "requires_sold": False, "deletes_record": True, "requires_notes": True},
-            "Lost COT": {"requires_date": False, "requires_sold": False, "deletes_record": True, "requires_notes": True},
-            "Already Renewed": {"requires_date": True, "requires_sold": False, "deletes_record": False, "requires_notes": False},
-            "Invalid Number": {"requires_date": False, "requires_sold": False, "deletes_record": True, "requires_notes": False},
-            "Meter De-energised": {"requires_date": False, "requires_sold": False, "deletes_record": True, "requires_notes": False},
-            "Broker in Place": {"requires_date": True, "requires_sold": False, "deletes_record": False, "requires_notes": False},
-            "End Date Changed": {"requires_date": True, "requires_sold": False, "deletes_record": False, "requires_notes": False},
-            "Complaint": {"requires_date": True, "requires_sold": False, "deletes_record": False, "requires_notes": True},
-            "Email Only": {"requires_date": True, "requires_sold": False, "deletes_record": False, "requires_notes": False},
-            "Renewed Directly": {"requires_date": True, "requires_sold": False, "deletes_record": False, "requires_notes": True},
-            "Incorrect Supplier": {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": True},
-            "Converted": {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
-        }
-
-        if status not in status_config:
-            return jsonify({'error': f'Invalid status: {status}'}), 400
-
-        cfg = status_config[status]
-
-        if cfg['requires_notes'] and not (notes or '').strip():
-            return jsonify({'error': 'Notes are required for this status'}), 400
-
-        if cfg['requires_sold'] and is_sold is None:
-            return jsonify({'error': 'Please select if the contract was sold'}), 400
-
-        if status == 'Already Renewed' and not renewed_by:
-            return jsonify({'error': 'Please select if renewed by customer or agent'}), 400
-
-        # Get stage_id
-        stage_row = (
-            session.query(Stage_Master.stage_id)
-            .filter(func.lower(Stage_Master.stage_name) == status.lower())
-            .first()
-        )
-        if stage_row:
-            stage_id = stage_row.stage_id
-        elif stage_id is not None:
-            try:
-                stage_id = int(stage_id)
-            except (TypeError, ValueError):
-                return jsonify({'error': 'Invalid stage_id'}), 400
-        else:
-            return jsonify({'error': f'Stage not found for status: {status}'}), 400
-
-        # Resolve lead
+        notes = data.get('notes', '')
+        
+        current_app.logger.info(f'📥 Leads callback: opportunity_id={opportunity_id}, status={status}, callback_date={callback_date}')
+        
+        # ✅ Resolve lead
         lead = (
-            session.query(Opportunity_Details.opportunity_id, Opportunity_Details.stage_id, Opportunity_Details.client_id)
+            session.query(Opportunity_Details)
             .filter(Opportunity_Details.tenant_id == tenant_id)
             .filter(
-                (Opportunity_Details.tenant_lead_id == opportunity_id) |
-                (Opportunity_Details.opportunity_id == opportunity_id)
+                (Opportunity_Details.opportunity_id == opportunity_id) |
+                (Opportunity_Details.tenant_lead_id == opportunity_id)
             )
             .first()
         )
-
+        
         if not lead:
             return jsonify({'error': 'Lead not found'}), 404
-
+        
         real_id = lead.opportunity_id
         lead_client_id = lead.client_id
-
-        def _parse_date(value):
-            if not value:
-                return None
-            try:
-                return datetime.strptime(str(value)[:10], '%Y-%m-%d').date()
-            except Exception:
-                return None
-
-        def _save_interaction():
-            if not lead_client_id:
-                logger.warning(
-                    'leads_callback: skipping interaction insert (no client_id) for opportunity_id=%s',
-                    real_id
-                )
-                return
-
-            reminder_dt = _parse_date(callback_date)
-            contact_dt = _parse_date(called_date) or datetime.utcnow().date()
-            formatted_notes = f"[{status}] {notes}".strip() if notes else f"[{status}]"
-
-            interaction = Client_Interactions(
-                client_id=lead_client_id,
-                contact_date=contact_dt,
-                contact_method=1,
-                reminder_date=reminder_dt,
-                notes=formatted_notes,
-                next_steps=status,
+        
+        # ✅ CRITICAL: If no client_id, create one first
+        if not lead_client_id:
+            current_app.logger.warning(f'Lead {real_id} has no client_id, creating one...')
+            
+            # Create client record
+            from backend.models import Client_Master
+            client = Client_Master(
+                tenant_id=int(tenant_id),
+                assigned_employee_id=lead.opportunity_owner_employee_id,
+                client_company_name=lead.business_name or lead.opportunity_title or '[IMPORTED LEADS]',
+                client_contact_name=lead.contact_person or '',
+                client_phone=lead.tel_number or '',
+                client_mobile=lead.mobile_no or '',
+                client_email=lead.email or '',
+                default_currency_id=1,
                 created_at=datetime.utcnow()
             )
-            session.add(interaction)
-
-        # Handle recycle bin statuses
-        if cfg['deletes_record']:
-            lost_stage_id = stage_id
-            if not lost_stage_id:
-                lost_stage = (
-                    session.query(Stage_Master.stage_id)
-                    .filter(func.lower(Stage_Master.stage_name) == status.lower())
-                    .first()
-                )
-                lost_stage_id = lost_stage.stage_id if lost_stage else 5
-
-            session.query(Opportunity_Details).filter(
-                Opportunity_Details.opportunity_id == real_id,
-                Opportunity_Details.tenant_id == tenant_id
-            ).update({'stage_id': lost_stage_id}, synchronize_session=False)
-
-            _save_interaction()
-            session.commit()
-
+            session.add(client)
+            session.flush()
+            
+            lead_client_id = client.client_id
+            lead.client_id = lead_client_id
+            session.flush()
+            
+            current_app.logger.info(f'✅ Created client_id={lead_client_id} for lead {real_id}')
+        
+        # ✅ Status validation
+        if not status:
+            return jsonify({'error': 'Status is required'}), 400
+        
+        # ✅ Handle cleansing statuses (Invalid Number, Incorrect Supplier)
         if status in ('Invalid Number', 'Incorrect Supplier'):
-            if lead_client_id:
-                client = session.query(Client_Master).filter(
-                    Client_Master.client_id == lead_client_id,
-                    Client_Master.tenant_id == tenant_id
-                ).first()
+            client = session.query(Client_Master).filter(
+                Client_Master.client_id == lead_client_id,
+                Client_Master.tenant_id == tenant_id
+            ).first()
+            
+            if client:
+                client.is_deleted = True
+                client.deleted_at = datetime.utcnow()
+                client.deleted_reason = status
+                if hasattr(client, 'is_cleansing'):
+                    client.is_cleansing = True
                 
-                if client:
-                    client.is_deleted = True
-                    client.deleted_at = datetime.utcnow()
-                    client.deleted_reason = status
-                    if hasattr(client, 'is_cleansing'):
-                        client.is_cleansing = True
-                    
-                    session.flush()
-                    logger.info(f'leads_callback: moved lead {real_id} to cleansing ({status})')
-                    
-                    _save_interaction()
-                    session.commit()
-                    
-                    return jsonify({
-                        'success': True,
-                        'message': f'Moved to Cleansing ({status})',
-                        'moved_to_cleansing': True,
-                    }), 200
+                # Update stage
+                stage = session.query(Stage_Master).filter(
+                    Stage_Master.stage_name == status
+                ).first()
+                if stage:
+                    lead.stage_id = stage.stage_id
+                
+                session.flush()
+                current_app.logger.info(f'leads_callback: moved lead {real_id} to cleansing ({status})')
+                
+                # Save interaction
+                formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
+                interaction = Client_Interactions(
+                    client_id=lead_client_id,
+                    contact_date=datetime.utcnow().date(),
+                    contact_method=1,
+                    reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
+                    notes=formatted_notes,
+                    next_steps=status,
+                    created_at=datetime.utcnow()
+                )
+                session.add(interaction)
+                session.commit()
+                
+                return jsonify({
+                    'success': True,
+                    'message': f'Moved to Cleansing ({status})',
+                    'moved_to_cleansing': True,
+                }), 200
 
         # ✅ Handle recycle bin statuses (Lost, Lost COT, Meter De-energised, Complaint)
         if status in ('Lost', 'Lost COT', 'Meter De-energised', 'Complaint'):
-            if lead_client_id:
-                client = session.query(Client_Master).filter(
-                    Client_Master.client_id == lead_client_id,
-                    Client_Master.tenant_id == tenant_id
-                ).first()
+            client = session.query(Client_Master).filter(
+                Client_Master.client_id == lead_client_id,
+                Client_Master.tenant_id == tenant_id
+            ).first()
+            
+            if client:
+                client.is_deleted = True
+                client.deleted_at = datetime.utcnow()
+                client.deleted_reason = status
+                if hasattr(client, 'is_cleansing'):
+                    client.is_cleansing = False
                 
-                if client:
-                    client.is_deleted = True
-                    client.deleted_at = datetime.utcnow()
-                    client.deleted_reason = status
-                    if hasattr(client, 'is_cleansing'):
-                        client.is_cleansing = False
-                    
-                    session.flush()
-                    logger.info(f'leads_callback: moved lead {real_id} to recycle bin ({status})')
-                    
-                    _save_interaction()
-                    session.commit()
-                    
-                    return jsonify({
-                        'success': True,
-                        'message': f'Moved to recycle bin ({status})',
-                        'moved_to_recycle_bin': True,
-                    }), 200
-
-        # Handle Priced: not sold
-        if status == 'Priced' and is_sold is False:
-            session.query(Opportunity_Details).filter(
-                Opportunity_Details.opportunity_id == real_id,
-                Opportunity_Details.tenant_id == tenant_id
-            ).update({'stage_id': stage_id or 4}, synchronize_session=False)
-
-            _save_interaction()
-            session.commit()
-
-            return jsonify({
-                'success': True,
-                'message': 'Moved to Priced page',
-                'moved_to_priced': True,
-            }), 200
-
-        # Update end date if provided
-        if new_end_date_str and status in ('End Date Changed', 'Already Renewed'):
-            session.query(Opportunity_Details).filter(
-                Opportunity_Details.opportunity_id == real_id,
-                Opportunity_Details.tenant_id == tenant_id
-            ).update({'end_date': new_end_date_str}, synchronize_session=False)
-
-        # Update supplier if provided
-        if new_supplier and new_supplier.strip():
-            sup = (
-                session.query(Supplier_Master.supplier_id)
-                .filter(func.lower(Supplier_Master.supplier_company_name) == new_supplier.strip().lower())
-                .first()
-            )
-            if sup:
-                session.query(Opportunity_Details).filter(
-                    Opportunity_Details.opportunity_id == real_id,
-                    Opportunity_Details.tenant_id == tenant_id
-                ).update({'supplier_id': sup.supplier_id}, synchronize_session=False)
-
-        # Update stage_id
-        if stage_id:
-            session.query(Opportunity_Details).filter(
-                Opportunity_Details.opportunity_id == real_id,
-                Opportunity_Details.tenant_id == tenant_id
-            ).update({'stage_id': stage_id}, synchronize_session=False)
-
-        _save_interaction()
+                # Update stage
+                stage = session.query(Stage_Master).filter(
+                    Stage_Master.stage_name == status
+                ).first()
+                if stage:
+                    lead.stage_id = stage.stage_id
+                
+                session.flush()
+                current_app.logger.info(f'leads_callback: moved lead {real_id} to recycle bin ({status})')
+                
+                # Save interaction
+                formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
+                interaction = Client_Interactions(
+                    client_id=lead_client_id,
+                    contact_date=datetime.utcnow().date(),
+                    contact_method=1,
+                    reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
+                    notes=formatted_notes,
+                    next_steps=status,
+                    created_at=datetime.utcnow()
+                )
+                session.add(interaction)
+                session.commit()
+                
+                return jsonify({
+                    'success': True,
+                    'message': f'Moved to recycle bin ({status})',
+                    'moved_to_recycle_bin': True,
+                }), 200
+        
+        # ✅ Update stage for regular statuses
+        stage = session.query(Stage_Master).filter(
+            Stage_Master.stage_name == status
+        ).first()
+        
+        if stage:
+            lead.stage_id = stage.stage_id
+            current_app.logger.info(f'Updated lead {real_id} stage to {status} (stage_id={stage.stage_id})')
+        else:
+            current_app.logger.warning(f'Stage not found for status: {status}')
+        
+        # ✅ Save the interaction to history
+        formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
+        interaction = Client_Interactions(
+            client_id=lead_client_id,
+            contact_date=datetime.utcnow().date(),
+            contact_method=1,
+            reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
+            notes=formatted_notes,
+            next_steps=status,
+            created_at=datetime.utcnow()
+        )
+        session.add(interaction)
+        session.flush()
+        
+        current_app.logger.info(f'✅ Interaction saved: interaction_id={interaction.interaction_id}, reminder_date={interaction.reminder_date}')
+        
         session.commit()
-
-        logger.info('leads_callback: saved status=%s for real_id=%s (url_id=%s)', status, real_id, opportunity_id)
-
+        current_app.logger.info(f'✅ Callback saved for lead {real_id}, status: {status}')
+        
         return jsonify({
             'success': True,
             'message': 'Callback saved successfully',
             'status': status,
+            'callback_date': callback_date,
+            'interaction_id': interaction.interaction_id
         }), 200
-
+        
     except Exception as e:
         session.rollback()
-        import traceback; traceback.print_exc()
+        current_app.logger.exception(f"❌ Error in leads_callback: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
