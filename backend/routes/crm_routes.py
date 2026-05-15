@@ -203,7 +203,6 @@ def get_leads():
                 rows = [r for r in rows if (r.get('stage_name') or '').strip().lower() != exclude_stage.strip().lower()]
             return jsonify(rows), 200
 
-        # Non-admins must have employee_id to scope rows; admins list the whole tenant.
         if not admin_user and not employee_id:
             current_app.logger.warning(
                 'crm.get_leads empty_result reason=no_employee_id tenant=%s user_id=%s',
@@ -233,6 +232,12 @@ def get_leads():
                 .filter(Opportunity_Details.service_id == service_id)
                 .filter(Opportunity_Details.opportunity_owner_employee_id.isnot(None))
                 .filter((Opportunity_Details.is_draft == False) | (Opportunity_Details.is_draft.is_(None)))
+            )
+
+            # ✅ CRITICAL FIX: Exclude soft-deleted leads (they're in Cleansing or Recycle Bin)
+            query = query.filter(
+                (Client_Master.is_deleted.is_(None)) | 
+                (Client_Master.is_deleted == False)
             )
 
             # Non-admin filter
@@ -306,7 +311,6 @@ def get_leads():
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
-
 
 @crm_bp.route('/leads/<int:opportunity_id>', methods=['GET'])
 @token_required
@@ -614,7 +618,7 @@ def update_lead(opportunity_id):
             if not old_lead:
                 return jsonify({'error': 'Lead not found'}), 404
  
-            # Store old values for comparison - only track fields that might be updated
+            # Store old values for comparison
             old_values = {}
             tracked_fields = [
                 'net_notch', 'aggregator', 'rate_1', 'rate_2', 'rate_3',
@@ -638,6 +642,29 @@ def update_lead(opportunity_id):
             
             session.flush()
             current_app.logger.info(f"   ✅ Lead updated in database")
+ 
+            # ✅ ENSURE CLIENT EXISTS
+            if not client_id:
+                current_app.logger.warning(f'   ⚠️ Lead {real_id} has no client_id, creating one...')
+                
+                client = Client_Master(
+                    tenant_id=int(tenant_id),
+                    assigned_employee_id=old_lead.opportunity_owner_employee_id,
+                    client_company_name=old_lead.business_name or old_lead.opportunity_title or '[IMPORTED LEADS]',
+                    client_contact_name=old_lead.contact_person or '',
+                    client_phone=old_lead.tel_number or '',
+                    client_mobile=old_lead.mobile_no or '',
+                    client_email=old_lead.email or '',
+                    default_currency_id=1,
+                    created_at=datetime.utcnow()
+                )
+                session.add(client)
+                session.flush()
+                
+                client_id = client.client_id
+                old_lead.client_id = client_id
+                session.flush()
+                current_app.logger.info(f'   ✅ Created client_id={client_id} for lead {real_id}')
  
             # ✅ COMPREHENSIVE FIELD CHANGE TRACKING
             if client_id:
@@ -667,6 +694,8 @@ def update_lead(opportunity_id):
                 }
                 
                 changes = []
+                end_date_changed = False
+                new_end_date = None
                 
                 # Compare each field
                 for field, label in field_labels.items():
@@ -689,6 +718,11 @@ def update_lead(opportunity_id):
                         
                         # Only log if changed
                         if old_str != new_str:
+                            # ✅ Track end_date changes specially for calendar
+                            if field == 'end_date':
+                                end_date_changed = True
+                                new_end_date = new_val
+                            
                             try:
                                 # Special handling for supplier_id - show supplier name
                                 if field == 'supplier_id':
@@ -711,39 +745,54 @@ def update_lead(opportunity_id):
                                 # Special handling for dates
                                 elif field in ['start_date', 'end_date']:
                                     if hasattr(old_val, 'isoformat'):
-                                        old_display = old_val.isoformat()
-                                    if hasattr(new_val, 'isoformat'):
-                                        new_display = new_val.isoformat()
-                                    elif isinstance(new_val, str):
-                                        new_display = new_val
+                                        old_display = old_val.strftime('%d/%m/%Y')
+                                    if isinstance(new_val, str):
+                                        try:
+                                            new_date = datetime.strptime(new_val, '%Y-%m-%d')
+                                            new_display = new_date.strftime('%d/%m/%Y')
+                                        except:
+                                            new_display = new_val
+                                    elif hasattr(new_val, 'strftime'):
+                                        new_display = new_val.strftime('%d/%m/%Y')
                                 
                                 changes.append(f"{label}: {old_display} → {new_display}")
                             
                             except Exception as field_error:
                                 current_app.logger.warning(f"   ⚠️ Error formatting {field}: {field_error}")
-                                # Add simplified change entry
                                 changes.append(f"{label} updated")
                 
-                # Log all changes in one interaction
+                # ✅ Log all changes in one interaction
                 if changes:
                     change_summary = " | ".join(changes)
                     current_app.logger.info(f"   📝 Logging changes: {change_summary}")
                     
                     try:
+                        # ✅ CRITICAL: If end_date changed, set reminder_date for calendar
+                        reminder_date = None
+                        if end_date_changed and new_end_date:
+                            if isinstance(new_end_date, str):
+                                reminder_date = datetime.strptime(new_end_date, '%Y-%m-%d').date()
+                            elif hasattr(new_end_date, 'date'):
+                                reminder_date = new_end_date.date() if callable(new_end_date.date) else new_end_date
+                            else:
+                                reminder_date = new_end_date
+                            
+                            current_app.logger.info(f"   📅 Setting calendar reminder for end_date: {reminder_date}")
+                        
                         interaction = Client_Interactions(
                             client_id=client_id,
                             contact_date=datetime.utcnow().date(),
                             contact_method=1,
                             notes=f"[Field Update] {change_summary}",
                             next_steps='Field Update',
+                            reminder_date=reminder_date,  # ✅ THIS PUTS IT IN CALENDAR
                             created_at=datetime.utcnow()
                         )
                         session.add(interaction)
                         session.flush()
-                        current_app.logger.info(f"   ✅ History logged successfully")
+                        current_app.logger.info(f"   ✅ History logged successfully (interaction_id={interaction.interaction_id})")
                     except Exception as log_error:
                         current_app.logger.error(f"   ❌ Error logging history: {log_error}")
-                        # Don't fail the whole update if logging fails
                         pass
                 else:
                     current_app.logger.info(f"   ℹ️  No changes detected to log")
@@ -802,25 +851,140 @@ def update_lead(opportunity_id):
 def update_lead_status(opportunity_id):
     """
     Update lead status (stage_id) only.
-    When stage becomes 'Lost', lead is soft-deleted (deleted_at=NOW()).
-
-    Path Parameters:
-        - opportunity_id: Opportunity identifier
-
-    Request Body:
-        { "stage_id": <number> }
-
-    Authentication:
-        - JWT (token must include `tenant_id`)
-
-    Returns:
-        200: Status updated successfully
-        400: Missing or invalid stage_id
-        404: Lead not found or access denied
-        500: Internal server error
+    Handles cleansing and recycle bin routing based on status.
     """
-    return crm_controller.update_lead_status(opportunity_id)
-
+    session = SessionLocal()
+    try:
+        tenant_id = g.tenant_id
+        data = request.get_json() or {}
+        
+        # Accept either stage_id or status (stage_name)
+        stage_id = data.get('stage_id')
+        status = data.get('status')
+        
+        current_app.logger.info(f'🔧 PATCH /api/crm/leads/{opportunity_id}/status')
+        current_app.logger.info(f'   Data: {data}')
+        
+        if not stage_id and not status:
+            return jsonify({'error': 'Either stage_id or status is required'}), 400
+        
+        # If status (stage_name) is provided, resolve to stage_id
+        if status and not stage_id:
+            stage = session.query(Stage_Master).filter(
+                Stage_Master.stage_name == status
+            ).first()
+            
+            if not stage:
+                return jsonify({'error': f'Stage not found: {status}'}), 400
+            
+            stage_id = stage.stage_id
+            current_app.logger.info(f'   Resolved status "{status}" to stage_id={stage_id}')
+        else:
+            # Get stage name from stage_id
+            stage = session.query(Stage_Master).filter(Stage_Master.stage_id == stage_id).first()
+            status = stage.stage_name if stage else None
+        
+        # Resolve opportunity
+        lead = (
+            session.query(Opportunity_Details)
+            .filter(Opportunity_Details.tenant_id == tenant_id)
+            .filter(
+                (Opportunity_Details.opportunity_id == opportunity_id) |
+                (Opportunity_Details.tenant_lead_id == opportunity_id)
+            )
+            .first()
+        )
+        
+        if not lead:
+            return jsonify({'error': 'Lead not found'}), 404
+        
+        real_id = lead.opportunity_id
+        lead_client_id = lead.client_id
+        
+        # ✅ CRITICAL: If no client_id, create one first
+        if not lead_client_id:
+            current_app.logger.warning(f'Lead {real_id} has no client_id, creating one...')
+            
+            client = Client_Master(
+                tenant_id=int(tenant_id),
+                assigned_employee_id=lead.opportunity_owner_employee_id,
+                client_company_name=lead.business_name or lead.opportunity_title or '[IMPORTED LEADS]',
+                client_contact_name=lead.contact_person or '',
+                client_phone=lead.tel_number or '',
+                client_mobile=lead.mobile_no or '',
+                client_email=lead.email or '',
+                default_currency_id=1,
+                created_at=datetime.utcnow()
+            )
+            session.add(client)
+            session.flush()
+            
+            lead_client_id = client.client_id
+            lead.client_id = lead_client_id
+            session.flush()
+        
+        # Update stage
+        lead.stage_id = stage_id
+        session.flush()
+        
+        current_app.logger.info(f'   ✅ Updated lead {real_id} to status: {status}')
+        
+        # ✅ Handle cleansing statuses (Invalid Number, Incorrect Supplier)
+        CLEANSING_STATUSES = {'Invalid Number', 'Incorrect Supplier'}
+        RECYCLE_BIN_STATUSES = {'Lost', 'Lost COT', 'Meter De-energised', 'Complaint'}
+        
+        if status in CLEANSING_STATUSES:
+            client = session.query(Client_Master).filter(
+                Client_Master.client_id == lead_client_id,
+                Client_Master.tenant_id == tenant_id
+            ).first()
+            
+            if client:
+                client.is_deleted = True
+                client.deleted_at = datetime.utcnow()
+                client.deleted_reason = status
+                if hasattr(client, 'is_cleansing'):
+                    client.is_cleansing = True
+                
+                session.flush()
+                current_app.logger.info(f'   ✅ Moved to Cleansing: {status}')
+        
+        # ✅ Handle recycle bin statuses
+        elif status in RECYCLE_BIN_STATUSES:
+            client = session.query(Client_Master).filter(
+                Client_Master.client_id == lead_client_id,
+                Client_Master.tenant_id == tenant_id
+            ).first()
+            
+            if client:
+                client.is_deleted = True
+                client.deleted_at = datetime.utcnow()
+                client.deleted_reason = status
+                if hasattr(client, 'is_cleansing'):
+                    client.is_cleansing = False
+                
+                session.flush()
+                current_app.logger.info(f'   ✅ Moved to Recycle Bin: {status}')
+        
+        session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': f'Status updated to {status}',
+            'stage_id': stage_id,
+            'stage_name': status,
+            'moved_to_cleansing': status in CLEANSING_STATUSES,
+            'moved_to_recycle_bin': status in RECYCLE_BIN_STATUSES,
+        }), 200
+        
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f'❌ Error in update_lead_status: {e}')
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
 
 @crm_bp.route('/leads/assign', methods=['PATCH'])
 @token_required
@@ -2784,7 +2948,6 @@ def accept_priced_lead(opportunity_id):
         assigned_employee_id = lead.get('opportunity_owner_employee_id')
         client_id = lead.get('client_id')
         if not client_id:
-            from backend.models import Client_Master
             client = Client_Master(
                 tenant_id=int(tenant_id),
                 assigned_employee_id=assigned_employee_id,
@@ -2989,7 +3152,6 @@ def reject_priced_lead(opportunity_id):
         real_id = lead['opportunity_id']
         client_id = lead.get('client_id')
         if not client_id:
-            from backend.models import Client_Master
             client = Client_Master(
                 tenant_id=int(tenant_id),
                 assigned_employee_id=lead.get('opportunity_owner_employee_id'),
@@ -3184,7 +3346,7 @@ def get_cleansing():
 
         # 2. Energy Clients (already using SessionLocal in your code)
         try:
-            from backend.models import Client_Master, Energy_Contract_Master, Project_Details, Supplier_Master
+            from backend.models import Energy_Contract_Master, Project_Details
 
             client_rows = (
                 session.query(Client_Master, Energy_Contract_Master, Supplier_Master)
@@ -3281,8 +3443,7 @@ def leads_callback(opportunity_id):
         if not lead_client_id:
             current_app.logger.warning(f'Lead {real_id} has no client_id, creating one...')
             
-            # Create client record
-            from backend.models import Client_Master
+            # Create client record (Client_Master already imported at top)
             client = Client_Master(
                 tenant_id=int(tenant_id),
                 assigned_employee_id=lead.opportunity_owner_employee_id,
