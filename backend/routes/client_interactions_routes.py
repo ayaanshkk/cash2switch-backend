@@ -83,6 +83,8 @@ def add_callback(client_id):
             # ✅ CHANGED: Incorrect Supplier soft-deletes to Cleansing
             "Incorrect Supplier": {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Converted":          {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
+            "Not Called":         {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
+            "Dead":               {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": True},
         }
  
         if not status:

@@ -704,17 +704,15 @@ def get_renewal_performance():
 
         if use_current_user:
             current_user = request.current_user
-            if hasattr(current_user, 'id'):
-                employee_id = current_user.id
-            elif hasattr(current_user, 'employee_id'):
-                employee_id = current_user.employee_id
-            else:
+            employee_id = getattr(current_user, 'employee_id', None) or getattr(current_user, 'id', None)
+            if not employee_id:
                 return jsonify({'error': 'User employee_id not found'}), 400
         else:
             employee_id = request.args.get('employee_id', type=int)
 
         today = datetime.utcnow().date()
 
+        # ✅ Base filter: active (non-deleted, non-archived) records only
         base_query = session.query(
             Project_Details,
             Energy_Contract_Master,
@@ -724,8 +722,9 @@ def get_renewal_performance():
             Client_Master, Project_Details.client_id == Client_Master.client_id
         ).filter(
             Client_Master.tenant_id == tenant_id,
-            Energy_Contract_Master.contract_end_date.isnot(None),
-            Energy_Contract_Master.service_id == service_id
+            Client_Master.is_deleted == False,
+            Client_Master.is_archived == False,
+            Energy_Contract_Master.service_id == service_id,
         )
 
         if employee_id:
@@ -735,24 +734,42 @@ def get_renewal_performance():
 
         all_results = base_query.all()
 
+        # ✅ Lost: query recycle bin separately (is_deleted=True)
+        lost_query = session.query(
+            Project_Details,
+        ).join(
+            Client_Master, Project_Details.client_id == Client_Master.client_id
+        ).join(
+            Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
+        ).filter(
+            Client_Master.tenant_id == tenant_id,
+            Client_Master.is_deleted == True,
+            Energy_Contract_Master.service_id == service_id,
+            func.lower(Client_Master.deleted_reason).in_(['lost', 'lost cot']),
+        )
+
+        if employee_id:
+            lost_query = lost_query.filter(
+                Project_Details.assigned_employee_id == employee_id
+            )
+
+        lost_count = lost_query.count()
+
         renewed_count = 0
         contacted_count = 0
         not_contacted_count = 0
-        lost_count = 0
         renewed_directly_count = 0
         end_date_changed_count = 0
         priced_count = 0
         not_due_count = 0
 
         for project, contract in all_results:
-            # ✅ Calculate days until renewal
-            days_until_renewal = (contract.contract_end_date - today).days
-            
-            # ✅ Count not_due (365+ days) FIRST
-            if days_until_renewal > 365:
+            days_until_renewal = (contract.contract_end_date - today).days if contract.contract_end_date else 0
+
+            if contract.contract_end_date and days_until_renewal > 365:
                 not_due_count += 1
-                continue  # Don't count in other categories
-            
+                continue
+
             status = project.status
 
             if status:
@@ -765,11 +782,10 @@ def get_renewal_performance():
                     priced_count += 1
                 elif status_lower in ['renewed', 'already renewed']:
                     renewed_count += 1
-                elif status_lower in ['called', 'callback', 'contacted', 'not answered']:
+                elif status_lower in ['called', 'callback', 'contacted', 'not answered',
+                                       'broker in place', 'email only', 'renewed directly']:
                     contacted_count += 1
-                elif status_lower in ['lost', 'lost cot']:
-                    lost_count += 1
-                elif status_lower in ['not contacted']:
+                elif status_lower in ['not called', 'dead']:
                     not_contacted_count += 1
                 else:
                     not_contacted_count += 1
@@ -800,7 +816,6 @@ def get_renewal_performance():
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
-
 
 @renewals_bp.route('/energy-renewals/staff-status-counts', methods=['GET'])
 @token_required

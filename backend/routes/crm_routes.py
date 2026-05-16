@@ -241,11 +241,10 @@ def get_leads():
             )
 
             # Non-admin filter
-            if not admin_user:
-                query = query.filter(
-                    Opportunity_Details.opportunity_owner_employee_id == employee_id,
-                    (Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None))
-                )
+            query = query.filter(
+                Opportunity_Details.opportunity_owner_employee_id == employee_id,
+                (Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None))
+            )
 
             # Exclude stage filter
             if exclude_stage:
@@ -1839,6 +1838,8 @@ def get_leads_performance():
                 in_progress_count += 1
             elif stage in ['lost', 'lost cot', 'invalid number', 'meter de-energised']:
                 lost_count += 1
+            elif stage in ('not called', 'dead'):
+                not_contacted_count += 1
             else:
                 not_contacted_count += 1
 
@@ -3624,7 +3625,7 @@ def get_allocated_leads():
             employee_id, admin_user, tenant_id, service_param
         )
 
-        if not admin_user and not employee_id:
+        if not employee_id:
             return jsonify([]), 200
 
         query = (

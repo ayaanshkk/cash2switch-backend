@@ -37,19 +37,18 @@ if use_sqlite:
 else:
     engine = create_engine(
         DATABASE_URL,
-        pool_size=5,        
-        max_overflow=10,     
-        pool_timeout=30,
-        pool_recycle=3600,
+        pool_size=2,         # ✅ Keep small — transaction mode recycles fast
+        max_overflow=3,      # ✅ Max 5 total connections
+        pool_timeout=20,
+        pool_recycle=300,    # ✅ Recycle every 5 min (not 1 hour)
         pool_pre_ping=True,
 
         connect_args={
             "sslmode": "require",
-            # TCP keepalives detect dead sockets at the OS level
             "keepalives": 1,
-            "keepalives_idle": 60,
+            "keepalives_idle": 30,
             "keepalives_interval": 10,
-            "keepalives_count": 5,
+            "keepalives_count": 3,
             "connect_timeout": 10,
         },
 

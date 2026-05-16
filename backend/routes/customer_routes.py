@@ -38,12 +38,8 @@ energy_customer_bp = Blueprint('energy_customers', __name__)
 
 
 def _renewals_clients_see_entire_tenant(user) -> bool:
-    """Align list visibility with Team Overview: admins see all assignments in tenant."""
-    jwt_role = getattr(user, 'role', None)
-    if is_crm_leads_admin_role(jwt_role):
-        return True
-    return bool(is_admin_user(user))
-
+    """Renewals: everyone only sees their own assigned contacts, including admins."""
+    return False
 
 def _energy_contract_proxy_from_ecm_tuple(ecm_flat):
     """
@@ -369,10 +365,11 @@ def get_energy_customers():
                     Project_Details.status == None,
                     ~func.lower(Project_Details.status).in_([
                         'priced', 'lost', 'lost_cot', 'lost cot',
-                        'invalid number',  # ✅ Added: Filter out cleansing records
-                        'incorrect supplier',  # ✅ Added: Filter out cleansing records
-                        'meter de-energised',  # ✅ Added: Filter out recycle bin records
-                        'complaint'  # ✅ Added: Filter out recycle bin records
+                        'invalid number',
+                        'incorrect supplier',
+                        'meter de-energised',
+                        'complaint',
+                        'dead'          # ✅ Added
                     ])
                 ),
             )
@@ -1430,6 +1427,48 @@ def delete_draft_energy_customers():
     finally:
         session.close()
 
+@energy_customer_bp.route('/energy-clients/init-data', methods=['GET', 'OPTIONS'])
+@token_required
+def get_init_data():
+    """Single endpoint to fetch suppliers, employees, and stages in one DB round-trip."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+
+        suppliers = session.query(Supplier_Master).order_by(Supplier_Master.supplier_company_name).all()
+        employees = session.query(Employee_Master).filter_by(tenant_id=tenant_id).order_by(Employee_Master.employee_name).all()
+        stages = session.query(Stage_Master).order_by(Stage_Master.stage_id).all()
+
+        return jsonify({
+            'suppliers': [{
+                'supplier_id': s.supplier_id,
+                'supplier_name': s.supplier_company_name,
+                'provisions': s.supplier_provisions,
+                'provisions_text': {0: 'Generic', 1: 'Electricity Only', 2: 'Gas Only', 3: 'Electricity & Gas'}.get(s.supplier_provisions, 'Unknown')
+            } for s in suppliers],
+            'employees': [{
+                'employee_id': e.employee_id,
+                'employee_name': e.employee_name,
+                'email': e.email
+            } for e in employees],
+            'stages': [{
+                'stage_id': s.stage_id,
+                'stage_name': s.stage_name,
+                'description': s.stage_description
+            } for s in stages],
+        }), 200
+
+    except Exception as e:
+        current_app.logger.exception(f"❌ Error fetching init data: {e}")
+        return jsonify({'error': 'Failed to fetch init data'}), 500
+    finally:
+        session.close()
+
 # ==========================================
 # SEARCH CUSTOMERS
 # ==========================================
@@ -2003,15 +2042,18 @@ def get_stats_by_employee():
             FROM "StreemLyne_MT"."Employee_Master" em
             LEFT JOIN "StreemLyne_MT"."Client_Master" cm 
                 ON em.employee_id = cm.assigned_employee_id
-                AND cm.tenant_id = :tenant_id
-                AND cm.client_company_name != '[IMPORTED LEADS]'
+                AND cast(cm.tenant_id AS VARCHAR) = :tenant_id
+                AND cm.is_deleted = false
+                AND cm.is_archived = false
+                AND (cm.is_draft = false OR cm.is_draft IS NULL)
+                AND (cm.is_allocated = false OR cm.is_allocated IS NULL)
             LEFT JOIN "StreemLyne_MT"."Project_Details" pd 
                 ON cm.client_id = pd.client_id
             LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm 
-                ON pd.project_id = ecm.project_id 
+                ON pd.project_id = ecm.project_id
                 AND ecm.service_id = :service_id
-            WHERE em.tenant_id = :tenant_id
-                AND ecm.energy_contract_master_id IS NOT NULL
+            WHERE cast(em.tenant_id AS VARCHAR) = :tenant_id
+            AND ecm.energy_contract_master_id IS NOT NULL
             GROUP BY em.employee_id, em.employee_name
             HAVING COUNT(DISTINCT cm.client_id) > 0
             ORDER BY em.employee_name ASC
@@ -2619,3 +2661,4 @@ def get_allocated_contacts():
         return jsonify({'error': 'Failed to fetch allocated contacts'}), 500
     finally:
         session.close()
+
