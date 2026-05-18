@@ -283,26 +283,36 @@ def _run_energy_import(
             except OSError:
                 pass
 
-        # ── Normalise columns then restore originals ───────────────────────────
-        original_cols = list(df.columns)
-        print(f"[job:{job_id}] Columns after smart-read: {original_cols[:15]}")
+        # ── Build column lookup: original-cased name → normalised for matching ──
+        # Build a direct dict: normalised_name -> original_col_name
+        # Then use _build_column_map() aliases to find the right original col.
+        import re as _re
 
-        normalised_cols = (
-            df.columns.str.strip()
-            .str.lower()
-            .str.replace('_', ' ', regex=False)
-            .str.replace(r'\s+', ' ', regex=True)
-            .tolist()
-        )
-        # Pass original cols so gcol() returns original-cased names for row.get()
-        actual_columns = _resolve_columns(normalised_cols, original_cols)
+        orig_cols = list(df.columns)
+        print(f"[job:{job_id}] Columns after smart-read: {orig_cols[:15]}")
 
-        print(f"[job:{job_id}] MAPPED {len(actual_columns)} fields: {actual_columns}")
+        # norm_map: normalised_col -> original_col
+        norm_map = {}
+        for orig in orig_cols:
+            normed = _re.sub(r'\s+', ' ', str(orig).strip().lower().replace('_', ' '))
+            norm_map[normed] = orig
+
+        # field_to_col: internal_field -> original_col_name
+        field_to_col = {}
+        col_map = _build_column_map()
+        for field, aliases in col_map.items():
+            for alias in aliases:
+                if alias in norm_map:
+                    field_to_col[field] = norm_map[alias]
+                    break
+
+        print(f"[job:{job_id}] MAPPED {len(field_to_col)} fields: {list(field_to_col.items())[:8]}")
 
         def gcol(field):
-            return actual_columns.get(field, '')
+            """Return the original-cased column name for a given internal field."""
+            return field_to_col.get(field, '')
 
-        # Drop completely empty rows (keep original column names)
+        # Drop completely empty rows
         df = df.dropna(how='all').reset_index(drop=True)
 
         total_rows = len(df)
@@ -534,10 +544,35 @@ def _run_energy_import(
                 session.add(new_project)
                 session.flush()
 
+                # supplier_id may be None if supplier name not recognised — use
+                # a default "Unknown" supplier rather than failing the row.
+                final_supplier_id = supplier_id
+                if final_supplier_id is None:
+                    # Try to find or create an "Unknown" supplier as fallback
+                    unknown_key = 'unknown'
+                    final_supplier_id = suppliers_dict.get(unknown_key)
+                    if final_supplier_id is None:
+                        try:
+                            unk_sup = Supplier_Master(
+                                supplier_company_name='Unknown',
+                                supplier_contact_name='Auto-created',
+                                supplier_provisions=0,
+                                created_at=datetime.utcnow(),
+                            )
+                            session.add(unk_sup)
+                            session.flush()
+                            final_supplier_id = unk_sup.supplier_id
+                            suppliers_dict[unknown_key] = final_supplier_id
+                        except Exception:
+                            session.rollback()
+                            # If we still can't get a supplier_id, skip contract creation
+                            # but still count the client+project as success
+                            final_supplier_id = None
+
                 new_contract = Energy_Contract_Master(
                     project_id=new_project.project_id,
                     employee_id=employee_id,
-                    supplier_id=supplier_id,
+                    supplier_id=final_supplier_id,
                     old_supplier_id=old_supplier_id,
                     contract_start_date=contract_start,
                     contract_end_date=contract_end,
@@ -688,23 +723,26 @@ def _run_leads_import(
             except OSError:
                 pass
 
-        original_cols = list(df.columns)
-        normalised_cols = (
-            df.columns.str.strip()
-            .str.lower()
-            .str.replace('_', ' ', regex=False)
-            .str.replace(r'\s+', ' ', regex=True)
-            .tolist()
-        )
-        # Pass original cols so gcol() returns original-cased names for row.get()
-        actual_columns = _resolve_columns(normalised_cols, original_cols)
+        import re as _re
 
-        print(f"[job:{job_id}] Leads MAPPED {len(actual_columns)} fields: {list(actual_columns.keys())}")
+        orig_cols = list(df.columns)
+        norm_map = {}
+        for orig in orig_cols:
+            normed = _re.sub(r'\s+', ' ', str(orig).strip().lower().replace('_', ' '))
+            norm_map[normed] = orig
+
+        field_to_col = {}
+        for field, aliases in _build_column_map().items():
+            for alias in aliases:
+                if alias in norm_map:
+                    field_to_col[field] = norm_map[alias]
+                    break
+
+        print(f"[job:{job_id}] Leads MAPPED {len(field_to_col)} fields from {len(orig_cols)} columns")
 
         def gcol(field):
-            return actual_columns.get(field, '')
+            return field_to_col.get(field, '')
 
-        # Drop completely empty rows
         df = df.dropna(how='all').reset_index(drop=True)
 
         total_rows = len(df)

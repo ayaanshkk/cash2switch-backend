@@ -1104,132 +1104,114 @@ def import_renewals():
 def get_draft_renewals():
     """
     GET /energy-clients/drafts
-    Returns unassigned draft renewals for the Drafts page table.
- 
-    Uses the same ECM subquery pattern as get_energy_customers but filters
-    to is_draft=True, assigned_employee_id IS NULL.
+    Returns all unassigned draft renewals for the Drafts page.
+    Uses raw SQL for simplicity and reliability.
     """
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
         if not tenant_id:
-            return jsonify({'error': 'Tenant not found'}), 400
+            return jsonify({"error": "Tenant not found"}), 400
  
-        service_param = request.args.get('service', 'utilities')
-        service_id = {'utilities': 1, 'electricity': 1, 'water': 2, 'gas': 3}.get(
+        service_param = request.args.get("service", "utilities")
+        service_id = {"utilities": 1, "electricity": 1, "water": 2, "gas": 3}.get(
             service_param.strip().lower(), 1
         )
  
-        from sqlalchemy import and_, cast, String, text
-        from ..models import Energy_Contract_Master as ECM, Supplier_Master
+        rows = session.execute(text("""
+            SELECT
+                cm.client_id,
+                cm.client_company_name   AS business_name,
+                cm.client_contact_name   AS contact_person,
+                cm.client_phone          AS phone,
+                cm.client_mobile         AS mobile_no,
+                cm.client_email          AS email,
+                cm.post_code             AS postcode,
+                cm.created_at,
+                pd.project_id,
+                pd.address               AS site_address,
+                pd."Misc_Col2"           AS annual_usage,
+                pd.site_name,
+                pd.town,
+                pd.county,
+                ecm.energy_contract_master_id AS contract_id,
+                ecm.mpan_number          AS mpan_top,
+                ecm.mpan_bottom,
+                ecm.contract_start_date  AS start_date,
+                ecm.contract_end_date    AS end_date,
+                ecm.supplier_id,
+                ecm.rate_1,
+                ecm.standing_charge,
+                ecm.net_notch,
+                ecm.payment_type,
+                sup.supplier_company_name AS supplier_name
+            FROM "StreemLyne_MT"."Client_Master" cm
+            JOIN "StreemLyne_MT"."Project_Details" pd
+                ON pd.client_id = cm.client_id
+            LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm
+                ON ecm.project_id = pd.project_id
+                AND ecm.service_id = :service_id
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup
+                ON sup.supplier_id = ecm.supplier_id
+            WHERE CAST(cm.tenant_id AS VARCHAR) = CAST(:tenant_id AS VARCHAR)
+              AND cm.is_draft = TRUE
+              AND cm.assigned_employee_id IS NULL
+              AND cm.is_deleted = FALSE
+              AND cm.is_archived = FALSE
+            ORDER BY cm.created_at DESC
+        """), {"tenant_id": tenant_id, "service_id": service_id}).mappings().all()
  
-        _nm = ECM
-        _ecm_sq = (
-            session.query(
-                _nm.energy_contract_master_id,
-                _nm.project_id,
-                _nm.service_id,
-                _nm.supplier_id,
-                _nm.contract_start_date,
-                _nm.contract_end_date,
-                _nm.mpan_number,
-                _nm.mpan_bottom,
-                _nm.terms_of_sale,
-                _nm.aggregator,
-                _nm.payment_type,
-                _nm.old_supplier_id,
-                cast(_nm.unit_rate,       String).label("unit_rate_s"),
-                cast(_nm.standing_charge, String).label("standing_charge_s"),
-                cast(_nm.rate_1,          String).label("rate_1_s"),
-                cast(_nm.rate_2,          String).label("rate_2_s"),
-                cast(_nm.rate_3,          String).label("rate_3_s"),
-                cast(_nm.net_notch,       String).label("net_notch_s"),
-                cast(_nm.comms_paid,      String).label("comms_paid_s"),
-                cast(_nm.term_sold,       String).label("term_sold_s"),
-            ).subquery("ecm_cast_drafts")
-        )
- 
-        _ecm_cols = (
-            _ecm_sq.c.energy_contract_master_id,
-            _ecm_sq.c.project_id,
-            _ecm_sq.c.service_id,
-            _ecm_sq.c.supplier_id,
-            _ecm_sq.c.contract_start_date,
-            _ecm_sq.c.contract_end_date,
-            _ecm_sq.c.mpan_number,
-            _ecm_sq.c.mpan_bottom,
-            _ecm_sq.c.terms_of_sale,
-            _ecm_sq.c.aggregator,
-            _ecm_sq.c.payment_type,
-            _ecm_sq.c.old_supplier_id,
-            _ecm_sq.c.unit_rate_s,
-            _ecm_sq.c.standing_charge_s,
-            _ecm_sq.c.rate_1_s,
-            _ecm_sq.c.rate_2_s,
-            _ecm_sq.c.rate_3_s,
-            _ecm_sq.c.net_notch_s,
-            _ecm_sq.c.comms_paid_s,
-            _ecm_sq.c.term_sold_s,
-        )
- 
-        from ..models import Client_Master, Project_Details
- 
-        query = (
-            session.query(
-                Client_Master,
-                Project_Details,
-                *_ecm_cols,
-                Supplier_Master,
-            )
-            .join(Project_Details, Client_Master.client_id == Project_Details.client_id)
-            .outerjoin(
-                _ecm_sq,
-                and_(
-                    Project_Details.project_id == _ecm_sq.c.project_id,
-                    _ecm_sq.c.service_id == service_id,
-                ),
-            )
-            .outerjoin(Supplier_Master, _ecm_sq.c.supplier_id == Supplier_Master.supplier_id)
-            .filter(
-                and_(
-                    cast(Client_Master.tenant_id, String) == str(tenant_id),
-                    Client_Master.is_deleted  == False,
-                    Client_Master.is_archived == False,
-                    Client_Master.is_draft    == True,
-                    Client_Master.assigned_employee_id == None,
-                )
-            )
-            .order_by(Client_Master.created_at.desc())
-        )
- 
-        results = query.all()
+        def _iso(v):
+            if v is None:
+                return None
+            if hasattr(v, "isoformat"):
+                return v.isoformat()
+            return str(v)
  
         customers = []
         seen = set()
-        n = _ECM_SELECT_LEN  # 20 — defined at module level in customer_routes.py
- 
-        for row in results:
-            client   = row[0]
-            project  = row[1]
-            ecm_flat = row[2 : 2 + n]
-            supplier = row[2 + n]
- 
-            if client.client_id in seen:
+        for r in rows:
+            cid = r["client_id"]
+            if cid in seen:
                 continue
-            seen.add(client.client_id)
- 
-            contract = _energy_contract_proxy_from_ecm_tuple(ecm_flat)
- 
-            # build_customer_response already handles None contract gracefully
-            data = build_customer_response(client, project, contract, None, None, supplier, None)
-            customers.append(data)
+            seen.add(cid)
+            customers.append({
+                "client_id":      cid,
+                "id":             cid,
+                "business_name":  r["business_name"] or "",
+                "contact_person": r["contact_person"] or "",
+                "phone":          r["phone"] or "",
+                "mobile_no":      r["mobile_no"] or "",
+                "email":          r["email"] or "",
+                "postcode":       r["postcode"] or "",
+                "site_address":   r["site_address"] or "",
+                "annual_usage":   r["annual_usage"],
+                "site_name":      r["site_name"],
+                "town":           r["town"],
+                "county":         r["county"],
+                "mpan_top":       r["mpan_top"] or "",
+                "mpan_mpr":       r["mpan_top"] or "",
+                "mpan_bottom":    r["mpan_bottom"] or "",
+                "start_date":     _iso(r["start_date"]),
+                "end_date":       _iso(r["end_date"]),
+                "supplier_id":    r["supplier_id"],
+                "supplier_name":  r["supplier_name"] or "",
+                "rate_1":         float(r["rate_1"]) if r["rate_1"] else None,
+                "standing_charge": float(r["standing_charge"]) if r["standing_charge"] else None,
+                "net_notch":      float(r["net_notch"]) if r["net_notch"] else None,
+                "payment_type":   r["payment_type"],
+                "assigned_to_id":   None,
+                "assigned_to_name": "Unassigned",
+                "created_at":     _iso(r["created_at"]),
+                "is_draft":       True,
+            })
  
         return jsonify(customers), 200
  
     except Exception as e:
         import traceback; traceback.print_exc()
-        current_app.logger.exception(f"❌ Error fetching draft renewals: {e}")
-        return jsonify({'error': str(e)}), 500
+        current_app.logger.exception(f"Error fetching draft renewals: {e}")
+        return jsonify({"error": str(e)}), 500
     finally:
         session.close()
 
