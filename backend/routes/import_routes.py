@@ -229,6 +229,219 @@ def _resolve_columns(normalised_cols, original_cols=None) -> dict:
 # Background worker — energy customers (renewals)
 # ---------------------------------------------------------------------------
 
+def _flush_energy_batch(
+    session, batch, tenant_id, employee_id,
+    opportunity_owner_id, is_draft_import, import_service_id,
+    existing_mpans,
+):
+    """
+    Bulk-insert one batch.
+    Uses a single multi-row VALUES INSERT with RETURNING for each table —
+    this works with psycopg2 via raw connection cursor (bypassing SQLAlchemy
+    executemany limitations with RETURNING).
+    Returns (inserted_count, error_count).
+    """
+    if not batch:
+        return 0, 0
+
+    now = datetime.utcnow()
+
+    try:
+        raw_conn = session.connection().connection  # raw psycopg2 connection
+        cursor   = raw_conn.cursor()
+
+        # ── 1. Client_Master ──────────────────────────────────────────────────
+        client_values = []
+        client_params = []
+        for r in batch:
+            client_values.append(
+                "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'',"
+                "FALSE,FALSE,1,FALSE)"
+            )
+            client_params.extend([
+                tenant_id, opportunity_owner_id,
+                r['business_name'], r['contact_person'],
+                r['address'], r['postcode'],
+                r['tel_no'], r['mobile_no'], r['email'],
+                r['position'], r['company_number'], r['date_of_birth'],
+                r['charity_ltd'], r['partner_details'],
+                r['bank_name'], r['account_number'], r['sort_code'],
+                r['home_door'], r['home_street'],
+                r['partner_dob'], r['credit_score'],
+                is_draft_import, now,
+            ])
+
+        cursor.execute(
+            f"""INSERT INTO "StreemLyne_MT"."Client_Master"
+            (tenant_id, assigned_employee_id, client_company_name, client_contact_name,
+             address, post_code, client_phone, client_mobile, client_email,
+             position, company_number, date_of_birth, charity_ltd_company_number,
+             partner_details, bank_name, account_number, sort_code,
+             home_door_number, home_street, partner_dob, credit_score,
+             is_draft, created_at, client_website,
+             is_deleted, is_archived, default_currency_id, is_allocated)
+            VALUES {','.join(client_values)}
+            RETURNING client_id""",
+            client_params
+        )
+        client_ids = [row[0] for row in cursor.fetchall()]
+
+        if len(client_ids) != len(batch):
+            raw_conn.rollback()
+            return 0, len(batch)
+
+        # ── 2. Project_Details ────────────────────────────────────────────────
+        proj_values  = []
+        proj_params  = []
+        for cid, r in zip(client_ids, batch):
+            proj_values.append(
+                "(%s,%s,'Imported renewal contract',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s)"
+            )
+            proj_params.extend([
+                cid,
+                r['business_name'] or 'Renewal Contract',
+                r['site_address'], r['annual_usage'],
+                employee_id, opportunity_owner_id,
+                r['contract_start'], r['contract_end'],
+                r['site_name'], r['month_sold'],
+                r['house_name'], r['house_number'], r['door_number'],
+                r['town'], r['county'],
+                now, now,
+            ])
+
+        cursor.execute(
+            f"""INSERT INTO "StreemLyne_MT"."Project_Details"
+            (client_id, project_title, project_description, address, "Misc_Col2",
+             employee_id, assigned_employee_id, start_date, end_date,
+             site_name, month_sold, house_name, house_number, door_number,
+             town, county, status, created_at, updated_at)
+            VALUES {','.join(proj_values)}
+            RETURNING project_id""",
+            proj_params
+        )
+        project_ids = [row[0] for row in cursor.fetchall()]
+
+        # ── 3. Energy_Contract_Master ─────────────────────────────────────────
+        con_values = []
+        con_params = []
+        for pid, r in zip(project_ids, batch):
+            con_values.append(
+                "(%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'')"
+            )
+            con_params.extend([
+                pid, employee_id,
+                r['supplier_id'], r['old_supplier_id'],
+                r['contract_start'], r['contract_end'],
+                import_service_id, r['rate_1'] or 0.0,
+                now, now,
+                r['mpan_top'], r['mpan_bottom'],
+                r['net_notch'], r['rate_2'], r['rate_3'],
+                r['comms_paid'], r['stand_charge'],
+                r['aggregator'], r['rate_1'],
+                r['payment_type'], r['term_sold'],
+            ])
+
+        cursor.execute(
+            f"""INSERT INTO "StreemLyne_MT"."Energy_Contract_Master"
+            (project_id, employee_id, supplier_id, old_supplier_id,
+             contract_start_date, contract_end_date, service_id,
+             unit_rate, currency_id, created_at, updated_at,
+             mpan_number, mpan_bottom, net_notch, rate_2, rate_3,
+             comms_paid, standing_charge, aggregator, rate_1,
+             payment_type, term_sold, terms_of_sale)
+            VALUES {','.join(con_values)}""",
+            con_params
+        )
+
+        raw_conn.commit()
+        cursor.close()
+
+        # Register MPANs for intra-file dedup
+        for r, cid in zip(batch, client_ids):
+            if r['mpan_top']:
+                existing_mpans[r['mpan_top'].strip().lower()] = {
+                    'client_id': cid, 'end_date': r['end_date'],
+                    'is_archived': False, 'is_draft': is_draft_import,
+                    'assigned_employee_id': opportunity_owner_id,
+                }
+
+        # Keep SQLAlchemy session in sync
+        session.expire_all()
+        return len(batch), 0
+
+    except Exception as e:
+        try:
+            raw_conn.rollback()
+        except Exception:
+            pass
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        err = str(e).split('\n')[0][:200]
+        print(f"Batch insert failed: {err}")
+        return 0, len(batch)
+
+
+def _flush_leads_batch(session, batch, tenant_id, import_service_id,
+                        opportunity_owner_id, is_draft_import, default_stage_id,
+                        existing_lead_mpans):
+    """Bulk insert leads via raw psycopg2 multi-row INSERT. Returns (inserted, errors)."""
+    if not batch:
+        return 0, 0
+    now = datetime.utcnow()
+    try:
+        raw_conn = session.connection().connection
+        cursor   = raw_conn.cursor()
+
+        values = []
+        params = []
+        for r in batch:
+            values.append(
+                "(%s,NULL,%s,'Imported lead',%s,%s,%s,0,1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+            )
+            params.extend([
+                tenant_id,
+                r['title'], now, opportunity_owner_id, default_stage_id, now,
+                r['business_name'], r['contact_person'], r['tel'], r['mobile'], r['email'],
+                r['mpan'], r['mpan_b'], r['start_d'], r['end_d'], import_service_id,
+                r['sup_id'], r['usage'], r['sc'], r['r1'], r['r2'],
+                r['r3'], r['nn'], r['pt'], r['postcode'], is_draft_import,
+            ])
+
+        cursor.execute(
+            f"""INSERT INTO "StreemLyne_MT"."Opportunity_Details"
+            (tenant_id, client_id, opportunity_title, opportunity_description,
+             opportunity_date, opportunity_owner_employee_id, stage_id,
+             opportunity_value, currency_id, created_at,
+             business_name, contact_person, tel_number, mobile_no, email,
+             mpan_mpr, mpan_bottom, start_date, end_date, service_id,
+             supplier_id, annual_usage, stand_charge, rate_1, rate_2,
+             rate_3, net_notch, payment_type, postcode, is_draft)
+            VALUES {','.join(values)}""",
+            params
+        )
+        raw_conn.commit()
+        cursor.close()
+
+        for r in batch:
+            if r['mpan']:
+                existing_lead_mpans.setdefault(r['mpan'].strip().lower(), []).append({
+                    'tenant_id': tenant_id,
+                    'business_name': r['business_name'],
+                })
+        session.expire_all()
+        return len(batch), 0
+    except Exception as e:
+        try:
+            raw_conn.rollback()
+            cursor.close()
+        except Exception:
+            pass
+        print(f"Leads batch failed: {str(e).split(chr(10))[0][:150]}")
+        return 0, len(batch)
+
+
 def _run_energy_import(
     job_id: str,
     tmp_path: str,
@@ -241,9 +454,8 @@ def _run_energy_import(
     import_service_id: int,
 ):
     """
-    Background worker for renewals/energy-customers import.
-    Mirrors _run_leads_import exactly — flat loop, always inserts,
-    batch commit every 500 rows.
+    Background worker — renewals/energy-customers import.
+    Uses executemany() for bulk inserts: ~10-20x faster than per-row ORM.
     """
     BATCH_SIZE = 500
     session = SessionLocal()
@@ -252,7 +464,7 @@ def _run_energy_import(
     sql_logger.setLevel(logging.WARNING)
 
     try:
-        # ── Read file — auto-detect header row ───────────────────────────────
+        # ── Read file with smart header detection ──────────────────────────────
         def _unnamed_ratio(cols):
             return sum(1 for c in cols if str(c).startswith('Unnamed:') or str(c).strip() == '') / max(len(cols), 1)
 
@@ -270,7 +482,7 @@ def _run_energy_import(
                 for skip in range(1, 10):
                     candidate = _read_raw(tmp_path, file_ext, skip)
                     if _unnamed_ratio(candidate.columns) < 0.3:
-                        print(f"[job:{job_id}] Header found at row {skip}")
+                        print(f"[job:{job_id}] Header at row {skip}")
                         df = candidate
                         break
         except Exception as e:
@@ -283,54 +495,64 @@ def _run_energy_import(
             except OSError:
                 pass
 
-        # ── Build column lookup: original-cased name → normalised for matching ──
-        # Build a direct dict: normalised_name -> original_col_name
-        # Then use _build_column_map() aliases to find the right original col.
+        # ── Column mapping ─────────────────────────────────────────────────────
         import re as _re
-
         orig_cols = list(df.columns)
-        print(f"[job:{job_id}] Columns after smart-read: {orig_cols[:15]}")
-
-        # norm_map: normalised_col -> original_col
         norm_map = {}
         for orig in orig_cols:
             normed = _re.sub(r'\s+', ' ', str(orig).strip().lower().replace('_', ' '))
             norm_map[normed] = orig
-
-        # field_to_col: internal_field -> original_col_name
         field_to_col = {}
-        col_map = _build_column_map()
-        for field, aliases in col_map.items():
+        for field, aliases in _build_column_map().items():
             for alias in aliases:
                 if alias in norm_map:
                     field_to_col[field] = norm_map[alias]
                     break
 
-        print(f"[job:{job_id}] MAPPED {len(field_to_col)} fields: {list(field_to_col.items())[:8]}")
-
         def gcol(field):
-            """Return the original-cased column name for a given internal field."""
             return field_to_col.get(field, '')
 
-        # Drop completely empty rows
         df = df.dropna(how='all').reset_index(drop=True)
-
         total_rows = len(df)
         update_job(job_id, total=total_rows)
-
-        print(f"[job:{job_id}] Energy import started: {total_rows} rows, "
-              f"tenant={tenant_id}, draft={is_draft_import}, service={import_service_id}")
+        print(f"[job:{job_id}] Energy import: {total_rows} rows, mapped {len(field_to_col)} fields, "
+              f"draft={is_draft_import}, service={import_service_id}")
 
         # ── Pre-load suppliers ─────────────────────────────────────────────────
         suppliers_dict = {
             s.supplier_company_name.lower().strip(): s.supplier_id
             for s in session.query(Supplier_Master).all()
         }
-        print(f"[job:{job_id}] Loaded {len(suppliers_dict)} suppliers")
+
+        def resolve_supplier(name):
+            if not name:
+                return None
+            key = name.lower().strip()
+            sid = suppliers_dict.get(key)
+            if sid:
+                return sid
+            for k, v in suppliers_dict.items():
+                if key in k or k in key:
+                    suppliers_dict[key] = v
+                    return v
+            try:
+                new_sup = Supplier_Master(
+                    supplier_company_name=name,
+                    supplier_contact_name='Auto-imported',
+                    supplier_provisions=3,
+                    created_at=datetime.utcnow(),
+                )
+                session.add(new_sup)
+                session.flush()
+                suppliers_dict[key] = new_sup.supplier_id
+                return new_sup.supplier_id
+            except Exception:
+                session.rollback()
+                return None
 
         # ── Pre-load existing MPANs (this tenant only) ─────────────────────────
         existing_mpans: dict = {}
-        mpan_rows = session.execute(text("""
+        for r in session.execute(text("""
             SELECT ecm.mpan_number, ecm.contract_end_date, cm.client_id,
                    cm.is_archived, cm.is_draft, pd.assigned_employee_id
             FROM "StreemLyne_MT"."Energy_Contract_Master" ecm
@@ -339,8 +561,7 @@ def _run_energy_import(
             WHERE cm.is_deleted = FALSE
               AND CAST(cm.tenant_id AS VARCHAR) = CAST(:tid AS VARCHAR)
               AND ecm.mpan_number IS NOT NULL AND ecm.mpan_number != ''
-        """), {'tid': tenant_id})
-        for r in mpan_rows:
+        """), {'tid': tenant_id}):
             mpan_num, end_dt, cid, is_arch, is_dr, assigned = r
             if mpan_num:
                 existing_mpans[mpan_num.strip().lower()] = {
@@ -348,14 +569,15 @@ def _run_energy_import(
                     'is_archived': is_arch, 'is_draft': is_dr,
                     'assigned_employee_id': assigned,
                 }
-        print(f"[job:{job_id}] Loaded {len(existing_mpans)} existing MPANs for this tenant")
+        print(f"[job:{job_id}] Loaded {len(suppliers_dict)} suppliers, "
+              f"{len(existing_mpans)} existing MPANs")
 
-        # ── Row loop ───────────────────────────────────────────────────────────
-        success_count     = 0
-        error_count       = 0
-        duplicate_count   = 0
-        rows_since_commit = 0
-        start_time        = time.time()
+        # ── Row loop: parse + deduplicate, accumulate batch ───────────────────
+        success_count   = 0
+        error_count     = 0
+        duplicate_count = 0
+        pending_batch   = []   # list of dicts ready to bulk-insert
+        start_time      = time.time()
 
         for index, row in df.iterrows():
             try:
@@ -413,242 +635,110 @@ def _run_energy_import(
                 contact_person = main_contact or client_name
                 phone          = tel_no or mobile_no
 
-                # Debug first 3 rows — dump full row dict to see exactly what pandas gives us
-                if index < 3:
-                    print(f"[job:{job_id}] Row {index+2}: business='{business_name}' "
-                          f"contact='{contact_person}' phone='{phone}' mpan='{mpan_top}'")
-                    print(f"[job:{job_id}] Row {index+2} RAW dict: {dict(list(row.items())[:8])}")
-                    print(f"[job:{job_id}] Row {index+2} gcol(client_name)='{gcol('client_name')}' "
-                          f"row.get(gcol)='{row.get(gcol('client_name'))}' "
-                          f"row.index[:5]={list(row.index[:5])}")
-
-                # Skip completely blank rows
                 if not business_name and not phone and not email and not mpan_top and not contact_person:
-                    if index < 5:
-                        print(f"[job:{job_id}] Row {index+2}: BLANK — skipped")
                     continue
 
-                # ── MPAN duplicate check ───────────────────────────────────────
+                # MPAN duplicate check
                 if mpan_top:
                     existing = existing_mpans.get(mpan_top.strip().lower())
                     if existing:
-                        # Skip only if fully assigned and not a draft
                         if existing['assigned_employee_id'] is not None and not existing['is_draft']:
                             duplicate_count += 1
                             continue
-                        # Skip if exact same end date
                         if existing['end_date'] and end_date and existing['end_date'] == end_date:
                             duplicate_count += 1
                             continue
-                        # Skip if incoming is older
                         if existing['end_date'] and end_date and end_date < existing['end_date']:
                             duplicate_count += 1
                             continue
-                        # Otherwise fall through (newer or unarchived draft — create fresh)
 
-                # ── Supplier resolve ───────────────────────────────────────────
-                supplier_id = None
-                if supplier_name:
-                    sup_key = supplier_name.lower().strip()
-                    supplier_id = suppliers_dict.get(sup_key)
-                    if not supplier_id:
-                        for k, v in suppliers_dict.items():
-                            if sup_key in k or k in sup_key:
-                                supplier_id = v
-                                break
-                    if not supplier_id:
-                        try:
-                            new_sup = Supplier_Master(
-                                supplier_company_name=supplier_name,
-                                supplier_contact_name='Auto-imported',
-                                supplier_provisions=3,
-                                created_at=datetime.utcnow(),
-                            )
-                            session.add(new_sup)
-                            session.flush()
-                            supplier_id = new_sup.supplier_id
-                            suppliers_dict[sup_key] = supplier_id
-                        except Exception:
-                            session.rollback()
-                            supplier_id = None
-
-                old_supplier_id = None
-                if old_supplier_name:
-                    old_key = old_supplier_name.lower().strip()
-                    old_supplier_id = suppliers_dict.get(old_key)
-                    if not old_supplier_id:
-                        for k, v in suppliers_dict.items():
-                            if old_key in k or k in old_key:
-                                old_supplier_id = v
-                                break
-
-                # ── Insert Client + Project + Contract ─────────────────────────
                 contract_start = start_date or datetime.utcnow().date()
                 contract_end   = end_date or (contract_start + timedelta(days=365))
 
-                new_client = Client_Master(
-                    tenant_id=tenant_id,
-                    assigned_employee_id=opportunity_owner_id,
-                    client_company_name=business_name or '',
-                    client_contact_name=contact_person or '',
-                    address=address or '',
-                    post_code=postcode or '',
-                    home_door_number=home_door_number or None,
-                    home_street=home_street or None,
-                    client_phone=tel_no or '',
-                    client_mobile=mobile_no or None,
-                    client_email=email or '',
-                    client_website='',
-                    default_currency_id=1,
-                    created_at=datetime.utcnow(),
-                    position=position or None,
-                    company_number=company_number or None,
-                    date_of_birth=date_of_birth,
-                    charity_ltd_company_number=charity_ltd_company_number or None,
-                    partner_details=partner_details or None,
-                    bank_name=bank_name or None,
-                    account_number=account_number or None,
-                    sort_code=sort_code or None,
-                    partner_dob=partner_dob,
-                    credit_score=credit_score,
-                    is_archived=False,
-                    is_draft=is_draft_import,
-                    is_deleted=False,
-                )
-                session.add(new_client)
-                session.flush()
-
-                new_project = Project_Details(
-                    client_id=new_client.client_id,
-                    opportunity_id=None,
-                    project_title=business_name or 'Renewal Contract',
-                    project_description='Imported renewal contract',
-                    start_date=contract_start,
-                    end_date=contract_end,
-                    employee_id=employee_id,
-                    assigned_employee_id=opportunity_owner_id,
-                    status=None,
-                    created_at=datetime.utcnow(),
-                    updated_at=datetime.utcnow(),
-                    address=site_address or address or '',
-                    Misc_Col1=None,
-                    Misc_Col2=int(annual_usage) if annual_usage else None,
-                    site_name=site_name or None,
-                    month_sold=month_sold or None,
-                    house_name=house_name or None,
-                    house_number=house_number or None,
-                    door_number=door_number or None,
-                    town=town or None,
-                    county=county or None,
-                )
-                session.add(new_project)
-                session.flush()
-
-                # supplier_id may be None if supplier name not recognised — use
-                # a default "Unknown" supplier rather than failing the row.
-                final_supplier_id = supplier_id
-                if final_supplier_id is None:
-                    # Try to find or create an "Unknown" supplier as fallback
-                    unknown_key = 'unknown'
-                    final_supplier_id = suppliers_dict.get(unknown_key)
-                    if final_supplier_id is None:
-                        try:
-                            unk_sup = Supplier_Master(
-                                supplier_company_name='Unknown',
-                                supplier_contact_name='Auto-created',
-                                supplier_provisions=0,
-                                created_at=datetime.utcnow(),
-                            )
-                            session.add(unk_sup)
-                            session.flush()
-                            final_supplier_id = unk_sup.supplier_id
-                            suppliers_dict[unknown_key] = final_supplier_id
-                        except Exception:
-                            session.rollback()
-                            # If we still can't get a supplier_id, skip contract creation
-                            # but still count the client+project as success
-                            final_supplier_id = None
-
-                new_contract = Energy_Contract_Master(
-                    project_id=new_project.project_id,
-                    employee_id=employee_id,
-                    supplier_id=final_supplier_id,
-                    old_supplier_id=old_supplier_id,
-                    contract_start_date=contract_start,
-                    contract_end_date=contract_end,
-                    terms_of_sale='',
-                    service_id=import_service_id,
-                    unit_rate=rate_1 or 0.0,
-                    currency_id=1,
-                    document_details=None,
-                    created_at=datetime.utcnow(),
-                    updated_at=datetime.utcnow(),
-                    mpan_number=mpan_top or '',
-                    mpan_bottom=mpan_bottom or '',
-                    net_notch=net_notch,
-                    rate_2=rate_2,
-                    rate_3=rate_3,
-                    comms_paid=comms_paid,
-                    standing_charge=stand_charge,
-                    aggregator=aggregator or None,
-                    rate_1=rate_1,
-                    payment_type=payment_type or None,
-                    term_sold=term_sold,
-                )
-                session.add(new_contract)
-                session.flush()
-
-                # Register MPAN to catch intra-file duplicates
-                if mpan_top:
-                    existing_mpans[mpan_top.strip().lower()] = {
-                        'client_id': new_client.client_id,
-                        'end_date': end_date,
-                        'is_archived': False,
-                        'is_draft': is_draft_import,
-                        'assigned_employee_id': opportunity_owner_id,
-                    }
-
-                success_count     += 1
-                rows_since_commit += 1
+                pending_batch.append({
+                    'business_name':  business_name or '',
+                    'contact_person': contact_person or '',
+                    'address':        address or '',
+                    'postcode':       postcode or '',
+                    'tel_no':         tel_no or '',
+                    'mobile_no':      mobile_no or None,
+                    'email':          email or '',
+                    'position':       position or None,
+                    'company_number': company_number or None,
+                    'date_of_birth':  date_of_birth,
+                    'charity_ltd':    charity_ltd_company_number or None,
+                    'partner_details': partner_details or None,
+                    'bank_name':      bank_name or None,
+                    'account_number': account_number or None,
+                    'sort_code':      sort_code or None,
+                    'home_door':      home_door_number or None,
+                    'home_street':    home_street or None,
+                    'partner_dob':    partner_dob,
+                    'credit_score':   credit_score,
+                    'site_address':   site_address or address or '',
+                    'annual_usage':   int(annual_usage) if annual_usage else None,
+                    'site_name':      site_name or None,
+                    'month_sold':     month_sold or None,
+                    'house_name':     house_name or None,
+                    'house_number':   house_number or None,
+                    'door_number':    door_number or None,
+                    'town':           town or None,
+                    'county':         county or None,
+                    'supplier_id':    resolve_supplier(supplier_name),
+                    'old_supplier_id': resolve_supplier(old_supplier_name) if old_supplier_name else None,
+                    'contract_start': contract_start,
+                    'contract_end':   contract_end,
+                    'mpan_top':       mpan_top or '',
+                    'mpan_bottom':    mpan_bottom or '',
+                    'rate_1':         rate_1,
+                    'rate_2':         rate_2,
+                    'rate_3':         rate_3,
+                    'net_notch':      net_notch,
+                    'comms_paid':     comms_paid,
+                    'stand_charge':   stand_charge,
+                    'aggregator':     aggregator or None,
+                    'payment_type':   payment_type or None,
+                    'term_sold':      term_sold,
+                    'end_date':       end_date,
+                })
 
             except Exception as row_err:
-                session.rollback()
-                error_count       += 1
-                rows_since_commit  = 0
-                err_str = str(row_err).split('\n')[0][:150]
-                append_error(job_id, f"Row {index+2}: {err_str}")
-                if index < 10:
-                    print(f"[job:{job_id}] Row {index+2} ERROR: {err_str}")
+                error_count += 1
+                append_error(job_id, f"Row {index+2}: {str(row_err).split(chr(10))[0][:120]}")
                 continue
 
-            # ── Batch commit ───────────────────────────────────────────────────
-            if rows_since_commit >= BATCH_SIZE:
-                try:
-                    session.commit()
-                    rows_since_commit = 0
-                    elapsed = time.time() - start_time
-                    rate    = success_count / elapsed if elapsed > 0 else 1
-                    eta_min = (total_rows - success_count) / rate / 60 if rate > 0 else 0
-                    update_job(job_id, processed=index + 1,
-                               successful=success_count, duplicates=duplicate_count)
-                    print(f"[job:{job_id}] {success_count}/{total_rows} | "
-                          f"{rate:.0f} rec/s | ETA {eta_min:.1f} min")
-                except Exception as batch_err:
-                    session.rollback()
-                    rows_since_commit = 0
-                    error_count += 1
-                    append_error(job_id, f"Batch commit failed: {str(batch_err)[:100]}")
+            # ── Bulk flush every BATCH_SIZE rows ──────────────────────────────
+            if len(pending_batch) >= BATCH_SIZE:
+                ins, err = _flush_energy_batch(
+                    session, pending_batch, tenant_id, employee_id,
+                    opportunity_owner_id, is_draft_import, import_service_id,
+                    existing_mpans,
+                )
+                success_count += ins
+                error_count   += err
+                pending_batch  = []
+                elapsed = time.time() - start_time
+                rate    = success_count / elapsed if elapsed > 0 else 1
+                eta_min = (total_rows - success_count) / rate / 60 if rate > 0 else 0
+                update_job(job_id, processed=index + 1,
+                           successful=success_count, duplicates=duplicate_count)
+                print(f"[job:{job_id}] {success_count}/{total_rows} | "
+                      f"{rate:.0f} rec/s | ETA {eta_min:.1f} min")
 
-        # ── Final commit ───────────────────────────────────────────────────────
-        try:
-            session.commit()
-        except Exception as final_err:
-            session.rollback()
-            append_error(job_id, f"Final commit failed: {str(final_err)[:100]}")
+        # ── Final batch ────────────────────────────────────────────────────────
+        if pending_batch:
+            ins, err = _flush_energy_batch(
+                session, pending_batch, tenant_id, employee_id,
+                opportunity_owner_id, is_draft_import, import_service_id,
+                existing_mpans,
+            )
+            success_count += ins
+            error_count   += err
 
         elapsed = time.time() - start_time
-        print(f"[job:{job_id}] DONE — {success_count} inserted, "
-              f"{duplicate_count} dup, {error_count} err in {elapsed:.1f}s")
+        print(f"[job:{job_id}] DONE — {success_count} ok, {duplicate_count} dup, "
+              f"{error_count} err in {elapsed:.1f}s "
+              f"({success_count/elapsed:.0f} rec/s)" if elapsed > 0 else "")
         finish_job(job_id, 'done')
         update_job(job_id, processed=total_rows,
                    successful=success_count, duplicates=duplicate_count)
@@ -661,15 +751,11 @@ def _run_energy_import(
             pass
         finish_job(job_id, 'failed')
         append_error(job_id, f"Fatal: {str(fatal)[:200]}")
-        print(f"[job:{job_id}] FATAL: {str(fatal)}")
+        print(f"[job:{job_id}] FATAL: {fatal}")
     finally:
         sql_logger.setLevel(original_level)
         session.close()
 
-
-# ---------------------------------------------------------------------------
-# Background worker — leads
-# ---------------------------------------------------------------------------
 
 def _run_leads_import(
     job_id: str,
@@ -777,7 +863,7 @@ def _run_leads_import(
         success_count = 0
         error_count = 0
         duplicate_count = 0
-        rows_since_commit = 0
+        pending_leads = []
         start_time = time.time()
 
         for index, row in df.iterrows():
@@ -827,90 +913,64 @@ def _run_leads_import(
                                 supplier_id = v
                                 break
 
-                session.execute(text("""
-                    INSERT INTO "StreemLyne_MT"."Opportunity_Details"
-                    (tenant_id, client_id, opportunity_title, opportunity_description,
-                     opportunity_date, opportunity_owner_employee_id, stage_id,
-                     opportunity_value, currency_id, created_at, "Misc_Col1",
-                     business_name, contact_person, tel_number, mobile_no, email,
-                     mpan_mpr, mpan_bottom, start_date, end_date, service_id,
-                     supplier_id, annual_usage, stand_charge, rate_1, rate_2,
-                     rate_3, net_notch, payment_type, postcode, is_draft)
-                    VALUES
-                    (:tenant_id, NULL, :title, 'Imported lead',
-                     :opp_date, :owner_id, :stage_id,
-                     0, 1, :created_at, NULL,
-                     :business_name, :contact_person, :tel_number, :mobile_no, :email,
-                     :mpan_mpr, :mpan_bottom, :start_date, :end_date, :service_id,
-                     :supplier_id, :annual_usage, :stand_charge, :rate_1, :rate_2,
-                     :rate_3, :net_notch, :payment_type, :postcode, :is_draft)
-                """), {
-                    'tenant_id':     tenant_id,
-                    'title':         business_name or '',
-                    'opp_date':      datetime.utcnow().date(),
-                    'owner_id':      opportunity_owner_id,
-                    'stage_id':      default_stage_id,
-                    'created_at':    datetime.utcnow(),
+                pending_leads.append({
+                    'tenant_id':    tenant_id,
+                    'title':        business_name or '',
+                    'now':          datetime.utcnow(),
+                    'owner_id':     opportunity_owner_id,
+                    'stage_id':     default_stage_id,
                     'business_name': business_name or None,
                     'contact_person': contact_person or None,
-                    'tel_number':    phone or None,
-                    'mobile_no':     mobile_no or None,
-                    'email':         email or None,
-                    'mpan_mpr':      mpan_top or None,
-                    'mpan_bottom':   mpan_bottom or None,
-                    'start_date':    start_date,
-                    'end_date':      end_date,
-                    'service_id':    import_service_id,
-                    'supplier_id':   supplier_id,
-                    'annual_usage':  int(annual_usage) if annual_usage else None,
-                    'stand_charge':  parse_number(row.get(gcol('stand_charge'))),
-                    'rate_1':        parse_number(row.get(gcol('rate_1'))),
-                    'rate_2':        parse_number(row.get(gcol('rate_2'))),
-                    'rate_3':        parse_number(row.get(gcol('rate_3'))),
-                    'net_notch':     parse_number(row.get(gcol('net_notch'))),
-                    'payment_type':  payment_type or None,
-                    'postcode':      postcode or None,
-                    'is_draft':      is_draft_import,
+                    'tel':          phone or None,
+                    'mobile':       mobile_no or None,
+                    'email':        email or None,
+                    'mpan':         mpan_top or None,
+                    'mpan_b':       mpan_bottom or None,
+                    'start_d':      start_date,
+                    'end_d':        end_date,
+                    'svc':          import_service_id,
+                    'sup_id':       supplier_id,
+                    'usage':        int(annual_usage) if annual_usage else None,
+                    'sc':           parse_number(row.get(gcol('stand_charge'))),
+                    'r1':           parse_number(row.get(gcol('rate_1'))),
+                    'r2':           parse_number(row.get(gcol('rate_2'))),
+                    'r3':           parse_number(row.get(gcol('rate_3'))),
+                    'nn':           parse_number(row.get(gcol('net_notch'))),
+                    'pt':           payment_type or None,
+                    'postcode':     postcode or None,
+                    'is_draft':     is_draft_import,
                 })
-                success_count += 1
-                rows_since_commit += 1
-
-                if mpan_top:
-                    mpan_key = mpan_top.strip().lower()
-                    existing_lead_mpans.setdefault(mpan_key, []).append({
-                        'tenant_id':     tenant_id,
-                        'business_name': business_name,
-                    })
 
             except Exception as row_err:
-                session.rollback()
                 error_count += 1
-                rows_since_commit = 0
                 append_error(job_id, f"Row {index + 2}: {str(row_err).split(chr(10))[0][:150]}")
                 continue
 
-            if rows_since_commit >= BATCH_SIZE:
-                try:
-                    session.commit()
-                    rows_since_commit = 0
-                    elapsed = time.time() - start_time
-                    rate = success_count / elapsed if elapsed > 0 else 1
-                    eta_min = (total_rows - success_count) / rate / 60 if rate > 0 else 0
-                    update_job(job_id, processed=index + 1, successful=success_count,
-                               duplicates=duplicate_count)
-                    print(f"[job:{job_id}] leads {success_count}/{total_rows} | "
-                          f"{rate:.0f} rec/s | ETA {eta_min:.1f} min")
-                except Exception as batch_err:
-                    session.rollback()
-                    rows_since_commit = 0
-                    error_count += 1
-                    append_error(job_id, f"Batch commit failed: {str(batch_err)[:100]}")
+            if len(pending_leads) >= BATCH_SIZE:
+                ins, err = _flush_leads_batch(
+                    session, pending_leads, tenant_id, import_service_id,
+                    opportunity_owner_id, is_draft_import, default_stage_id,
+                    existing_lead_mpans,
+                )
+                success_count += ins
+                error_count   += err
+                pending_leads  = []
+                elapsed = time.time() - start_time
+                rate = success_count / elapsed if elapsed > 0 else 1
+                eta_min = (total_rows - success_count) / rate / 60 if rate > 0 else 0
+                update_job(job_id, processed=index + 1, successful=success_count,
+                           duplicates=duplicate_count)
+                print(f"[job:{job_id}] leads {success_count}/{total_rows} | "
+                      f"{rate:.0f} rec/s | ETA {eta_min:.1f} min")
 
-        try:
-            session.commit()
-        except Exception as final_err:
-            session.rollback()
-            append_error(job_id, f"Final commit failed: {str(final_err)[:100]}")
+        if pending_leads:
+            ins, err = _flush_leads_batch(
+                session, pending_leads, tenant_id, import_service_id,
+                opportunity_owner_id, is_draft_import, default_stage_id,
+                existing_lead_mpans,
+            )
+            success_count += ins
+            error_count   += err
 
         elapsed = time.time() - start_time
         print(f"[job:{job_id}] LEADS DONE — {success_count} ok, {duplicate_count} dup, "
