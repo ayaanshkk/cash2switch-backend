@@ -37,10 +37,10 @@ if use_sqlite:
 else:
     engine = create_engine(
         DATABASE_URL,
-        pool_size=2,         # ✅ Keep small — transaction mode recycles fast
-        max_overflow=3,      # ✅ Max 5 total connections
-        pool_timeout=20,
-        pool_recycle=300,    # ✅ Recycle every 5 min (not 1 hour)
+        pool_size=10,        # ✅ Increase from 2
+        max_overflow=10,     # ✅ Increase from 3 (20 total connections max)
+        pool_timeout=30,     # ✅ Increase from 20
+        pool_recycle=600,    # ✅ Recycle every 10 min
         pool_pre_ping=True,
 
         connect_args={
@@ -54,7 +54,6 @@ else:
 
         future=True,
     )
-
 
 @event.listens_for(engine, "connect")
 def set_search_path(dbapi_connection, connection_record):

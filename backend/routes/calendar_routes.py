@@ -3,6 +3,8 @@
 Calendar Routes - FIXED VERSION with Customer Details Sync
 Syncs with renewals page AND customer details page (callbacks)
 """
+from email.mime import text
+
 from flask import Blueprint, g, jsonify, request
 from datetime import datetime
 from backend.routes.auth_helpers import token_required
@@ -312,7 +314,17 @@ def get_leads_calendar():
                     ci."notes",
                     ROW_NUMBER() OVER (
                         PARTITION BY ci."client_id"
-                        ORDER BY ci."created_at" DESC NULLS LAST, ci."interaction_id" DESC
+                        ORDER BY
+                            -- ✅ Prioritise real callbacks over migration/system entries
+                            CASE
+                                WHEN ci."next_steps" NOT IN ('End Date Reminder', 'End Date', 'Field Update', 'Migration', 'Restored')
+                                AND ci."notes" NOT LIKE '[Migration]%'
+                                AND ci."notes" NOT LIKE '[Field Update]%'
+                                THEN 0
+                                ELSE 1
+                            END ASC,
+                            ci."created_at" DESC NULLS LAST,
+                            ci."interaction_id" DESC
                     ) AS rn
                 FROM "StreemLyne_MT"."Client_Interactions" ci
                 WHERE ci."reminder_date" IS NOT NULL
@@ -349,18 +361,18 @@ def get_leads_calendar():
                 ON od."supplier_id" = sup."supplier_id"
             LEFT JOIN latest_ci lci
                 ON lci."client_id" = od."client_id"
-               AND lci.rn = 1
+            AND lci.rn = 1
             WHERE (od."tenant_id" = :tenant_id OR (od."client_id" IS NOT NULL AND cm."tenant_id" = :tenant_id))
-              AND od."service_id" = :service_id
-              AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
-              AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") NOT IN ('lost', 'lost cot'))
-              AND NOT EXISTS (
+            AND od."service_id" = :service_id
+            AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
+            AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") NOT IN ('lost', 'lost cot'))
+            AND NOT EXISTS (
                     SELECT 1
                     FROM "StreemLyne_MT"."Project_Details" pd
                     WHERE pd."opportunity_id" = od."opportunity_id"
                 )
-              AND lci."reminder_date" IS NOT NULL
-              {employee_filter}
+            AND lci."reminder_date" IS NOT NULL
+            {employee_filter}
             ORDER BY lci."reminder_date" ASC
         ''')
 
