@@ -698,21 +698,31 @@ def get_renewal_performance():
         if not tenant_id:
             return jsonify({'error': 'Tenant not found'}), 400
 
-        use_current_user = request.args.get('use_current_user', 'false').lower() == 'true'
+        current_user = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id = {'utilities': 1, 'water': 2, 'gas': 3}.get(service_param.strip().lower(), 1)
 
-        if use_current_user:
-            current_user = request.current_user
+        # ✅ Import platform admin check
+        from backend.crm.utils.role_helpers import is_platform_admin
+
+        use_current_user = request.args.get('use_current_user', 'false').lower() == 'true'
+
+        if is_platform_admin(current_user):
+            # ✅ Platform admin: see all tenant renewals unless ?employee_id=X specified
+            requested_employee_id = request.args.get('employee_id', type=int)
+            employee_id = requested_employee_id  # None = all tenant
+        elif use_current_user:
             employee_id = getattr(current_user, 'employee_id', None) or getattr(current_user, 'id', None)
             if not employee_id:
                 return jsonify({'error': 'User employee_id not found'}), 400
         else:
-            employee_id = request.args.get('employee_id', type=int)
+            # ✅ Non-admin: always scoped to their own employee_id
+            employee_id = getattr(current_user, 'employee_id', None)
+            if not employee_id:
+                return jsonify({'error': 'User employee_id not found'}), 400
 
         today = datetime.utcnow().date()
 
-        # ✅ Base filter: active (non-deleted, non-archived) records only
         base_query = session.query(
             Project_Details,
             Energy_Contract_Master,
@@ -727,6 +737,7 @@ def get_renewal_performance():
             Energy_Contract_Master.service_id == service_id,
         )
 
+        # ✅ Only filter by employee if specified
         if employee_id:
             base_query = base_query.filter(
                 Project_Details.assigned_employee_id == employee_id
@@ -734,7 +745,7 @@ def get_renewal_performance():
 
         all_results = base_query.all()
 
-        # ✅ Lost: query recycle bin separately (is_deleted=True)
+        # ✅ Lost: query recycle bin separately
         lost_query = session.query(
             Project_Details,
         ).join(

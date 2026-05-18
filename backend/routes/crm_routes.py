@@ -212,7 +212,6 @@ def get_leads():
 
         session = SessionLocal()
         try:
-            # Base query using SQLAlchemy ORM
             query = (
                 session.query(
                     Opportunity_Details,
@@ -232,19 +231,19 @@ def get_leads():
                 .filter(Opportunity_Details.service_id == service_id)
                 .filter(Opportunity_Details.opportunity_owner_employee_id.isnot(None))
                 .filter((Opportunity_Details.is_draft == False) | (Opportunity_Details.is_draft.is_(None)))
+                # ✅ Exclude soft-deleted leads (Cleansing / Recycle Bin)
+                .filter(
+                    (Client_Master.is_deleted.is_(None)) |
+                    (Client_Master.is_deleted == False)
+                )
             )
 
-            # ✅ CRITICAL FIX: Exclude soft-deleted leads (they're in Cleansing or Recycle Bin)
-            query = query.filter(
-                (Client_Master.is_deleted.is_(None)) | 
-                (Client_Master.is_deleted == False)
-            )
-
-            # Non-admin filter
-            query = query.filter(
-                Opportunity_Details.opportunity_owner_employee_id == employee_id,
-                (Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None))
-            )
+            # ✅ Platform admin sees ALL leads, everyone else sees only their own
+            if not admin_user:
+                query = query.filter(
+                    Opportunity_Details.opportunity_owner_employee_id == employee_id,
+                    (Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None))
+                )
 
             # Exclude stage filter
             if exclude_stage:
@@ -254,7 +253,6 @@ def get_leads():
                 )
 
             query = query.order_by(Opportunity_Details.created_at.desc())
-            
             rows = query.all()
 
             # Build results
@@ -1764,19 +1762,18 @@ def get_leads_performance():
         role_name = getattr(current_user, 'role', None)
         admin_user = is_crm_leads_admin_role(role_name)
         my_emp_id = getattr(current_user, 'employee_id', None)
-        
-        # ✅ For non-admins: always use their own employee_id
-        # ✅ For admins: allow ?employee_id=X to view specific user, otherwise use their own
-        if not admin_user:
-            employee_id = my_emp_id
-        else:
-            requested_employee_id = request.args.get('employee_id', type=int)
-            # If admin didn't specify employee_id, use their own (not all leads)
-            employee_id = requested_employee_id if requested_employee_id else my_emp_id
 
-        current_app.logger.info(
-            f'📊 get_leads_performance: employee_id={employee_id}, my_emp_id={my_emp_id}, '
-            f'is_admin={admin_user}, requested={request.args.get("employee_id")}'
+        # ✅ Admin sees ALL leads across tenant (no employee filter)
+        # ✅ Non-admin sees only their own
+        if admin_user:
+            requested_employee_id = request.args.get('employee_id', type=int)
+            employee_id = requested_employee_id  # None = all tenant, or specific employee
+        else:
+            employee_id = my_emp_id  # always scoped to themselves
+
+        current_app.logger.warning(
+            f'📊 get_leads_performance: tenant={tenant_id}, my_emp_id={my_emp_id}, '
+            f'is_admin={admin_user}, filtering_by_employee_id={employee_id}'
         )
 
         query = (
@@ -1790,13 +1787,20 @@ def get_leads_performance():
             )
             .filter(Opportunity_Details.service_id == service_id)
             .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
+            # ✅ Exclude soft-deleted leads
+            .filter(
+                (Client_Master.is_deleted.is_(None)) |
+                (Client_Master.is_deleted == False)
+            )
         )
 
-        # ✅ CRITICAL: Always filter by employee_id (no "show all" option)
+        # ✅ Only filter by employee if non-admin OR admin specified ?employee_id=X
         if employee_id:
-            query = query.filter(Opportunity_Details.opportunity_owner_employee_id == employee_id)
-        else:
-            # If no employee_id, return empty results (don't show all tenant data)
+            query = query.filter(
+                Opportunity_Details.opportunity_owner_employee_id == employee_id
+            )
+        elif not admin_user:
+            # Non-admin with no employee_id - return zeros
             return jsonify({
                 'converted_count': 0,
                 'renewed_count': 0,
@@ -1838,8 +1842,6 @@ def get_leads_performance():
                 in_progress_count += 1
             elif stage in ['lost', 'lost cot', 'invalid number', 'meter de-energised']:
                 lost_count += 1
-            elif stage in ('not called', 'dead'):
-                not_contacted_count += 1
             else:
                 not_contacted_count += 1
 
@@ -1848,7 +1850,7 @@ def get_leads_performance():
             ((converted_count + renewed_count + renewed_directly_count) / total * 100), 1
         ) if total > 0 else 0
 
-        current_app.logger.info(
+        current_app.logger.warning(
             f'✅ Performance for employee_id={employee_id}: total={total}, '
             f'not_contacted={not_contacted_count}, converted={converted_count}'
         )
