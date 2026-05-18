@@ -400,98 +400,109 @@ class CRMController:
             }), 500
 
     def bulk_delete_leads(self):
-        """
-        POST /api/crm/leads/bulk-delete
-        Bulk delete multiple leads - accepts tenant_lead_id or opportunity_id
-        """
         try:
             from flask import request, jsonify, g
+            from backend.db import SessionLocal
+            from backend.models import Opportunity_Details, Client_Master
+            from sqlalchemy import or_, func, String, cast
             import logging
-            
+
             logger = logging.getLogger(__name__)
-            logger.warning('🔥 BULK DELETE START')
-            
-            # Get request data
+
             data = request.get_json()
-            
             if not data or 'opportunity_ids' not in data:
-                logger.error('❌ Missing opportunity_ids in request')
-                return jsonify({
-                    'success': False,
-                    'error': 'opportunity_ids is required'
-                }), 400
-            
-            # ✅ These could be tenant_lead_ids OR opportunity_ids - repository handles both
+                return jsonify({'success': False, 'error': 'opportunity_ids is required'}), 400
+
             lead_ids = data.get('opportunity_ids', [])
-            
             if not isinstance(lead_ids, list) or len(lead_ids) == 0:
-                logger.error('❌ opportunity_ids is not a valid list')
-                return jsonify({
-                    'success': False,
-                    'error': 'opportunity_ids must be a non-empty list'
-                }), 400
-            
-            logger.warning(f'🔥 Deleting {len(lead_ids)} leads with IDs: {lead_ids}')
-            
-            # Get tenant_id from g
+                return jsonify({'success': False, 'error': 'opportunity_ids must be a non-empty list'}), 400
+
             tenant_id = g.get('tenant_id')
-            
             if not tenant_id:
-                logger.error('❌ No tenant_id found in g')
+                return jsonify({'success': False, 'error': 'Tenant ID not found'}), 400
+
+            logger.warning(f'🗑️ bulk_delete_leads: tenant={tenant_id}, ids={lead_ids}')
+
+            session = SessionLocal()
+            try:
+                # Cast both sides to VARCHAR to avoid type mismatch
+                leads = (
+                    session.query(Opportunity_Details)
+                    .filter(
+                        or_(
+                            Opportunity_Details.opportunity_id.in_(lead_ids),
+                            Opportunity_Details.tenant_lead_id.in_(lead_ids),
+                        )
+                    )
+                    .filter(
+                        cast(Opportunity_Details.tenant_id, String) == str(tenant_id)
+                    )
+                    .all()
+                )
+
+                # Fallback: imported leads may only have tenant_id on client or
+                # stored as a different type — try int cast as well
+                if not leads:
+                    logger.warning(f'First query found nothing, trying int cast fallback')
+                    try:
+                        leads = (
+                            session.query(Opportunity_Details)
+                            .filter(
+                                or_(
+                                    Opportunity_Details.opportunity_id.in_(lead_ids),
+                                    Opportunity_Details.tenant_lead_id.in_(lead_ids),
+                                )
+                            )
+                            .filter(Opportunity_Details.tenant_id == int(tenant_id))
+                            .all()
+                        )
+                    except (ValueError, TypeError):
+                        leads = []
+
+                logger.warning(f'Resolved {len(leads)} leads to delete out of {len(lead_ids)} requested')
+
+                deleted_count = 0
+                for lead in leads:
+                    if lead.client_id:
+                        from backend.models import Project_Details
+                        other_projects = (
+                            session.query(Project_Details)
+                            .filter(Project_Details.client_id == lead.client_id)
+                            .count()
+                        )
+                        if other_projects == 0:
+                            client = session.query(Client_Master).filter(
+                                Client_Master.client_id == lead.client_id
+                            ).first()
+                            if client:
+                                session.delete(client)
+
+                    session.delete(lead)
+                    deleted_count += 1
+
+                session.commit()
+
+                logger.warning(f'✅ Deleted {deleted_count} leads')
                 return jsonify({
-                    'success': False,
-                    'error': 'Tenant ID not found in request context'
-                }), 400
-            
-            logger.warning(f'🔥 Tenant ID: {tenant_id}')
-            
-            # ✅ Repository automatically resolves tenant_lead_id OR opportunity_id
-            from backend.crm.repositories.lead_repository import LeadRepository
-            repo = LeadRepository()
-            
-            logger.warning('🔥 Calling repo.bulk_delete_leads...')
-            result = repo.bulk_delete_leads(tenant_id, lead_ids)  # ✅ Changed variable name
-            logger.warning(f'🔥 Repository result: {result}')
-            
-            if not result.get('success'):
-                logger.error(f'❌ Repository returned failure: {result}')
-                return jsonify(result), 400
-            
-            # Build response
-            deleted = result.get('deleted', 0)
-            total = result.get('total_requested', 0)
-            errors = result.get('errors', [])
-            
-            message = f"{deleted} lead(s) deleted successfully."
-            if deleted < total:
-                message += f" {total - deleted} failed."
-            
-            response_data = {
-                'success': True,
-                'deleted': deleted,
-                'total_requested': total,
-                'errors': errors,
-                'message': message
-            }
-            
-            logger.warning(f'🔥 Returning response: {response_data}')
-            
-            return jsonify(response_data), 200
-            
+                    'success': True,
+                    'deleted': deleted_count,
+                    'total_requested': len(lead_ids),
+                    'errors': [],
+                    'message': f'{deleted_count} lead(s) deleted successfully.',
+                }), 200
+
+            except Exception as e:
+                session.rollback()
+                logger.exception(f'❌ bulk_delete_leads DB error: {e}')
+                return jsonify({'success': False, 'error': str(e)}), 500
+            finally:
+                session.close()
+
         except Exception as e:
-            import traceback
-            import logging
-            
-            logger = logging.getLogger(__name__)
-            logger.exception(f'❌ BULK DELETE EXCEPTION: {e}')
+            import logging, traceback
+            logging.getLogger(__name__).exception(f'❌ bulk_delete_leads outer error: {e}')
             traceback.print_exc()
-            
-            return jsonify({
-                'success': False,
-                'error': 'Failed to delete leads',
-                'details': str(e),
-                'type': type(e).__name__
-            }), 500
+            return jsonify({'success': False, 'error': str(e)}), 500
     
     def import_leads(self) -> tuple:
             """

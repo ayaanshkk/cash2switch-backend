@@ -2219,34 +2219,9 @@ def get_leads_stats_by_employee_detailed():
         session.close()
 
 @crm_bp.route('/leads/bulk-delete', methods=['POST'])
-@require_tenant
+@token_required
+@tenant_from_jwt
 def bulk_delete_leads():
-    """
-    Bulk delete multiple leads at once
-    Automatically resets ID sequence to 1 if all leads are deleted
-
-    Request Body:
-        - opportunity_ids: List of opportunity IDs to delete (required)
-
-    Example:
-        {
-            "opportunity_ids": [15, 16, 17, 18, 19, 20]
-        }
-
-    Headers:
-        - X-Tenant-ID: Tenant identifier (required)
-
-    Returns:
-        200: {
-            "success": true,
-            "deleted": 6,
-            "total_requested": 6,
-            "errors": [],
-            "message": "6 leads deleted successfully. ID sequence reset to 1."
-        }
-        400: Invalid request data
-        500: Internal server error
-    """
     return crm_controller.bulk_delete_leads()
 
 
