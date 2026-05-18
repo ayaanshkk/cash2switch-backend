@@ -203,17 +203,24 @@ def _build_column_map() -> dict:
     }
 
 
-def _resolve_columns(df_columns) -> dict:
-    """Map internal field names to actual column names present in the file."""
-    normalised = [c.strip().lower().replace('_', ' ') for c in df_columns]
+def _resolve_columns(normalised_cols, original_cols=None) -> dict:
+    """
+    Map internal field names to actual (original-cased) column names.
+
+    normalised_cols: lowercased/stripped column names (for matching aliases)
+    original_cols:   original column names from the file (returned as values)
+                     if None, normalised_cols are used as values too
+    """
+    import re
+    if original_cols is None:
+        original_cols = normalised_cols
     column_map = _build_column_map()
     actual = {}
     for field, aliases in column_map.items():
-        for i, norm_col in enumerate(normalised):
-            import re
-            norm_col = re.sub(r'\s+', ' ', norm_col)
+        for i, norm_col in enumerate(normalised_cols):
+            norm_col = re.sub(r'\s+', ' ', str(norm_col).strip().lower().replace('_', ' '))
             if norm_col in aliases:
-                actual[field] = df_columns[i]
+                actual[field] = original_cols[i]  # always return original name
                 break
     return actual
 
@@ -280,22 +287,22 @@ def _run_energy_import(
         original_cols = list(df.columns)
         print(f"[job:{job_id}] Columns after smart-read: {original_cols[:15]}")
 
-        df.columns = (
+        normalised_cols = (
             df.columns.str.strip()
             .str.lower()
             .str.replace('_', ' ', regex=False)
             .str.replace(r'\s+', ' ', regex=True)
+            .tolist()
         )
-        normalised_cols = list(df.columns)
-        actual_columns = _resolve_columns(normalised_cols)
-        df.columns = original_cols
+        # Pass original cols so gcol() returns original-cased names for row.get()
+        actual_columns = _resolve_columns(normalised_cols, original_cols)
 
-        print(f"[job:{job_id}] MAPPED {len(actual_columns)} fields: {list(actual_columns.keys())}")
+        print(f"[job:{job_id}] MAPPED {len(actual_columns)} fields: {actual_columns}")
 
         def gcol(field):
             return actual_columns.get(field, '')
 
-        # Drop completely empty rows
+        # Drop completely empty rows (keep original column names)
         df = df.dropna(how='all').reset_index(drop=True)
 
         total_rows = len(df)
@@ -396,10 +403,14 @@ def _run_energy_import(
                 contact_person = main_contact or client_name
                 phone          = tel_no or mobile_no
 
-                # Debug first 3 rows
+                # Debug first 3 rows — dump full row dict to see exactly what pandas gives us
                 if index < 3:
                     print(f"[job:{job_id}] Row {index+2}: business='{business_name}' "
                           f"contact='{contact_person}' phone='{phone}' mpan='{mpan_top}'")
+                    print(f"[job:{job_id}] Row {index+2} RAW dict: {dict(list(row.items())[:8])}")
+                    print(f"[job:{job_id}] Row {index+2} gcol(client_name)='{gcol('client_name')}' "
+                          f"row.get(gcol)='{row.get(gcol('client_name'))}' "
+                          f"row.index[:5]={list(row.index[:5])}")
 
                 # Skip completely blank rows
                 if not business_name and not phone and not email and not mpan_top and not contact_person:
@@ -678,14 +689,17 @@ def _run_leads_import(
                 pass
 
         original_cols = list(df.columns)
-        df.columns = (
+        normalised_cols = (
             df.columns.str.strip()
             .str.lower()
             .str.replace('_', ' ', regex=False)
             .str.replace(r'\s+', ' ', regex=True)
+            .tolist()
         )
-        actual_columns = _resolve_columns(list(df.columns))
-        df.columns = original_cols
+        # Pass original cols so gcol() returns original-cased names for row.get()
+        actual_columns = _resolve_columns(normalised_cols, original_cols)
+
+        print(f"[job:{job_id}] Leads MAPPED {len(actual_columns)} fields: {list(actual_columns.keys())}")
 
         def gcol(field):
             return actual_columns.get(field, '')

@@ -225,40 +225,36 @@ def get_leads():
                 .outerjoin(Supplier_Master, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
                 .outerjoin(Client_Master, Opportunity_Details.client_id == Client_Master.client_id)
                 .filter(
-                    (Opportunity_Details.tenant_id == tenant_id) | 
+                    (Opportunity_Details.tenant_id == tenant_id) |
                     ((Opportunity_Details.client_id.isnot(None)) & (Client_Master.tenant_id == tenant_id))
                 )
                 .filter(Opportunity_Details.service_id == service_id)
                 .filter(Opportunity_Details.opportunity_owner_employee_id.isnot(None))
                 .filter((Opportunity_Details.is_draft == False) | (Opportunity_Details.is_draft.is_(None)))
-                # ✅ Exclude soft-deleted leads (Cleansing / Recycle Bin)
                 .filter(
                     (Client_Master.is_deleted.is_(None)) |
                     (Client_Master.is_deleted == False)
                 )
             )
 
-            # ✅ Platform admin sees ALL leads, everyone else sees only their own
             if not admin_user:
                 query = query.filter(
                     Opportunity_Details.opportunity_owner_employee_id == employee_id,
                     (Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None))
                 )
 
-            # Exclude stage filter
             if exclude_stage:
                 query = query.filter(
-                    (Stage_Master.stage_name.is_(None)) | 
+                    (Stage_Master.stage_name.is_(None)) |
                     (func.lower(Stage_Master.stage_name) != exclude_stage.lower())
                 )
 
             query = query.order_by(Opportunity_Details.created_at.desc())
             rows = query.all()
 
-            # Build results
             results = []
             for row in rows:
-                od = row[0]  # Opportunity_Details object
+                od = row[0]
                 results.append({
                     'opportunity_id': od.opportunity_id,
                     'tenant_lead_id': od.tenant_lead_id,
@@ -289,14 +285,54 @@ def get_leads():
 
             current_app.logger.warning(
                 'crm.get_leads result tenant=%s user_id=%s employee_id=%s is_admin=%s returned=%s first_ids=%s',
-                tenant_id,
-                user_id,
-                employee_id,
-                admin_user,
-                len(results),
+                tenant_id, user_id, employee_id, admin_user, len(results),
                 [r.get('tenant_lead_id') or r.get('opportunity_id') for r in results[:5]]
             )
 
+            # ✅ Build team stats for admin
+            if admin_user:
+                stats_rows = (
+                    session.query(
+                        Employee_Master.employee_id,
+                        Employee_Master.employee_name,
+                        func.count(Opportunity_Details.opportunity_id).label('count')
+                    )
+                    .outerjoin(Client_Master, Opportunity_Details.client_id == Client_Master.client_id)
+                    .join(Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id)
+                    .filter(
+                        (Opportunity_Details.tenant_id == tenant_id) |
+                        ((Opportunity_Details.client_id.isnot(None)) & (Client_Master.tenant_id == tenant_id))
+                    )
+                    .filter(Opportunity_Details.service_id == service_id)
+                    .filter(Opportunity_Details.opportunity_owner_employee_id.isnot(None))
+                    .filter((Opportunity_Details.is_draft == False) | (Opportunity_Details.is_draft.is_(None)))
+                    .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
+                    .filter(
+                        (Client_Master.is_deleted.is_(None)) |
+                        (Client_Master.is_deleted == False)
+                    )
+                    .group_by(Employee_Master.employee_id, Employee_Master.employee_name)
+                    .having(func.count(Opportunity_Details.opportunity_id) > 0)
+                    .order_by(Employee_Master.employee_name.asc())
+                    .all()
+                )
+
+                team_stats = [
+                    {
+                        'employee_id': r.employee_id,
+                        'employee_name': r.employee_name,
+                        'count': int(r.count or 0),
+                    }
+                    for r in stats_rows
+                ]
+
+                return jsonify({
+                    'data': results,
+                    'team_stats': team_stats,
+                    'total': len(results)
+                }), 200
+
+            # Non-admin: return plain array (frontend handles both formats)
             return jsonify(results), 200
 
         except Exception as e:
@@ -2043,6 +2079,13 @@ def get_leads_stats_by_employee():
     session = SessionLocal()
     try:
         tenant_id = g.tenant_id
+        current_user = request.current_user
+        role_name = getattr(current_user, 'role', None)
+
+        # ✅ Only platform admins can see team overview
+        if not is_crm_leads_admin_role(role_name):
+            return jsonify({'stats': []}), 200
+
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
 
@@ -2060,10 +2103,16 @@ def get_leads_stats_by_employee():
             )
             .filter(Opportunity_Details.service_id == service_id)
             .filter(Opportunity_Details.opportunity_owner_employee_id.isnot(None))
+            .filter((Opportunity_Details.is_draft == False) | (Opportunity_Details.is_draft.is_(None)))
             .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
+            # ✅ Exclude soft-deleted
+            .filter(
+                (Client_Master.is_deleted.is_(None)) |
+                (Client_Master.is_deleted == False)
+            )
             .group_by(Employee_Master.employee_id, Employee_Master.employee_name)
             .having(func.count(Opportunity_Details.opportunity_id) > 0)
-            .order_by(func.count(Opportunity_Details.opportunity_id).desc())
+            .order_by(Employee_Master.employee_name.asc())
             .all()
         )
 
@@ -2083,7 +2132,6 @@ def get_leads_stats_by_employee():
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
-
 
 @crm_bp.route('/leads/stats-by-employee-detailed', methods=['GET'])
 @token_required
