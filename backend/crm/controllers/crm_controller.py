@@ -4,6 +4,7 @@ CRM Controllers
 Request handling layer for CRM operations
 """
 from pydoc import text
+from venv import logger
 
 from flask import request, jsonify, g
 from typing import Dict, Any
@@ -311,8 +312,8 @@ class CRMController:
                         employee_name = emp_result[0]
                 
                 # Determine is_allocated flag
-                current_user_employee_id = user.employee_id
-                is_allocated = (employee_id != current_user_employee_id)
+                current_user_employee_id = getattr(user, 'employee_id', None)
+                is_allocated = (current_user_employee_id is None) or (employee_id != current_user_employee_id)
                 
                 # Perform the assignment
                 for lead_id in lead_ids:
@@ -331,22 +332,26 @@ class CRMController:
                     
                     # Log assignment in history
                     if assignment_notes:
-                        from backend.routes.crm_routes import ensure_lead_client_id
-                        from backend.models import Client_Interactions
                         from datetime import datetime
-                        
                         try:
-                            client_id = ensure_lead_client_id(session, lead_id, tenant_id)
+                            lead_row = session.execute(text("""
+                                SELECT client_id FROM "StreemLyne_MT"."Opportunity_Details"
+                                WHERE opportunity_id = :id AND tenant_id = :tid
+                                LIMIT 1
+                            """), {'id': lead_id, 'tid': tenant_id}).fetchone()
                             
-                            interaction = Client_Interactions(
-                                client_id=client_id,
-                                contact_date=datetime.utcnow().date(),
-                                contact_method=1,
-                                notes=f"[Assignment] Assigned to {employee_name}: {assignment_notes}",
-                                next_steps='Assignment',
-                                created_at=datetime.utcnow()
-                            )
-                            session.add(interaction)
+                            client_id = lead_row[0] if lead_row else None
+                            
+                            if client_id:
+                                session.execute(text("""
+                                    INSERT INTO "StreemLyne_MT"."Client_Interactions"
+                                        (client_id, contact_date, contact_method, notes, next_steps, created_at)
+                                    VALUES (:cid, CURRENT_DATE, 1, :notes, 'Assignment', :now)
+                                """), {
+                                    'cid': client_id,
+                                    'notes': f"[Assignment] Assigned to {employee_name}: {assignment_notes}",
+                                    'now': datetime.utcnow()
+                                })
                         except Exception as e:
                             logger.error(f'❌ Error logging assignment history: {e}')
                 

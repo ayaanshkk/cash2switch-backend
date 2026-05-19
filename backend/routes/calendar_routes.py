@@ -96,7 +96,7 @@ def get_renewals_calendar():
             AND cm.client_company_name != '[IMPORTED LEADS]'
             AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
             AND ecm.contract_end_date IS NOT NULL
-            AND (pd.status IS NULL OR LOWER(pd.status) NOT IN ('priced', 'lost', 'lost cot'))
+            AND (pd.status IS NULL OR LOWER(pd.status) NOT IN ('priced', 'lost', 'lost cot', 'dead', 'invalid number', 'incorrect supplier', 'broker in place', 'complaint'))
             {employee_filter}
         ''')
         
@@ -148,7 +148,7 @@ def get_renewals_calendar():
             AND cm.client_company_name != '[IMPORTED LEADS]'
             AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
             AND lci.reminder_date IS NOT NULL
-            AND (pd2.status IS NULL OR LOWER(pd2.status) NOT IN ('priced', 'lost', 'lost cot'))
+            AND (pd2.status IS NULL OR LOWER(pd2.status) NOT IN ('priced', 'lost', 'lost cot', 'dead', 'invalid number', 'incorrect supplier', 'broker in place', 'complaint'))
             {callback_employee_filter}
             ORDER BY cm.client_id
         ''')
@@ -365,7 +365,7 @@ def get_leads_calendar():
             WHERE (od."tenant_id" = :tenant_id OR (od."client_id" IS NOT NULL AND cm."tenant_id" = :tenant_id))
             AND od."service_id" = :service_id
             AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
-            AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") NOT IN ('lost', 'lost cot'))
+            AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") NOT IN ('lost', 'lost cot', 'dead', 'invalid number', 'incorrect supplier', 'broker in place', 'complaint'))
             AND NOT EXISTS (
                     SELECT 1
                     FROM "StreemLyne_MT"."Project_Details" pd
@@ -472,7 +472,7 @@ def get_contract_schedule():
             LEFT JOIN "StreemLyne_MT"."Client_Interactions" ci ON cm.client_id = ci.client_id
             WHERE cm.tenant_id = %s
             AND (ecm.contract_end_date IS NOT NULL OR ci.reminder_date IS NOT NULL)
-            AND (pd.status IS NULL OR LOWER(pd.status) NOT IN ('priced', 'lost'))
+            AND (pd.status IS NULL OR LOWER(pd.status) NOT IN ('priced', 'lost', 'dead', 'invalid number', 'incorrect supplier', 'broker in place', 'complaint'))
             ORDER BY cm.client_id
         '''
         

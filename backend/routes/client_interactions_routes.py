@@ -299,7 +299,11 @@ def add_callback(client_id):
                     notes = f"Old end date: {old_fmt} → New end date: {new_fmt}"
                     if data.get('notes', '').strip():
                         notes = f"{data.get('notes').strip()} | {notes}"
- 
+                    
+                    # ✅ FIX: Override callback_date to new_end_date so calendar shows
+                    # the event on the correct contract end date, not today's log date
+                    callback_date = new_end_date_str
+
             except Exception as e:
                 session.rollback()
                 import traceback; traceback.print_exc()

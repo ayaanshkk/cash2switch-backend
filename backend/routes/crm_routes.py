@@ -1025,7 +1025,7 @@ def update_lead_status(opportunity_id):
 def assign_leads():
     """
     PATCH /api/crm/leads/assign
-    Bulk assign leads to an employee. Admin only.
+    Bulk assign leads to an employee. Available to all users.
     Request body: { lead_ids: [...], employee_id: N }
     """
     return crm_controller.assign_leads()
