@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ bucket_title }}</title>
+</head>
+<body style="font-family: system-ui, Segoe UI, sans-serif; line-height: 1.5; color: #1a1a1a; max-width: 560px; margin: 0 auto; padding: 24px;">
+  <p>Hello{% if contact_name %} {{ contact_name }}{% endif %},</p>
+
+  {% if bucket_key == 'renewal_60_90' %}
+  <p>Your <strong>{{ service_label }}</strong> agreement with <strong>{{ company_name }}</strong> is due for renewal in <strong>{{ days_remaining }} days</strong>, on <strong>{{ contract_end_date }}</strong>.</p>
+  <p>Please contact us soon so we can help you secure the best options before your current contract ends.</p>
+  {% elif bucket_key == 'renewal_91_180' %}
+  <p>Your <strong>{{ service_label }}</strong> plan for <strong>{{ company_name }}</strong> ends on <strong>{{ contract_end_date }}</strong> (in <strong>{{ days_remaining }} days</strong>). It is a good time to start reviewing renewal options.</p>
+  {% else %}
+  <p>We are writing to let you know that your <strong>{{ service_label }}</strong> contract for <strong>{{ company_name }}</strong> is scheduled to end on <strong>{{ contract_end_date }}</strong> (in <strong>{{ days_remaining }} days</strong>). We will stay in touch as your renewal date approaches.</p>
+  {% endif %}
+
+  {% if postal_address_line %}
+  <p style="font-size: 0.85rem; color: #555;">Registered / correspondence address: {{ postal_address_line }}</p>
+  {% endif %}
+</body>
+</html>

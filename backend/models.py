@@ -7,7 +7,7 @@ import uuid
 import secrets
 from datetime import datetime, timedelta
 from sqlalchemy import (
-    Column, Integer, SmallInteger, String, Boolean, DateTime, Date, 
+    Column, Integer, BigInteger, SmallInteger, String, Boolean, DateTime, Date,
     ForeignKey, Text, Float, Numeric
 )
 from sqlalchemy.orm import relationship
@@ -253,7 +253,8 @@ class Project_Details(Base):
     updated_at = Column(DateTime)
     address = Column(String(500))
     Misc_Col1 = Column(String(255))
-    Misc_Col2 = Column(Integer)
+    # Stored as varchar in some deployments; map as string and parse in app/SQL
+    Misc_Col2 = Column(String(255))
     site_name = Column(String(255))
     month_sold = Column(String(50))
     house_name = Column(String(255))
@@ -291,18 +292,25 @@ class Energy_Contract_Master(Base):
     rate_3 = Column(Numeric(10, 4))
     comms_paid = Column(Numeric(10, 2))
     term_sold = Column(Numeric(10, 2))
-    standing_charge = Column(Numeric(10, 2))
+    standing_charge = Column(String(50))
     aggregator = Column(String(255))
     rate_1 = Column(Numeric(10, 4))
     payment_type = Column(String(50))
 
 
 class Opportunity_Details(Base):
+    """
+    ✅ CORRECTED: Added all missing columns that are queried in crm_routes.py
+    This model now matches the actual database schema after ALTER TABLE migrations.
+    """
     __tablename__ = 'Opportunity_Details'
     __table_args__ = {'schema': SCHEMA}
     
+    # ── Core fields ──────────────────────────────────────────────────────────
     opportunity_id = Column(SmallInteger, primary_key=True, autoincrement=True)
     tenant_opportunity_id = Column(SmallInteger, nullable=True)
+    tenant_lead_id = Column(SmallInteger, nullable=True)  # Display ID for leads
+    tenant_id = Column(SmallInteger, nullable=True)  # ✅ REQUIRED for tenant filtering
     client_id = Column(SmallInteger, nullable=True)
     opportunity_title = Column(String(255))
     opportunity_description = Column(Text)
@@ -313,6 +321,68 @@ class Opportunity_Details(Base):
     currency_id = Column(SmallInteger)
     created_at = Column(DateTime)
     Misc_Col1 = Column(String(255))
+    
+    # ── Lead-specific fields (from ALTER TABLE migrations) ──────────────────
+    service_id = Column(SmallInteger, nullable=True)  # ✅ 1=electricity, 2=water
+    business_name = Column(String(255), nullable=True)  # ✅ Required for display
+    contact_person = Column(String(255), nullable=True)
+    tel_number = Column(String(50), nullable=True)
+    mobile_no = Column(String(50), nullable=True)
+    email = Column(String(255), nullable=True)
+    mpan_mpr = Column(String(100), nullable=True)
+    mpan_bottom = Column(String(100), nullable=True)
+    start_date = Column(Date, nullable=True)
+    end_date = Column(Date, nullable=True)
+    
+    # ── Contract details ─────────────────────────────────────────────────────
+    supplier_id = Column(SmallInteger, nullable=True)  # ✅ Required for filtering
+    annual_usage = Column(Numeric(10, 2), nullable=True)
+    stand_charge = Column(Numeric(10, 4), nullable=True)
+    rate_1 = Column(Numeric(10, 4), nullable=True)
+    rate_2 = Column(Numeric(10, 4), nullable=True)
+    rate_3 = Column(Numeric(10, 4), nullable=True)
+    net_notch = Column(Numeric(10, 2), nullable=True)
+    payment_type = Column(String(50), nullable=True)
+    
+    # ── Address fields ───────────────────────────────────────────────────────
+    postcode = Column(String(20), nullable=True)
+    house_name = Column(String(255), nullable=True)
+    house_number = Column(String(50), nullable=True)
+    door_number = Column(String(50), nullable=True)
+    address = Column(String(500), nullable=True)
+    town = Column(String(100), nullable=True)
+    county = Column(String(100), nullable=True)
+    
+    # ── Personal details ─────────────────────────────────────────────────────
+    position = Column(String(100), nullable=True)
+    company_number = Column(String(50), nullable=True)
+    date_of_birth = Column(Date, nullable=True)
+    
+    # ── Banking ──────────────────────────────────────────────────────────────
+    bank_name = Column(String(255), nullable=True)
+    bank_account_number = Column(String(50), nullable=True)
+    bank_sort_code = Column(String(20), nullable=True)
+    charity_ltd_company_number = Column(String(50), nullable=True)
+    partner_details = Column(Text, nullable=True)
+    
+    # ── Additional fields ────────────────────────────────────────────────────
+    meter_ref = Column(String(100), nullable=True)
+    uplift = Column(Numeric(10, 2), nullable=True)
+    comments = Column(Text, nullable=True)
+    document_details = Column(String(500), nullable=True)
+    site_name = Column(String(255), nullable=True)
+    month_sold = Column(String(50), nullable=True)
+    term_sold = Column(Numeric(10, 2), nullable=True)
+    aggregator = Column(String(255), nullable=True)
+    other_charges_1 = Column(Numeric(10, 4), nullable=True)
+    other_charges_2 = Column(Numeric(10, 4), nullable=True)
+    other_charges_3 = Column(Numeric(10, 4), nullable=True)
+    night_charge = Column(Numeric(10, 4), nullable=True)
+    eve_weekend_charge = Column(Numeric(10, 4), nullable=True)
+    
+    # ── Assignment tracking (mirrors Client_Master.is_allocated behavior) ───
+    is_allocated = Column(Boolean, default=False, nullable=True)  # ✅ Required
+    notes = Column(Text, nullable=True)
 
 
 class Client_Interactions(Base):
@@ -450,3 +520,20 @@ class Notification_Master(Base):
     
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     read_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class Renewal_Email_Send_Log(Base):
+    """Audit and idempotency for automated renewal reminder emails to customers."""
+    __tablename__ = 'Renewal_Email_Send_Log'
+    __table_args__ = {'schema': SCHEMA}
+
+    renewal_email_send_log_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    tenant_id = Column(SmallInteger, nullable=False)
+    energy_contract_master_id = Column(SmallInteger, nullable=False)
+    contract_end_date = Column(Date, nullable=False)
+    bucket_key = Column(String(50), nullable=False)
+    recipient_email = Column(String(255), nullable=False)
+    provider_message_id = Column(String(255), nullable=True)
+    status = Column(String(50), nullable=False)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)

@@ -46,17 +46,6 @@ def create_app():
         raise ValueError("JWT_SECRET_KEY must be set in environment variables")
     app.config["SECRET_KEY"] = jwt_secret
 
-    try:
-        from backend.dummy_local_dashboard_data import local_demo_dashboard_enabled
-
-        if local_demo_dashboard_enabled():
-            logging.warning(
-                "LOCAL_DEMO_DASHBOARD is enabled: mock data for /energy-renewals/* and /employees "
-                "(set LOCAL_DEMO_DASHBOARD=0 or use production to disable)."
-            )
-    except Exception:
-        pass
-
     # ============================================
     # ⚙️ DATABASE INITIALIZATION (NEW LOCATION)
     # ============================================
@@ -123,27 +112,18 @@ def create_app():
     # ============================================
     CORS(
         app,
-        resources={r"/*": {
-            "origins": [
-                "https://cash2switch.vercel.app",
-                "https://cash2switch-*.vercel.app",
-                "https://business-gas.vercel.app",  # ✅ ADD THIS
-                "https://business-gas-*.vercel.app",  # ✅ ADD THIS for preview deployments
-                "http://localhost:3000",
-                "http://localhost:3001",
-                "*"
-            ],
-            "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-            "allow_headers": [
-                "Content-Type", 
-                "Authorization", 
-                "X-Requested-With",
-                "X-Tenant-ID"  # ✅ ADD THIS - was missing!
-            ],
-            "expose_headers": ["Content-Type", "Authorization"],
-            "supports_credentials": False,
-            "max_age": 3600,
-        }}
+        origins="*",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=[
+            "Content-Type",
+            "Authorization",
+            "X-Requested-With",
+            "X-Tenant-ID"
+        ],
+        expose_headers=["Content-Type", "Authorization"],
+        supports_credentials=False,
+        max_age=3600,
+        automatic_options=True
     )
 
     # ============================================
@@ -153,8 +133,9 @@ def create_app():
         auth_routes, db_routes,
         notification_routes,
         customer_routes, file_routes,
-        crm_routes, document_routes, calendar_routes, customer_portal_routes,
+        crm_routes, document_routes, calendar_routes,
         import_routes, energy_renewals_routes, bulk_import_optimized, async_bulk_routes, client_interactions_routes,
+        renewal_email_routes,
     )
 
     app.register_blueprint(auth_routes.auth_bp, url_prefix='/auth')
@@ -167,8 +148,8 @@ def create_app():
     app.register_blueprint(crm_routes.crm_bp)
     app.register_blueprint(document_routes.document_bp)
     app.register_blueprint(calendar_routes.calendar_bp)
-    app.register_blueprint(customer_portal_routes.customer_portal_bp)
     app.register_blueprint(client_interactions_routes.client_interaction_bp)
+    app.register_blueprint(renewal_email_routes.renewal_email_bp)
     # app.register_blueprint(bulk_import_optimized.bulk_import_bp, url_prefix='/api')
     # app.register_blueprint(async_bulk_routes.async_bulk_bp, url_prefix='/api')
     logging.info("CRM Blueprint registered successfully") 

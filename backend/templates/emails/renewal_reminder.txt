@@ -1,0 +1,12 @@
+Hello{% if contact_name %} {{ contact_name }}{% endif %},
+
+{% if bucket_key == 'renewal_60_90' %}
+Your {{ service_label }} agreement is due for renewal in {{ days_remaining }} days, on {{ contract_end_date }}.
+Please contact us so we can help before your current contract ends.
+{% elif bucket_key == 'renewal_91_180' %}
+Your {{ service_label }} plan ends on {{ contract_end_date }} ({{ days_remaining }} days). It is a good time to start reviewing renewal options.
+{% else %}
+Your {{ service_label }} contract is scheduled to end on {{ contract_end_date }} ({{ days_remaining }} days). We will stay in touch as your renewal date approaches.
+{% endif %}
+
+{% if postal_address_line %}Address: {{ postal_address_line }}{% endif %}
