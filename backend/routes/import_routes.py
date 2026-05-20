@@ -44,18 +44,68 @@ LEADS_BATCH_SIZE  = 1000  # Opportunity_Details is simpler, can go larger
 def _get_raw_connection():
     """
     Open a raw psycopg2 connection independent of SQLAlchemy.
-    Uses DATABASE_URL env var (strips SQLAlchemy driver prefix if present).
+    Handles Supabase URLs which contain options=--search_path=... 
+    that psycopg2 cannot parse directly.
     """
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+    import re
+
     db_url = os.environ.get('DATABASE_URL', '')
+
+    # Strip SQLAlchemy driver prefixes
     for prefix in ('postgresql+psycopg2://', 'postgresql+pg8000://',
                    'postgres+psycopg2://', 'postgres+pg8000://'):
         if db_url.startswith(prefix):
             db_url = 'postgresql://' + db_url[len(prefix):]
             break
+
     if not db_url:
         raise RuntimeError('DATABASE_URL environment variable not set')
+
+    # ── Parse out the options param which Supabase adds ───────────────────────
+    # Supabase adds: ?options=--search_path%3Dpublic  (encoded =)
+    # psycopg2 chokes on the nested = in the query string
+    parsed = urlparse(db_url)
+    search_path = None
+
+    if parsed.query:
+        # Decode query string manually
+        query_params = parse_qs(parsed.query, keep_blank_values=True)
+        options_val  = query_params.pop('options', [None])[0]
+
+        if options_val:
+            # Extract --search_path=xxx from the options value
+            m = re.search(r'--search_path[= ]([^\s&]+)', options_val)
+            if m:
+                search_path = m.group(1)
+
+        # Rebuild URL without the options param
+        new_query = urlencode(
+            {k: v[0] for k, v in query_params.items()},
+            safe=''
+        )
+        parsed    = parsed._replace(query=new_query)
+        db_url    = urlunparse(parsed)
+
+    # Remove trailing ? if query is now empty
+    if db_url.endswith('?'):
+        db_url = db_url[:-1]
+
     conn = psycopg2.connect(db_url)
     conn.autocommit = False
+
+    # Apply search_path if extracted from options
+    if search_path:
+        cur = conn.cursor()
+        # search_path may be comma-separated; quote each schema
+        schemas = ', '.join(
+            f'"{s.strip()}"' if not s.strip().startswith('"') else s.strip()
+            for s in search_path.split(',')
+        )
+        cur.execute(f'SET search_path TO {schemas}')
+        cur.close()
+        conn.commit()
+
     return conn
 
 
