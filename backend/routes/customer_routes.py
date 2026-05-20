@@ -712,6 +712,7 @@ def update_energy_customer(client_id):
 
         # Update Project_Details
         project = session.query(Project_Details).filter_by(client_id=client_id).first()
+        old_status_for_log = project.status if project else None  # ✅ always initialize
         if project:
             for field, col in [('site_address', 'address'), ('annual_usage', 'Misc_Col2'),
                                 ('site_name', 'site_name'), ('month_sold', 'month_sold'),
@@ -721,6 +722,7 @@ def update_energy_customer(client_id):
                     setattr(project, col, data[field])
 
             # ✅ Status now on Project_Details
+            old_status_for_log = project.status  
             if 'status' in data:
                 status_value = data['status']
                 project.status = None if status_value in ['None', 'null', '', None] else status_value
@@ -780,10 +782,12 @@ def update_energy_customer(client_id):
             old_assigned_to = None
             new_assigned_to = None
             assignment_notes = None
+            old_status_for_log = None
         else:
             old_assigned_to = None
             new_assigned_to = None
             assignment_notes = None
+            old_status_for_log = None
  
         # Update Energy_Contract_Master
         if project:

@@ -234,127 +234,169 @@ def _flush_energy_batch(
     opportunity_owner_id, is_draft_import, import_service_id,
     existing_mpans,
 ):
-    """
-    Bulk-insert one batch.
-    Uses a single multi-row VALUES INSERT with RETURNING for each table —
-    this works with psycopg2 via raw connection cursor (bypassing SQLAlchemy
-    executemany limitations with RETURNING).
-    Returns (inserted_count, error_count).
-    """
     if not batch:
         return 0, 0
 
     now = datetime.utcnow()
 
     try:
-        raw_conn = session.connection().connection  # raw psycopg2 connection
-        cursor   = raw_conn.cursor()
-
         # ── 1. Client_Master ──────────────────────────────────────────────────
-        client_values = []
-        client_params = []
+        client_rows = []
         for r in batch:
-            client_values.append(
-                "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'',"
-                "FALSE,FALSE,1,FALSE)"
-            )
-            client_params.extend([
-                tenant_id, opportunity_owner_id,
-                r['business_name'], r['contact_person'],
-                r['address'], r['postcode'],
-                r['tel_no'], r['mobile_no'], r['email'],
-                r['position'], r['company_number'], r['date_of_birth'],
-                r['charity_ltd'], r['partner_details'],
-                r['bank_name'], r['account_number'], r['sort_code'],
-                r['home_door'], r['home_street'],
-                r['partner_dob'], r['credit_score'],
-                is_draft_import, now,
-            ])
+            client_rows.append({
+                'tenant_id': str(tenant_id),
+                'assigned_employee_id': opportunity_owner_id,
+                'client_company_name': r['business_name'],
+                'client_contact_name': r['contact_person'],
+                'address': r['address'],
+                'post_code': r['postcode'],
+                'client_phone': r['tel_no'],
+                'client_mobile': r['mobile_no'],
+                'client_email': r['email'],
+                'position': r['position'],
+                'company_number': r['company_number'],
+                'date_of_birth': r['date_of_birth'],
+                'charity_ltd_company_number': r['charity_ltd'],
+                'partner_details': r['partner_details'],
+                'bank_name': r['bank_name'],
+                'account_number': r['account_number'],
+                'sort_code': r['sort_code'],
+                'home_door_number': r['home_door'],
+                'home_street': r['home_street'],
+                'partner_dob': r['partner_dob'],
+                'credit_score': r['credit_score'],
+                'is_draft': is_draft_import,
+                'created_at': now,
+                'client_website': '',
+                'is_deleted': False,
+                'is_archived': False,
+                'default_currency_id': 1,
+                'is_allocated': False,
+            })
 
-        cursor.execute(
-            f"""INSERT INTO "StreemLyne_MT"."Client_Master"
-            (tenant_id, assigned_employee_id, client_company_name, client_contact_name,
-             address, post_code, client_phone, client_mobile, client_email,
-             position, company_number, date_of_birth, charity_ltd_company_number,
-             partner_details, bank_name, account_number, sort_code,
-             home_door_number, home_street, partner_dob, credit_score,
-             is_draft, created_at, client_website,
-             is_deleted, is_archived, default_currency_id, is_allocated)
-            VALUES {','.join(client_values)}
-            RETURNING client_id""",
-            client_params
+        result = session.execute(
+            text("""
+                INSERT INTO "StreemLyne_MT"."Client_Master"
+                (tenant_id, assigned_employee_id, client_company_name, client_contact_name,
+                 address, post_code, client_phone, client_mobile, client_email,
+                 position, company_number, date_of_birth, charity_ltd_company_number,
+                 partner_details, bank_name, account_number, sort_code,
+                 home_door_number, home_street, partner_dob, credit_score,
+                 is_draft, created_at, client_website,
+                 is_deleted, is_archived, default_currency_id, is_allocated)
+                VALUES (
+                    :tenant_id, :assigned_employee_id, :client_company_name, :client_contact_name,
+                    :address, :post_code, :client_phone, :client_mobile, :client_email,
+                    :position, :company_number, :date_of_birth, :charity_ltd_company_number,
+                    :partner_details, :bank_name, :account_number, :sort_code,
+                    :home_door_number, :home_street, :partner_dob, :credit_score,
+                    :is_draft, :created_at, :client_website,
+                    :is_deleted, :is_archived, :default_currency_id, :is_allocated
+                )
+                RETURNING client_id
+            """),
+            client_rows
         )
-        client_ids = [row[0] for row in cursor.fetchall()]
+        client_ids = [row[0] for row in result.fetchall()]
 
         if len(client_ids) != len(batch):
-            raw_conn.rollback()
+            session.rollback()
             return 0, len(batch)
 
         # ── 2. Project_Details ────────────────────────────────────────────────
-        proj_values  = []
-        proj_params  = []
+        project_rows = []
         for cid, r in zip(client_ids, batch):
-            proj_values.append(
-                "(%s,%s,'Imported renewal contract',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s)"
-            )
-            proj_params.extend([
-                cid,
-                r['business_name'] or 'Renewal Contract',
-                r['site_address'], r['annual_usage'],
-                employee_id, opportunity_owner_id,
-                r['contract_start'], r['contract_end'],
-                r['site_name'], r['month_sold'],
-                r['house_name'], r['house_number'], r['door_number'],
-                r['town'], r['county'],
-                now, now,
-            ])
+            project_rows.append({
+                'client_id': cid,
+                'project_title': r['business_name'] or 'Renewal Contract',
+                'project_description': 'Imported renewal contract',
+                'address': r['site_address'],
+                'Misc_Col2': r['annual_usage'],
+                'employee_id': employee_id,
+                'assigned_employee_id': opportunity_owner_id,
+                'start_date': r['contract_start'],
+                'end_date': r['contract_end'],
+                'site_name': r['site_name'],
+                'month_sold': r['month_sold'],
+                'house_name': r['house_name'],
+                'house_number': r['house_number'],
+                'door_number': r['door_number'],
+                'town': r['town'],
+                'county': r['county'],
+                'created_at': now,
+                'updated_at': now,
+            })
 
-        cursor.execute(
-            f"""INSERT INTO "StreemLyne_MT"."Project_Details"
-            (client_id, project_title, project_description, address, "Misc_Col2",
-             employee_id, assigned_employee_id, start_date, end_date,
-             site_name, month_sold, house_name, house_number, door_number,
-             town, county, status, created_at, updated_at)
-            VALUES {','.join(proj_values)}
-            RETURNING project_id""",
-            proj_params
+        result = session.execute(
+            text("""
+                INSERT INTO "StreemLyne_MT"."Project_Details"
+                (client_id, project_title, project_description, address, "Misc_Col2",
+                 employee_id, assigned_employee_id, start_date, end_date,
+                 site_name, month_sold, house_name, house_number, door_number,
+                 town, county, status, created_at, updated_at)
+                VALUES (
+                    :client_id, :project_title, :project_description, :address, :Misc_Col2,
+                    :employee_id, :assigned_employee_id, :start_date, :end_date,
+                    :site_name, :month_sold, :house_name, :house_number, :door_number,
+                    :town, :county, NULL, :created_at, :updated_at
+                )
+                RETURNING project_id
+            """),
+            project_rows
         )
-        project_ids = [row[0] for row in cursor.fetchall()]
+        project_ids = [row[0] for row in result.fetchall()]
 
         # ── 3. Energy_Contract_Master ─────────────────────────────────────────
-        con_values = []
-        con_params = []
+        contract_rows = []
         for pid, r in zip(project_ids, batch):
-            con_values.append(
-                "(%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'')"
-            )
-            con_params.extend([
-                pid, employee_id,
-                r['supplier_id'], r['old_supplier_id'],
-                r['contract_start'], r['contract_end'],
-                import_service_id, r['rate_1'] or 0.0,
-                now, now,
-                r['mpan_top'], r['mpan_bottom'],
-                r['net_notch'], r['rate_2'], r['rate_3'],
-                r['comms_paid'], r['stand_charge'],
-                r['aggregator'], r['rate_1'],
-                r['payment_type'], r['term_sold'],
-            ])
+            contract_rows.append({
+                'project_id': pid,
+                'employee_id': employee_id,
+                'supplier_id': r['supplier_id'],
+                'old_supplier_id': r['old_supplier_id'],
+                'contract_start_date': r['contract_start'],
+                'contract_end_date': r['contract_end'],
+                'service_id': import_service_id,
+                'unit_rate': r['rate_1'] or 0.0,
+                'currency_id': 1,
+                'created_at': now,
+                'updated_at': now,
+                'mpan_number': r['mpan_top'],
+                'mpan_bottom': r['mpan_bottom'],
+                'net_notch': r['net_notch'],
+                'rate_2': r['rate_2'],
+                'rate_3': r['rate_3'],
+                'comms_paid': r['comms_paid'],
+                'standing_charge': r['stand_charge'],
+                'aggregator': r['aggregator'],
+                'rate_1': r['rate_1'],
+                'payment_type': r['payment_type'],
+                'term_sold': r['term_sold'],
+                'terms_of_sale': '',
+            })
 
-        cursor.execute(
-            f"""INSERT INTO "StreemLyne_MT"."Energy_Contract_Master"
-            (project_id, employee_id, supplier_id, old_supplier_id,
-             contract_start_date, contract_end_date, service_id,
-             unit_rate, currency_id, created_at, updated_at,
-             mpan_number, mpan_bottom, net_notch, rate_2, rate_3,
-             comms_paid, standing_charge, aggregator, rate_1,
-             payment_type, term_sold, terms_of_sale)
-            VALUES {','.join(con_values)}""",
-            con_params
+        session.execute(
+            text("""
+                INSERT INTO "StreemLyne_MT"."Energy_Contract_Master"
+                (project_id, employee_id, supplier_id, old_supplier_id,
+                 contract_start_date, contract_end_date, service_id,
+                 unit_rate, currency_id, created_at, updated_at,
+                 mpan_number, mpan_bottom, net_notch, rate_2, rate_3,
+                 comms_paid, standing_charge, aggregator, rate_1,
+                 payment_type, term_sold, terms_of_sale)
+                VALUES (
+                    :project_id, :employee_id, :supplier_id, :old_supplier_id,
+                    :contract_start_date, :contract_end_date, :service_id,
+                    :unit_rate, :currency_id, :created_at, :updated_at,
+                    :mpan_number, :mpan_bottom, :net_notch, :rate_2, :rate_3,
+                    :comms_paid, :standing_charge, :aggregator, :rate_1,
+                    :payment_type, :term_sold, :terms_of_sale
+                )
+            """),
+            contract_rows
         )
 
-        raw_conn.commit()
-        cursor.close()
+        session.commit()
 
         # Register MPANs for intra-file dedup
         for r, cid in zip(batch, client_ids):
@@ -365,17 +407,11 @@ def _flush_energy_batch(
                     'assigned_employee_id': opportunity_owner_id,
                 }
 
-        # Keep SQLAlchemy session in sync
-        session.expire_all()
         return len(batch), 0
 
     except Exception as e:
         try:
-            raw_conn.rollback()
-        except Exception:
-            pass
-        try:
-            cursor.close()
+            session.rollback()
         except Exception:
             pass
         err = str(e).split('\n')[0][:200]
@@ -386,43 +422,67 @@ def _flush_energy_batch(
 def _flush_leads_batch(session, batch, tenant_id, import_service_id,
                         opportunity_owner_id, is_draft_import, default_stage_id,
                         existing_lead_mpans):
-    """Bulk insert leads via raw psycopg2 multi-row INSERT. Returns (inserted, errors)."""
     if not batch:
         return 0, 0
     now = datetime.utcnow()
     try:
-        raw_conn = session.connection().connection
-        cursor   = raw_conn.cursor()
-
-        values = []
-        params = []
+        rows = []
         for r in batch:
-            values.append(
-                "(%s,NULL,%s,'Imported lead',%s,%s,%s,0,1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
-            )
-            params.extend([
-                tenant_id,
-                r['title'], now, opportunity_owner_id, default_stage_id, now,
-                r['business_name'], r['contact_person'], r['tel'], r['mobile'], r['email'],
-                r['mpan'], r['mpan_b'], r['start_d'], r['end_d'], import_service_id,
-                r['sup_id'], r['usage'], r['sc'], r['r1'], r['r2'],
-                r['r3'], r['nn'], r['pt'], r['postcode'], is_draft_import,
-            ])
+            rows.append({
+                'tenant_id': str(tenant_id),
+                'opportunity_title': r['title'],
+                'opportunity_description': 'Imported lead',
+                'opportunity_date': now,
+                'opportunity_owner_employee_id': opportunity_owner_id,
+                'stage_id': default_stage_id,
+                'opportunity_value': 0,
+                'currency_id': 1,
+                'created_at': now,
+                'business_name': r['business_name'],
+                'contact_person': r['contact_person'],
+                'tel_number': r['tel'],
+                'mobile_no': r['mobile'],
+                'email': r['email'],
+                'mpan_mpr': r['mpan'],
+                'mpan_bottom': r['mpan_b'],
+                'start_date': r['start_d'],
+                'end_date': r['end_d'],
+                'service_id': import_service_id,
+                'supplier_id': r['sup_id'],
+                'annual_usage': r['usage'],
+                'stand_charge': r['sc'],
+                'rate_1': r['r1'],
+                'rate_2': r['r2'],
+                'rate_3': r['r3'],
+                'net_notch': r['nn'],
+                'payment_type': r['pt'],
+                'postcode': r['postcode'],
+                'is_draft': is_draft_import,
+            })
 
-        cursor.execute(
-            f"""INSERT INTO "StreemLyne_MT"."Opportunity_Details"
-            (tenant_id, client_id, opportunity_title, opportunity_description,
-             opportunity_date, opportunity_owner_employee_id, stage_id,
-             opportunity_value, currency_id, created_at,
-             business_name, contact_person, tel_number, mobile_no, email,
-             mpan_mpr, mpan_bottom, start_date, end_date, service_id,
-             supplier_id, annual_usage, stand_charge, rate_1, rate_2,
-             rate_3, net_notch, payment_type, postcode, is_draft)
-            VALUES {','.join(values)}""",
-            params
+        session.execute(
+            text("""
+                INSERT INTO "StreemLyne_MT"."Opportunity_Details"
+                (tenant_id, client_id, opportunity_title, opportunity_description,
+                 opportunity_date, opportunity_owner_employee_id, stage_id,
+                 opportunity_value, currency_id, created_at,
+                 business_name, contact_person, tel_number, mobile_no, email,
+                 mpan_mpr, mpan_bottom, start_date, end_date, service_id,
+                 supplier_id, annual_usage, stand_charge, rate_1, rate_2,
+                 rate_3, net_notch, payment_type, postcode, is_draft)
+                VALUES (
+                    :tenant_id, NULL, :opportunity_title, :opportunity_description,
+                    :opportunity_date, :opportunity_owner_employee_id, :stage_id,
+                    :opportunity_value, :currency_id, :created_at,
+                    :business_name, :contact_person, :tel_number, :mobile_no, :email,
+                    :mpan_mpr, :mpan_bottom, :start_date, :end_date, :service_id,
+                    :supplier_id, :annual_usage, :stand_charge, :rate_1, :rate_2,
+                    :rate_3, :net_notch, :payment_type, :postcode, :is_draft
+                )
+            """),
+            rows
         )
-        raw_conn.commit()
-        cursor.close()
+        session.commit()
 
         for r in batch:
             if r['mpan']:
@@ -430,17 +490,16 @@ def _flush_leads_batch(session, batch, tenant_id, import_service_id,
                     'tenant_id': tenant_id,
                     'business_name': r['business_name'],
                 })
-        session.expire_all()
+
         return len(batch), 0
+
     except Exception as e:
         try:
-            raw_conn.rollback()
-            cursor.close()
+            session.rollback()
         except Exception:
             pass
         print(f"Leads batch failed: {str(e).split(chr(10))[0][:150]}")
         return 0, len(batch)
-
 
 def _run_energy_import(
     job_id: str,
