@@ -834,13 +834,23 @@ def update_energy_customer(client_id):
                 if 'unit_rate' in data and data['unit_rate'] is not None:
                     contract.unit_rate = data['unit_rate']
                 if 'rate_1' in data and data['rate_1'] is not None:
-                    contract.unit_rate = data['rate_1']  # rate_1 maps to unit_rate
-                
-                # ✅ FIX: Add rate_2, rate_3, net_notch saving
+                    contract.rate_1 = data['rate_1']
                 if 'rate_2' in data and data['rate_2'] is not None:
                     contract.rate_2 = data['rate_2']
                 if 'rate_3' in data and data['rate_3'] is not None:
                     contract.rate_3 = data['rate_3']
+                if 'standing_charge' in data and data['standing_charge'] is not None:
+                    contract.standing_charge = data['standing_charge']
+                if 'night_charge' in data and data['night_charge'] is not None:
+                    contract.night_charge = data['night_charge']
+                if 'eve_weekend_charge' in data and data['eve_weekend_charge'] is not None:
+                    contract.eve_weekend_charge = data['eve_weekend_charge']
+                if 'other_charges_1' in data and data['other_charges_1'] is not None:
+                    contract.other_charges_1 = data['other_charges_1']
+                if 'other_charges_2' in data and data['other_charges_2'] is not None:
+                    contract.other_charges_2 = data['other_charges_2']
+                if 'other_charges_3' in data and data['other_charges_3'] is not None:
+                    contract.other_charges_3 = data['other_charges_3']
                 if 'net_notch' in data and data['net_notch'] is not None:
                     contract.net_notch = data['net_notch']
                 if 'comms_paid' in data and data['comms_paid'] is not None:
