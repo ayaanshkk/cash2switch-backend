@@ -882,41 +882,31 @@ def update_lead(opportunity_id):
 @token_required
 @tenant_from_jwt
 def update_lead_status(opportunity_id):
-    """
-    Update lead status (stage_id) only.
-    Handles cleansing and recycle bin routing based on status.
-    """
     session = SessionLocal()
     try:
         tenant_id = g.tenant_id
         data = request.get_json() or {}
-        
-        # Accept either stage_id or status (stage_name)
+
         stage_id = data.get('stage_id')
         status = data.get('status')
-        
-        current_app.logger.info(f'🔧 PATCH /api/crm/leads/{opportunity_id}/status')
-        current_app.logger.info(f'   Data: {data}')
-        
+
+        current_app.logger.info(f'🔧 PATCH /api/crm/leads/{opportunity_id}/status — data: {data}')
+
         if not stage_id and not status:
             return jsonify({'error': 'Either stage_id or status is required'}), 400
-        
-        # If status (stage_name) is provided, resolve to stage_id
+
+        # ✅ Always resolve stage from DB
         if status and not stage_id:
-            stage = session.query(Stage_Master).filter(
-                Stage_Master.stage_name == status
-            ).first()
-            
+            stage = session.query(Stage_Master).filter(Stage_Master.stage_name == status).first()
             if not stage:
                 return jsonify({'error': f'Stage not found: {status}'}), 400
-            
             stage_id = stage.stage_id
-            current_app.logger.info(f'   Resolved status "{status}" to stage_id={stage_id}')
         else:
-            # Get stage name from stage_id
             stage = session.query(Stage_Master).filter(Stage_Master.stage_id == stage_id).first()
-            status = stage.stage_name if stage else None
-        
+            if not stage:
+                return jsonify({'error': f'Stage not found for id: {stage_id}'}), 400
+            status = stage.stage_name
+
         # Resolve opportunity
         lead = (
             session.query(Opportunity_Details)
@@ -927,17 +917,22 @@ def update_lead_status(opportunity_id):
             )
             .first()
         )
-        
+
         if not lead:
             return jsonify({'error': 'Lead not found'}), 404
-        
+
         real_id = lead.opportunity_id
         lead_client_id = lead.client_id
-        
-        # ✅ CRITICAL: If no client_id, create one first
+
+        # ✅ Capture old stage for history
+        old_stage_name = None
+        if lead.stage_id:
+            old_stage_row = session.query(Stage_Master).filter_by(stage_id=lead.stage_id).first()
+            old_stage_name = old_stage_row.stage_name if old_stage_row else None
+
+        # ✅ CRITICAL: Create client if missing
         if not lead_client_id:
             current_app.logger.warning(f'Lead {real_id} has no client_id, creating one...')
-            
             client = Client_Master(
                 tenant_id=int(tenant_id),
                 assigned_employee_id=lead.opportunity_owner_employee_id,
@@ -951,65 +946,93 @@ def update_lead_status(opportunity_id):
             )
             session.add(client)
             session.flush()
-            
             lead_client_id = client.client_id
             lead.client_id = lead_client_id
             session.flush()
-        
-        # Update stage
+
+        # ✅ Update stage
         lead.stage_id = stage_id
         session.flush()
-        
-        current_app.logger.info(f'   ✅ Updated lead {real_id} to status: {status}')
-        
-        # ✅ Handle cleansing statuses (Invalid Number, Incorrect Supplier)
+        current_app.logger.info(f'✅ Updated lead {real_id}: {old_stage_name} → {status}')
+
+        # ✅ Write history BEFORE any early returns
+        transition = f"Status: {old_stage_name or 'None'} → {status}"
+        notes = data.get('notes', '')
+        formatted_notes = f"[{status}] {transition}" + (f" | {notes}" if notes else "")
+
+        interaction = Client_Interactions(
+            client_id=lead_client_id,
+            contact_date=datetime.utcnow().date(),
+            contact_method=1,
+            notes=formatted_notes,
+            next_steps=status,
+            created_at=datetime.utcnow()
+        )
+        session.add(interaction)
+        session.flush()
+
         CLEANSING_STATUSES = {'Invalid Number', 'Incorrect Supplier'}
         RECYCLE_BIN_STATUSES = {'Lost', 'Lost COT', 'Meter De-energised', 'Complaint'}
-        
+
         if status in CLEANSING_STATUSES:
             client = session.query(Client_Master).filter(
                 Client_Master.client_id == lead_client_id,
                 Client_Master.tenant_id == tenant_id
             ).first()
-            
             if client:
                 client.is_deleted = True
                 client.deleted_at = datetime.utcnow()
                 client.deleted_reason = status
                 if hasattr(client, 'is_cleansing'):
                     client.is_cleansing = True
-                
                 session.flush()
-                current_app.logger.info(f'   ✅ Moved to Cleansing: {status}')
-        
-        # ✅ Handle recycle bin statuses
+
+            session.commit()
+            return jsonify({
+                'success': True,
+                'message': f'Status updated to {status}',
+                'stage_id': stage_id,
+                'stage_name': status,
+                'moved_to_cleansing': True,
+                'moved_to_recycle_bin': False,
+                'interaction_id': interaction.interaction_id,
+            }), 200
+
         elif status in RECYCLE_BIN_STATUSES:
             client = session.query(Client_Master).filter(
                 Client_Master.client_id == lead_client_id,
                 Client_Master.tenant_id == tenant_id
             ).first()
-            
             if client:
                 client.is_deleted = True
                 client.deleted_at = datetime.utcnow()
                 client.deleted_reason = status
                 if hasattr(client, 'is_cleansing'):
                     client.is_cleansing = False
-                
                 session.flush()
-                current_app.logger.info(f'   ✅ Moved to Recycle Bin: {status}')
-        
+
+            session.commit()
+            return jsonify({
+                'success': True,
+                'message': f'Status updated to {status}',
+                'stage_id': stage_id,
+                'stage_name': status,
+                'moved_to_cleansing': False,
+                'moved_to_recycle_bin': True,
+                'interaction_id': interaction.interaction_id,
+            }), 200
+
         session.commit()
-        
         return jsonify({
             'success': True,
             'message': f'Status updated to {status}',
             'stage_id': stage_id,
             'stage_name': status,
-            'moved_to_cleansing': status in CLEANSING_STATUSES,
-            'moved_to_recycle_bin': status in RECYCLE_BIN_STATUSES,
+            'moved_to_cleansing': False,
+            'moved_to_recycle_bin': False,
+            'interaction_id': interaction.interaction_id,
         }), 200
-        
+
     except Exception as e:
         session.rollback()
         current_app.logger.exception(f'❌ Error in update_lead_status: {e}')
@@ -3429,197 +3452,182 @@ def get_cleansing():
 @token_required
 @tenant_from_jwt
 def leads_callback(opportunity_id):
-    """
-    POST /api/crm/leads/<id>/callback
-    Save callback status and notes to history
-    """
     if request.method == 'OPTIONS':
         return jsonify({}), 200
-    
+
     session = SessionLocal()
-    
+
     try:
         tenant_id = g.tenant_id
         data = request.get_json()
-        
+
         status = data.get('status')
         callback_date = data.get('callback_date')
         notes = data.get('notes', '')
-        
-        current_app.logger.info(f'📥 Leads callback: opportunity_id={opportunity_id}, status={status}, callback_date={callback_date}')
-        
-        # ✅ Resolve lead
-        lead = (
-            session.query(Opportunity_Details)
-            .filter(Opportunity_Details.tenant_id == tenant_id)
-            .filter(
-                (Opportunity_Details.opportunity_id == opportunity_id) |
-                (Opportunity_Details.tenant_lead_id == opportunity_id)
-            )
-            .first()
+
+        current_app.logger.info(
+            f'📥 Leads callback: opportunity_id={opportunity_id}, status={status}, '
+            f'callback_date={callback_date}, tenant_id={tenant_id}'
         )
-        
+
+        if not status:
+            return jsonify({'error': 'Status is required'}), 400
+
+        # ✅ Resolve lead — URL param may be opportunity_id OR tenant_lead_id
+        lead = session.query(Opportunity_Details).filter(
+            Opportunity_Details.tenant_id == tenant_id,
+            Opportunity_Details.opportunity_id == opportunity_id
+        ).first()
+
         if not lead:
+            lead = session.query(Opportunity_Details).filter(
+                Opportunity_Details.tenant_id == tenant_id,
+                Opportunity_Details.tenant_lead_id == opportunity_id
+            ).first()
+
+        if not lead:
+            current_app.logger.error(
+                f'❌ Lead not found: opportunity_id param={opportunity_id}, tenant={tenant_id}'
+            )
             return jsonify({'error': 'Lead not found'}), 404
-        
+
         real_id = lead.opportunity_id
         lead_client_id = lead.client_id
-        
-        # ✅ CRITICAL: If no client_id, create one first
+
+        current_app.logger.info(
+            f'✅ Resolved lead: real_opportunity_id={real_id}, client_id={lead_client_id}'
+        )
+
+        # ✅ Capture old stage name for history
+        old_stage = None
+        if lead.stage_id:
+            old_stage_row = session.query(Stage_Master).filter_by(
+                stage_id=lead.stage_id
+            ).first()
+            old_stage = old_stage_row.stage_name if old_stage_row else None
+
+        # ✅ Always resolve stage_id from DB — never trust frontend
+        stage = session.query(Stage_Master).filter(
+            Stage_Master.stage_name == status
+        ).first()
+
+        if not stage:
+            return jsonify({'error': f'Stage not found: {status}'}), 400
+
+        stage_id = stage.stage_id
+
+        # ✅ If no client_id, create one
         if not lead_client_id:
             current_app.logger.warning(f'Lead {real_id} has no client_id, creating one...')
-            
-            # Create client record (Client_Master already imported at top)
-            client = Client_Master(
-                tenant_id=int(tenant_id),
+            new_client = Client_Master(
+                tenant_id=tenant_id,  # ✅ keep original type, don't force int
                 assigned_employee_id=lead.opportunity_owner_employee_id,
                 client_company_name=lead.business_name or lead.opportunity_title or '[IMPORTED LEADS]',
                 client_contact_name=lead.contact_person or '',
-                client_phone=lead.tel_number or '',
+                client_phone=str(lead.tel_number).replace('.0', '') if lead.tel_number else '',
                 client_mobile=lead.mobile_no or '',
                 client_email=lead.email or '',
                 default_currency_id=1,
                 created_at=datetime.utcnow()
             )
-            session.add(client)
+            session.add(new_client)
             session.flush()
-            
-            lead_client_id = client.client_id
+            lead_client_id = new_client.client_id
             lead.client_id = lead_client_id
             session.flush()
-            
             current_app.logger.info(f'✅ Created client_id={lead_client_id} for lead {real_id}')
-        
-        # ✅ Status validation
-        if not status:
-            return jsonify({'error': 'Status is required'}), 400
-        
-        # ✅ Handle cleansing statuses (Invalid Number, Incorrect Supplier)
-        if status in ('Invalid Number', 'Incorrect Supplier'):
-            client = session.query(Client_Master).filter(
-                Client_Master.client_id == lead_client_id,
-                Client_Master.tenant_id == tenant_id
-            ).first()
-            
-            if client:
-                client.is_deleted = True
-                client.deleted_at = datetime.utcnow()
-                client.deleted_reason = status
-                if hasattr(client, 'is_cleansing'):
-                    client.is_cleansing = True
-                
-                # Update stage
-                stage = session.query(Stage_Master).filter(
-                    Stage_Master.stage_name == status
-                ).first()
-                if stage:
-                    lead.stage_id = stage.stage_id
-                
-                session.flush()
-                current_app.logger.info(f'leads_callback: moved lead {real_id} to cleansing ({status})')
-                
-                # Save interaction
-                formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
-                interaction = Client_Interactions(
-                    client_id=lead_client_id,
-                    contact_date=datetime.utcnow().date(),
-                    contact_method=1,
-                    reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
-                    notes=formatted_notes,
-                    next_steps=status,
-                    created_at=datetime.utcnow()
-                )
-                session.add(interaction)
-                session.commit()
-                
-                return jsonify({
-                    'success': True,
-                    'message': f'Moved to Cleansing ({status})',
-                    'moved_to_cleansing': True,
-                }), 200
 
-        # ✅ Handle recycle bin statuses (Lost, Lost COT, Meter De-energised, Complaint)
-        if status in ('Lost', 'Lost COT', 'Meter De-energised', 'Complaint'):
-            client = session.query(Client_Master).filter(
-                Client_Master.client_id == lead_client_id,
-                Client_Master.tenant_id == tenant_id
-            ).first()
-            
-            if client:
-                client.is_deleted = True
-                client.deleted_at = datetime.utcnow()
-                client.deleted_reason = status
-                if hasattr(client, 'is_cleansing'):
-                    client.is_cleansing = False
-                
-                # Update stage
-                stage = session.query(Stage_Master).filter(
-                    Stage_Master.stage_name == status
-                ).first()
-                if stage:
-                    lead.stage_id = stage.stage_id
-                
-                session.flush()
-                current_app.logger.info(f'leads_callback: moved lead {real_id} to recycle bin ({status})')
-                
-                # Save interaction
-                formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
-                interaction = Client_Interactions(
-                    client_id=lead_client_id,
-                    contact_date=datetime.utcnow().date(),
-                    contact_method=1,
-                    reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
-                    notes=formatted_notes,
-                    next_steps=status,
-                    created_at=datetime.utcnow()
-                )
-                session.add(interaction)
-                session.commit()
-                
-                return jsonify({
-                    'success': True,
-                    'message': f'Moved to recycle bin ({status})',
-                    'moved_to_recycle_bin': True,
-                }), 200
-        
-        # ✅ Update stage for regular statuses
-        stage = session.query(Stage_Master).filter(
-            Stage_Master.stage_name == status
-        ).first()
-        
-        if stage:
-            lead.stage_id = stage.stage_id
-            current_app.logger.info(f'Updated lead {real_id} stage to {status} (stage_id={stage.stage_id})')
-        else:
-            current_app.logger.warning(f'Stage not found for status: {status}')
-        
-        # ✅ Save the interaction to history
-        formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
+        # ✅ Update stage on lead
+        lead.stage_id = stage_id
+        session.flush()
+        current_app.logger.info(f'Updated lead {real_id} stage: {old_stage} → {status}')
+
+        # ✅ Build history note with status transition
+        transition = f"Status: {old_stage or 'None'} → {status}"
+        formatted_notes = f"[{status}] {transition}" + (f" | {notes}" if notes else "")
+
+        reminder_date = None
+        if callback_date:
+            try:
+                reminder_date = datetime.strptime(callback_date, '%Y-%m-%d').date()
+            except ValueError:
+                current_app.logger.warning(f'Invalid callback_date format: {callback_date}')
+
+        # ✅ Write history BEFORE any early returns
         interaction = Client_Interactions(
             client_id=lead_client_id,
             contact_date=datetime.utcnow().date(),
             contact_method=1,
-            reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
+            reminder_date=reminder_date,
             notes=formatted_notes,
             next_steps=status,
             created_at=datetime.utcnow()
         )
         session.add(interaction)
         session.flush()
-        
-        current_app.logger.info(f'✅ Interaction saved: interaction_id={interaction.interaction_id}, reminder_date={interaction.reminder_date}')
-        
+        current_app.logger.info(
+            f'✅ History logged: interaction_id={interaction.interaction_id}'
+        )
+
+        CLEANSING_STATUSES = {'Invalid Number', 'Incorrect Supplier'}
+        RECYCLE_BIN_STATUSES = {'Lost', 'Lost COT', 'Meter De-energised', 'Complaint'}
+
+        if status in CLEANSING_STATUSES:
+            client = session.query(Client_Master).filter(
+                Client_Master.client_id == lead_client_id,
+                Client_Master.tenant_id == tenant_id
+            ).first()
+            if client:
+                client.is_deleted = True
+                client.deleted_at = datetime.utcnow()
+                client.deleted_reason = status
+                if hasattr(client, 'is_cleansing'):
+                    client.is_cleansing = True
+                session.flush()
+
+            session.commit()
+            return jsonify({
+                'success': True,
+                'message': f'Moved to Cleansing ({status})',
+                'moved_to_cleansing': True,
+                'interaction_id': interaction.interaction_id,
+            }), 200
+
+        if status in RECYCLE_BIN_STATUSES:
+            client = session.query(Client_Master).filter(
+                Client_Master.client_id == lead_client_id,
+                Client_Master.tenant_id == tenant_id
+            ).first()
+            if client:
+                client.is_deleted = True
+                client.deleted_at = datetime.utcnow()
+                client.deleted_reason = status
+                if hasattr(client, 'is_cleansing'):
+                    client.is_cleansing = False
+                session.flush()
+
+            session.commit()
+            return jsonify({
+                'success': True,
+                'message': f'Moved to recycle bin ({status})',
+                'moved_to_recycle_bin': True,
+                'interaction_id': interaction.interaction_id,
+            }), 200
+
         session.commit()
-        current_app.logger.info(f'✅ Callback saved for lead {real_id}, status: {status}')
-        
+        current_app.logger.info(
+            f'✅ Callback saved for lead {real_id}, status: {status}'
+        )
+
         return jsonify({
             'success': True,
             'message': 'Callback saved successfully',
             'status': status,
+            'stage_id': stage_id,
             'callback_date': callback_date,
-            'interaction_id': interaction.interaction_id
+            'interaction_id': interaction.interaction_id,
         }), 200
-        
+
     except Exception as e:
         session.rollback()
         current_app.logger.exception(f"❌ Error in leads_callback: {e}")

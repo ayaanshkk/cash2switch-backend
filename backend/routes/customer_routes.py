@@ -891,19 +891,28 @@ def update_energy_customer(client_id):
         
         # ✅ FIX: Track field changes in history for renewals
         # Compare old values (captured before update) with new values
+
         changes = []
-        
-        if 'net_notch' in data:
+
+        # ── Capture old status BEFORE the status update above committed ───────
+        # (old_status_for_log was set before the project.status assignment)
+
+        if 'net_notch' in data and contract:
             new_val = data['net_notch']
-            if old_net_notch != new_val:
+            if str(old_net_notch or '') != str(new_val or ''):
                 changes.append(f"Net Notch: {old_net_notch or 'None'} → {new_val}")
-        
-        if 'aggregator' in data:
+
+        if 'aggregator' in data and contract:
             new_val = data['aggregator']
-            if old_aggregator != new_val:
+            if str(old_aggregator or '') != str(new_val or ''):
                 changes.append(f"Aggregator: {old_aggregator or 'None'} → {new_val}")
-        
-        # If any fields changed, log it
+
+        # ✅ Log status change if it happened
+        if 'status' in data and project:
+            new_status = project.status  # already set above
+            if old_status_for_log != new_status:
+                changes.append(f"Status: {old_status_for_log or 'None'} → {new_status or 'None'}")
+
         if changes:
             change_summary = " | ".join(changes)
             session.execute(text("""
