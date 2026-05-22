@@ -34,7 +34,7 @@ import_bp = Blueprint('import', __name__)
 
 ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'csv'}
 ENERGY_BATCH_SIZE = 500   # rows per INSERT round-trip
-LEADS_BATCH_SIZE  = 1000  # Opportunity_Details is simpler, can go larger
+LEADS_BATCH_SIZE  = 2000  # Opportunity_Details is simpler, can go larger
 
 
 # ---------------------------------------------------------------------------
@@ -397,26 +397,20 @@ def _load_existing_mpans(raw_conn, tenant_id) -> dict:
     return result
 
 
-def _load_existing_lead_mpans(raw_conn) -> dict:
-    """Load existing lead MPANs from Opportunity_Details."""
+def _load_existing_lead_mpans(raw_conn, tenant_id) -> dict:
+    """Load existing lead MPANs for this tenant only."""
     cur = raw_conn.cursor()
     cur.execute("""
-        SELECT od.mpan_mpr, od.tenant_id, od.business_name, od.opportunity_title
+        SELECT od.mpan_mpr
         FROM "StreemLyne_MT"."Opportunity_Details" od
-        WHERE od.mpan_mpr IS NOT NULL AND od.mpan_mpr != ''
-          AND NOT EXISTS (
-              SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd
-              WHERE pd.opportunity_id = od.opportunity_id
-          )
-    """)
+        WHERE od.mpan_mpr IS NOT NULL 
+          AND od.mpan_mpr != ''
+          AND od.tenant_id = %s
+    """, (str(tenant_id),))
     result = {}
-    for mpan, tenant_id, bname, otitle in cur.fetchall():
+    for (mpan,) in cur.fetchall():
         if mpan:
-            key = mpan.strip().lower()
-            result.setdefault(key, []).append({
-                'tenant_id': tenant_id,
-                'business_name': bname or otitle,
-            })
+            result[mpan.strip().lower()] = True
     cur.close()
     return result
 
@@ -593,82 +587,6 @@ def _flush_energy_batch(
         except Exception:
             pass
         print(f"Energy batch failed: {str(e).split(chr(10))[0][:200]}")
-        return 0, len(batch)
-
-
-# ---------------------------------------------------------------------------
-# Batch flush — leads
-# ---------------------------------------------------------------------------
-
-def _flush_leads_batch(
-    raw_conn, batch, tenant_id, import_service_id,
-    opportunity_owner_id, is_draft_import, default_stage_id,
-    existing_lead_mpans,
-):
-    if not batch:
-        return 0, 0
-
-    now = datetime.utcnow()
-    cur = raw_conn.cursor()
-
-    try:
-        lead_tuples = [
-            (
-                str(tenant_id), None,
-                r['title'] or '', 'Imported lead',
-                now, opportunity_owner_id,
-                default_stage_id, 0, 1, now,
-                r['business_name'], r['contact_person'],
-                r['tel'], r['mobile'], r['email'],
-                r['mpan'], r['mpan_b'],
-                r['start_d'], r['end_d'],
-                import_service_id, r['sup_id'],
-                r['usage'], r['sc'],
-                r['r1'], r['r2'], r['r3'],
-                r['nn'], r['pt'],
-                r['postcode'], is_draft_import,
-            )
-            for r in batch
-        ]
-
-        execute_values(
-            cur,
-            """
-            INSERT INTO "StreemLyne_MT"."Opportunity_Details"
-            (tenant_id, client_id, opportunity_title, opportunity_description,
-             opportunity_date, opportunity_owner_employee_id, stage_id,
-             opportunity_value, currency_id, created_at,
-             business_name, contact_person, tel_number, mobile_no, email,
-             mpan_mpr, mpan_bottom, start_date, end_date, service_id,
-             supplier_id, annual_usage, stand_charge, rate_1, rate_2,
-             rate_3, net_notch, payment_type, postcode, is_draft)
-            VALUES %s
-            """,
-            lead_tuples,
-            fetch=False,
-        )
-
-        raw_conn.commit()
-        cur.close()
-
-        for r in batch:
-            if r['mpan']:
-                existing_lead_mpans.setdefault(
-                    r['mpan'].strip().lower(), []
-                ).append({
-                    'tenant_id': tenant_id,
-                    'business_name': r['business_name'],
-                })
-
-        return len(batch), 0
-
-    except Exception as e:
-        raw_conn.rollback()
-        try:
-            cur.close()
-        except Exception:
-            pass
-        print(f"Leads batch failed: {str(e).split(chr(10))[0][:150]}")
         return 0, len(batch)
 
 
@@ -1020,95 +938,136 @@ def _run_leads_import(
             except OSError:
                 pass
 
-        field_map = _build_field_map(df)
+        field_map  = _build_field_map(df)
         total_rows = len(df)
         update_job(job_id, total=total_rows)
-        print(f"[job:{job_id}] Leads import: {total_rows} rows, "
-              f"mapped {len(field_map)} fields")
+        print(f"[job:{job_id}] Leads: {total_rows} rows, {len(field_map)} fields mapped")
 
         if total_rows == 0:
             finish_job(job_id, 'done')
             update_job(job_id, processed=0, successful=0, duplicates=0)
             return
 
-        # ── 2. Open raw connection + preload lookups ───────────────────────────
+        # ── 2. Open raw connection + preload lookups FIRST ────────────────────
+        # Must happen before vectorised extraction so suppliers_dict exists
         raw_conn = _get_raw_connection()
-        suppliers_dict       = _load_suppliers(raw_conn)
-        existing_lead_mpans  = _load_existing_lead_mpans(raw_conn)
+        suppliers_dict      = _load_suppliers(raw_conn)
+        existing_lead_mpans = _load_existing_lead_mpans(raw_conn, tenant_id)
 
-        # Use passed default_stage_id (resolved in route before thread spawned)
-        print(f"[job:{job_id}] Loaded {len(suppliers_dict)} suppliers, "
-              f"{len(existing_lead_mpans)} existing lead MPANs")
+        # ── Pre-generate tenant_opportunity_id ────────────────────────────────
+        cur = raw_conn.cursor()
+        cur.execute("""
+            SELECT COALESCE(MAX(tenant_opportunity_id), 0)
+            FROM "StreemLyne_MT"."Opportunity_Details"
+            WHERE tenant_id = %s
+        """, (str(tenant_id),))
+        tenant_opp_counter = cur.fetchone()[0]
+        cur.close()
+        print(f"[job:{job_id}] tenant_opportunity_id starting from {tenant_opp_counter + 1}")
 
-        def gcol(field):
-            col = field_map.get(field, '')
-            return col if col and col in df.columns else None
+        # ── 3. Vectorised column extraction ───────────────────────────────────
+        def col(field) -> pd.Series:
+            c = field_map.get(field)
+            if c and c in df.columns:
+                return df[c].fillna('')
+            return pd.Series([''] * total_rows, index=df.index)
 
-        def col_vals(field):
-            c = gcol(field)
-            return df[c].tolist() if c else [None] * total_rows
+        def vstr(series):
+            s = series.astype(str).str.strip()
+            mask = s.str.endswith('.0') & s.str[:-2].str.match(r'^\d+$')
+            s = s.where(~mask, s.str[:-2])
+            return s.where(~s.isin(['nan', 'None', 'NaT']), '')
 
-        client_names  = col_vals('client_name')
-        trading_names = col_vals('trading_name')
-        main_contacts = col_vals('main_contact')
-        tel_nos       = col_vals('tel_no')
-        mobile_nos    = col_vals('mobile_no')
-        emails        = col_vals('email')
-        mpan_tops     = col_vals('mpan_top')
-        mpan_bottoms  = col_vals('mpan_bottom')
-        suppliers     = col_vals('supplier')
-        start_dates   = col_vals('start_date')
-        end_dates     = col_vals('contract_end')
-        annual_usages = col_vals('annual_usage')
-        payment_types = col_vals('payment_type')
-        postcodes     = col_vals('postcode')
-        stand_charges = col_vals('stand_charge')
-        rates_1       = col_vals('rate_1')
-        rates_2       = col_vals('rate_2')
-        rates_3       = col_vals('rate_3')
-        net_notches   = col_vals('net_notch')
+        def vdate(series):
+            return [parse_date(v) for v in series.tolist()]
+
+        def vnum(series):
+            s = series.astype(str).str.replace(',', '', regex=False)
+            s = s.str.replace('£', '', regex=False).str.strip()
+            s = s.where(s.str.match(r'^-?\d+(\.\d+)?$'), other=None)
+            return pd.to_numeric(s, errors='coerce')
+
+        l_client   = vstr(col('client_name')).tolist()
+        l_trading  = vstr(col('trading_name')).tolist()
+        l_contact  = vstr(col('main_contact')).tolist()
+        l_tel      = vstr(col('tel_no')).tolist()
+        l_mobile   = vstr(col('mobile_no')).tolist()
+        l_email    = vstr(col('email')).tolist()
+        l_mpan_top = vstr(col('mpan_top')).tolist()
+        l_mpan_bot = vstr(col('mpan_bottom')).tolist()
+        l_supplier = vstr(col('supplier')).tolist()
+        l_postcode = vstr(col('postcode')).tolist()
+        l_payment  = vstr(col('payment_type')).tolist()
+
+        l_usage    = vnum(col('annual_usage')).tolist()
+        l_sc       = vnum(col('stand_charge')).tolist()
+        l_r1       = vnum(col('rate_1')).tolist()
+        l_r2       = vnum(col('rate_2')).tolist()
+        l_r3       = vnum(col('rate_3')).tolist()
+        l_nn       = vnum(col('net_notch')).tolist()
+
+        d_start    = vdate(col('start_date'))
+        d_end      = vdate(col('contract_end'))
+
+        print(f"[job:{job_id}] Vectorised extraction complete")
+
+        # Pre-resolve all unique suppliers in one pass — zero per-row DB hits
+        unique_sups = set(l_supplier) - {'', 'nan', 'None'}
+        for sup in unique_sups:
+            _resolve_supplier(sup, suppliers_dict, raw_conn)
+        print(f"[job:{job_id}] Resolved {len(unique_sups)} unique suppliers")
+
+        # ── 4. Row loop ───────────────────────────────────────────────────────
+        def ns(v): return v if v else None
+
+        def nn_val(v):
+            try:
+                return float(v) if v is not None and not (
+                    isinstance(v, float) and pd.isna(v)
+                ) else None
+            except (TypeError, ValueError):
+                return None
 
         success_count   = 0
         error_count     = 0
         duplicate_count = 0
-        pending_leads   = []
+        pending_tuples  = []   # ← pre-built tuples, not dicts
         start_time      = time.time()
+        now             = datetime.utcnow()
 
         for i in range(total_rows):
             try:
-                client_name   = safe_str(client_names[i])
-                trading_name  = safe_str(trading_names[i])
-                main_contact  = safe_str(main_contacts[i])
-                tel_no        = safe_str(tel_nos[i])
-                mobile_no     = safe_str(mobile_nos[i])
-                email         = safe_str(emails[i])
-                mpan_top      = safe_str(mpan_tops[i])
-                mpan_bottom   = safe_str(mpan_bottoms[i])
-                supplier_name = safe_str(suppliers[i])
-                start_date    = parse_date(start_dates[i])
-                end_date      = parse_date(end_dates[i])
-                annual_usage  = parse_number(annual_usages[i])
-                payment_type  = safe_str(payment_types[i])
-                postcode      = safe_str(postcodes[i])
+                client_name = l_client[i]
+                trading     = l_trading[i]
+                contact     = l_contact[i]
+                tel         = l_tel[i]
+                mobile      = l_mobile[i]
+                email       = l_email[i]
+                mpan        = l_mpan_top[i]
+                mpan_b      = l_mpan_bot[i]
+                business    = trading or client_name
+                person      = contact or client_name
+                sup_name    = l_supplier[i]
+                postcode    = l_postcode[i]
+                payment     = l_payment[i]
+                start_d     = d_start[i]
+                end_d       = d_end[i]
 
-                business_name  = trading_name or client_name
-                contact_person = main_contact or client_name
-                phone          = tel_no or mobile_no
-
-                if not business_name and not phone and not email and not mpan_top and not contact_person:
+                # Skip empty rows
+                if not business and not tel and not mobile and not email and not mpan and not person:
                     continue
 
-                # Duplicate check
-                if mpan_top:
-                    mpan_key = mpan_top.strip().lower()
+                # In-memory MPAN duplicate check
+                if mpan:
+                    mpan_key = mpan.strip().lower()
                     if mpan_key in existing_lead_mpans:
                         duplicate_count += 1
                         continue
 
-                # Supplier lookup — read-only for leads
+                # Supplier lookup — already pre-resolved, pure dict lookup
                 supplier_id = None
-                if supplier_name:
-                    sup_key = supplier_name.lower().strip()
+                if sup_name:
+                    sup_key = sup_name.lower().strip()
                     supplier_id = suppliers_dict.get(sup_key)
                     if not supplier_id:
                         for k, v in suppliers_dict.items():
@@ -1116,68 +1075,77 @@ def _run_leads_import(
                                 supplier_id = v
                                 break
 
-                pending_leads.append({
-                    'title':          business_name or '',
-                    'business_name':  business_name or None,
-                    'contact_person': contact_person or None,
-                    'tel':            phone or None,
-                    'mobile':         mobile_no or None,
-                    'email':          email or None,
-                    'mpan':           mpan_top or None,
-                    'mpan_b':         mpan_bottom or None,
-                    'start_d':        start_date,
-                    'end_d':          end_date,
-                    'sup_id':         supplier_id,
-                    'usage':          int(annual_usage) if annual_usage else None,
-                    'sc':             parse_number(stand_charges[i]),
-                    'r1':             parse_number(rates_1[i]),
-                    'r2':             parse_number(rates_2[i]),
-                    'r3':             parse_number(rates_3[i]),
-                    'nn':             parse_number(net_notches[i]),
-                    'pt':             payment_type or None,
-                    'postcode':       postcode or None,
-                })
+                tenant_opp_counter += 1
+
+                pending_tuples.append((
+                    str(tenant_id),
+                    None,
+                    business or '',
+                    'Imported lead',
+                    now,
+                    opportunity_owner_id,
+                    default_stage_id,
+                    0, 1, now,
+                    ns(business), ns(person),
+                    ns(tel) or ns(mobile),
+                    ns(mobile), ns(email),
+                    ns(mpan), ns(mpan_b),
+                    start_d, end_d,
+                    import_service_id, supplier_id,
+                    nn_val(l_usage[i]),
+                    nn_val(l_sc[i]),
+                    nn_val(l_r1[i]), nn_val(l_r2[i]), nn_val(l_r3[i]),
+                    nn_val(l_nn[i]),
+                    ns(payment), ns(postcode),
+                    is_draft_import,
+                    tenant_opp_counter,
+                ))
+
+                # Register MPAN immediately for intra-file dedup
+                if mpan:
+                    existing_lead_mpans[mpan.strip().lower()] = True
 
             except Exception as row_err:
                 error_count += 1
-                append_error(job_id, f"Row {i + 2}: {str(row_err).split(chr(10))[0][:150]}")
+                if error_count <= 20:
+                    append_error(
+                        job_id,
+                        f"Row {i + 2}: {str(row_err).split(chr(10))[0][:120]}"
+                    )
                 continue
 
-            if len(pending_leads) >= LEADS_BATCH_SIZE:
-                ins, err = _flush_leads_batch(
-                    raw_conn, pending_leads, tenant_id, import_service_id,
-                    opportunity_owner_id, is_draft_import,
-                    default_stage_id, existing_lead_mpans,
-                )
-                success_count += ins
-                error_count   += err
-                pending_leads  = []
+            # ── Flush batch ───────────────────────────────────────────────────
+            if len(pending_tuples) >= LEADS_BATCH_SIZE:
+                ins, skipped = _flush_leads_tuples(raw_conn, pending_tuples)
+                success_count   += ins
+                duplicate_count += skipped
+                pending_tuples   = []
 
                 elapsed = time.time() - start_time
                 rate    = success_count / elapsed if elapsed > 0 else 1
+                eta_s   = (total_rows - i) / rate if rate > 0 else 0
                 update_job(
                     job_id,
                     processed=i + 1,
                     successful=success_count,
                     duplicates=duplicate_count,
                 )
-                print(f"[job:{job_id}] leads {i+1}/{total_rows} | "
-                      f"{success_count} inserted | {rate:.0f} rec/s")
+                print(f"[job:{job_id}] {i+1}/{total_rows} | "
+                      f"{success_count} ok | {rate:.0f} rec/s | "
+                      f"ETA {eta_s/60:.1f}m")
 
-        if pending_leads:
-            ins, err = _flush_leads_batch(
-                raw_conn, pending_leads, tenant_id, import_service_id,
-                opportunity_owner_id, is_draft_import,
-                default_stage_id, existing_lead_mpans,
-            )
-            success_count += ins
-            error_count   += err
+        # Final batch
+        if pending_tuples:
+            ins, skipped = _flush_leads_tuples(raw_conn, pending_tuples)
+            success_count   += ins
+            duplicate_count += skipped
 
         elapsed = time.time() - start_time
         rate = success_count / elapsed if elapsed > 0 else 0
         print(f"[job:{job_id}] LEADS DONE — {success_count} ok, "
               f"{duplicate_count} dup, {error_count} err "
               f"in {elapsed:.1f}s ({rate:.0f} rec/s)")
+
         finish_job(job_id, 'done')
         update_job(
             job_id,
@@ -1200,6 +1168,85 @@ def _run_leads_import(
             try: raw_conn.close()
             except Exception: pass
 
+def _flush_leads_tuples(raw_conn, tuples):
+    if not tuples:
+        return 0, 0
+
+    try:
+        # ── Must commit any open transaction before changing autocommit ────────
+        raw_conn.commit()
+
+        # ── DDL: disable trigger (needs autocommit=True) ──────────────────────
+        raw_conn.autocommit = True
+        cur = raw_conn.cursor()
+        cur.execute("""
+            ALTER TABLE "StreemLyne_MT"."Opportunity_Details"
+            DISABLE TRIGGER trigger_set_tenant_opportunity_display_id
+        """)
+        cur.close()
+        raw_conn.autocommit = False
+
+        # ── Bulk insert ───────────────────────────────────────────────────────
+        cur = raw_conn.cursor()
+        execute_values(
+            cur,
+            """
+            INSERT INTO "StreemLyne_MT"."Opportunity_Details"
+            (tenant_id, client_id, opportunity_title, opportunity_description,
+             opportunity_date, opportunity_owner_employee_id, stage_id,
+             opportunity_value, currency_id, created_at,
+             business_name, contact_person, tel_number, mobile_no, email,
+             mpan_mpr, mpan_bottom, start_date, end_date, service_id,
+             supplier_id, annual_usage, stand_charge, rate_1, rate_2,
+             rate_3, net_notch, payment_type, postcode, is_draft,
+             tenant_opportunity_id)
+            VALUES %s
+            """,
+            tuples,
+            fetch=False,
+            page_size=500,
+        )
+        raw_conn.commit()
+        cur.close()
+
+        # ── DDL: re-enable trigger ────────────────────────────────────────────
+        raw_conn.commit()  # ensure clean state before autocommit switch
+        raw_conn.autocommit = True
+        cur = raw_conn.cursor()
+        cur.execute("""
+            ALTER TABLE "StreemLyne_MT"."Opportunity_Details"
+            ENABLE TRIGGER trigger_set_tenant_opportunity_display_id
+        """)
+        cur.close()
+        raw_conn.autocommit = False
+
+        return len(tuples), 0
+
+    except Exception as e:
+        # Restore safe state
+        try:
+            raw_conn.autocommit = False
+        except Exception:
+            pass
+        try:
+            raw_conn.rollback()
+        except Exception:
+            pass
+        # Always re-enable trigger
+        try:
+            raw_conn.commit()
+            raw_conn.autocommit = True
+            cur2 = raw_conn.cursor()
+            cur2.execute("""
+                ALTER TABLE "StreemLyne_MT"."Opportunity_Details"
+                ENABLE TRIGGER trigger_set_tenant_opportunity_display_id
+            """)
+            cur2.close()
+            raw_conn.autocommit = False
+        except Exception:
+            pass
+        print(f"Leads flush failed: {str(e).split(chr(10))[0][:200]}")
+        return 0, len(tuples)
 
 # ---------------------------------------------------------------------------
 # Routes

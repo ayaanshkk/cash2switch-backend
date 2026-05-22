@@ -32,7 +32,7 @@ def get_tenant_id_from_user(user):
 CLEANSING_STATUSES = {"Invalid Number", "Incorrect Supplier"}
  
 # ── Statuses that go to Recycle Bin (soft-delete with is_cleansing=False) ────
-RECYCLE_BIN_STATUSES = {"Lost", "Lost COT", "Meter De-energised", "Complaint"}
+RECYCLE_BIN_STATUSES = {"Lost", "Lost COT", "Meter De-energised", "Complaint", "Duplicate"}
 
 
 # ── Helper: return CORS preflight response immediately (before auth check) ──
@@ -124,6 +124,7 @@ def add_callback(client_id):
             "Converted":          {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Not Called":         {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Dead":               {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": True},
+            "Duplicate":          {"requires_date": False, "requires_sold": False, "deletes_record": True, "requires_notes": False},
         }
 
         if not status:
