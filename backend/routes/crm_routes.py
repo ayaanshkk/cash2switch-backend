@@ -1129,10 +1129,6 @@ def delete_draft_leads():
 @token_required
 @tenant_from_jwt
 def get_draft_leads():
-    """
-    GET /api/crm/leads/drafts
-    Get all unassigned draft leads (is_draft=TRUE, opportunity_owner_employee_id IS NULL)
-    """
     session = SessionLocal()
     try:
         tenant_id = g.tenant_id
@@ -1160,8 +1156,39 @@ def get_draft_leads():
             .all()
         )
 
-        results = []
+        # Deduplicate by mpan_mpr — keep the one with the latest end_date
+        seen_mpans: dict = {}  # mpan -> best row tuple
+        no_mpan_rows = []
+
         for row in rows:
+            od = row[0]
+            mpan = (od.mpan_mpr or '').strip().lower()
+
+            if not mpan:
+                no_mpan_rows.append(row)
+                continue
+
+            if mpan not in seen_mpans:
+                seen_mpans[mpan] = row
+            else:
+                existing_od = seen_mpans[mpan][0]
+                existing_end = existing_od.end_date
+                current_end  = od.end_date
+
+                # Prefer latest end_date; tiebreak by lowest opportunity_id
+                if current_end is None:
+                    pass  # keep existing
+                elif existing_end is None:
+                    seen_mpans[mpan] = row
+                elif current_end > existing_end:
+                    seen_mpans[mpan] = row
+                elif current_end == existing_end and od.opportunity_id < existing_od.opportunity_id:
+                    seen_mpans[mpan] = row
+
+        deduped_rows = list(seen_mpans.values()) + no_mpan_rows
+
+        results = []
+        for row in deduped_rows:
             od = row[0]
             results.append({
                 'opportunity_id': od.opportunity_id,
@@ -2382,23 +2409,6 @@ def import_leads():
             }), 400
 
         file = request.files.get('file')
-
-        # IMPORTANT: Before importing, delete existing draft leads for this tenant and service
-        # This allows re-uploading the same file without duplicates
-        try:
-            deleted_drafts = (
-                session.query(Opportunity_Details)
-                .filter(Opportunity_Details.tenant_id == tenant_id)
-                .filter(Opportunity_Details.service_id == service_id)
-                .filter(Opportunity_Details.is_draft == True)
-                .filter(Opportunity_Details.opportunity_owner_employee_id.is_(None))
-                .delete(synchronize_session=False)
-            )
-            session.commit()
-            current_app.logger.info(f'Deleted {deleted_drafts} existing draft leads before import')
-        except Exception as cleanup_err:
-            current_app.logger.warning(f'Could not clean up drafts before import: {cleanup_err}')
-            session.rollback()
 
         # Step 1: Validate and preview
         preview_result = crm_controller.crm_service.preview_lead_import(tenant_id, file)

@@ -398,8 +398,11 @@ def _load_existing_mpans(raw_conn, tenant_id) -> dict:
 
 
 def _load_existing_lead_mpans(raw_conn, tenant_id) -> dict:
-    """Load existing lead MPANs for this tenant only."""
+    """Load existing lead MPANs AND energy contract MPANs for this tenant."""
     cur = raw_conn.cursor()
+    result = {}
+
+    # From Opportunity_Details (leads)
     cur.execute("""
         SELECT od.mpan_mpr
         FROM "StreemLyne_MT"."Opportunity_Details" od
@@ -407,10 +410,27 @@ def _load_existing_lead_mpans(raw_conn, tenant_id) -> dict:
           AND od.mpan_mpr != ''
           AND od.tenant_id = %s
     """, (str(tenant_id),))
-    result = {}
     for (mpan,) in cur.fetchall():
         if mpan:
             result[mpan.strip().lower()] = True
+
+    # From Energy_Contract_Master (renewals) — cross-check against renewals DB too
+    cur.execute("""
+        SELECT ecm.mpan_number
+        FROM "StreemLyne_MT"."Energy_Contract_Master" ecm
+        JOIN "StreemLyne_MT"."Project_Details" pd
+            ON ecm.project_id = pd.project_id
+        JOIN "StreemLyne_MT"."Client_Master" cm
+            ON pd.client_id = cm.client_id
+        WHERE ecm.mpan_number IS NOT NULL
+          AND ecm.mpan_number != ''
+          AND cm.tenant_id = %s
+          AND cm.is_deleted = FALSE
+    """, (str(tenant_id),))
+    for (mpan,) in cur.fetchall():
+        if mpan:
+            result[mpan.strip().lower()] = True
+
     cur.close()
     return result
 
