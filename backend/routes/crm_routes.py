@@ -3579,15 +3579,12 @@ def leads_callback(opportunity_id):
 
         # ✅ Resolve lead — URL param may be opportunity_id OR tenant_lead_id
         lead = session.query(Opportunity_Details).filter(
-            Opportunity_Details.tenant_id == tenant_id,
-            Opportunity_Details.opportunity_id == opportunity_id
+            Opportunity_Details.tenant_id == str(tenant_id),
+            (Opportunity_Details.opportunity_id == opportunity_id) |
+            (Opportunity_Details.tenant_lead_id == opportunity_id)
+        ).order_by(
+            (Opportunity_Details.tenant_lead_id == opportunity_id).desc()
         ).first()
-
-        if not lead:
-            lead = session.query(Opportunity_Details).filter(
-                Opportunity_Details.tenant_id == tenant_id,
-                Opportunity_Details.tenant_lead_id == opportunity_id
-            ).first()
 
         if not lead:
             current_app.logger.error(
