@@ -7,7 +7,7 @@ import uuid
 import secrets
 from datetime import datetime, timedelta
 from sqlalchemy import (
-    Column, Integer, SmallInteger, String, Boolean, DateTime, Date, 
+    Column, Integer, BigInteger, SmallInteger, String, Boolean, DateTime, Date,
     ForeignKey, Text, Float, Numeric
 )
 from sqlalchemy.orm import relationship
@@ -522,3 +522,20 @@ class Notification_Master(Base):
     
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     read_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class Renewal_Email_Send_Log(Base):
+    """Audit and idempotency for automated renewal reminder emails to customers."""
+    __tablename__ = 'Renewal_Email_Send_Log'
+    __table_args__ = {'schema': SCHEMA}
+
+    renewal_email_send_log_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    tenant_id = Column(SmallInteger, nullable=False)
+    energy_contract_master_id = Column(SmallInteger, nullable=False)
+    contract_end_date = Column(Date, nullable=False)
+    bucket_key = Column(String(50), nullable=False)
+    recipient_email = Column(String(255), nullable=False)
+    provider_message_id = Column(String(255), nullable=True)
+    status = Column(String(50), nullable=False)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
