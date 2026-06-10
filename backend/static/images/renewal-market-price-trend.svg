@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="675" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
+  <title id="title">UK Business Energy Market Price Trend</title>
+  <desc id="desc">A professional line chart showing UK business energy market prices trending upward from January to June.</desc>
+  <rect width="1200" height="675" fill="#ffffff"/>
+  <text x="56" y="72" fill="#07183b" font-family="Arial, Helvetica, sans-serif" font-size="43" font-weight="700">UK Business Energy Market Price Trend</text>
+  <text x="58" y="116" fill="#4b5563" font-family="Arial, Helvetica, sans-serif" font-size="25">Wholesale energy prices have increased over recent months</text>
+
+  <g transform="translate(138 166)">
+    <line x1="0" y1="380" x2="1010" y2="380" stroke="#59606a" stroke-width="2"/>
+    <line x1="0" y1="380" x2="0" y2="18" stroke="#59606a" stroke-width="2"/>
+    <polygon points="0,10 -6,24 6,24" fill="#59606a"/>
+
+    <g stroke="#d5d9df" stroke-width="1.5" stroke-dasharray="5 6">
+      <line x1="36" y1="0" x2="36" y2="380"/>
+      <line x1="218" y1="0" x2="218" y2="380"/>
+      <line x1="400" y1="0" x2="400" y2="380"/>
+      <line x1="582" y1="0" x2="582" y2="380"/>
+      <line x1="764" y1="0" x2="764" y2="380"/>
+      <line x1="946" y1="0" x2="946" y2="380"/>
+      <line x1="0" y1="55" x2="1010" y2="55"/>
+      <line x1="0" y1="112" x2="1010" y2="112"/>
+      <line x1="0" y1="169" x2="1010" y2="169"/>
+      <line x1="0" y1="226" x2="1010" y2="226"/>
+      <line x1="0" y1="283" x2="1010" y2="283"/>
+      <line x1="0" y1="340" x2="1010" y2="340"/>
+    </g>
+
+    <text x="-86" y="88" fill="#07183b" font-family="Arial, Helvetica, sans-serif" font-size="19">Market</text>
+    <text x="-88" y="113" fill="#07183b" font-family="Arial, Helvetica, sans-serif" font-size="19">Going Up</text>
+    <line x1="-62" y1="168" x2="-62" y2="113" stroke="#07183b" stroke-width="3"/>
+    <polygon points="-62,104 -72,122 -52,122" fill="#07183b"/>
+
+    <text x="-76" y="230" fill="#111827" font-family="Arial, Helvetica, sans-serif" font-size="22" transform="rotate(-90 -76 230)">Market Price</text>
+
+    <polyline fill="none" stroke="#06246a" stroke-width="4" points="36,334 218,293 400,247 582,196 764,145 946,82"/>
+    <g fill="#06246a" stroke="#06246a">
+      <circle cx="36" cy="334" r="9"/>
+      <circle cx="218" cy="293" r="9"/>
+      <circle cx="400" cy="247" r="9"/>
+      <circle cx="582" cy="196" r="9"/>
+      <circle cx="764" cy="145" r="9"/>
+      <circle cx="946" cy="82" r="9"/>
+    </g>
+
+    <g fill="#111827" font-family="Arial, Helvetica, sans-serif" font-size="22">
+      <text x="22" y="420">Jan</text>
+      <text x="204" y="420">Feb</text>
+      <text x="386" y="420">Mar</text>
+      <text x="568" y="420">Apr</text>
+      <text x="750" y="420">May</text>
+      <text x="932" y="420">Jun</text>
+    </g>
+
+    <line x1="918" y1="145" x2="946" y2="101" stroke="#06246a" stroke-width="3"/>
+    <polygon points="951,94 946,112 936,101" fill="#06246a"/>
+    <text x="842" y="176" fill="#07183b" font-family="Arial, Helvetica, sans-serif" font-style="italic" font-size="23">Prices trending</text>
+    <text x="862" y="205" fill="#07183b" font-family="Arial, Helvetica, sans-serif" font-style="italic" font-size="23">upward</text>
+
+    <g transform="translate(382 476)">
+      <line x1="0" y1="0" x2="70" y2="0" stroke="#06246a" stroke-width="4"/>
+      <circle cx="35" cy="0" r="9" fill="#06246a"/>
+      <text x="86" y="8" fill="#111827" font-family="Arial, Helvetica, sans-serif" font-size="22">Market Price Index</text>
+    </g>
+  </g>
+</svg>
