@@ -371,7 +371,7 @@ def get_lead_detail(opportunity_id):
             .outerjoin(Stage_Master, Opportunity_Details.stage_id == Stage_Master.stage_id)
             .outerjoin(Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id)
             .outerjoin(Supplier_Master, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
-            .filter(Opportunity_Details.tenant_id == tenant_id)
+            .filter(Opportunity_Details.tenant_id == str(tenant_id))
         )
  
         # Choose filter based on query parameter
@@ -441,18 +441,19 @@ def get_lead_history(opportunity_id):
         print(f"   tenant_id: {tenant_id}, use_display_id: {use_display_id}")
         
         # Resolve lead
-        query = (
+        lead = (
             session.query(Opportunity_Details.opportunity_id, Opportunity_Details.client_id)
-            .filter(Opportunity_Details.tenant_id == tenant_id)
+            .filter(Opportunity_Details.tenant_id == str(tenant_id))
+            .filter(
+                (Opportunity_Details.tenant_lead_id == opportunity_id) |
+                (Opportunity_Details.opportunity_id == opportunity_id)
+            )
+            .order_by(
+                # Prefer tenant_lead_id match when both could match
+                (Opportunity_Details.tenant_lead_id == opportunity_id).desc()
+            )
+            .first()
         )
-        
-        if use_display_id:
-            query = query.filter(Opportunity_Details.tenant_lead_id == opportunity_id)
-        else:
-            # DEFAULT: Use opportunity_id (the primary key)
-            query = query.filter(Opportunity_Details.opportunity_id == opportunity_id)
-        
-        lead = query.first()
  
         if not lead:
             return jsonify({'error': 'Lead not found'}), 404
@@ -510,17 +511,18 @@ def delete_lead_history(opportunity_id, interaction_id):
         use_display_id = request.args.get('use_display_id', 'false').lower() == 'true'
  
         # Resolve lead
-        query = (
+        lead = (
             session.query(Opportunity_Details.opportunity_id, Opportunity_Details.client_id)
-            .filter(Opportunity_Details.tenant_id == tenant_id)
+            .filter(Opportunity_Details.tenant_id == str(tenant_id))
+            .filter(
+                (Opportunity_Details.tenant_lead_id == opportunity_id) |
+                (Opportunity_Details.opportunity_id == opportunity_id)
+            )
+            .order_by(
+                (Opportunity_Details.tenant_lead_id == opportunity_id).desc()
+            )
+            .first()
         )
-        
-        if use_display_id:
-            query = query.filter(Opportunity_Details.tenant_lead_id == opportunity_id)
-        else:
-            query = query.filter(Opportunity_Details.opportunity_id == opportunity_id)
-        
-        lead = query.first()
  
         if not lead:
             return jsonify({'error': 'Lead not found'}), 404
@@ -557,26 +559,83 @@ def delete_lead_history(opportunity_id, interaction_id):
 @token_required
 @tenant_from_jwt
 def create_lead():
-    """
-    Create a new lead
+    session = SessionLocal()
+    try:
+        tenant_id = g.tenant_id
+        current_user = request.current_user
+        data = request.get_json() or {}
 
-    Request Body:
-        - opportunity_name: Lead/opportunity name (required)
-        - client_name: Client name (required)
-        - stage_id: Stage identifier (optional)
-        - status: Lead status (optional)
-        - estimated_value: Estimated value (optional)
-        - assigned_to: Assigned user ID (optional)
+        employee_id = getattr(current_user, 'employee_id', None)
 
-    Authentication:
-        - JWT (token must include `tenant_id`)
+        service = data.get('service', 'utilities')
+        service_id = 2 if str(service).strip().lower() == 'water' else 1
 
-    Returns:
-        201: Lead created successfully
-        400: Invalid request data
-        500: Internal server error
-    """
-    return crm_controller.create_lead()
+        assigned_employee_id = data.get('opportunity_owner_employee_id') or employee_id
+
+        lead = Opportunity_Details(
+            tenant_id=str(tenant_id),
+            opportunity_title=data.get('business_name') or data.get('opportunity_title') or '',
+            business_name=data.get('business_name') or '',
+            contact_person=data.get('contact_person') or '',
+            tel_number=data.get('tel_number') or '',
+            mobile_no=data.get('mobile_no') or '',
+            email=data.get('email') or '',
+            address=data.get('address') or '',
+            postcode=data.get('postcode') or data.get('post_code') or '',
+            mpan_mpr=data.get('mpan_mpr') or data.get('mpan_top') or '',
+            mpan_bottom=data.get('mpan_bottom') or '',
+            supplier_id=data.get('supplier_id'),
+            annual_usage=data.get('annual_usage'),
+            start_date=data.get('start_date') or None,
+            end_date=data.get('end_date') or None,
+            service_id=service_id,
+            opportunity_owner_employee_id=assigned_employee_id,
+            stage_id=6,  # ✅ "Not Called" — default stage for new leads
+            is_draft=False,
+            is_allocated=False,
+            created_at=datetime.utcnow(),
+        )
+
+        session.add(lead)
+        session.flush()
+
+        # Create linked Client_Master so history works
+        client = Client_Master(
+            tenant_id=int(tenant_id),
+            assigned_employee_id=assigned_employee_id,
+            client_company_name=lead.business_name or lead.opportunity_title or '[LEAD]',
+            client_contact_name=lead.contact_person or '',
+            client_phone=lead.tel_number or '',
+            client_email=lead.email or '',
+            default_currency_id=1,
+            created_at=datetime.utcnow(),
+        )
+        session.add(client)
+        session.flush()
+
+        lead.client_id = client.client_id
+        session.commit()
+
+        current_app.logger.info(
+            f'✅ Lead created: opportunity_id={lead.opportunity_id}, '
+            f'tenant_lead_id={lead.tenant_lead_id}, client_id={client.client_id}'
+        )
+
+        return jsonify({
+            'success': True,
+            'opportunity_id': lead.opportunity_id,
+            'tenant_lead_id': lead.tenant_lead_id,
+            'client_id': client.client_id,
+            'message': 'Lead created successfully',
+        }), 201
+
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f'❌ Error creating lead: {e}')
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
 
 
 @crm_bp.route('/leads/<int:opportunity_id>', methods=['PUT', 'PATCH'])
@@ -615,43 +674,50 @@ def update_lead(opportunity_id):
                 'meter_ref', 'uplift', 'comments', 'document_details',
             }
  
-            update_fields = {
-                k: v for k, v in data.items()
-                if k in ALLOWED_PATCH_FIELDS
-            }
- 
+            DATE_FIELDS = {'start_date', 'end_date', 'date_of_birth'}
+
+            update_fields = {}
+            for k, v in data.items():
+                if k not in ALLOWED_PATCH_FIELDS:
+                    continue
+                if k in DATE_FIELDS:
+                    if v is None or v == '':
+                        update_fields[k] = None
+                    else:
+                        try:
+                            # Normalise to date object — handles "2024-01-01" and "2024-01-01T00:00:00"
+                            if isinstance(v, str):
+                                update_fields[k] = datetime.strptime(v[:10], '%Y-%m-%d').date()
+                            else:
+                                update_fields[k] = v
+                        except ValueError:
+                            return jsonify({'error': f'Invalid date format for {k}: {v}'}), 400
+                else:
+                    update_fields[k] = v
+
             if not update_fields:
                 return jsonify({'error': 'No valid fields provided'}), 400
  
             # Resolve opportunity_id
-            lead = (
-                session.query(Opportunity_Details.opportunity_id, Opportunity_Details.client_id)
-                .filter(Opportunity_Details.tenant_id == tenant_id)
+            lead_obj = (
+                session.query(Opportunity_Details)
+                .filter(Opportunity_Details.tenant_id == str(tenant_id))
                 .filter(
                     (Opportunity_Details.tenant_lead_id == opportunity_id) |
                     (Opportunity_Details.opportunity_id == opportunity_id)
                 )
                 .first()
             )
- 
-            if not lead:
+
+            if not lead_obj:
                 return jsonify({'error': 'Lead not found'}), 404
- 
-            real_id = lead.opportunity_id
-            client_id = lead.client_id
-            
-            current_app.logger.info(f"   Resolved: real_id={real_id}, client_id={client_id}")
- 
-            # ✅ CAPTURE OLD VALUES BEFORE UPDATE
-            old_lead = session.query(Opportunity_Details).filter(
-                Opportunity_Details.opportunity_id == real_id,
-                Opportunity_Details.tenant_id == tenant_id
-            ).first()
- 
-            if not old_lead:
-                return jsonify({'error': 'Lead not found'}), 404
- 
-            # Store old values for comparison
+
+            real_id = lead_obj.opportunity_id
+            client_id = lead_obj.client_id
+
+            current_app.logger.warning(f"   Resolved: real_id={real_id}, client_id={client_id}")
+
+            # Capture old values for change tracking
             old_values = {}
             tracked_fields = [
                 'net_notch', 'aggregator', 'rate_1', 'rate_2', 'rate_3',
@@ -659,22 +725,48 @@ def update_lead(opportunity_id):
                 'payment_type', 'supplier_id', 'start_date', 'end_date',
                 'mpan_mpr', 'mpan_bottom', 'business_name', 'contact_person',
                 'tel_number', 'mobile_no', 'email', 'address', 'postcode',
+                # Extended fields
+                'position', 'company_number', 'date_of_birth', 'site_name',
+                'month_sold', 'house_name', 'house_number', 'door_number',
+                'town', 'county', 'bank_name', 'bank_account_number',
+                'bank_sort_code', 'comments', 'uplift', 'meter_ref',
+                'night_charge', 'eve_weekend_charge', 'other_charges_1',
+                'other_charges_2', 'other_charges_3', 'partner_details',
+                'charity_ltd_company_number',
             ]
-            
             for field in tracked_fields:
-                if hasattr(old_lead, field):
-                    old_values[field] = getattr(old_lead, field)
- 
-            current_app.logger.info(f"   Old values captured: {len(old_values)} fields")
- 
-            # Update the lead
-            session.query(Opportunity_Details).filter(
-                Opportunity_Details.opportunity_id == real_id,
-                Opportunity_Details.tenant_id == tenant_id
-            ).update(update_fields, synchronize_session=False)
-            
+                if hasattr(lead_obj, field):
+                    old_values[field] = getattr(lead_obj, field)
+
+            # Apply updates
+            for field, value in update_fields.items():
+                setattr(lead_obj, field, value)
+
             session.flush()
-            current_app.logger.info(f"   ✅ Lead updated in database")
+            current_app.logger.warning(
+                f"   ✅ Flushed updates to real_id={real_id}, "
+                f"business_name={lead_obj.business_name}, "
+                f"tel_number={lead_obj.tel_number}"
+            )
+
+            # Use lead_obj as old_lead for client creation below
+            old_lead = lead_obj
+            rows_updated = 1
+
+            session.flush()
+            current_app.logger.warning(
+                f"   ✅ UPDATE fired: rows_updated={rows_updated}, real_id={real_id}, "
+                f"tenant_id={tenant_id!r}, "
+                f"start_date={update_fields.get('start_date')}, "
+                f"end_date={update_fields.get('end_date')}, "
+                f"supplier_id={update_fields.get('supplier_id')}"
+            )
+
+            if rows_updated == 0:
+                current_app.logger.error(
+                    f"   ❌ NO ROWS UPDATED — opportunity_id={real_id}, tenant_id={tenant_id!r}"
+                )
+                return jsonify({'error': 'Update failed — record not found or tenant mismatch'}), 404
  
             # ✅ ENSURE CLIENT EXISTS
             if not client_id:
@@ -702,135 +794,137 @@ def update_lead(opportunity_id):
             # ✅ COMPREHENSIVE FIELD CHANGE TRACKING
             if client_id:
                 field_labels = {
-                    'net_notch': 'Net Notch',
-                    'aggregator': 'Aggregator',
-                    'rate_1': 'Rate 1',
-                    'rate_2': 'Rate 2',
-                    'rate_3': 'Rate 3',
-                    'stand_charge': 'Standing Charge',
-                    'annual_usage': 'Annual Usage',
-                    'comms_paid': 'Comms Paid',
-                    'term_sold': 'Term Sold',
-                    'payment_type': 'Payment Type',
-                    'supplier_id': 'Supplier',
-                    'start_date': 'Start Date',
-                    'end_date': 'End Date',
-                    'mpan_mpr': 'MPAN/MPR',
-                    'mpan_bottom': 'MPAN Bottom',
-                    'business_name': 'Business Name',
-                    'contact_person': 'Contact Person',
-                    'tel_number': 'Phone',
-                    'mobile_no': 'Mobile',
-                    'email': 'Email',
-                    'address': 'Address',
-                    'postcode': 'Postcode',
+                    'net_notch': 'Net Notch', 'aggregator': 'Aggregator',
+                    'rate_1': 'Rate 1', 'rate_2': 'Rate 2', 'rate_3': 'Rate 3',
+                    'stand_charge': 'Standing Charge', 'annual_usage': 'Annual Usage',
+                    'comms_paid': 'Comms Paid', 'term_sold': 'Term Sold',
+                    'payment_type': 'Payment Type', 'supplier_id': 'Supplier',
+                    'start_date': 'Start Date', 'end_date': 'End Date',
+                    'mpan_mpr': 'MPAN/MPR', 'mpan_bottom': 'MPAN Bottom',
+                    'business_name': 'Business Name', 'contact_person': 'Contact Person',
+                    'tel_number': 'Phone', 'mobile_no': 'Mobile',
+                    'email': 'Email', 'address': 'Address', 'postcode': 'Postcode',
+                    'position': 'Position', 'company_number': 'Company Number',
+                    'date_of_birth': 'Date of Birth', 'site_name': 'Site Name',
+                    'month_sold': 'Month Sold', 'house_name': 'House Name',
+                    'house_number': 'House Number', 'door_number': 'Door Number',
+                    'town': 'Town', 'county': 'County', 'bank_name': 'Bank Name',
+                    'bank_account_number': 'Account Number', 'bank_sort_code': 'Sort Code',
+                    'comments': 'Comments', 'uplift': 'Uplift', 'meter_ref': 'Meter Ref',
+                    'night_charge': 'Night Charge', 'eve_weekend_charge': 'Eve/Weekend Charge',
+                    'other_charges_1': 'Other Charges 1', 'other_charges_2': 'Other Charges 2',
+                    'other_charges_3': 'Other Charges 3', 'partner_details': 'Partner Details',
+                    'charity_ltd_company_number': 'Charity/Ltd Number',
                 }
-                
+
+                def _normalise_for_compare(val):
+                    """Normalise a value to a stable string for comparison."""
+                    if val is None or val == '':
+                        return ''
+                    # Dates: always compare as YYYY-MM-DD string
+                    if hasattr(val, 'isoformat'):
+                        return val.isoformat()[:10]
+                    # Numbers: strip trailing .0 for integers stored as float
+                    try:
+                        from decimal import Decimal
+                        if isinstance(val, (int, float, Decimal)):
+                            f = float(val)
+                            return str(int(f)) if f == int(f) else str(round(f, 6))
+                    except Exception:
+                        pass
+                    return str(val).strip()
+
+                def _display_value(field, val):
+                    """Human-readable display for a field value."""
+                    if val is None or val == '':
+                        return 'None'
+                    if field in ('start_date', 'end_date', 'date_of_birth'):
+                        if hasattr(val, 'strftime'):
+                            return val.strftime('%d/%m/%Y')
+                        try:
+                            return datetime.strptime(str(val)[:10], '%Y-%m-%d').strftime('%d/%m/%Y')
+                        except Exception:
+                            return str(val)
+                    return str(val)
+
                 changes = []
                 end_date_changed = False
-                new_end_date = None
-                
-                # Compare each field
+                new_end_date_val = None
+
                 for field, label in field_labels.items():
-                    if field in update_fields:
-                        old_val = old_values.get(field)
-                        new_val = update_fields[field]
-                        
-                        # Handle None/empty values
-                        def format_value(val):
-                            if val is None or val == '':
-                                return 'None'
-                            return val
-                        
-                        old_display = format_value(old_val)
-                        new_display = format_value(new_val)
-                        
-                        # Convert to string for comparison
-                        old_str = str(old_display)
-                        new_str = str(new_display)
-                        
-                        # Only log if changed
-                        if old_str != new_str:
-                            # ✅ Track end_date changes specially for calendar
-                            if field == 'end_date':
-                                end_date_changed = True
-                                new_end_date = new_val
-                            
-                            try:
-                                # Special handling for supplier_id - show supplier name
-                                if field == 'supplier_id':
-                                    old_supplier_name = 'None'
-                                    new_supplier_name = 'None'
-                                    
-                                    if old_val:
-                                        old_sup = session.query(Supplier_Master).filter_by(supplier_id=old_val).first()
-                                        if old_sup:
-                                            old_supplier_name = old_sup.supplier_company_name
-                                    
-                                    if new_val:
-                                        new_sup = session.query(Supplier_Master).filter_by(supplier_id=new_val).first()
-                                        if new_sup:
-                                            new_supplier_name = new_sup.supplier_company_name
-                                    
-                                    old_display = old_supplier_name
-                                    new_display = new_supplier_name
-                                
-                                # Special handling for dates
-                                elif field in ['start_date', 'end_date']:
-                                    if hasattr(old_val, 'isoformat'):
-                                        old_display = old_val.strftime('%d/%m/%Y')
-                                    if isinstance(new_val, str):
-                                        try:
-                                            new_date = datetime.strptime(new_val, '%Y-%m-%d')
-                                            new_display = new_date.strftime('%d/%m/%Y')
-                                        except:
-                                            new_display = new_val
-                                    elif hasattr(new_val, 'strftime'):
-                                        new_display = new_val.strftime('%d/%m/%Y')
-                                
-                                changes.append(f"{label}: {old_display} → {new_display}")
-                            
-                            except Exception as field_error:
-                                current_app.logger.warning(f"   ⚠️ Error formatting {field}: {field_error}")
-                                changes.append(f"{label} updated")
-                
-                # ✅ Log all changes in one interaction
+                    if field not in update_fields:
+                        continue
+
+                    old_val = old_values.get(field)
+                    new_val = update_fields[field]
+
+                    old_norm = _normalise_for_compare(old_val)
+                    new_norm = _normalise_for_compare(new_val)
+
+                    current_app.logger.info(
+                        f"   🔍 {field}: old={old_norm!r} new={new_norm!r} changed={old_norm != new_norm}"
+                    )
+
+                    if old_norm == new_norm:
+                        continue
+
+                    if field == 'end_date':
+                        end_date_changed = True
+                        new_end_date_val = new_val
+
+                    try:
+                        if field == 'supplier_id':
+                            old_display = 'None'
+                            new_display = 'None'
+                            if old_val:
+                                old_sup = session.query(Supplier_Master).filter_by(supplier_id=old_val).first()
+                                if old_sup:
+                                    old_display = old_sup.supplier_company_name
+                            if new_val:
+                                new_sup = session.query(Supplier_Master).filter_by(supplier_id=new_val).first()
+                                if new_sup:
+                                    new_display = new_sup.supplier_company_name
+                        else:
+                            old_display = _display_value(field, old_val)
+                            new_display = _display_value(field, new_val)
+
+                        changes.append(f"{label}: {old_display} → {new_display}")
+                    except Exception as field_error:
+                        current_app.logger.warning(f"   ⚠️ Error formatting {field}: {field_error}")
+                        changes.append(f"{label} updated")
+
+                current_app.logger.warning(f"   📋 client_id={client_id}, changes_count={len(changes)}, changes={changes}")
+
                 if changes:
                     change_summary = " | ".join(changes)
-                    current_app.logger.info(f"   📝 Logging changes: {change_summary}")
-                    
                     try:
-                        # ✅ CRITICAL: If end_date changed, set reminder_date for calendar
                         reminder_date = None
-                        if end_date_changed and new_end_date:
-                            if isinstance(new_end_date, str):
-                                reminder_date = datetime.strptime(new_end_date, '%Y-%m-%d').date()
-                            elif hasattr(new_end_date, 'date'):
-                                reminder_date = new_end_date.date() if callable(new_end_date.date) else new_end_date
+                        if end_date_changed and new_end_date_val:
+                            if isinstance(new_end_date_val, str):
+                                reminder_date = datetime.strptime(new_end_date_val[:10], '%Y-%m-%d').date()
+                            elif hasattr(new_end_date_val, 'date') and callable(new_end_date_val.date):
+                                reminder_date = new_end_date_val.date()
                             else:
-                                reminder_date = new_end_date
-                            
-                            current_app.logger.info(f"   📅 Setting calendar reminder for end_date: {reminder_date}")
-                        
+                                reminder_date = new_end_date_val
+
                         interaction = Client_Interactions(
                             client_id=client_id,
                             contact_date=datetime.utcnow().date(),
                             contact_method=1,
                             notes=f"[Field Update] {change_summary}",
                             next_steps='Field Update',
-                            reminder_date=reminder_date,  # ✅ THIS PUTS IT IN CALENDAR
+                            reminder_date=reminder_date,
                             created_at=datetime.utcnow()
                         )
                         session.add(interaction)
                         session.flush()
-                        current_app.logger.info(f"   ✅ History logged successfully (interaction_id={interaction.interaction_id})")
+                        current_app.logger.info(f"   ✅ History logged (interaction_id={interaction.interaction_id})")
                     except Exception as log_error:
                         current_app.logger.error(f"   ❌ Error logging history: {log_error}")
-                        pass
                 else:
-                    current_app.logger.info(f"   ℹ️  No changes detected to log")
+                    current_app.logger.info("   ℹ️  No changes detected — nothing to log")
             else:
-                current_app.logger.warning(f"   ⚠️ No client_id - skipping history log")
+                current_app.logger.warning("   ⚠️ No client_id — skipping history log")
  
             session.commit()
             current_app.logger.info(f"   ✅ Transaction committed")
@@ -848,7 +942,7 @@ def update_lead(opportunity_id):
                 .outerjoin(Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id)
                 .outerjoin(Supplier_Master, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
                 .filter(Opportunity_Details.opportunity_id == real_id)
-                .filter(Opportunity_Details.tenant_id == tenant_id)
+                .filter(Opportunity_Details.tenant_id == str(tenant_id))
                 .first()
             )
  
@@ -910,7 +1004,7 @@ def update_lead_status(opportunity_id):
         # Resolve opportunity
         lead = (
             session.query(Opportunity_Details)
-            .filter(Opportunity_Details.tenant_id == tenant_id)
+            .filter(Opportunity_Details.tenant_id == str(tenant_id))
             .filter(
                 (Opportunity_Details.opportunity_id == opportunity_id) |
                 (Opportunity_Details.tenant_lead_id == opportunity_id)
@@ -1099,7 +1193,7 @@ def delete_draft_leads():
         # Delete draft leads (is_draft=TRUE and no employee assigned)
         deleted_count = (
             session.query(Opportunity_Details)
-            .filter(Opportunity_Details.tenant_id == tenant_id)
+            .filter(Opportunity_Details.tenant_id == str(tenant_id))
             .filter(Opportunity_Details.opportunity_id.in_(lead_ids))
             .filter(Opportunity_Details.opportunity_owner_employee_id.is_(None))
             .filter(Opportunity_Details.is_draft == True)
@@ -3371,7 +3465,7 @@ def get_cleansing():
             .outerjoin(Stage_Master, Opportunity_Details.stage_id == Stage_Master.stage_id)
             .outerjoin(Supplier_Master, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
             .outerjoin(Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id)
-            .filter(Opportunity_Details.tenant_id == tenant_id)
+            .filter(Opportunity_Details.tenant_id == str(tenant_id))
             .filter(Stage_Master.stage_name.in_(['Invalid Number', 'Incorrect Supplier']))
             .order_by(Opportunity_Details.created_at.desc())
             .all()
@@ -3754,7 +3848,7 @@ def get_archived_leads():
             .outerjoin(Stage_Master, Opportunity_Details.stage_id == Stage_Master.stage_id)
             .outerjoin(Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id)
             .outerjoin(Supplier_Master, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
-            .filter(Opportunity_Details.tenant_id == tenant_id)
+            .filter(Opportunity_Details.tenant_id == str(tenant_id))
             .filter(Opportunity_Details.service_id == service_id)
             .filter(Opportunity_Details.is_archived == True)
         )
