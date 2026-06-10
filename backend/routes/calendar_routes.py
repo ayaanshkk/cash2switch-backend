@@ -57,13 +57,13 @@ def get_renewals_calendar():
         # Build employee filter
         if is_admin and filter_employee_id:
             employee_filter = f"AND pd.assigned_employee_id = {filter_employee_id}"
-            callback_employee_filter = f"AND pd2.assigned_employee_id = {filter_employee_id}"
+            callback_employee_filter = f"AND lp.assigned_employee_id = {filter_employee_id}"
         elif is_admin:
             employee_filter = ""
             callback_employee_filter = ""
         else:
             employee_filter = f"AND pd.assigned_employee_id = {current_user.employee_id}"
-            callback_employee_filter = f"AND pd2.assigned_employee_id = {current_user.employee_id}"
+            callback_employee_filter = f"AND lp.assigned_employee_id = {current_user.employee_id}"
         
         # PART 1: Get contract end dates
         contract_query = text(f'''
@@ -110,18 +110,38 @@ def get_renewals_calendar():
                     ci.notes,
                     ROW_NUMBER() OVER (
                         PARTITION BY ci.client_id
-                        ORDER BY ci.created_at DESC NULLS LAST, ci.interaction_id DESC
+                        ORDER BY
+                            CASE WHEN ci.next_steps IN ('Field Update', 'Migration', 'Restored', 'Priced Accepted')
+                                THEN 1 ELSE 0 END ASC,
+                            ci.created_at DESC NULLS LAST,
+                            ci.interaction_id DESC
                     ) AS rn
                 FROM "StreemLyne_MT"."Client_Interactions" ci
                 WHERE ci.reminder_date IS NOT NULL
+            ),
+            latest_project AS (
+                SELECT DISTINCT ON (pd.client_id)
+                    pd.client_id,
+                    pd.project_id,
+                    pd.assigned_employee_id,
+                    pd.status,
+                    ecm.mpan_number,
+                    ecm.contract_end_date,
+                    ecm.contract_start_date,
+                    ecm.unit_rate,
+                    ecm.service_id
+                FROM "StreemLyne_MT"."Project_Details" pd
+                LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm
+                    ON pd.project_id = ecm.project_id
+                ORDER BY pd.client_id, pd.project_id DESC
             )
             SELECT
                 cm.client_id,
                 COALESCE(NULLIF(TRIM(cm.client_company_name), ''), cm.client_contact_name, 'Unknown') as name,
-                ecm.mpan_number as mpan,
+                lp.mpan_number as mpan,
                 sm.supplier_company_name as supplier,
-                ecm.contract_end_date,
-                ecm.contract_start_date,
+                lp.contract_end_date,
+                lp.contract_start_date,
                 lci.reminder_date as callback_date,
                 lci.next_steps as interaction_status,
                 cm.address,
@@ -131,24 +151,22 @@ def get_renewals_calendar():
                 cm.client_phone as phone,
                 lci.notes as callback_notes,
                 srv.service_title,
-                ecm.unit_rate as rates,
-                pd2.status as status,
-                em2.employee_name as assigned_to,
+                lp.unit_rate as rates,
+                lp.status as status,
+                em.employee_name as assigned_to,
                 'callback' as event_type
             FROM latest_ci lci
             INNER JOIN "StreemLyne_MT"."Client_Master" cm ON lci.client_id = cm.client_id
-            LEFT JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
-            LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
-            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
-            LEFT JOIN "StreemLyne_MT"."Services_Master" srv ON ecm.service_id = srv.service_id
-            LEFT JOIN "StreemLyne_MT"."Project_Details" pd2 ON cm.client_id = pd2.client_id
-            LEFT JOIN "StreemLyne_MT"."Employee_Master" em2 ON pd2.assigned_employee_id = em2.employee_id
+            LEFT JOIN latest_project lp ON cm.client_id = lp.client_id
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON lp.service_id = sm.supplier_id
+            LEFT JOIN "StreemLyne_MT"."Services_Master" srv ON lp.service_id = srv.service_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON lp.assigned_employee_id = em.employee_id
             WHERE lci.rn = 1
             AND cm.tenant_id = :tenant_id
             AND cm.client_company_name != '[IMPORTED LEADS]'
             AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
             AND lci.reminder_date IS NOT NULL
-            AND (pd2.status IS NULL OR LOWER(pd2.status) NOT IN ('priced', 'lost', 'lost cot', 'dead', 'invalid number', 'incorrect supplier', 'broker in place', 'complaint'))
+            AND (lp.status IS NULL OR LOWER(lp.status) NOT IN ('priced', 'lost', 'lost cot', 'dead', 'invalid number', 'incorrect supplier', 'broker in place', 'complaint'))
             {callback_employee_filter}
             ORDER BY cm.client_id
         ''')
@@ -309,30 +327,28 @@ def get_leads_calendar():
             WITH latest_ci AS (
                 SELECT
                     ci."client_id",
-                    ci."reminder_date",
+                    ci."reminder_date"::date AS reminder_date,  -- ✅ strip timezone
                     ci."next_steps",
                     ci."notes",
                     ROW_NUMBER() OVER (
                         PARTITION BY ci."client_id"
                         ORDER BY
-                            -- ✅ Prioritise real callbacks over migration/system entries
-                            CASE
-                                WHEN ci."next_steps" NOT IN ('End Date Reminder', 'End Date', 'Field Update', 'Migration', 'Restored')
-                                AND ci."notes" NOT LIKE '[Migration]%'
-                                AND ci."notes" NOT LIKE '[Field Update]%'
-                                THEN 0
-                                ELSE 1
-                            END ASC,
+                            CASE WHEN ci."next_steps" IN ('Field Update', 'Migration', 'Restored', 'Priced Accepted')
+                                THEN 1 ELSE 0 END ASC,
                             ci."created_at" DESC NULLS LAST,
                             ci."interaction_id" DESC
                     ) AS rn
                 FROM "StreemLyne_MT"."Client_Interactions" ci
                 WHERE ci."reminder_date" IS NOT NULL
+                AND ci."next_steps" NOT IN (
+                    'Migration', 'Restored',
+                    'End Date Reminder', 'End Date', 'Priced Accepted'
+                )
             )
             SELECT
                 od."opportunity_id",
                 od."tenant_lead_id",
-                COALESCE(NULLIF(TRIM(od."business_name"), ''), NULLIF(TRIM(od."opportunity_title"), ''), 'Unknown') AS name,
+                COALESCE(NULLIF(TRIM(od."business_name"), \'\'), NULLIF(TRIM(od."opportunity_title"), \'\'), \'Unknown\') AS name,
                 od."contact_person",
                 od."tel_number",
                 od."email",
@@ -361,16 +377,18 @@ def get_leads_calendar():
                 ON od."supplier_id" = sup."supplier_id"
             LEFT JOIN latest_ci lci
                 ON lci."client_id" = od."client_id"
-            AND lci.rn = 1
+                AND lci.rn = 1
             WHERE (od."tenant_id" = :tenant_id OR (od."client_id" IS NOT NULL AND cm."tenant_id" = :tenant_id))
             AND od."service_id" = :service_id
             AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
-            AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") NOT IN ('lost', 'lost cot', 'dead', 'invalid number', 'incorrect supplier', 'broker in place', 'complaint'))
+            AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") NOT IN (
+                \'lost\', \'lost cot\', \'dead\', \'invalid number\', 
+                \'incorrect supplier\', \'broker in place\', \'complaint\'
+            ))
             AND NOT EXISTS (
-                    SELECT 1
-                    FROM "StreemLyne_MT"."Project_Details" pd
-                    WHERE pd."opportunity_id" = od."opportunity_id"
-                )
+                SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd
+                WHERE pd."opportunity_id" = od."opportunity_id"
+            )
             AND lci."reminder_date" IS NOT NULL
             {employee_filter}
             ORDER BY lci."reminder_date" ASC
@@ -392,7 +410,7 @@ def get_leads_calendar():
 
             events.append({
                 'id': f"lead-callback-{lead.get('opportunity_id')}",
-                'customer_id': open_id,
+                'customer_id': lead.get('opportunity_id'),  # ✅ Always opportunity_id
                 'type': 'callback',
                 'title': f"{lead_name} - {callback_type}",
                 'name': lead_name,

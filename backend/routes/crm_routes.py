@@ -378,7 +378,7 @@ def get_lead_detail(opportunity_id):
         if use_display_id:
             row = base_query.filter(Opportunity_Details.tenant_lead_id == opportunity_id).first()
         else:
-            # DEFAULT: Use opportunity_id (the primary key)
+            # ✅ Strict match on opportunity_id only — no fallback
             row = base_query.filter(Opportunity_Details.opportunity_id == opportunity_id).first()
  
         if not row:
@@ -445,12 +445,12 @@ def get_lead_history(opportunity_id):
             session.query(Opportunity_Details.opportunity_id, Opportunity_Details.client_id)
             .filter(Opportunity_Details.tenant_id == str(tenant_id))
             .filter(
-                (Opportunity_Details.tenant_lead_id == opportunity_id) |
-                (Opportunity_Details.opportunity_id == opportunity_id)
+                (Opportunity_Details.opportunity_id == opportunity_id) |
+                (Opportunity_Details.tenant_lead_id == opportunity_id)
             )
             .order_by(
-                # Prefer tenant_lead_id match when both could match
-                (Opportunity_Details.tenant_lead_id == opportunity_id).desc()
+                # ✅ Prefer opportunity_id match, not tenant_lead_id
+                (Opportunity_Details.opportunity_id == opportunity_id).desc()
             )
             .first()
         )
@@ -515,11 +515,12 @@ def delete_lead_history(opportunity_id, interaction_id):
             session.query(Opportunity_Details.opportunity_id, Opportunity_Details.client_id)
             .filter(Opportunity_Details.tenant_id == str(tenant_id))
             .filter(
-                (Opportunity_Details.tenant_lead_id == opportunity_id) |
-                (Opportunity_Details.opportunity_id == opportunity_id)
+                (Opportunity_Details.opportunity_id == opportunity_id) |
+                (Opportunity_Details.tenant_lead_id == opportunity_id)
             )
             .order_by(
-                (Opportunity_Details.tenant_lead_id == opportunity_id).desc()
+                # ✅ Prefer opportunity_id match
+                (Opportunity_Details.opportunity_id == opportunity_id).desc()
             )
             .first()
         )
@@ -3577,13 +3578,12 @@ def leads_callback(opportunity_id):
         if not status:
             return jsonify({'error': 'Status is required'}), 400
 
-        # ✅ Resolve lead — URL param may be opportunity_id OR tenant_lead_id
         lead = session.query(Opportunity_Details).filter(
             Opportunity_Details.tenant_id == str(tenant_id),
             (Opportunity_Details.opportunity_id == opportunity_id) |
             (Opportunity_Details.tenant_lead_id == opportunity_id)
         ).order_by(
-            (Opportunity_Details.tenant_lead_id == opportunity_id).desc()
+            (Opportunity_Details.opportunity_id == opportunity_id).desc()  # ✅ prefer opportunity_id match
         ).first()
 
         if not lead:
@@ -3599,7 +3599,6 @@ def leads_callback(opportunity_id):
             f'✅ Resolved lead: real_opportunity_id={real_id}, client_id={lead_client_id}'
         )
 
-        # ✅ Capture old stage name for history
         old_stage = None
         if lead.stage_id:
             old_stage_row = session.query(Stage_Master).filter_by(
@@ -3607,7 +3606,6 @@ def leads_callback(opportunity_id):
             ).first()
             old_stage = old_stage_row.stage_name if old_stage_row else None
 
-        # ✅ Always resolve stage_id from DB — never trust frontend
         stage = session.query(Stage_Master).filter(
             Stage_Master.stage_name == status
         ).first()
@@ -3617,11 +3615,10 @@ def leads_callback(opportunity_id):
 
         stage_id = stage.stage_id
 
-        # ✅ If no client_id, create one
         if not lead_client_id:
             current_app.logger.warning(f'Lead {real_id} has no client_id, creating one...')
             new_client = Client_Master(
-                tenant_id=tenant_id,  # ✅ keep original type, don't force int
+                tenant_id=tenant_id,
                 assigned_employee_id=lead.opportunity_owner_employee_id,
                 client_company_name=lead.business_name or lead.opportunity_title or '[IMPORTED LEADS]',
                 client_contact_name=lead.contact_person or '',
@@ -3638,12 +3635,10 @@ def leads_callback(opportunity_id):
             session.flush()
             current_app.logger.info(f'✅ Created client_id={lead_client_id} for lead {real_id}')
 
-        # ✅ Update stage on lead
         lead.stage_id = stage_id
         session.flush()
         current_app.logger.info(f'Updated lead {real_id} stage: {old_stage} → {status}')
 
-        # ✅ Build history note with status transition
         transition = f"Status: {old_stage or 'None'} → {status}"
         formatted_notes = f"[{status}] {transition}" + (f" | {notes}" if notes else "")
 
@@ -3654,7 +3649,8 @@ def leads_callback(opportunity_id):
             except ValueError:
                 current_app.logger.warning(f'Invalid callback_date format: {callback_date}')
 
-        # ✅ Write history BEFORE any early returns
+        # Always insert a fresh row — guarantees new interaction_id and new created_at
+        # so the calendar CTE (ORDER BY created_at DESC, interaction_id DESC) picks this row
         interaction = Client_Interactions(
             client_id=lead_client_id,
             contact_date=datetime.utcnow().date(),
@@ -3667,7 +3663,8 @@ def leads_callback(opportunity_id):
         session.add(interaction)
         session.flush()
         current_app.logger.info(
-            f'✅ History logged: interaction_id={interaction.interaction_id}'
+            f'✅ Inserted new interaction_id={interaction.interaction_id} '
+            f'reminder_date={reminder_date} status={status}'
         )
 
         CLEANSING_STATUSES = {'Invalid Number', 'Incorrect Supplier'}
@@ -3687,6 +3684,7 @@ def leads_callback(opportunity_id):
                 session.flush()
 
             session.commit()
+            current_app.logger.info(f'✅ Committed — moved to cleansing: {status}')
             return jsonify({
                 'success': True,
                 'message': f'Moved to Cleansing ({status})',
@@ -3708,6 +3706,7 @@ def leads_callback(opportunity_id):
                 session.flush()
 
             session.commit()
+            current_app.logger.info(f'✅ Committed — moved to recycle bin: {status}')
             return jsonify({
                 'success': True,
                 'message': f'Moved to recycle bin ({status})',
@@ -3717,7 +3716,9 @@ def leads_callback(opportunity_id):
 
         session.commit()
         current_app.logger.info(
-            f'✅ Callback saved for lead {real_id}, status: {status}'
+            f'✅ Committed — callback saved for lead {real_id}, '
+            f'status={status}, reminder_date={reminder_date}, '
+            f'interaction_id={interaction.interaction_id}'
         )
 
         return jsonify({
