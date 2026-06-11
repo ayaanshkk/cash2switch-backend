@@ -278,8 +278,8 @@ def get_renewals_calendar():
 def get_leads_calendar():
     """Get lead callback events from Opportunity_Details.
 
-    Leads calendar intentionally shows callback dates only. Contract end dates
-    belong on the renewals calendar.
+    Leads calendar shows callback dates, and contract end date reminders
+    for leads that don't have an active callback scheduled.
     """
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -389,28 +389,32 @@ def get_leads_calendar():
                 SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd
                 WHERE pd."opportunity_id" = od."opportunity_id"
             )
-            AND lci."reminder_date" IS NOT NULL
             {employee_filter}
-            ORDER BY lci."reminder_date" ASC
+            ORDER BY lci."reminder_date" ASC NULLS LAST
         ''')
 
         rows = session.execute(query, query_params)
         lead_rows = [dict(row._mapping) for row in rows]
 
         events = []
+
+        # ✅ First pass: callback events from Client_Interactions
+        leads_with_callback = set()
         for lead in lead_rows:
             callback_date = lead.get('ci_reminder_date')
             if callback_date is None:
                 continue
 
+            opp_id = lead.get('opportunity_id')
+            leads_with_callback.add(opp_id)
+
             callback_type = lead.get('ci_next_steps') or 'Callback'
             notes = lead.get('ci_notes')
             lead_name = lead.get('name') or 'Unknown'
-            open_id = lead.get('opportunity_id')
 
             events.append({
-                'id': f"lead-callback-{lead.get('opportunity_id')}",
-                'customer_id': lead.get('opportunity_id'),  # ✅ Always opportunity_id
+                'id': f"lead-callback-{opp_id}",
+                'customer_id': opp_id,  # ✅ Always opportunity_id
                 'type': 'callback',
                 'title': f"{lead_name} - {callback_type}",
                 'name': lead_name,
@@ -434,6 +438,47 @@ def get_leads_calendar():
                 'assigned_to': lead.get('assigned_to'),
             })
 
+        # ✅ Second pass: contract end date reminders for leads without an active callback.
+        # Sourced directly from Opportunity_Details.end_date (live field, always current
+        # after PATCH updates) — independent of Client_Interactions ranking.
+        for lead in lead_rows:
+            opp_id = lead.get('opportunity_id')
+
+            if opp_id in leads_with_callback:
+                continue
+
+            end_date = lead.get('end_date')
+            if end_date is None:
+                continue
+
+            lead_name = lead.get('name') or 'Unknown'
+
+            events.append({
+                'id': f"lead-enddate-{opp_id}",
+                'customer_id': opp_id,
+                'type': 'end_date',
+                'title': f"{lead_name} - Contract End",
+                'name': lead_name,
+                'mpan': lead.get('mpan_mpr'),
+                'supplier': lead.get('supplier'),
+                'contract_start_date': str(lead['start_date']) if lead.get('start_date') else None,
+                'contract_end_date': str(end_date),
+                'reminder_date': str(end_date),
+                'address': lead.get('address'),
+                'postcode': lead.get('postcode'),
+                'contact': lead.get('contact_person'),
+                'email': lead.get('email'),
+                'phone': str(lead.get('tel_number')) if lead.get('tel_number') is not None else None,
+                'service_title': lead.get('service_title') or service_param.title(),
+                'rates': None,
+                'notes': None,
+                'display_date': str(end_date),
+                'display_type': 'Contract End',
+                'is_overdue': str(end_date) < str(datetime.utcnow().date()),
+                'status': lead.get('stage_name') or 'Active',
+                'assigned_to': lead.get('assigned_to'),
+            })
+
         return jsonify({'success': True, 'data': events, 'count': len(events)}), 200
 
     except Exception as e:
@@ -445,7 +490,6 @@ def get_leads_calendar():
         }), 500
     finally:
         session.close()
-
 
 @calendar_bp.route('/contracts', methods=['GET', 'OPTIONS'])
 @token_required
