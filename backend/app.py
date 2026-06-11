@@ -158,11 +158,16 @@ def create_app():
     try:
         from backend.crm.repositories.tenant_repository import TenantRepository
         test_repo = TenantRepository()
-        test_tenant = test_repo.get_tenant_by_id(1)
+        test_tenant_id = (
+            os.getenv("LOGIN_ALLOWED_TENANT_ID")
+            or os.getenv("RENEWAL_EMAIL_CRON_TENANT_ID")
+            or "1"
+        )
+        test_tenant = test_repo.get_tenant_by_id(str(test_tenant_id))
         if test_tenant:
             logging.info(f"✅ CRM Supabase connection test: SUCCESS - Found tenant '{test_tenant.get('tenant_company_name')}'")
         else:
-            logging.warning("CRM Supabase connection test: Tenant ID 1 not found")
+            logging.warning("CRM Supabase connection test: Tenant ID %s not found", test_tenant_id)
     except Exception as e:
         logging.error("CRM Supabase connection test FAILED: %s", e)
 
