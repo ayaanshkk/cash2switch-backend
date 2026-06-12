@@ -1,4 +1,4 @@
-Hello {{ advisor_name }},
+Hello {{ customer_name }},
 
 {% if bucket_key == 'renewal_under_30' %}
 Your {{ service_label }} contract is due to end on {{ contract_end_date }}, which is in {{ days_remaining }} days.

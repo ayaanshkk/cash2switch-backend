@@ -6,7 +6,7 @@
   <title>{{ bucket_title }}</title>
 </head>
 <body style="font-family: Arial, Helvetica, sans-serif; line-height: 1.5; color: #1a1a1a; max-width: 640px; margin: 0 auto; padding: 24px; background: #ffffff;">
-  <p>Hello {{ advisor_name }},</p>
+  <p>Hello {{ customer_name }},</p>
 
   {% if bucket_key == 'renewal_under_30' %}
   <p>Your <strong>{{ service_label }}</strong> contract is due to end on <strong>{{ contract_end_date }}</strong>, which is in <strong>{{ days_remaining }} days</strong>.</p>

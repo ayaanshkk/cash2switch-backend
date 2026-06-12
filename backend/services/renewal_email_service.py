@@ -360,7 +360,6 @@ def _context_from_contract_row(row: dict, anchor: date, bucket) -> Dict[str, Any
     supplier_name = (row.get("supplier_name") or "").strip()
     aggregator_name = _mapped_value(row.get("aggregator") or "", _AGGREGATOR_DISPLAY_NAMES)
     advisor_name = _mapped_value(row.get("assigned_employee_name") or "", _ADVISOR_DISPLAY_NAMES)
-    advisor_name = (os.getenv("RENEWAL_EMAIL_ADVISOR_NAME_OVERRIDE") or "").strip() or advisor_name
     advisor_phone = (row.get("assigned_employee_phone") or "").strip()
     service_label = "Water" if int(row.get("service_id") or 0) == 2 else "Electricity"
     return build_renewal_email_context(
