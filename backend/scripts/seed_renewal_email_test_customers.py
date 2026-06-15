@@ -1,8 +1,7 @@
 """
 Seed temporary CRM rows for renewal email automation testing.
 
-Creates or updates **one** client (`ayaans1804@gmail.com`) with **four** projects (slots 1–4) and
-one energy contract each, ending in **75 days** (inside the 60–90 day bucket). Two electricity and two water contracts.
+Creates or updates test clients/projects/contracts for renewal email testing.
 
 Usage (from cash2switch-backend, with .env and DATABASE_URL):
 
@@ -44,9 +43,11 @@ SEED_ROWS = [
 ]
 
 BUCKET_SUITE_ROWS = [
-    (129, TEST_EMAIL, 1, 29, "under_30"),
-    (175, TEST_EMAIL, 1, 75, "60_90"),
-    (220, TEST_EMAIL, 1, 120, "91_180"),
+    (190, TEST_EMAIL, 1, 90, "90_day"),
+    (180, TEST_EMAIL, 1, 80, "80_day"),
+    (170, TEST_EMAIL, 1, 70, "70_day"),
+    (160, TEST_EMAIL, 1, 60, "60_day"),
+    (130, TEST_EMAIL, 1, 30, "30_day"),
 ]
 
 
@@ -116,7 +117,7 @@ def main() -> None:
     parser.add_argument(
         "--bucket-suite",
         action="store_true",
-        help="Create one test contract for each renewal email bucket: 29, 75, and 120 days",
+        help="Create one test contract for each renewal email reminder day: 90, 80, 70, 60, and 30 days",
     )
     parser.add_argument(
         "--bucket-suite-run-id",

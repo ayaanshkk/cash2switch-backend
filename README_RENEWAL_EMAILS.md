@@ -50,7 +50,6 @@ Remove the variable, or leave it empty, before production. To clean up DB rows l
 | `RENEWAL_EMAIL_TEST_WHITELIST` | Optional, testing only | Comma-separated recipient emails; when set, only these addresses receive renewal emails |
 | `RENEWAL_EMAIL_SEED_TENANT_ID` | Optional | Used by the seed script when `--tenant-id` is omitted |
 | `RENEWAL_EMAIL_CRON_TENANT_ID` | Optional | Tenant id used by the daily 8am UK scheduler when `--tenant-id` is omitted |
-| `RENEWAL_EMAIL_ADVISOR_NAME_OVERRIDE` | Optional, demo only | Forces every email to show one advisor name; remove/empty for live real advisor names |
 | `RENEWAL_EMAIL_DEBUG` | Optional | `1` / `true`: verbose renewal email logs |
 
 ## Daily schedule
@@ -86,8 +85,6 @@ For live sending, do not pass `--dry-run`, and make sure:
 - `RENEWAL_EMAIL_TEST_WHITELIST` is empty or removed
 - `RESEND_API_KEY` is set
 - `RENEWAL_EMAIL_FROM` uses the verified sender domain
-- `RENEWAL_EMAIL_ADVISOR_NAME_OVERRIDE` is empty or removed unless one fixed advisor name is intended for every email
-
 The worker logs the next run in both UK time and UTC. During British Summer Time, 08:00 UK is 07:00 UTC. During GMT, 08:00 UK is 08:00 UTC.
 
 ### Option B: HTTP cron
@@ -113,13 +110,15 @@ python -m backend.scripts.run_renewal_emails --tenant-id 2
 
 ## Buckets
 
-Buckets are based on days until `contract_end_date`:
+Emails are sent only on these exact days remaining until `contract_end_date`:
 
-- **Under 30 days**: `renewal_under_30`
-- **60-90 days**: `renewal_60_90`
-- **91-180 days**: `renewal_91_180`
+- **90 days**: `renewal_90`
+- **80 days**: `renewal_80`
+- **70 days**: `renewal_70`
+- **60 days**: `renewal_60`
+- **30 days**: `renewal_30`
 
-Contracts outside these buckets are not emailed.
+Contracts outside these exact reminder days are not emailed.
 
 ## Live checklist
 
@@ -127,6 +126,5 @@ Contracts outside these buckets are not emailed.
 2. Confirm the migration has run on the live database.
 3. Set live `.env` values for `DATABASE_URL`, `RESEND_API_KEY`, and `RENEWAL_EMAIL_FROM`.
 4. Remove or empty `RENEWAL_EMAIL_TEST_WHITELIST`.
-5. Remove or empty `RENEWAL_EMAIL_ADVISOR_NAME_OVERRIDE` unless the business wants one fixed advisor name.
-6. Run `python -m backend.scripts.run_renewal_emails --tenant-id 2 --dry-run`.
-7. Start the 8am UK worker or configure an external HTTP cron for 08:00 Europe/London.
+5. Run `python -m backend.scripts.run_renewal_emails --tenant-id 2 --dry-run`.
+6. Start the 8am UK worker or configure an external HTTP cron for 08:00 Europe/London.

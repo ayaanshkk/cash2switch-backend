@@ -1,14 +1,11 @@
 Hello {{ customer_name }},
 
-{% if bucket_key == 'renewal_under_30' %}
+{% if bucket_key == 'renewal_30' %}
 Your {{ service_label }} contract is due to end on {{ contract_end_date }}, which is in {{ days_remaining }} days.
 This is now urgent. We recommend reviewing your renewal options immediately so your business can avoid moving onto out-of-contract or higher variable rates.
-{% elif bucket_key == 'renewal_60_90' %}
+{% elif bucket_key in ['renewal_90', 'renewal_80', 'renewal_70', 'renewal_60'] %}
 Your {{ service_label }} contract is due to end on {{ contract_end_date }}, which is in {{ days_remaining }} days.
 We recommend starting your renewal review now rather than waiting until the final weeks. Acting early can help secure more competitive options before prices move further.
-{% elif bucket_key == 'renewal_91_180' %}
-Your {{ service_label }} contract is due to end on {{ contract_end_date }}, which is in {{ days_remaining }} days.
-This is a good time to begin planning your renewal. Reviewing the market early gives your business more time to compare options and avoid last-minute pricing pressure.
 {% else %}
 Your {{ service_label }} contract is scheduled to end on {{ contract_end_date }}, which is in {{ days_remaining }} days.
 {% endif %}
@@ -27,4 +24,4 @@ Your renewal advisor:
 {{ advisor_name }}{% if advisor_phone %}
 {{ advisor_phone }}{% endif %}
 
-Please contact your renewal advisor to review available options and avoid your contract moving onto out-of-contract or higher variable rates.
+Please reply to this email if you would like to renew or review your available renewal options. Your renewal advisor will then contact you to help secure the best available pricing and avoid your contract moving onto out-of-contract or higher variable rates.

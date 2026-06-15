@@ -306,25 +306,31 @@ def render_renewal_email_bodies(ctx: Dict[str, Any]) -> tuple[str, str, str]:
     return subject, html, txt
 
 
-def render_renewal_email_sample_preview(bucket_key: str = "renewal_60_90") -> tuple[str, str]:
+def render_renewal_email_sample_preview(bucket_key: str = "renewal_90") -> tuple[str, str]:
     """Static sample for client review (no database). Returns (html, plain_text)."""
     from backend.services.renewal_email_buckets import (
-        BUCKET_RENEWAL_UNDER_30,
-        BUCKET_RENEWAL_60_90,
-        BUCKET_RENEWAL_91_180,
+        BUCKET_RENEWAL_30,
+        BUCKET_RENEWAL_60,
+        BUCKET_RENEWAL_70,
+        BUCKET_RENEWAL_80,
+        BUCKET_RENEWAL_90,
     )
 
     titles = {
-        BUCKET_RENEWAL_UNDER_30: "Your contract ends very soon",
-        BUCKET_RENEWAL_60_90: "Your plan renews soon",
-        BUCKET_RENEWAL_91_180: "Plan renewal planning",
+        BUCKET_RENEWAL_90: "Your renewal is due in 90 days",
+        BUCKET_RENEWAL_80: "Your renewal is due in 80 days",
+        BUCKET_RENEWAL_70: "Your renewal is due in 70 days",
+        BUCKET_RENEWAL_60: "Your renewal is due in 60 days",
+        BUCKET_RENEWAL_30: "Your contract ends in 30 days",
     }
-    key = bucket_key if bucket_key in titles else BUCKET_RENEWAL_60_90
+    key = bucket_key if bucket_key in titles else BUCKET_RENEWAL_90
     anchor = date(2026, 10, 1)
     sample_days = {
-        BUCKET_RENEWAL_UNDER_30: 29,
-        BUCKET_RENEWAL_60_90: 75,
-        BUCKET_RENEWAL_91_180: 120,
+        BUCKET_RENEWAL_90: 90,
+        BUCKET_RENEWAL_80: 80,
+        BUCKET_RENEWAL_70: 70,
+        BUCKET_RENEWAL_60: 60,
+        BUCKET_RENEWAL_30: 30,
     }[key]
     sample_end = anchor + timedelta(days=sample_days)
     days = (sample_end - anchor).days
