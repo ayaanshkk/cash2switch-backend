@@ -158,7 +158,7 @@ def fetch_eligible_contract_rows(
         INNER JOIN "StreemLyne_MT"."Project_Details" pd ON ecm.project_id = pd.project_id
         INNER JOIN "StreemLyne_MT"."Client_Master" cm ON pd.client_id = cm.client_id
         LEFT JOIN "StreemLyne_MT"."Employee_Master" em
-          ON COALESCE(ecm.employee_id, pd.assigned_employee_id, pd.employee_id, cm.assigned_employee_id) = em.employee_id
+          ON COALESCE(pd.assigned_employee_id, cm.assigned_employee_id, pd.employee_id, ecm.employee_id) = em.employee_id
         LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
         WHERE cm.is_deleted = false
           AND cm.is_archived = false
