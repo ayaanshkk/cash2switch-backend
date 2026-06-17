@@ -14,7 +14,8 @@ from sqlalchemy import text, bindparam, func, String
 from backend.db import SessionLocal
 from backend.models import (
     Opportunity_Details, Client_Master, Stage_Master, 
-    Employee_Master, Supplier_Master, Client_Interactions
+    Employee_Master, Supplier_Master, Client_Interactions,
+    Project_Details, Energy_Contract_Master
 )
 from backend.crm.controllers.crm_controller import CRMController
 from backend.crm.middleware.tenant_middleware import require_tenant
@@ -3568,6 +3569,7 @@ def leads_callback(opportunity_id):
 
         status = data.get('status')
         callback_date = data.get('callback_date')
+        new_end_date_str = data.get('new_end_date')
         notes = data.get('notes', '')
 
         current_app.logger.info(
@@ -3615,6 +3617,13 @@ def leads_callback(opportunity_id):
 
         stage_id = stage.stage_id
 
+        parsed_new_end_date = None
+        if new_end_date_str:
+            try:
+                parsed_new_end_date = datetime.strptime(str(new_end_date_str)[:10], '%Y-%m-%d').date()
+            except ValueError:
+                return jsonify({'error': 'Invalid new_end_date format. Expected YYYY-MM-DD'}), 400
+
         if not lead_client_id:
             current_app.logger.warning(f'Lead {real_id} has no client_id, creating one...')
             new_client = Client_Master(
@@ -3636,10 +3645,47 @@ def leads_callback(opportunity_id):
             current_app.logger.info(f'✅ Created client_id={lead_client_id} for lead {real_id}')
 
         lead.stage_id = stage_id
+        old_end_date = lead.end_date
+        updated_project_count = 0
+        updated_contract_count = 0
+
+        if parsed_new_end_date:
+            lead.end_date = parsed_new_end_date
+
+            projects = session.query(Project_Details).filter(
+                Project_Details.opportunity_id == real_id
+            ).all()
+
+            if not projects and lead_client_id:
+                projects = session.query(Project_Details).filter(
+                    Project_Details.client_id == lead_client_id
+                ).all()
+
+            project_ids = []
+            for project in projects:
+                project.end_date = parsed_new_end_date
+                project.updated_at = datetime.utcnow()
+                updated_project_count += 1
+                if project.project_id is not None:
+                    project_ids.append(project.project_id)
+
+            if project_ids:
+                contracts = session.query(Energy_Contract_Master).filter(
+                    Energy_Contract_Master.project_id.in_(project_ids)
+                ).all()
+                for contract in contracts:
+                    contract.contract_end_date = parsed_new_end_date
+                    contract.updated_at = datetime.utcnow()
+                    updated_contract_count += 1
+
         session.flush()
         current_app.logger.info(f'Updated lead {real_id} stage: {old_stage} → {status}')
 
         transition = f"Status: {old_stage or 'None'} → {status}"
+        if parsed_new_end_date:
+            old_end_text = old_end_date.strftime('%d/%m/%Y') if old_end_date else 'None'
+            new_end_text = parsed_new_end_date.strftime('%d/%m/%Y')
+            transition = f"{transition} | Contract end date: {old_end_text} -> {new_end_text}"
         formatted_notes = f"[{status}] {transition}" + (f" | {notes}" if notes else "")
 
         reminder_date = None
@@ -3648,6 +3694,8 @@ def leads_callback(opportunity_id):
                 reminder_date = datetime.strptime(callback_date, '%Y-%m-%d').date()
             except ValueError:
                 current_app.logger.warning(f'Invalid callback_date format: {callback_date}')
+        elif status == 'End Date Changed' and parsed_new_end_date:
+            reminder_date = parsed_new_end_date
 
         # Always insert a fresh row — guarantees new interaction_id and new created_at
         # so the calendar CTE (ORDER BY created_at DESC, interaction_id DESC) picks this row
@@ -3728,6 +3776,12 @@ def leads_callback(opportunity_id):
             'stage_id': stage_id,
             'callback_date': callback_date,
             'interaction_id': interaction.interaction_id,
+            'lead': {
+                'opportunity_id': real_id,
+                'stage_id': stage_id,
+                'stage_name': status,
+                'end_date': parsed_new_end_date.isoformat() if parsed_new_end_date else _iso(lead.end_date),
+            },
         }), 200
 
     except Exception as e:
