@@ -161,6 +161,7 @@ def cron_renewal_emails():
 
 
 @renewal_email_bp.route("/internal/admin/renewal-email-logs", methods=["GET"])
+@renewal_email_bp.route("/api/internal/admin/renewal-email-logs", methods=["GET"])
 @_admin_required
 def admin_renewal_email_logs():
     page = max(int(request.args.get("page", 1) or 1), 1)
@@ -230,6 +231,7 @@ def admin_renewal_email_logs():
 
 
 @renewal_email_bp.route("/internal/admin/renewal-email-logs/summary", methods=["GET"])
+@renewal_email_bp.route("/api/internal/admin/renewal-email-logs/summary", methods=["GET"])
 @_admin_required
 def admin_renewal_email_logs_summary():
     where_sql, params = _admin_logs_filters()
