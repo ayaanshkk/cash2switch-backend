@@ -56,6 +56,9 @@ def _serial(v):
         pass
     return v
 
+def _row_to_json(row):
+    return {key: _serial(value) for key, value in dict(row).items()}
+
 def _safe_float(v):
     try:
         if v is None:
@@ -148,6 +151,53 @@ def _resolve_opportunity_ts_expr(db) -> str:
     return 'NOW()'
 
 
+_RENEWAL_EMAIL_LOGS_FROM_SQL = """
+FROM "StreemLyne_MT"."Renewal_Email_Send_Log" rel
+LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm
+  ON rel.energy_contract_master_id = ecm.energy_contract_master_id
+LEFT JOIN "StreemLyne_MT"."Project_Details" pd
+  ON ecm.project_id = pd.project_id
+LEFT JOIN "StreemLyne_MT"."Client_Master" cm
+  ON pd.client_id = cm.client_id
+LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm
+  ON ecm.supplier_id = sm.supplier_id
+LEFT JOIN "StreemLyne_MT"."Employee_Master" em
+  ON COALESCE(pd.assigned_employee_id, cm.assigned_employee_id, pd.employee_id, ecm.employee_id) = em.employee_id
+"""
+
+
+def _renewal_email_log_filters():
+    params = {}
+    where = []
+    tenant_id = getattr(g, "tenant_id", None)
+    if tenant_id is not None:
+        where.append("TRIM(CAST(rel.tenant_id AS TEXT)) = :tenant_id_text")
+        params["tenant_id_text"] = str(tenant_id)
+
+    search = (request.args.get("search") or "").strip().lower()
+    if search:
+        where.append(
+            """
+            (
+              LOWER(COALESCE(rel.recipient_email, '')) LIKE :search
+              OR LOWER(COALESCE(cm.client_company_name, '')) LIKE :search
+              OR LOWER(COALESCE(cm.client_contact_name, '')) LIKE :search
+              OR LOWER(COALESCE(em.employee_name, '')) LIKE :search
+              OR LOWER(COALESCE(rel.provider_message_id, '')) LIKE :search
+            )
+            """
+        )
+        params["search"] = f"%{search}%"
+
+    status = (request.args.get("status") or "").strip()
+    if status:
+        where.append("LOWER(rel.status) = LOWER(:status)")
+        params["status"] = status
+
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+    return where_sql, params
+
+
 def _safe_float(v):
     try:
         if v is None:
@@ -174,6 +224,152 @@ def _lead_stage_bucket(stage_name: str) -> str:
 # ========================================
 # LEAD ROUTES
 # ========================================
+
+@crm_bp.route('/renewal-email-logs', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_renewal_email_logs():
+    current_user = request.current_user
+    if not is_crm_leads_admin_role(getattr(current_user, 'role', None)):
+        return jsonify({'error': 'Admin access required'}), 403
+
+    page = max(request.args.get('page', 1, type=int) or 1, 1)
+    page_size = min(max(request.args.get('page_size', 25, type=int) or 25, 1), 100)
+    offset = (page - 1) * page_size
+
+    where_sql, params = _renewal_email_log_filters()
+    params.update({'limit': page_size, 'offset': offset})
+
+    session = SessionLocal()
+    try:
+        total = session.execute(
+            text(f'SELECT COUNT(*) AS total {_RENEWAL_EMAIL_LOGS_FROM_SQL} {where_sql}'),
+            params,
+        ).scalar_one()
+
+        rows = session.execute(
+            text(
+                f"""
+                SELECT
+                  rel.renewal_email_send_log_id AS id,
+                  rel.tenant_id,
+                  rel.created_at AS sent_at,
+                  rel.status,
+                  rel.bucket_key,
+                  rel.recipient_email,
+                  rel.provider_message_id,
+                  rel.error_message,
+                  rel.contract_end_date,
+                  rel.energy_contract_master_id,
+                  ecm.service_id,
+                  CASE WHEN ecm.service_id = 2 THEN 'Water' ELSE 'Electricity' END AS service_label,
+                  ecm.project_id,
+                  cm.client_id,
+                  cm.client_company_name AS business_name,
+                  cm.client_contact_name AS customer_name,
+                  TRIM(CONCAT_WS(', ', NULLIF(cm.address, ''), NULLIF(cm.post_code, ''))) AS site_address,
+                  sm.supplier_company_name AS supplier_name,
+                  em.employee_name AS advisor_name,
+                  em.phone AS advisor_phone,
+                  (rel.contract_end_date - CURRENT_DATE) AS days_remaining
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {where_sql}
+                ORDER BY rel.created_at DESC, rel.renewal_email_send_log_id DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            params,
+        ).mappings().all()
+
+        return jsonify({
+            'items': [_row_to_json(row) for row in rows],
+            'page': page,
+            'page_size': page_size,
+            'total': int(total or 0),
+        }), 200
+    except Exception as e:
+        current_app.logger.exception("get_renewal_email_logs failed: %s", e)
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+@crm_bp.route('/renewal-email-logs/summary', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_renewal_email_logs_summary():
+    current_user = request.current_user
+    if not is_crm_leads_admin_role(getattr(current_user, 'role', None)):
+        return jsonify({'error': 'Admin access required'}), 403
+
+    where_sql, params = _renewal_email_log_filters()
+    scoped_where = where_sql if where_sql else "WHERE 1=1"
+
+    session = SessionLocal()
+    try:
+        counts = session.execute(
+            text(
+                f"""
+                SELECT
+                  COUNT(*) FILTER (
+                    WHERE LOWER(rel.status) = 'sent'
+                    AND rel.created_at >= CURRENT_DATE
+                  ) AS sent_today,
+                  COUNT(*) FILTER (
+                    WHERE LOWER(rel.status) = 'sent'
+                    AND rel.created_at >= NOW() - INTERVAL '7 days'
+                  ) AS sent_last_7_days,
+                  COUNT(*) FILTER (
+                    WHERE LOWER(rel.status) NOT IN ('sent', 'dry_run')
+                    AND rel.created_at >= NOW() - INTERVAL '7 days'
+                  ) AS failed_last_7_days,
+                  COUNT(*) FILTER (WHERE LOWER(rel.status) = 'sent') AS total_sent,
+                  COUNT(*) AS total_logged
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {scoped_where}
+                """
+            ),
+            params,
+        ).mappings().one()
+
+        latest_rows = session.execute(
+            text(
+                f"""
+                SELECT
+                  rel.renewal_email_send_log_id AS id,
+                  rel.created_at AS sent_at,
+                  rel.status,
+                  rel.bucket_key,
+                  rel.recipient_email,
+                  rel.contract_end_date,
+                  CASE WHEN ecm.service_id = 2 THEN 'Water' ELSE 'Electricity' END AS service_label,
+                  cm.client_company_name AS business_name,
+                  cm.client_contact_name AS customer_name,
+                  em.employee_name AS advisor_name
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {scoped_where}
+                ORDER BY rel.created_at DESC, rel.renewal_email_send_log_id DESC
+                LIMIT 6
+                """
+            ),
+            params,
+        ).mappings().all()
+
+        return jsonify({
+            **_row_to_json(counts),
+            'latest': [_row_to_json(row) for row in latest_rows],
+        }), 200
+    except Exception as e:
+        current_app.logger.exception("get_renewal_email_logs_summary failed: %s", e)
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
 
 @crm_bp.route('/leads', methods=['GET'])
 @token_required
