@@ -3188,7 +3188,9 @@ def health_check():
         'success': True,
         'module': 'CRM',
         'status': 'operational',
-        'message': 'StreemLyne CRM module is running'
+        'message': 'StreemLyne CRM module is running',
+        'email_logs_routes': True,
+        'email_logs_route_path': '/api/crm/renewal-email-logs',
     }, 200
 
 
