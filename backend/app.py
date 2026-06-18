@@ -150,6 +150,28 @@ def create_app():
     app.register_blueprint(calendar_routes.calendar_bp)
     app.register_blueprint(client_interactions_routes.client_interaction_bp)
     app.register_blueprint(renewal_email_routes.renewal_email_bp)
+
+    # Direct aliases for the admin email-log UI. These intentionally live on the
+    # app object as well as the CRM blueprint so live deployments cannot miss
+    # them if a blueprint import/registration path changes.
+    app.add_url_rule(
+        "/api/admin/renewal-email-logs",
+        "direct_admin_renewal_email_logs",
+        crm_routes.get_renewal_email_logs,
+        methods=["GET"],
+    )
+    app.add_url_rule(
+        "/api/admin/renewal-email-logs/summary",
+        "direct_admin_renewal_email_logs_summary",
+        crm_routes.get_renewal_email_logs_summary,
+        methods=["GET"],
+    )
+    app.add_url_rule(
+        "/__email-logs-build-check",
+        "email_logs_build_check",
+        lambda: jsonify({"email_logs_routes": True, "commit_hint": "app-direct-email-logs"}),
+        methods=["GET"],
+    )
     # app.register_blueprint(bulk_import_optimized.bulk_import_bp, url_prefix='/api')
     # app.register_blueprint(async_bulk_routes.async_bulk_bp, url_prefix='/api')
     logging.info("CRM Blueprint registered successfully") 
