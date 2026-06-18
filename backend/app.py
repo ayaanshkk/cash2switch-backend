@@ -167,9 +167,25 @@ def create_app():
         methods=["GET"],
     )
     app.add_url_rule(
+        "/api/entrypoint/renewal-email-logs",
+        "backend_app_entrypoint_renewal_email_logs",
+        crm_routes.get_renewal_email_logs,
+        methods=["GET"],
+    )
+    app.add_url_rule(
+        "/api/entrypoint/renewal-email-logs/summary",
+        "backend_app_entrypoint_renewal_email_logs_summary",
+        crm_routes.get_renewal_email_logs_summary,
+        methods=["GET"],
+    )
+    app.add_url_rule(
         "/__email-logs-build-check",
         "email_logs_build_check",
-        lambda: jsonify({"email_logs_routes": True, "commit_hint": "app-direct-email-logs"}),
+        lambda: jsonify({
+            "email_logs_routes": True,
+            "commit_hint": "backend-app-direct-email-logs",
+            "start_command": "backend.app:create_app()",
+        }),
         methods=["GET"],
     )
     # app.register_blueprint(bulk_import_optimized.bulk_import_bp, url_prefix='/api')
