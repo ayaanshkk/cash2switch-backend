@@ -166,7 +166,7 @@ LEFT JOIN "StreemLyne_MT"."Employee_Master" em
 """
 
 
-def _renewal_email_log_filters():
+def _renewal_email_log_filters(include_advisor=True):
     params = {}
     where = []
     tenant_id = getattr(g, "tenant_id", None)
@@ -194,8 +194,26 @@ def _renewal_email_log_filters():
         where.append("LOWER(rel.status) = LOWER(:status)")
         params["status"] = status
 
+    advisor = (request.args.get("advisor") or "").strip()
+    if include_advisor and advisor:
+        where.append("LOWER(COALESCE(em.employee_name, '')) = LOWER(:advisor)")
+        params["advisor"] = advisor
+
     where_sql = "WHERE " + " AND ".join(where) if where else ""
     return where_sql, params
+
+
+def _renewal_email_logs_order_sql():
+    sort = (request.args.get("sort") or "sent_desc").strip().lower()
+    sort_map = {
+        "sent_asc": "rel.created_at ASC, rel.renewal_email_send_log_id ASC",
+        "advisor_asc": "LOWER(COALESCE(em.employee_name, '')) ASC NULLS LAST, rel.created_at DESC",
+        "advisor_desc": "LOWER(COALESCE(em.employee_name, '')) DESC NULLS LAST, rel.created_at DESC",
+        "end_date_asc": "rel.contract_end_date ASC NULLS LAST, rel.created_at DESC",
+        "end_date_desc": "rel.contract_end_date DESC NULLS LAST, rel.created_at DESC",
+        "sent_desc": "rel.created_at DESC, rel.renewal_email_send_log_id DESC",
+    }
+    return sort_map.get(sort, sort_map["sent_desc"])
 
 
 def _safe_float(v):
@@ -238,7 +256,9 @@ def get_renewal_email_logs():
     offset = (page - 1) * page_size
 
     where_sql, params = _renewal_email_log_filters()
+    advisor_where_sql, advisor_params = _renewal_email_log_filters(include_advisor=False)
     params.update({'limit': page_size, 'offset': offset})
+    order_sql = _renewal_email_logs_order_sql()
 
     session = SessionLocal()
     try:
@@ -274,15 +294,36 @@ def get_renewal_email_logs():
                   (rel.contract_end_date - CURRENT_DATE) AS days_remaining
                 {_RENEWAL_EMAIL_LOGS_FROM_SQL}
                 {where_sql}
-                ORDER BY rel.created_at DESC, rel.renewal_email_send_log_id DESC
+                ORDER BY {order_sql}
                 LIMIT :limit OFFSET :offset
                 """
             ),
             params,
         ).mappings().all()
 
+        advisors = session.execute(
+            text(
+                f"""
+                SELECT DISTINCT em.employee_name AS advisor_name
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {advisor_where_sql}
+                AND NULLIF(TRIM(COALESCE(em.employee_name, '')), '') IS NOT NULL
+                ORDER BY em.employee_name ASC
+                """
+                if advisor_where_sql
+                else f"""
+                SELECT DISTINCT em.employee_name AS advisor_name
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                WHERE NULLIF(TRIM(COALESCE(em.employee_name, '')), '') IS NOT NULL
+                ORDER BY em.employee_name ASC
+                """
+            ),
+            advisor_params,
+        ).scalars().all()
+
         return jsonify({
             'items': [_row_to_json(row) for row in rows],
+            'advisors': [advisor for advisor in advisors if advisor],
             'page': page,
             'page_size': page_size,
             'total': int(total or 0),
