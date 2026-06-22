@@ -417,22 +417,33 @@ def run_renewal_email_campaign(
         "skipped_bucket": 0,
         "skipped_bad_email": 0,
         "skipped_not_whitelist": 0,
+        "skipped_weekend": 0,
         "failed": 0,
     }
 
+    if anchor.weekday() in (5, 6):
+        counts["skipped_weekend"] = 1
+        logger.info(
+            "Renewal email campaign skipped for weekend date %s; reminders will be picked up on Monday",
+            anchor,
+        )
+        return counts
+
+    run_anchors = [anchor]
+    if anchor.weekday() == 0:
+        run_anchors = [anchor - timedelta(days=2), anchor - timedelta(days=1), anchor]
+
     session = SessionLocal()
     try:
-        window_start, window_end = contract_window_end_dates(anchor)
         whitelist = renewal_email_test_whitelist()
         allow_sql: Optional[List[str]] = sorted(whitelist) if whitelist else None
         wl_raw = os.getenv("RENEWAL_EMAIL_TEST_WHITELIST", "")
 
         if _renewal_debug_on():
             logger.info(
-                "[renewal-debug] anchor=%s window_start=%s window_end=%s tenant_id_filter=%s dry_run=%s",
+                "[renewal-debug] anchor=%s effective_anchors=%s tenant_id_filter=%s dry_run=%s",
                 anchor,
-                window_start,
-                window_end,
+                run_anchors,
                 tenant_id,
                 dry_run,
             )
@@ -453,18 +464,49 @@ def run_renewal_email_campaign(
                 len(whitelist),
             )
 
-        rows = fetch_eligible_contract_rows(session, anchor, tenant_id, email_allowlist_lower=allow_sql)
+        candidate_rows: List[tuple[Any, date]] = []
+        seen_candidates = set()
+        for effective_anchor in run_anchors:
+            window_start, window_end = contract_window_end_dates(effective_anchor)
+            if _renewal_debug_on():
+                logger.info(
+                    "[renewal-debug] effective_anchor=%s window_start=%s window_end=%s",
+                    effective_anchor,
+                    window_start,
+                    window_end,
+                )
+            rows = fetch_eligible_contract_rows(
+                session,
+                effective_anchor,
+                tenant_id,
+                email_allowlist_lower=allow_sql,
+            )
+            for row in rows:
+                end_d = _normalize_date(row["contract_end_date"])
+                days_for_anchor = (end_d - effective_anchor).days
+                bucket = bucket_for_days_remaining(days_for_anchor)
+                candidate_key = (
+                    str(row.get("tenant_id")).strip(),
+                    row.get("energy_contract_master_id"),
+                    end_d,
+                    bucket.key if bucket else None,
+                )
+                if candidate_key in seen_candidates:
+                    continue
+                seen_candidates.add(candidate_key)
+                candidate_rows.append((row, effective_anchor))
 
         if _renewal_debug_on():
-            logger.info("[renewal-debug] eligible contracts count (after all SQL filters)=%s", len(rows))
-            for r in rows:
+            logger.info("[renewal-debug] eligible contract candidates count (after all SQL filters)=%s", len(candidate_rows))
+            for r, effective_anchor in candidate_rows:
                 rd = dict(r)
                 end_d = _normalize_date(rd["contract_end_date"])
-                dr = (end_d - anchor).days
+                dr = (end_d - effective_anchor).days
                 bk = bucket_for_days_remaining(dr)
                 logger.info(
-                    "[renewal-debug] eligible row ecm_id=%s client_id=%s tenant_id=%r email=%r "
+                    "[renewal-debug] eligible row effective_anchor=%s ecm_id=%s client_id=%s tenant_id=%r email=%r "
                     "contract_end=%s days_remaining=%s bucket=%s service_id=%s",
+                    effective_anchor,
                     rd.get("energy_contract_master_id"),
                     rd.get("client_id"),
                     rd.get("tenant_id"),
@@ -482,7 +524,7 @@ def run_renewal_email_campaign(
                     "[renewal-debug] same anchor/tenant WITHOUT email IN filter: count=%s",
                     len(rows_no_email),
                 )
-                if len(rows_no_email) and not len(rows):
+                if len(rows_no_email) and not len(candidate_rows):
                     for r in rows_no_email[:10]:
                         rd = dict(r)
                         em = (rd.get("client_email") or "").strip().lower()
@@ -494,10 +536,10 @@ def run_renewal_email_campaign(
                             em,
                             allowed,
                         )
-            if not rows:
+            if not candidate_rows:
                 _debug_probe_seeded_contracts(session, anchor, tenant_id)
 
-        for row in rows:
+        for row, effective_anchor in candidate_rows:
             email = (row.get("client_email") or "").strip()
             wl_ok = is_allowed_renewal_recipient(email, whitelist)
             if _renewal_debug_on():
@@ -520,7 +562,7 @@ def run_renewal_email_campaign(
                 continue
 
             end = _normalize_date(row["contract_end_date"])
-            days = (end - anchor).days
+            days = (end - effective_anchor).days
             bucket = bucket_for_days_remaining(days)
             if _renewal_debug_on():
                 logger.info(
@@ -560,7 +602,7 @@ def run_renewal_email_campaign(
                 counts["skipped_dup"] += 1
                 continue
 
-            ctx = _context_from_contract_row(row, anchor, bucket)
+            ctx = _context_from_contract_row(row, effective_anchor, bucket)
             subject, html, txt = render_renewal_email_bodies(ctx)
 
             if dry_run:

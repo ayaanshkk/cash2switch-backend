@@ -1440,6 +1440,10 @@ def search_all_energy_customers():
  
     session = SessionLocal()
     try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found for user'}), 400
+
         query_param = request.args.get('q', '').strip()
         service_param = request.args.get('service', 'utilities').strip().lower()
  
@@ -1467,6 +1471,7 @@ def search_all_energy_customers():
             Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id
         ).filter(
             and_(
+                Client_Master.tenant_id == tenant_id,
                 Client_Master.is_deleted == False,
                 or_(
                     Energy_Contract_Master.service_id == service_id,

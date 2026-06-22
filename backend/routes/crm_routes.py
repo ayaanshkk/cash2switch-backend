@@ -194,9 +194,21 @@ def _renewal_email_log_filters(include_advisor=True):
         where.append("LOWER(rel.status) = LOWER(:status)")
         params["status"] = status
 
+    sent_from = (request.args.get("sent_from") or "").strip()
+    if sent_from:
+        where.append("rel.created_at::date >= CAST(:sent_from AS DATE)")
+        params["sent_from"] = sent_from
+
+    sent_to = (request.args.get("sent_to") or "").strip()
+    if sent_to:
+        where.append("rel.created_at::date <= CAST(:sent_to AS DATE)")
+        params["sent_to"] = sent_to
+
     advisor = (request.args.get("advisor") or "").strip()
     if include_advisor and advisor:
-        where.append("LOWER(COALESCE(em.employee_name, '')) = LOWER(:advisor)")
+        where.append(
+            "LOWER(COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie')) = LOWER(:advisor)"
+        )
         params["advisor"] = advisor
 
     where_sql = "WHERE " + " AND ".join(where) if where else ""
@@ -207,8 +219,8 @@ def _renewal_email_logs_order_sql():
     sort = (request.args.get("sort") or "sent_desc").strip().lower()
     sort_map = {
         "sent_asc": "rel.created_at ASC, rel.renewal_email_send_log_id ASC",
-        "advisor_asc": "LOWER(COALESCE(em.employee_name, '')) ASC NULLS LAST, rel.created_at DESC",
-        "advisor_desc": "LOWER(COALESCE(em.employee_name, '')) DESC NULLS LAST, rel.created_at DESC",
+        "advisor_asc": "LOWER(COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie')) ASC, rel.created_at DESC",
+        "advisor_desc": "LOWER(COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie')) DESC, rel.created_at DESC",
         "end_date_asc": "rel.contract_end_date ASC NULLS LAST, rel.created_at DESC",
         "end_date_desc": "rel.contract_end_date DESC NULLS LAST, rel.created_at DESC",
         "sent_desc": "rel.created_at DESC, rel.renewal_email_send_log_id DESC",
@@ -289,7 +301,7 @@ def get_renewal_email_logs():
                   cm.client_contact_name AS customer_name,
                   TRIM(CONCAT_WS(', ', NULLIF(cm.address, ''), NULLIF(cm.post_code, ''))) AS site_address,
                   sm.supplier_company_name AS supplier_name,
-                  em.employee_name AS advisor_name,
+                  COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie') AS advisor_name,
                   em.phone AS advisor_phone,
                   (rel.contract_end_date - CURRENT_DATE) AS days_remaining
                 {_RENEWAL_EMAIL_LOGS_FROM_SQL}
@@ -304,18 +316,16 @@ def get_renewal_email_logs():
         advisors = session.execute(
             text(
                 f"""
-                SELECT DISTINCT em.employee_name AS advisor_name
+                SELECT DISTINCT COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie') AS advisor_name
                 {_RENEWAL_EMAIL_LOGS_FROM_SQL}
                 {advisor_where_sql}
-                AND NULLIF(TRIM(COALESCE(em.employee_name, '')), '') IS NOT NULL
-                ORDER BY em.employee_name ASC
+                ORDER BY advisor_name ASC
                 """
                 if advisor_where_sql
                 else f"""
-                SELECT DISTINCT em.employee_name AS advisor_name
+                SELECT DISTINCT COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie') AS advisor_name
                 {_RENEWAL_EMAIL_LOGS_FROM_SQL}
-                WHERE NULLIF(TRIM(COALESCE(em.employee_name, '')), '') IS NOT NULL
-                ORDER BY em.employee_name ASC
+                ORDER BY advisor_name ASC
                 """
             ),
             advisor_params,
@@ -389,7 +399,7 @@ def get_renewal_email_logs_summary():
                   CASE WHEN ecm.service_id = 2 THEN 'Water' ELSE 'Electricity' END AS service_label,
                   cm.client_company_name AS business_name,
                   cm.client_contact_name AS customer_name,
-                  em.employee_name AS advisor_name
+                  COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie') AS advisor_name
                 {_RENEWAL_EMAIL_LOGS_FROM_SQL}
                 {scoped_where}
                 ORDER BY rel.created_at DESC, rel.renewal_email_send_log_id DESC
@@ -399,9 +409,89 @@ def get_renewal_email_logs_summary():
             params,
         ).mappings().all()
 
+        status_rows = session.execute(
+            text(
+                f"""
+                SELECT
+                  LOWER(COALESCE(rel.status, 'unknown')) AS label,
+                  COUNT(*) AS value
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {scoped_where}
+                GROUP BY LOWER(COALESCE(rel.status, 'unknown'))
+                ORDER BY value DESC, label ASC
+                """
+            ),
+            params,
+        ).mappings().all()
+
+        advisor_rows = session.execute(
+            text(
+                f"""
+                SELECT
+                  COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie') AS label,
+                  COUNT(*) AS value
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {scoped_where}
+                GROUP BY COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie')
+                ORDER BY value DESC, label ASC
+                LIMIT 8
+                """
+            ),
+            params,
+        ).mappings().all()
+
+        service_rows = session.execute(
+            text(
+                f"""
+                SELECT
+                  CASE WHEN ecm.service_id = 2 THEN 'Water' ELSE 'Electricity' END AS label,
+                  COUNT(*) AS value
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {scoped_where}
+                GROUP BY CASE WHEN ecm.service_id = 2 THEN 'Water' ELSE 'Electricity' END
+                ORDER BY value DESC, label ASC
+                """
+            ),
+            params,
+        ).mappings().all()
+
+        daily_rows = session.execute(
+            text(
+                f"""
+                SELECT
+                  rel.created_at::date AS label,
+                  COUNT(*) FILTER (WHERE LOWER(rel.status) = 'sent') AS sent,
+                  COUNT(*) FILTER (WHERE LOWER(rel.status) <> 'sent') AS other,
+                  COUNT(*) AS total
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {scoped_where}
+                  AND rel.created_at >= NOW() - INTERVAL '14 days'
+                GROUP BY rel.created_at::date
+                ORDER BY label ASC
+                """
+                if scoped_where
+                else f"""
+                SELECT
+                  rel.created_at::date AS label,
+                  COUNT(*) FILTER (WHERE LOWER(rel.status) = 'sent') AS sent,
+                  COUNT(*) FILTER (WHERE LOWER(rel.status) <> 'sent') AS other,
+                  COUNT(*) AS total
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                WHERE rel.created_at >= NOW() - INTERVAL '14 days'
+                GROUP BY rel.created_at::date
+                ORDER BY label ASC
+                """
+            ),
+            params,
+        ).mappings().all()
+
         return jsonify({
             **_row_to_json(counts),
             'latest': [_row_to_json(row) for row in latest_rows],
+            'by_status': [_row_to_json(row) for row in status_rows],
+            'by_advisor': [_row_to_json(row) for row in advisor_rows],
+            'by_service': [_row_to_json(row) for row in service_rows],
+            'daily': [_row_to_json(row) for row in daily_rows],
         }), 200
     except Exception as e:
         current_app.logger.exception("get_renewal_email_logs_summary failed: %s", e)
