@@ -1682,7 +1682,6 @@ def search_all_leads():
             )
             .filter(Opportunity_Details.service_id == service_id)
             .filter(Opportunity_Details.opportunity_owner_employee_id.isnot(None))
-            .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
             .filter(
                 (func.lower(func.coalesce(Opportunity_Details.business_name, Client_Master.client_company_name, Opportunity_Details.opportunity_title, '')).like(like_q)) |
                 (func.lower(func.coalesce(Opportunity_Details.contact_person, '')).like(like_q)) |
