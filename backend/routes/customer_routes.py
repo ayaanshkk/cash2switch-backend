@@ -35,6 +35,26 @@ from backend.models import (
 )
 
 energy_customer_bp = Blueprint('energy_customers', __name__)
+FIELD_SALES_ROLE_ID = 7
+
+
+def _is_field_sales_user(session, user) -> bool:
+    role = str(getattr(user, "role", "") or "").strip().lower()
+    if role in ("field sales", "fieldsales", "field_sales") or getattr(user, "role_id", None) == FIELD_SALES_ROLE_ID:
+        return True
+
+    user_id = getattr(user, "user_id", None)
+    if not user_id:
+        return False
+
+    row = session.execute(text("""
+        SELECT 1
+        FROM "StreemLyne_MT"."User_Role_Mapping"
+        WHERE user_id = :user_id
+          AND role_id = :role_id
+        LIMIT 1
+    """), {"user_id": user_id, "role_id": FIELD_SALES_ROLE_ID}).first()
+    return row is not None
 
 
 def _renewals_clients_see_entire_tenant(user) -> bool:
@@ -1451,8 +1471,10 @@ def search_all_energy_customers():
             return jsonify([]), 200
  
         service_id = {'utilities': 1, 'electricity': 1, 'water': 2, 'gas': 3}.get(service_param, 1)
+        restrict_to_own_records = _is_field_sales_user(session, request.current_user)
+        current_employee_id = getattr(request.current_user, 'employee_id', None)
  
-        results = session.query(
+        query = session.query(
             Client_Master,
             Project_Details,
             Energy_Contract_Master,
@@ -1489,7 +1511,12 @@ def search_all_energy_customers():
                     Supplier_Master.supplier_company_name.ilike(f'%{query_param}%')
                 )
             )
-        ).order_by(Client_Master.client_id.desc()).limit(50).all()
+        )
+
+        if restrict_to_own_records:
+            query = query.filter(Project_Details.assigned_employee_id == current_employee_id)
+
+        results = query.order_by(Client_Master.client_id.desc()).limit(50).all()
  
         customers = []
         seen_clients = set()

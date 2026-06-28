@@ -108,6 +108,26 @@ crm_bp = Blueprint('crm', __name__, url_prefix='/api/crm')
 crm_controller = CRMController()
 
 OFFSHORE_ROLE_ID = 5
+FIELD_SALES_ROLE_ID = 7
+
+
+def _is_field_sales_user(session, user) -> bool:
+    role = str(getattr(user, "role", "") or "").strip().lower()
+    if role in ("field sales", "fieldsales", "field_sales") or getattr(user, "role_id", None) == FIELD_SALES_ROLE_ID:
+        return True
+
+    user_id = getattr(user, "user_id", None)
+    if not user_id:
+        return False
+
+    row = session.execute(text("""
+        SELECT 1
+        FROM "StreemLyne_MT"."User_Role_Mapping"
+        WHERE user_id = :user_id
+          AND role_id = :role_id
+        LIMIT 1
+    """), {"user_id": user_id, "role_id": FIELD_SALES_ROLE_ID}).first()
+    return row is not None
 
 
 def _staff_period_bounds(period: str):
@@ -1663,8 +1683,11 @@ def search_all_leads():
             return jsonify([]), 200
 
         like_q = f'%{q.lower()}%'
+        current_user = getattr(request, 'current_user', None)
+        restrict_to_own_records = _is_field_sales_user(session, current_user)
+        current_employee_id = getattr(current_user, 'employee_id', None)
 
-        rows = (
+        query = (
             session.query(
                 Opportunity_Details,
                 Stage_Master.stage_name,
@@ -1689,9 +1712,12 @@ def search_all_leads():
                 (func.lower(func.coalesce(Opportunity_Details.email, '')).like(like_q)) |
                 (func.lower(func.coalesce(Opportunity_Details.mpan_mpr, '')).like(like_q))
             )
-            .order_by(Opportunity_Details.created_at.desc())
-            .all()
         )
+
+        if restrict_to_own_records:
+            query = query.filter(Opportunity_Details.opportunity_owner_employee_id == current_employee_id)
+
+        rows = query.order_by(Opportunity_Details.created_at.desc()).all()
 
         results = []
         for row in rows:
