@@ -3978,6 +3978,9 @@ def leads_callback(opportunity_id):
             except ValueError:
                 return jsonify({'error': 'Invalid new_end_date format. Expected YYYY-MM-DD'}), 400
 
+        if status == 'Renewed Directly' and not parsed_new_end_date:
+            return jsonify({'error': 'Please enter the new contract end date'}), 400
+
         if not lead_client_id:
             current_app.logger.warning(f'Lead {real_id} has no client_id, creating one...')
             new_client = Client_Master(

@@ -119,7 +119,7 @@ def add_callback(client_id):
             "End Date Changed":   {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Complaint":          {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Email Only":         {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
-            "Renewed Directly":   {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": True},
+            "Renewed Directly":   {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Incorrect Supplier": {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Converted":          {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Not Called":         {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
@@ -137,6 +137,9 @@ def add_callback(client_id):
 
         if config["requires_notes"] and not notes.strip():
             return jsonify({'error': 'Please enter the reason why it was lost'}), 400
+
+        if status == "Renewed Directly" and not new_end_date_str:
+            return jsonify({'error': 'Please enter the new contract end date'}), 400
 
         date_required = False
         if config["requires_sold"]:
@@ -312,7 +315,7 @@ def add_callback(client_id):
                 return jsonify({'error': f'Failed to update information: {str(e)}'}), 500
 
         # ── End Date Changed ───────────────────────────────────────────────────
-        elif status == "End Date Changed" and new_end_date_str:
+        elif status in ("End Date Changed", "Renewed Directly") and new_end_date_str:
             try:
                 new_end_date = datetime.strptime(new_end_date_str, '%Y-%m-%d').date()
 
@@ -335,7 +338,8 @@ def add_callback(client_id):
                     if data.get('notes', '').strip():
                         notes = f"{data.get('notes').strip()} | {notes}"
 
-                    callback_date = new_end_date_str
+                    if status == "End Date Changed":
+                        callback_date = new_end_date_str
 
             except Exception as e:
                 session.rollback()
