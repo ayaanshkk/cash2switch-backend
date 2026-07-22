@@ -390,6 +390,7 @@ def get_period_breakdown():
                 'contract_end_date': r.contract_end_date.isoformat() if r.contract_end_date else None,
                 'days_until_expiry': days_until_expiry,
                 'mpan_number': r.mpan_number,
+                'mpan_mpr': r.mpan_number,
                 'annual_usage': r.annual_usage,
                 'estimated_revenue': round(revenue, 2),
                 'assigned_to': r.employee_name or 'Unassigned',

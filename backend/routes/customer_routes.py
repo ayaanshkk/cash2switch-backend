@@ -1783,13 +1783,28 @@ def restore_customer(client_id):
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
-        client = (
-            session.query(Client_Master).filter_by(display_order=client_id, tenant_id=tenant_id).first() or
-            session.query(Client_Master).filter_by(tenant_client_id=client_id, tenant_id=tenant_id).first() or
-            session.query(Client_Master).filter_by(client_id=client_id, tenant_id=tenant_id).first()
-        )
-        if client and not client.is_deleted:
-            client = None
+        # The recycle-bin UI sends the real primary key. Resolve that first and
+        # only look at deleted rows so display IDs cannot collide with client_id.
+        client = session.query(Client_Master).filter_by(
+            client_id=client_id,
+            tenant_id=tenant_id,
+            is_deleted=True,
+        ).first()
+
+        if not client:
+            client = session.query(Client_Master).filter_by(
+                display_order=client_id,
+                tenant_id=tenant_id,
+                is_deleted=True,
+            ).first()
+
+        if not client:
+            client = session.query(Client_Master).filter_by(
+                tenant_client_id=client_id,
+                tenant_id=tenant_id,
+                is_deleted=True,
+            ).first()
+
         if not client:
             return jsonify({'error': 'Customer not found in recycle bin'}), 404
 
@@ -1797,11 +1812,14 @@ def restore_customer(client_id):
         actual_client_id = client.client_id
 
         assigned_employee_id = client.assigned_employee_id
+        project = session.query(Project_Details).filter_by(client_id=actual_client_id).first()
+        if not assigned_employee_id and project:
+            assigned_employee_id = project.assigned_employee_id
+
         client.is_deleted = False
         client.deleted_at = None
         client.deleted_reason = None
 
-        project = session.query(Project_Details).filter_by(client_id=actual_client_id).first()
         if project and project.status:
             project.status = None
  
