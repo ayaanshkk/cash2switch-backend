@@ -11,6 +11,7 @@ from sqlalchemy import and_, text
 from backend.models import Client_Interactions, Client_Master, Energy_Contract_Master, Project_Details, Supplier_Master
 from backend.db import SessionLocal, safe_add_with_sequence_retry
 from backend.routes.auth_routes import token_required
+from backend.utils.commission_schedule import generate_commission_schedule_for_project
  
 client_interaction_bp = Blueprint('client_interactions', __name__)
  
@@ -216,6 +217,7 @@ def add_callback(client_id):
         if status == "Already Renewed":
             try:
                 changes_made = []
+                commission_generation_result = None
 
                 contract = session.query(Energy_Contract_Master).select_from(Client_Master).join(
                     Project_Details, Client_Master.client_id == Project_Details.client_id
@@ -284,6 +286,12 @@ def add_callback(client_id):
 
                 if project:
                     project.status = final_status
+                    if final_status == 'Already Renewed':
+                        session.flush()
+                        commission_generation_result = generate_commission_schedule_for_project(
+                            session,
+                            project.project_id,
+                        ).to_dict()
                     if old_status != final_status:
                         changes_made.append(f"Status: {old_status or 'None'} → {final_status}")
 
@@ -306,7 +314,8 @@ def add_callback(client_id):
                     'success': True,
                     'message': 'Callback saved successfully',
                     'status': final_status,
-                    'callback_date': callback_date
+                    'callback_date': callback_date,
+                    'commission_generation': commission_generation_result,
                 }), 200
 
             except Exception as e:
