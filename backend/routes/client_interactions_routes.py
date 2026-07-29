@@ -32,7 +32,7 @@ def get_tenant_id_from_user(user):
 CLEANSING_STATUSES = {"Invalid Number", "Incorrect Supplier"}
  
 # ── Statuses that go to Recycle Bin (soft-delete with is_cleansing=False) ────
-RECYCLE_BIN_STATUSES = {"Lost", "Lost COT", "Meter De-energised", "Complaint", "Duplicate"}
+RECYCLE_BIN_STATUSES = {"Lost", "Lost COT", "Meter De-energised", "Complaint", "Duplicate", "Dead"}
 
 
 # ── Helper: return CORS preflight response immediately (before auth check) ──
@@ -123,7 +123,7 @@ def add_callback(client_id):
             "Incorrect Supplier": {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Converted":          {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Not Called":         {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
-            "Dead":               {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": True},
+            "Dead":               {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Duplicate":          {"requires_date": False, "requires_sold": False, "deletes_record": True, "requires_notes": False},
         }
 
@@ -136,7 +136,7 @@ def add_callback(client_id):
         config = status_config[status]
 
         if config["requires_notes"] and not notes.strip():
-            return jsonify({'error': 'Please enter the reason why it was lost'}), 400
+            return jsonify({'error': f'Please enter the reason for {status}'}), 400
 
         if status == "Renewed Directly" and not new_end_date_str:
             return jsonify({'error': 'Please enter the new contract end date'}), 400

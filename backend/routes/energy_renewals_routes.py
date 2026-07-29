@@ -12,6 +12,46 @@ from .auth_helpers import token_required, get_tenant_id_from_user
 
 renewals_bp = Blueprint("renewals", __name__)
 
+RENEWAL_RECYCLE_BIN_STATUSES = ("Lost", "Lost COT", "Dead")
+
+
+def sync_recycle_bin_renewal_statuses(session, tenant_id, employee_id=None):
+    """Move active renewals with recycle-bin statuses into the recycle bin."""
+    filters = [
+        Client_Master.tenant_id == tenant_id,
+        Client_Master.is_deleted == False,
+        Project_Details.status.in_(RENEWAL_RECYCLE_BIN_STATUSES),
+    ]
+    if employee_id:
+        filters.append(Project_Details.assigned_employee_id == employee_id)
+
+    rows = session.query(Client_Master, Project_Details).join(
+        Project_Details,
+        Client_Master.client_id == Project_Details.client_id,
+    ).join(
+        Energy_Contract_Master,
+        Project_Details.project_id == Energy_Contract_Master.project_id,
+    ).filter(*filters).all()
+
+    if not rows:
+        return 0
+
+    now = datetime.utcnow()
+    for client, project in rows:
+        client.is_deleted = True
+        client.deleted_at = client.deleted_at or now
+        client.deleted_reason = project.status
+        if hasattr(client, "is_cleansing"):
+            client.is_cleansing = False
+
+    session.commit()
+    current_app.logger.info(
+        "Moved %s existing renewal(s) to recycle bin for statuses %s",
+        len(rows),
+        ", ".join(RENEWAL_RECYCLE_BIN_STATUSES),
+    )
+    return len(rows)
+
 # ============================================================================
 # ENERGY RENEWALS ENDPOINTS
 # ============================================================================
@@ -47,6 +87,12 @@ def get_renewals():
             date_filter = "AND ecm.contract_end_date IS NOT NULL"
         else:
             date_filter = "AND ecm.contract_end_date BETWEEN :today AND :ninety_days_later"
+
+        sync_recycle_bin_renewal_statuses(
+            db,
+            tenant_id,
+            int(employee_id) if employee_id else None,
+        )
 
         query = text(f"""
             SELECT
@@ -131,6 +177,8 @@ def get_renewal_stats():
         today = datetime.utcnow().date()
         days_365_later = today + timedelta(days=365)
 
+        sync_recycle_bin_renewal_statuses(session, tenant_id, employee_id)
+
         base_query = session.query(
             Client_Master,
             Project_Details,
@@ -141,6 +189,7 @@ def get_renewal_stats():
             Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
         ).filter(
             Client_Master.tenant_id == tenant_id,
+            Client_Master.is_deleted == False,
             Energy_Contract_Master.contract_end_date.isnot(None)
         )
 
@@ -724,6 +773,8 @@ def get_renewal_performance():
 
         today = datetime.utcnow().date()
 
+        sync_recycle_bin_renewal_statuses(session, tenant_id, employee_id)
+
         base_query = session.query(
             Project_Details,
             Energy_Contract_Master,
@@ -757,7 +808,7 @@ def get_renewal_performance():
             Client_Master.tenant_id == tenant_id,
             Client_Master.is_deleted == True,
             Energy_Contract_Master.service_id == service_id,
-            func.lower(Client_Master.deleted_reason).in_(['lost', 'lost cot']),
+            func.lower(Client_Master.deleted_reason).in_(['lost', 'lost cot', 'dead']),
         )
 
         if employee_id:
@@ -844,6 +895,8 @@ def get_staff_status_counts():
             return jsonify({'error': 'Tenant not found'}), 400
  
         employee_id = request.args.get('employee_id', type=int)
+
+        sync_recycle_bin_renewal_statuses(session, tenant_id, employee_id)
         
         print(f"\n{'='*80}")
         print(f"🔍 RENEWALS STAFF PERFORMANCE REQUEST")
@@ -920,6 +973,7 @@ def get_staff_status_counts():
                 INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm 
                     ON pd.project_id = ecm.project_id
                 WHERE cm.tenant_id = :tenant_id
+                AND cm.is_deleted = false
                 AND pd.assigned_employee_id = :emp_id
                 AND ecm.contract_end_date IS NOT NULL
             """
