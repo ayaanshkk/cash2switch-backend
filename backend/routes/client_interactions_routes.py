@@ -7,10 +7,11 @@ Updated Callback Route - backend/routes/client_interactions_routes.py
  
 from flask import Blueprint, request, jsonify, current_app
 from datetime import datetime, timedelta
-from sqlalchemy import and_, text
+from sqlalchemy import and_, or_, text
 from backend.models import Client_Interactions, Client_Master, Energy_Contract_Master, Project_Details, Supplier_Master
 from backend.db import SessionLocal, safe_add_with_sequence_retry
 from backend.routes.auth_routes import token_required
+from backend.utils.commission_schedule import generate_commission_schedule_for_project
  
 client_interaction_bp = Blueprint('client_interactions', __name__)
  
@@ -26,6 +27,20 @@ def get_tenant_id_from_user(user):
             if 'tenant' in k.lower() and v is not None:
                 return v
     return None
+
+
+def resolve_client_for_tenant(session, raw_client_id, tenant_id):
+    query = session.query(Client_Master).filter(
+        or_(
+            Client_Master.client_id == raw_client_id,
+            Client_Master.tenant_client_id == raw_client_id,
+            Client_Master.display_id == raw_client_id,
+            Client_Master.display_order == raw_client_id,
+        )
+    )
+    if tenant_id:
+        query = query.filter(Client_Master.tenant_id == tenant_id)
+    return query.first()
  
  
 # ── Statuses that go to Cleansing page (soft-delete with is_cleansing=True) ──
@@ -63,14 +78,13 @@ def add_callback(client_id):
         new_supplier = data.get('new_supplier')
         new_address = data.get('new_address')
         renewed_by = data.get('renewed_by')
+        commission_generation_result = None
 
         print(f"📥 Callback for client_id param {client_id} — status: {status}")
 
         # ✅ Resolve real client — URL param may be display_order or tenant_client_id
-        client = session.query(Client_Master).filter(
-            Client_Master.client_id == client_id
-        ).first()
-
+        requested_client_id = client_id
+        client = resolve_client_for_tenant(session, requested_client_id, tenant_id)
         if not client:
             row = session.execute(text("""
                 SELECT client_id FROM "StreemLyne_MT"."Client_Master"
@@ -287,6 +301,13 @@ def add_callback(client_id):
                     if old_status != final_status:
                         changes_made.append(f"Status: {old_status or 'None'} → {final_status}")
 
+                    if final_status == 'Already Renewed':
+                        commission_generation_result = generate_commission_schedule_for_project(
+                            session,
+                            project.project_id,
+                        ).to_dict()
+                        print(f"Commission schedule generation: {commission_generation_result}")
+
                 formatted_notes = f"[{final_status}] {notes}" if notes else f"[{final_status}]"
                 safe_add_with_sequence_retry(
                     session,
@@ -306,7 +327,8 @@ def add_callback(client_id):
                     'success': True,
                     'message': 'Callback saved successfully',
                     'status': final_status,
-                    'callback_date': callback_date
+                    'callback_date': callback_date,
+                    'commission_generation': commission_generation_result,
                 }), 200
 
             except Exception as e:
@@ -398,7 +420,8 @@ def add_callback(client_id):
             'success': True,
             'message': 'Callback saved successfully',
             'status': status,
-            'callback_date': callback_date
+            'callback_date': callback_date,
+            'commission_generation': commission_generation_result,
         }), 200
 
     except Exception as e:

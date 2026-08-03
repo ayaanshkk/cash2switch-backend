@@ -135,7 +135,7 @@ def create_app():
         customer_routes, file_routes,
         crm_routes, document_routes, calendar_routes,
         import_routes, energy_renewals_routes, bulk_import_optimized, async_bulk_routes, client_interactions_routes,
-        renewal_email_routes,
+        renewal_email_routes, commission_routes,
     )
 
     app.register_blueprint(auth_routes.auth_bp, url_prefix='/auth')
@@ -150,6 +150,7 @@ def create_app():
     app.register_blueprint(calendar_routes.calendar_bp)
     app.register_blueprint(client_interactions_routes.client_interaction_bp)
     app.register_blueprint(renewal_email_routes.renewal_email_bp)
+    app.register_blueprint(commission_routes.commission_bp)
 
     # Direct aliases for the admin email-log UI. These intentionally live on the
     # app object as well as the CRM blueprint so live deployments cannot miss

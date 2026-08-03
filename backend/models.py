@@ -8,7 +8,7 @@ import secrets
 from datetime import datetime, timedelta
 from sqlalchemy import (
     Column, Integer, BigInteger, SmallInteger, String, Boolean, DateTime, Date,
-    ForeignKey, Text, Float, Numeric
+    ForeignKey, Text, Float, Numeric, UniqueConstraint, CheckConstraint
 )
 from sqlalchemy.orm import relationship
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -409,7 +409,123 @@ class Supplier_Master(Base):
     supplier_company_name = Column(String(255))
     supplier_contact_name = Column(String(255))
     supplier_provisions = Column(SmallInteger)
+    commission_payment_delay_days = Column(Integer, nullable=True)
+    multi_year_commission_payment_mode = Column(String(20), nullable=True)
+    commission_payment_type = Column(String(40), nullable=True)
+    upfront_percentage = Column(Numeric(5, 2), nullable=True)
+    reconciliation_required = Column(Boolean, nullable=True)
+    invoice_delay_days = Column(Integer, nullable=True)
+    customer_payment_days = Column(Integer, nullable=True)
+    grace_days = Column(Integer, nullable=True)
+    commission_payment_frequency = Column(String(20), nullable=True)
     created_at = Column(DateTime)
+
+
+class Commission_Payment(Base):
+    __tablename__ = 'Commission_Payment'
+    __table_args__ = (
+        UniqueConstraint(
+            'contract_id',
+            'instalment_year',
+            name='uq_commission_payment_contract_instalment'
+        ),
+        CheckConstraint(
+            "status IN ('Scheduled', 'Pending', 'Due', 'Received', 'Partially Paid', 'Chasing Supplier', 'Closed')",
+            name='ck_commission_payment_status'
+        ),
+        {'schema': SCHEMA},
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id = Column(String(50), nullable=True)
+    client_id = Column(Integer, ForeignKey(f'{SCHEMA}.Client_Master.client_id'), nullable=True)
+    project_id = Column(Integer, ForeignKey(f'{SCHEMA}.Project_Details.project_id'), nullable=True)
+    contract_id = Column(Integer, ForeignKey(f'{SCHEMA}.Energy_Contract_Master.energy_contract_master_id'), nullable=True)
+    supplier_id = Column(Integer, ForeignKey(f'{SCHEMA}.Supplier_Master.supplier_id'), nullable=True)
+    employee_id = Column(Integer, ForeignKey(f'{SCHEMA}.Employee_Master.employee_id'), nullable=True)
+    instalment_year = Column(Integer, nullable=False)
+    payment_policy_type = Column(String(40), nullable=True)
+    payment_period_label = Column(String(100), nullable=True)
+    payment_period_start = Column(Date, nullable=True)
+    payment_period_end = Column(Date, nullable=True)
+    aggregator = Column(String(255), nullable=True)
+    annual_usage = Column(Numeric(14, 2), nullable=True)
+    uplift = Column(Numeric(14, 4), nullable=True)
+    contract_term_years = Column(Integer, nullable=True)
+    live_date = Column(Date, nullable=True)
+    expected_gross_amount = Column(Numeric(14, 2), nullable=False, default=0)
+    expected_net_amount = Column(Numeric(14, 2), nullable=False, default=0)
+    due_date = Column(Date, nullable=True)
+    amount_received = Column(Numeric(14, 2), nullable=False, default=0)
+    outstanding_amount = Column(Numeric(14, 2), nullable=False, default=0)
+    status = Column(String(50), nullable=False, default='Pending')
+    last_checked_at = Column(DateTime, nullable=True)
+    next_follow_up_date = Column(Date, nullable=True)
+    follow_up_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Commission_Payment_Receipt(Base):
+    __tablename__ = 'Commission_Payment_Receipt'
+    __table_args__ = {'schema': SCHEMA}
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    commission_payment_id = Column(String(36), ForeignKey(f'{SCHEMA}.Commission_Payment.id'), nullable=False)
+    tenant_id = Column(String(50), nullable=True)
+    amount_received = Column(Numeric(14, 2), nullable=False)
+    date_received = Column(Date, nullable=False)
+    notes = Column(Text, nullable=True)
+    logged_by = Column(Integer, ForeignKey(f'{SCHEMA}.Employee_Master.employee_id'), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class Agent_Commission_Batch(Base):
+    __tablename__ = 'Agent_Commission_Batch'
+    __table_args__ = (
+        UniqueConstraint(
+            'tenant_id',
+            'employee_id',
+            'batch_month',
+            name='uq_agent_commission_batch_tenant_employee_month',
+        ),
+        CheckConstraint(
+            "status IN ('Awaiting Payment', 'Commission Paid')",
+            name='ck_agent_commission_batch_status',
+        ),
+        {'schema': SCHEMA},
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id = Column(String(50), nullable=True)
+    employee_id = Column(Integer, ForeignKey(f'{SCHEMA}.Employee_Master.employee_id'), nullable=True)
+    batch_month = Column(Date, nullable=False)
+    total_amount = Column(Numeric(14, 2), nullable=False, default=0)
+    status = Column(String(50), nullable=False, default='Awaiting Payment')
+    paid_at = Column(DateTime, nullable=True)
+    paid_by = Column(Integer, ForeignKey(f'{SCHEMA}.Employee_Master.employee_id'), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class Agent_Commission_Batch_Item(Base):
+    __tablename__ = 'Agent_Commission_Batch_Item'
+    __table_args__ = (
+        UniqueConstraint(
+            'commission_payment_receipt_id',
+            name='uq_agent_commission_batch_item_receipt',
+        ),
+        {'schema': SCHEMA},
+    )
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    batch_id = Column(String(36), ForeignKey(f'{SCHEMA}.Agent_Commission_Batch.id'), nullable=False)
+    commission_payment_id = Column(String(36), ForeignKey(f'{SCHEMA}.Commission_Payment.id'), nullable=False)
+    commission_payment_receipt_id = Column(String(36), ForeignKey(f'{SCHEMA}.Commission_Payment_Receipt.id'), nullable=False)
+    client_name = Column(String(255), nullable=True)
+    receipt_amount = Column(Numeric(14, 2), nullable=False, default=0)
+    commission_rate_snapshot = Column(Numeric(8, 4), nullable=False, default=0)
+    commission_amount = Column(Numeric(14, 2), nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
 class Stage_Master(Base):
