@@ -395,7 +395,6 @@ def get_leads_calendar():
             AND od."service_id" = :service_id
             AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
             AND (cm."client_id" IS NULL OR cm."is_archived" IS NULL OR cm."is_archived" = FALSE)
-            AND (od."is_archived" IS NULL OR od."is_archived" = FALSE)
             AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") NOT IN (
                 \'lost\', \'lost cot\', \'dead\', \'invalid number\', 
                 \'incorrect supplier\', \'broker in place\', \'complaint\', \'debt\'
