@@ -583,6 +583,11 @@ def get_leads():
                     (Client_Master.is_deleted.is_(None)) |
                     (Client_Master.is_deleted == False)
                 )
+                .filter(
+                    (Client_Master.client_id.is_(None)) |
+                    (Client_Master.is_archived.is_(None)) |
+                    (Client_Master.is_archived == False)
+                )
             )
 
             if not admin_user:
@@ -658,6 +663,11 @@ def get_leads():
                     .filter(
                         (Client_Master.is_deleted.is_(None)) |
                         (Client_Master.is_deleted == False)
+                    )
+                    .filter(
+                        (Client_Master.client_id.is_(None)) |
+                        (Client_Master.is_archived.is_(None)) |
+                        (Client_Master.is_archived == False)
                     )
                     .group_by(Employee_Master.employee_id, Employee_Master.employee_name)
                     .having(func.count(Opportunity_Details.opportunity_id) > 0)

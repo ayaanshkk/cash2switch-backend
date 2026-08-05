@@ -95,6 +95,7 @@ def get_renewals_calendar():
             WHERE cm.tenant_id = :tenant_id
             AND cm.client_company_name != '[IMPORTED LEADS]'
             AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
+            AND (cm.is_archived IS NULL OR cm.is_archived = FALSE)
             AND ecm.contract_end_date IS NOT NULL
             AND (pd.status IS NULL OR LOWER(pd.status) NOT IN ('priced', 'lost', 'lost cot', 'dead', 'invalid number', 'incorrect supplier', 'broker in place', 'complaint'))
             {employee_filter}
@@ -118,6 +119,17 @@ def get_renewals_calendar():
                     ) AS rn
                 FROM "StreemLyne_MT"."Client_Interactions" ci
                 WHERE ci.reminder_date IS NOT NULL
+                AND (
+                    ci.next_steps IS NULL
+                    OR ci.next_steps NOT IN ('End Date Reminder', 'End Date', 'Field Update', 'Migration', 'Restored')
+                )
+                AND (
+                    ci.notes IS NULL
+                    OR (
+                        ci.notes NOT LIKE '[Migration]%'
+                        AND ci.notes NOT LIKE '[Field Update]%'
+                    )
+                )
             ),
             latest_project AS (
                 SELECT DISTINCT ON (pd.client_id)
@@ -165,6 +177,7 @@ def get_renewals_calendar():
             AND cm.tenant_id = :tenant_id
             AND cm.client_company_name != '[IMPORTED LEADS]'
             AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
+            AND (cm.is_archived IS NULL OR cm.is_archived = FALSE)
             AND lci.reminder_date IS NOT NULL
             AND (lp.status IS NULL OR LOWER(lp.status) NOT IN ('priced', 'lost', 'lost cot', 'dead', 'invalid number', 'incorrect supplier', 'broker in place', 'complaint'))
             {callback_employee_filter}
@@ -381,9 +394,11 @@ def get_leads_calendar():
             WHERE (od."tenant_id" = :tenant_id OR (od."client_id" IS NOT NULL AND cm."tenant_id" = :tenant_id))
             AND od."service_id" = :service_id
             AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
+            AND (cm."client_id" IS NULL OR cm."is_archived" IS NULL OR cm."is_archived" = FALSE)
+            AND (od."is_archived" IS NULL OR od."is_archived" = FALSE)
             AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") NOT IN (
                 \'lost\', \'lost cot\', \'dead\', \'invalid number\', 
-                \'incorrect supplier\', \'broker in place\', \'complaint\'
+                \'incorrect supplier\', \'broker in place\', \'complaint\', \'debt\'
             ))
             AND NOT EXISTS (
                 SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd

@@ -119,6 +119,7 @@ def get_renewals():
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON pd.assigned_employee_id = em.employee_id
             WHERE cm.tenant_id = :tenant_id
             AND cm.is_deleted = false
+            AND (cm.is_archived IS NULL OR cm.is_archived = false)
             {date_filter}
             {employee_filter}
             ORDER BY ecm.contract_end_date ASC
@@ -150,7 +151,8 @@ def get_renewals():
                 "status": row.status or "Pending",
                 "assigned_to_name": row.assigned_to_name or "Unassigned",
                 "assigned_to_id": row.assigned_to_id,
-                "mpan_number": row.mpan_number or ""
+                "mpan_number": row.mpan_number or "",
+                "mpan_mpr": row.mpan_number or ""
             })
 
         db.close()
@@ -190,6 +192,7 @@ def get_renewal_stats():
         ).filter(
             Client_Master.tenant_id == tenant_id,
             Client_Master.is_deleted == False,
+            (Client_Master.is_archived == False) | (Client_Master.is_archived.is_(None)),
             Energy_Contract_Master.contract_end_date.isnot(None)
         )
 
@@ -314,6 +317,8 @@ def get_supplier_breakdown():
             Project_Details.client_id == Client_Master.client_id
         ).filter(
             Client_Master.tenant_id == tenant_id,
+            Client_Master.is_deleted == False,
+            (Client_Master.is_archived == False) | (Client_Master.is_archived.is_(None)),
             Energy_Contract_Master.contract_end_date.isnot(None)
         )
 
@@ -413,6 +418,8 @@ def get_period_breakdown():
             Project_Details.assigned_employee_id == Employee_Master.employee_id
         ).filter(
             Client_Master.tenant_id == tenant_id,
+            Client_Master.is_deleted == False,
+            (Client_Master.is_archived == False) | (Client_Master.is_archived.is_(None)),
             Energy_Contract_Master.contract_end_date.between(start_date, end_date)
         )
 
@@ -652,6 +659,8 @@ def get_aq_breakdown():
             Project_Details.project_id == Energy_Contract_Master.project_id
         ).filter(
             Client_Master.tenant_id == tenant_id,
+            Client_Master.is_deleted == False,
+            (Client_Master.is_archived == False) | (Client_Master.is_archived.is_(None)),
             Energy_Contract_Master.contract_end_date.isnot(None),
             Project_Details.Misc_Col2.isnot(None),
             Employee_Master.tenant_id == tenant_id
