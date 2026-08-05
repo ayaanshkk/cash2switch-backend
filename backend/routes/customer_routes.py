@@ -226,6 +226,35 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
     return response
 
 
+SCHEDULED_CALLBACK_EXCLUDED_STEPS = (
+    'End Date Reminder',
+    'End Date',
+    'Field Update',
+    'Migration',
+    'Restored',
+    'Priced Accepted',
+    'Assignment',
+)
+
+
+def latest_scheduled_interaction_subquery(session):
+    return (
+        session.query(
+            Client_Interactions.client_id,
+            func.max(Client_Interactions.interaction_id).label('max_id')
+        )
+        .filter(Client_Interactions.reminder_date.isnot(None))
+        .filter(
+            or_(
+                Client_Interactions.next_steps.is_(None),
+                ~Client_Interactions.next_steps.in_(SCHEDULED_CALLBACK_EXCLUDED_STEPS),
+            )
+        )
+        .group_by(Client_Interactions.client_id)
+        .subquery()
+    )
+
+
 def get_user_role_name(user, session):
     """Get the role name for a user from User_Role_Mapping and Role_Master"""
     try:
@@ -470,15 +499,8 @@ def get_energy_customer(client_id):
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
 
-        # Subquery: get only the latest interaction_id per client
-        latest_interaction_sq = (
-            session.query(
-                Client_Interactions.client_id,
-                func.max(Client_Interactions.interaction_id).label('max_id')
-            )
-            .group_by(Client_Interactions.client_id)
-            .subquery()
-        )
+        # Use the latest scheduled callback, not the latest interaction of any type.
+        latest_interaction_sq = latest_scheduled_interaction_subquery(session)
 
         LatestInteraction = aliased(Client_Interactions)
 
@@ -934,15 +956,8 @@ def update_energy_customer(client_id):
         session.commit()
         session.expire_all()
  
-        # Fetch updated data
-        latest_sq = (
-            session.query(
-                Client_Interactions.client_id,
-                func.max(Client_Interactions.interaction_id).label('max_id')
-            )
-            .group_by(Client_Interactions.client_id)
-            .subquery()
-        )
+        # Fetch updated data with the latest scheduled callback.
+        latest_sq = latest_scheduled_interaction_subquery(session)
         LatestInteraction = aliased(Client_Interactions)
 
         updated = session.query(

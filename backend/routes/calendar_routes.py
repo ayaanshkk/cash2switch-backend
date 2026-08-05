@@ -179,7 +179,7 @@ def get_renewals_calendar():
             AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
             AND (cm.is_archived IS NULL OR cm.is_archived = FALSE)
             AND lci.reminder_date IS NOT NULL
-            AND (lp.status IS NULL OR LOWER(lp.status) NOT IN ('priced', 'lost', 'lost cot', 'dead', 'invalid number', 'incorrect supplier', 'broker in place', 'complaint'))
+            AND (lp.status IS NULL OR LOWER(lp.status) NOT IN ('priced', 'lost', 'lost cot', 'dead', 'invalid number', 'incorrect supplier', 'complaint'))
             {callback_employee_filter}
             ORDER BY cm.client_id
         ''')
