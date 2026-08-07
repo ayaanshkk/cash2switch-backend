@@ -185,6 +185,7 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'end_date': safe_date_to_iso(contract.contract_end_date if contract else None),
         'unit_rate': float(contract.unit_rate) if contract and contract.unit_rate else None,
         'terms_of_sale': contract.terms_of_sale if contract else None,
+        'comments': contract.terms_of_sale if contract else None,
         'standing_charge': float(contract.standing_charge) if contract and hasattr(contract, 'standing_charge') and contract.standing_charge else None,
         'aggregator': getattr(contract, 'aggregator', None) if contract else None,
         'rate_1': float(contract.rate_1) if contract and hasattr(contract, 'rate_1') and contract.rate_1 else None,
@@ -884,6 +885,7 @@ def update_energy_customer(client_id):
                 if 'comms_paid' in data and data['comms_paid'] is not None:
                     contract.comms_paid = data['comms_paid']
                 if 'terms_of_sale' in data: contract.terms_of_sale = data['terms_of_sale']
+                if 'comments' in data: contract.terms_of_sale = data['comments']
                 if 'payment_type' in data: contract.payment_type = data['payment_type']
                 if 'aggregator' in data: contract.aggregator = data['aggregator']
                 contract.updated_at = datetime.utcnow()
