@@ -12,6 +12,46 @@ from .auth_helpers import token_required, get_tenant_id_from_user
 
 renewals_bp = Blueprint("renewals", __name__)
 
+RENEWAL_RECYCLE_BIN_STATUSES = ("Lost", "Lost COT", "Dead")
+
+
+def sync_recycle_bin_renewal_statuses(session, tenant_id, employee_id=None):
+    """Move active renewals with recycle-bin statuses into the recycle bin."""
+    filters = [
+        Client_Master.tenant_id == tenant_id,
+        Client_Master.is_deleted == False,
+        Project_Details.status.in_(RENEWAL_RECYCLE_BIN_STATUSES),
+    ]
+    if employee_id:
+        filters.append(Project_Details.assigned_employee_id == employee_id)
+
+    rows = session.query(Client_Master, Project_Details).join(
+        Project_Details,
+        Client_Master.client_id == Project_Details.client_id,
+    ).join(
+        Energy_Contract_Master,
+        Project_Details.project_id == Energy_Contract_Master.project_id,
+    ).filter(*filters).all()
+
+    if not rows:
+        return 0
+
+    now = datetime.utcnow()
+    for client, project in rows:
+        client.is_deleted = True
+        client.deleted_at = client.deleted_at or now
+        client.deleted_reason = project.status
+        if hasattr(client, "is_cleansing"):
+            client.is_cleansing = False
+
+    session.commit()
+    current_app.logger.info(
+        "Moved %s existing renewal(s) to recycle bin for statuses %s",
+        len(rows),
+        ", ".join(RENEWAL_RECYCLE_BIN_STATUSES),
+    )
+    return len(rows)
+
 # ============================================================================
 # ENERGY RENEWALS ENDPOINTS
 # ============================================================================
@@ -48,6 +88,12 @@ def get_renewals():
         else:
             date_filter = "AND ecm.contract_end_date BETWEEN :today AND :ninety_days_later"
 
+        sync_recycle_bin_renewal_statuses(
+            db,
+            tenant_id,
+            int(employee_id) if employee_id else None,
+        )
+
         query = text(f"""
             SELECT
                 cm.client_id,
@@ -73,6 +119,7 @@ def get_renewals():
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON pd.assigned_employee_id = em.employee_id
             WHERE cm.tenant_id = :tenant_id
             AND cm.is_deleted = false
+            AND (cm.is_archived IS NULL OR cm.is_archived = false)
             {date_filter}
             {employee_filter}
             ORDER BY ecm.contract_end_date ASC
@@ -104,7 +151,8 @@ def get_renewals():
                 "status": row.status or "Pending",
                 "assigned_to_name": row.assigned_to_name or "Unassigned",
                 "assigned_to_id": row.assigned_to_id,
-                "mpan_number": row.mpan_number or ""
+                "mpan_number": row.mpan_number or "",
+                "mpan_mpr": row.mpan_number or ""
             })
 
         db.close()
@@ -131,6 +179,8 @@ def get_renewal_stats():
         today = datetime.utcnow().date()
         days_365_later = today + timedelta(days=365)
 
+        sync_recycle_bin_renewal_statuses(session, tenant_id, employee_id)
+
         base_query = session.query(
             Client_Master,
             Project_Details,
@@ -141,6 +191,8 @@ def get_renewal_stats():
             Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
         ).filter(
             Client_Master.tenant_id == tenant_id,
+            Client_Master.is_deleted == False,
+            (Client_Master.is_archived == False) | (Client_Master.is_archived.is_(None)),
             Energy_Contract_Master.contract_end_date.isnot(None)
         )
 
@@ -196,7 +248,7 @@ def get_renewal_stats():
                     contacted_count += 1
                 elif status_lower in ['not contacted']:
                     not_contacted_count += 1
-                elif status_lower in ['priced', 'renewed', 'already renewed', 'end date changed']:
+                elif status_lower in ['priced', 'renewed', 'already renewed', 'sold', 'end date changed']:
                     renewed_count += 1
                 elif status_lower == 'lost':
                     lost_count += 1
@@ -265,6 +317,8 @@ def get_supplier_breakdown():
             Project_Details.client_id == Client_Master.client_id
         ).filter(
             Client_Master.tenant_id == tenant_id,
+            Client_Master.is_deleted == False,
+            (Client_Master.is_archived == False) | (Client_Master.is_archived.is_(None)),
             Energy_Contract_Master.contract_end_date.isnot(None)
         )
 
@@ -364,6 +418,8 @@ def get_period_breakdown():
             Project_Details.assigned_employee_id == Employee_Master.employee_id
         ).filter(
             Client_Master.tenant_id == tenant_id,
+            Client_Master.is_deleted == False,
+            (Client_Master.is_archived == False) | (Client_Master.is_archived.is_(None)),
             Energy_Contract_Master.contract_end_date.between(start_date, end_date)
         )
 
@@ -390,6 +446,7 @@ def get_period_breakdown():
                 'contract_end_date': r.contract_end_date.isoformat() if r.contract_end_date else None,
                 'days_until_expiry': days_until_expiry,
                 'mpan_number': r.mpan_number,
+                'mpan_mpr': r.mpan_number,
                 'annual_usage': r.annual_usage,
                 'estimated_revenue': round(revenue, 2),
                 'assigned_to': r.employee_name or 'Unassigned',
@@ -602,6 +659,8 @@ def get_aq_breakdown():
             Project_Details.project_id == Energy_Contract_Master.project_id
         ).filter(
             Client_Master.tenant_id == tenant_id,
+            Client_Master.is_deleted == False,
+            (Client_Master.is_archived == False) | (Client_Master.is_archived.is_(None)),
             Energy_Contract_Master.contract_end_date.isnot(None),
             Project_Details.Misc_Col2.isnot(None),
             Employee_Master.tenant_id == tenant_id
@@ -723,6 +782,8 @@ def get_renewal_performance():
 
         today = datetime.utcnow().date()
 
+        sync_recycle_bin_renewal_statuses(session, tenant_id, employee_id)
+
         base_query = session.query(
             Project_Details,
             Energy_Contract_Master,
@@ -756,7 +817,7 @@ def get_renewal_performance():
             Client_Master.tenant_id == tenant_id,
             Client_Master.is_deleted == True,
             Energy_Contract_Master.service_id == service_id,
-            func.lower(Client_Master.deleted_reason).in_(['lost', 'lost cot']),
+            func.lower(Client_Master.deleted_reason).in_(['lost', 'lost cot', 'dead']),
         )
 
         if employee_id:
@@ -791,7 +852,7 @@ def get_renewal_performance():
                     end_date_changed_count += 1
                 elif status_lower == 'priced':
                     priced_count += 1
-                elif status_lower in ['renewed', 'already renewed']:
+                elif status_lower in ['renewed', 'already renewed', 'sold']:
                     renewed_count += 1
                 elif status_lower in ['called', 'callback', 'contacted', 'not answered',
                                        'broker in place', 'email only', 'renewed directly']:
@@ -843,6 +904,8 @@ def get_staff_status_counts():
             return jsonify({'error': 'Tenant not found'}), 400
  
         employee_id = request.args.get('employee_id', type=int)
+
+        sync_recycle_bin_renewal_statuses(session, tenant_id, employee_id)
         
         print(f"\n{'='*80}")
         print(f"🔍 RENEWALS STAFF PERFORMANCE REQUEST")
@@ -889,9 +952,9 @@ def get_staff_status_counts():
                 SELECT 
                     COUNT(*) as total_contacts,
                     
-                    -- Renewed: ONLY "Already Renewed" (not including other success statuses)
+                    -- Renewed: Already Renewed or Sold
                     SUM(CASE 
-                        WHEN pd.status = 'Already Renewed'
+                        WHEN pd.status IN ('Already Renewed', 'Sold')
                         THEN 1 ELSE 0 
                     END) as renewed_count,
                     
@@ -919,6 +982,7 @@ def get_staff_status_counts():
                 INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm 
                     ON pd.project_id = ecm.project_id
                 WHERE cm.tenant_id = :tenant_id
+                AND cm.is_deleted = false
                 AND pd.assigned_employee_id = :emp_id
                 AND ecm.contract_end_date IS NOT NULL
             """
@@ -934,7 +998,7 @@ def get_staff_status_counts():
             not_contacted = stats_result.not_contacted_count or 0
             lost = stats_result.lost_count or 0
             
-            # Conversion = Renewed / Total (only counting "Already Renewed")
+            # Conversion = Renewed / Total
             conversion_rate = round((renewed / total * 100), 1) if total > 0 else 0
             
             print(f"   📊 {emp_name}:")

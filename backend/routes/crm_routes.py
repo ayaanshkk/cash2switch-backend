@@ -14,7 +14,8 @@ from sqlalchemy import text, bindparam, func, String
 from backend.db import SessionLocal
 from backend.models import (
     Opportunity_Details, Client_Master, Stage_Master, 
-    Employee_Master, Supplier_Master, Client_Interactions
+    Employee_Master, Supplier_Master, Client_Interactions,
+    Project_Details, Energy_Contract_Master
 )
 from backend.crm.controllers.crm_controller import CRMController
 from backend.crm.middleware.tenant_middleware import require_tenant
@@ -54,6 +55,9 @@ def _serial(v):
     except ImportError:
         pass
     return v
+
+def _row_to_json(row):
+    return {key: _serial(value) for key, value in dict(row).items()}
 
 def _safe_float(v):
     try:
@@ -104,6 +108,26 @@ crm_bp = Blueprint('crm', __name__, url_prefix='/api/crm')
 crm_controller = CRMController()
 
 OFFSHORE_ROLE_ID = 5
+FIELD_SALES_ROLE_ID = 7
+
+
+def _is_field_sales_user(session, user) -> bool:
+    role = str(getattr(user, "role", "") or "").strip().lower()
+    if role in ("field sales", "fieldsales", "field_sales") or getattr(user, "role_id", None) == FIELD_SALES_ROLE_ID:
+        return True
+
+    user_id = getattr(user, "user_id", None)
+    if not user_id:
+        return False
+
+    row = session.execute(text("""
+        SELECT 1
+        FROM "StreemLyne_MT"."User_Role_Mapping"
+        WHERE user_id = :user_id
+          AND role_id = :role_id
+        LIMIT 1
+    """), {"user_id": user_id, "role_id": FIELD_SALES_ROLE_ID}).first()
+    return row is not None
 
 
 def _staff_period_bounds(period: str):
@@ -147,6 +171,83 @@ def _resolve_opportunity_ts_expr(db) -> str:
     return 'NOW()'
 
 
+_RENEWAL_EMAIL_LOGS_FROM_SQL = """
+FROM "StreemLyne_MT"."Renewal_Email_Send_Log" rel
+LEFT JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm
+  ON rel.energy_contract_master_id = ecm.energy_contract_master_id
+LEFT JOIN "StreemLyne_MT"."Project_Details" pd
+  ON ecm.project_id = pd.project_id
+LEFT JOIN "StreemLyne_MT"."Client_Master" cm
+  ON pd.client_id = cm.client_id
+LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm
+  ON ecm.supplier_id = sm.supplier_id
+LEFT JOIN "StreemLyne_MT"."Employee_Master" em
+  ON COALESCE(pd.assigned_employee_id, cm.assigned_employee_id, pd.employee_id, ecm.employee_id) = em.employee_id
+"""
+
+
+def _renewal_email_log_filters(include_advisor=True):
+    params = {}
+    where = []
+    tenant_id = getattr(g, "tenant_id", None)
+    if tenant_id is not None:
+        where.append("TRIM(CAST(rel.tenant_id AS TEXT)) = :tenant_id_text")
+        params["tenant_id_text"] = str(tenant_id)
+
+    search = (request.args.get("search") or "").strip().lower()
+    if search:
+        where.append(
+            """
+            (
+              LOWER(COALESCE(rel.recipient_email, '')) LIKE :search
+              OR LOWER(COALESCE(cm.client_company_name, '')) LIKE :search
+              OR LOWER(COALESCE(cm.client_contact_name, '')) LIKE :search
+              OR LOWER(COALESCE(em.employee_name, '')) LIKE :search
+              OR LOWER(COALESCE(rel.provider_message_id, '')) LIKE :search
+            )
+            """
+        )
+        params["search"] = f"%{search}%"
+
+    status = (request.args.get("status") or "").strip()
+    if status:
+        where.append("LOWER(rel.status) = LOWER(:status)")
+        params["status"] = status
+
+    sent_from = (request.args.get("sent_from") or "").strip()
+    if sent_from:
+        where.append("rel.created_at::date >= CAST(:sent_from AS DATE)")
+        params["sent_from"] = sent_from
+
+    sent_to = (request.args.get("sent_to") or "").strip()
+    if sent_to:
+        where.append("rel.created_at::date <= CAST(:sent_to AS DATE)")
+        params["sent_to"] = sent_to
+
+    advisor = (request.args.get("advisor") or "").strip()
+    if include_advisor and advisor:
+        where.append(
+            "LOWER(COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie')) = LOWER(:advisor)"
+        )
+        params["advisor"] = advisor
+
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+    return where_sql, params
+
+
+def _renewal_email_logs_order_sql():
+    sort = (request.args.get("sort") or "sent_desc").strip().lower()
+    sort_map = {
+        "sent_asc": "rel.created_at ASC, rel.renewal_email_send_log_id ASC",
+        "advisor_asc": "LOWER(COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie')) ASC, rel.created_at DESC",
+        "advisor_desc": "LOWER(COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie')) DESC, rel.created_at DESC",
+        "end_date_asc": "rel.contract_end_date ASC NULLS LAST, rel.created_at DESC",
+        "end_date_desc": "rel.contract_end_date DESC NULLS LAST, rel.created_at DESC",
+        "sent_desc": "rel.created_at DESC, rel.renewal_email_send_log_id DESC",
+    }
+    return sort_map.get(sort, sort_map["sent_desc"])
+
+
 def _safe_float(v):
     try:
         if v is None:
@@ -173,6 +274,253 @@ def _lead_stage_bucket(stage_name: str) -> str:
 # ========================================
 # LEAD ROUTES
 # ========================================
+
+@crm_bp.route('/renewal-email-logs', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_renewal_email_logs():
+    current_user = request.current_user
+    if not is_crm_leads_admin_role(getattr(current_user, 'role', None)):
+        return jsonify({'error': 'Admin access required'}), 403
+
+    page = max(request.args.get('page', 1, type=int) or 1, 1)
+    page_size = min(max(request.args.get('page_size', 25, type=int) or 25, 1), 100)
+    offset = (page - 1) * page_size
+
+    where_sql, params = _renewal_email_log_filters()
+    advisor_where_sql, advisor_params = _renewal_email_log_filters(include_advisor=False)
+    params.update({'limit': page_size, 'offset': offset})
+    order_sql = _renewal_email_logs_order_sql()
+
+    session = SessionLocal()
+    try:
+        total = session.execute(
+            text(f'SELECT COUNT(*) AS total {_RENEWAL_EMAIL_LOGS_FROM_SQL} {where_sql}'),
+            params,
+        ).scalar_one()
+
+        rows = session.execute(
+            text(
+                f"""
+                SELECT
+                  rel.renewal_email_send_log_id AS id,
+                  rel.tenant_id,
+                  rel.created_at AS sent_at,
+                  rel.status,
+                  rel.bucket_key,
+                  rel.recipient_email,
+                  rel.provider_message_id,
+                  rel.error_message,
+                  rel.contract_end_date,
+                  rel.energy_contract_master_id,
+                  ecm.service_id,
+                  CASE WHEN ecm.service_id = 2 THEN 'Water' ELSE 'Electricity' END AS service_label,
+                  ecm.project_id,
+                  cm.client_id,
+                  cm.client_company_name AS business_name,
+                  cm.client_contact_name AS customer_name,
+                  TRIM(CONCAT_WS(', ', NULLIF(cm.address, ''), NULLIF(cm.post_code, ''))) AS site_address,
+                  sm.supplier_company_name AS supplier_name,
+                  COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie') AS advisor_name,
+                  em.phone AS advisor_phone,
+                  (rel.contract_end_date - CURRENT_DATE) AS days_remaining
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {where_sql}
+                ORDER BY {order_sql}
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            params,
+        ).mappings().all()
+
+        advisors = session.execute(
+            text(
+                f"""
+                SELECT DISTINCT COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie') AS advisor_name
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {advisor_where_sql}
+                ORDER BY advisor_name ASC
+                """
+                if advisor_where_sql
+                else f"""
+                SELECT DISTINCT COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie') AS advisor_name
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                ORDER BY advisor_name ASC
+                """
+            ),
+            advisor_params,
+        ).scalars().all()
+
+        return jsonify({
+            'items': [_row_to_json(row) for row in rows],
+            'advisors': [advisor for advisor in advisors if advisor],
+            'page': page,
+            'page_size': page_size,
+            'total': int(total or 0),
+        }), 200
+    except Exception as e:
+        current_app.logger.exception("get_renewal_email_logs failed: %s", e)
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+@crm_bp.route('/renewal-email-logs/summary', methods=['GET'])
+@token_required
+@tenant_from_jwt
+def get_renewal_email_logs_summary():
+    current_user = request.current_user
+    if not is_crm_leads_admin_role(getattr(current_user, 'role', None)):
+        return jsonify({'error': 'Admin access required'}), 403
+
+    where_sql, params = _renewal_email_log_filters()
+    scoped_where = where_sql if where_sql else "WHERE 1=1"
+
+    session = SessionLocal()
+    try:
+        counts = session.execute(
+            text(
+                f"""
+                SELECT
+                  COUNT(*) FILTER (
+                    WHERE LOWER(rel.status) = 'sent'
+                    AND rel.created_at >= CURRENT_DATE
+                  ) AS sent_today,
+                  COUNT(*) FILTER (
+                    WHERE LOWER(rel.status) = 'sent'
+                    AND rel.created_at >= NOW() - INTERVAL '7 days'
+                  ) AS sent_last_7_days,
+                  COUNT(*) FILTER (
+                    WHERE LOWER(rel.status) NOT IN ('sent', 'dry_run')
+                    AND rel.created_at >= NOW() - INTERVAL '7 days'
+                  ) AS failed_last_7_days,
+                  COUNT(*) FILTER (WHERE LOWER(rel.status) = 'sent') AS total_sent,
+                  COUNT(*) AS total_logged
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {scoped_where}
+                """
+            ),
+            params,
+        ).mappings().one()
+
+        latest_rows = session.execute(
+            text(
+                f"""
+                SELECT
+                  rel.renewal_email_send_log_id AS id,
+                  rel.created_at AS sent_at,
+                  rel.status,
+                  rel.bucket_key,
+                  rel.recipient_email,
+                  rel.contract_end_date,
+                  CASE WHEN ecm.service_id = 2 THEN 'Water' ELSE 'Electricity' END AS service_label,
+                  cm.client_company_name AS business_name,
+                  cm.client_contact_name AS customer_name,
+                  COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie') AS advisor_name
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {scoped_where}
+                ORDER BY rel.created_at DESC, rel.renewal_email_send_log_id DESC
+                LIMIT 6
+                """
+            ),
+            params,
+        ).mappings().all()
+
+        status_rows = session.execute(
+            text(
+                f"""
+                SELECT
+                  LOWER(COALESCE(rel.status, 'unknown')) AS label,
+                  COUNT(*) AS value
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {scoped_where}
+                GROUP BY LOWER(COALESCE(rel.status, 'unknown'))
+                ORDER BY value DESC, label ASC
+                """
+            ),
+            params,
+        ).mappings().all()
+
+        advisor_rows = session.execute(
+            text(
+                f"""
+                SELECT
+                  COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie') AS label,
+                  COUNT(*) AS value
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {scoped_where}
+                GROUP BY COALESCE(NULLIF(TRIM(em.employee_name), ''), 'Abu Sacranie')
+                ORDER BY value DESC, label ASC
+                LIMIT 8
+                """
+            ),
+            params,
+        ).mappings().all()
+
+        service_rows = session.execute(
+            text(
+                f"""
+                SELECT
+                  CASE WHEN ecm.service_id = 2 THEN 'Water' ELSE 'Electricity' END AS label,
+                  COUNT(*) AS value
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {scoped_where}
+                GROUP BY CASE WHEN ecm.service_id = 2 THEN 'Water' ELSE 'Electricity' END
+                ORDER BY value DESC, label ASC
+                """
+            ),
+            params,
+        ).mappings().all()
+
+        daily_rows = session.execute(
+            text(
+                f"""
+                SELECT
+                  rel.created_at::date AS label,
+                  COUNT(*) FILTER (WHERE LOWER(rel.status) = 'sent') AS sent,
+                  COUNT(*) FILTER (WHERE LOWER(rel.status) <> 'sent') AS other,
+                  COUNT(*) AS total
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                {scoped_where}
+                  AND rel.created_at >= NOW() - INTERVAL '14 days'
+                GROUP BY rel.created_at::date
+                ORDER BY label ASC
+                """
+                if scoped_where
+                else f"""
+                SELECT
+                  rel.created_at::date AS label,
+                  COUNT(*) FILTER (WHERE LOWER(rel.status) = 'sent') AS sent,
+                  COUNT(*) FILTER (WHERE LOWER(rel.status) <> 'sent') AS other,
+                  COUNT(*) AS total
+                {_RENEWAL_EMAIL_LOGS_FROM_SQL}
+                WHERE rel.created_at >= NOW() - INTERVAL '14 days'
+                GROUP BY rel.created_at::date
+                ORDER BY label ASC
+                """
+            ),
+            params,
+        ).mappings().all()
+
+        return jsonify({
+            **_row_to_json(counts),
+            'latest': [_row_to_json(row) for row in latest_rows],
+            'by_status': [_row_to_json(row) for row in status_rows],
+            'by_advisor': [_row_to_json(row) for row in advisor_rows],
+            'by_service': [_row_to_json(row) for row in service_rows],
+            'daily': [_row_to_json(row) for row in daily_rows],
+        }), 200
+    except Exception as e:
+        current_app.logger.exception("get_renewal_email_logs_summary failed: %s", e)
+        return jsonify({'error': str(e)}), 500
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
 
 @crm_bp.route('/leads', methods=['GET'])
 @token_required
@@ -234,6 +582,11 @@ def get_leads():
                 .filter(
                     (Client_Master.is_deleted.is_(None)) |
                     (Client_Master.is_deleted == False)
+                )
+                .filter(
+                    (Client_Master.client_id.is_(None)) |
+                    (Client_Master.is_archived.is_(None)) |
+                    (Client_Master.is_archived == False)
                 )
             )
 
@@ -310,6 +663,11 @@ def get_leads():
                     .filter(
                         (Client_Master.is_deleted.is_(None)) |
                         (Client_Master.is_deleted == False)
+                    )
+                    .filter(
+                        (Client_Master.client_id.is_(None)) |
+                        (Client_Master.is_archived.is_(None)) |
+                        (Client_Master.is_archived == False)
                     )
                     .group_by(Employee_Master.employee_id, Employee_Master.employee_name)
                     .having(func.count(Opportunity_Details.opportunity_id) > 0)
@@ -1335,8 +1693,11 @@ def search_all_leads():
             return jsonify([]), 200
 
         like_q = f'%{q.lower()}%'
+        current_user = getattr(request, 'current_user', None)
+        restrict_to_own_records = _is_field_sales_user(session, current_user)
+        current_employee_id = getattr(current_user, 'employee_id', None)
 
-        rows = (
+        query = (
             session.query(
                 Opportunity_Details,
                 Stage_Master.stage_name,
@@ -1354,7 +1715,6 @@ def search_all_leads():
             )
             .filter(Opportunity_Details.service_id == service_id)
             .filter(Opportunity_Details.opportunity_owner_employee_id.isnot(None))
-            .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
             .filter(
                 (func.lower(func.coalesce(Opportunity_Details.business_name, Client_Master.client_company_name, Opportunity_Details.opportunity_title, '')).like(like_q)) |
                 (func.lower(func.coalesce(Opportunity_Details.contact_person, '')).like(like_q)) |
@@ -1362,9 +1722,12 @@ def search_all_leads():
                 (func.lower(func.coalesce(Opportunity_Details.email, '')).like(like_q)) |
                 (func.lower(func.coalesce(Opportunity_Details.mpan_mpr, '')).like(like_q))
             )
-            .order_by(Opportunity_Details.created_at.desc())
-            .all()
         )
+
+        if restrict_to_own_records:
+            query = query.filter(Opportunity_Details.opportunity_owner_employee_id == current_employee_id)
+
+        rows = query.order_by(Opportunity_Details.created_at.desc()).all()
 
         results = []
         for row in rows:
@@ -2991,7 +3354,9 @@ def health_check():
         'success': True,
         'module': 'CRM',
         'status': 'operational',
-        'message': 'StreemLyne CRM module is running'
+        'message': 'StreemLyne CRM module is running',
+        'email_logs_routes': True,
+        'email_logs_route_path': '/api/crm/renewal-email-logs',
     }, 200
 
 
@@ -3568,6 +3933,7 @@ def leads_callback(opportunity_id):
 
         status = data.get('status')
         callback_date = data.get('callback_date')
+        new_end_date_str = data.get('new_end_date')
         notes = data.get('notes', '')
 
         current_app.logger.info(
@@ -3615,6 +3981,16 @@ def leads_callback(opportunity_id):
 
         stage_id = stage.stage_id
 
+        parsed_new_end_date = None
+        if new_end_date_str:
+            try:
+                parsed_new_end_date = datetime.strptime(str(new_end_date_str)[:10], '%Y-%m-%d').date()
+            except ValueError:
+                return jsonify({'error': 'Invalid new_end_date format. Expected YYYY-MM-DD'}), 400
+
+        if status == 'Renewed Directly' and not parsed_new_end_date:
+            return jsonify({'error': 'Please enter the new contract end date'}), 400
+
         if not lead_client_id:
             current_app.logger.warning(f'Lead {real_id} has no client_id, creating one...')
             new_client = Client_Master(
@@ -3636,10 +4012,47 @@ def leads_callback(opportunity_id):
             current_app.logger.info(f'✅ Created client_id={lead_client_id} for lead {real_id}')
 
         lead.stage_id = stage_id
+        old_end_date = lead.end_date
+        updated_project_count = 0
+        updated_contract_count = 0
+
+        if parsed_new_end_date:
+            lead.end_date = parsed_new_end_date
+
+            projects = session.query(Project_Details).filter(
+                Project_Details.opportunity_id == real_id
+            ).all()
+
+            if not projects and lead_client_id:
+                projects = session.query(Project_Details).filter(
+                    Project_Details.client_id == lead_client_id
+                ).all()
+
+            project_ids = []
+            for project in projects:
+                project.end_date = parsed_new_end_date
+                project.updated_at = datetime.utcnow()
+                updated_project_count += 1
+                if project.project_id is not None:
+                    project_ids.append(project.project_id)
+
+            if project_ids:
+                contracts = session.query(Energy_Contract_Master).filter(
+                    Energy_Contract_Master.project_id.in_(project_ids)
+                ).all()
+                for contract in contracts:
+                    contract.contract_end_date = parsed_new_end_date
+                    contract.updated_at = datetime.utcnow()
+                    updated_contract_count += 1
+
         session.flush()
         current_app.logger.info(f'Updated lead {real_id} stage: {old_stage} → {status}')
 
         transition = f"Status: {old_stage or 'None'} → {status}"
+        if parsed_new_end_date:
+            old_end_text = old_end_date.strftime('%d/%m/%Y') if old_end_date else 'None'
+            new_end_text = parsed_new_end_date.strftime('%d/%m/%Y')
+            transition = f"{transition} | Contract end date: {old_end_text} -> {new_end_text}"
         formatted_notes = f"[{status}] {transition}" + (f" | {notes}" if notes else "")
 
         reminder_date = None
@@ -3648,6 +4061,8 @@ def leads_callback(opportunity_id):
                 reminder_date = datetime.strptime(callback_date, '%Y-%m-%d').date()
             except ValueError:
                 current_app.logger.warning(f'Invalid callback_date format: {callback_date}')
+        elif status == 'End Date Changed' and parsed_new_end_date:
+            reminder_date = parsed_new_end_date
 
         # Always insert a fresh row — guarantees new interaction_id and new created_at
         # so the calendar CTE (ORDER BY created_at DESC, interaction_id DESC) picks this row
@@ -3728,6 +4143,12 @@ def leads_callback(opportunity_id):
             'stage_id': stage_id,
             'callback_date': callback_date,
             'interaction_id': interaction.interaction_id,
+            'lead': {
+                'opportunity_id': real_id,
+                'stage_id': stage_id,
+                'stage_name': status,
+                'end_date': parsed_new_end_date.isoformat() if parsed_new_end_date else _iso(lead.end_date),
+            },
         }), 200
 
     except Exception as e:

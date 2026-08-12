@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ bucket_title }}</title>
+</head>
+<body style="font-family: Arial, Helvetica, sans-serif; line-height: 1.5; color: #1a1a1a; max-width: 640px; margin: 0 auto; padding: 24px; background: #ffffff;">
+  <p>Hello {{ customer_name }},</p>
+
+  {% if bucket_key == 'renewal_30' %}
+  <p>Your <strong>{{ service_label }}</strong> contract is due to end on <strong>{{ contract_end_date }}</strong>, which is in <strong>{{ days_remaining }} days</strong>.</p>
+  <p>This is now urgent. We recommend reviewing your renewal options immediately so your business can avoid moving onto out-of-contract or higher variable rates.</p>
+  {% elif bucket_key in ['renewal_90', 'renewal_80', 'renewal_70', 'renewal_60'] %}
+  <p>Your <strong>{{ service_label }}</strong> contract is due to end on <strong>{{ contract_end_date }}</strong>, which is in <strong>{{ days_remaining }} days</strong>.</p>
+  <p>We recommend starting your renewal review now rather than waiting until the final weeks. Acting early can help secure more competitive options before prices move further.</p>
+  {% else %}
+  <p>Your <strong>{{ service_label }}</strong> contract is scheduled to end on <strong>{{ contract_end_date }}</strong>, which is in <strong>{{ days_remaining }} days</strong>.</p>
+  {% endif %}
+
+  <p>Market prices have been moving upward, and delaying renewal may reduce the number of competitive options available to your business. The attached market graph image shows recent movement and why it is sensible to secure renewal pricing early.</p>
+
+  <table role="presentation" cellpadding="0" cellspacing="0" style="width: 100%; margin: 22px 0; border-collapse: separate;">
+    <tr>
+      <td style="background: #f8fafc; border: 1px solid #e5e7eb; padding: 18px 20px;">
+        <p style="margin: 0 0 14px; font-size: 16px; font-weight: 700; color: #111827;">Your renewal details</p>
+        <table role="presentation" cellpadding="0" cellspacing="0" style="width: 100%; border-collapse: collapse;">
+          <tr>
+            <td style="padding: 4px 0; width: 38%; color: #6b7280; font-size: 13px;">Service</td>
+            <td style="padding: 4px 0; color: #111827; font-size: 14px; font-weight: 600;">{{ service_label }}</td>
+          </tr>
+          <tr>
+            <td style="padding: 4px 0; color: #6b7280; font-size: 13px;">Current supplier</td>
+            <td style="padding: 4px 0; color: #111827; font-size: 14px; font-weight: 600;">{{ supplier_name }}</td>
+          </tr>
+          <tr>
+            <td style="padding: 4px 0; color: #6b7280; font-size: 13px;">Site address</td>
+            <td style="padding: 4px 0; color: #111827; font-size: 14px; font-weight: 600;">{{ postal_address_line or "Not available" }}</td>
+          </tr>
+          <tr>
+            <td style="padding: 4px 0; color: #6b7280; font-size: 13px;">Contract end date</td>
+            <td style="padding: 4px 0; color: #111827; font-size: 14px; font-weight: 600;">{{ contract_end_date }}</td>
+          </tr>
+          <tr>
+            <td style="padding: 4px 0; color: #6b7280; font-size: 13px;">Days remaining</td>
+            <td style="padding: 4px 0; color: #111827; font-size: 14px; font-weight: 600;">{{ days_remaining }}</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+
+  <p><strong>Your renewal advisor:</strong><br />
+  {{ advisor_name }}{% if advisor_phone %}<br />
+  {{ advisor_phone }}{% endif %}</p>
+
+  <p>Please reply to this email if you would like to renew or review your available renewal options. Your renewal advisor will then contact you to help secure the best available pricing and avoid your contract moving onto out-of-contract or higher variable rates.</p>
+</body>
+</html>

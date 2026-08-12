@@ -134,7 +134,8 @@ def create_app():
         notification_routes,
         customer_routes, file_routes,
         crm_routes, document_routes, calendar_routes,
-        import_routes, energy_renewals_routes, bulk_import_optimized, async_bulk_routes, client_interactions_routes, 
+        import_routes, energy_renewals_routes, bulk_import_optimized, async_bulk_routes, client_interactions_routes,
+        renewal_email_routes, commission_routes,
     )
 
     app.register_blueprint(auth_routes.auth_bp, url_prefix='/auth')
@@ -148,6 +149,46 @@ def create_app():
     app.register_blueprint(document_routes.document_bp)
     app.register_blueprint(calendar_routes.calendar_bp)
     app.register_blueprint(client_interactions_routes.client_interaction_bp)
+    app.register_blueprint(renewal_email_routes.renewal_email_bp)
+    app.register_blueprint(commission_routes.commission_bp)
+
+    # Direct aliases for the admin email-log UI. These intentionally live on the
+    # app object as well as the CRM blueprint so live deployments cannot miss
+    # them if a blueprint import/registration path changes.
+    app.add_url_rule(
+        "/api/admin/renewal-email-logs",
+        "direct_admin_renewal_email_logs",
+        crm_routes.get_renewal_email_logs,
+        methods=["GET"],
+    )
+    app.add_url_rule(
+        "/api/admin/renewal-email-logs/summary",
+        "direct_admin_renewal_email_logs_summary",
+        crm_routes.get_renewal_email_logs_summary,
+        methods=["GET"],
+    )
+    app.add_url_rule(
+        "/api/entrypoint/renewal-email-logs",
+        "backend_app_entrypoint_renewal_email_logs",
+        crm_routes.get_renewal_email_logs,
+        methods=["GET"],
+    )
+    app.add_url_rule(
+        "/api/entrypoint/renewal-email-logs/summary",
+        "backend_app_entrypoint_renewal_email_logs_summary",
+        crm_routes.get_renewal_email_logs_summary,
+        methods=["GET"],
+    )
+    app.add_url_rule(
+        "/__email-logs-build-check",
+        "email_logs_build_check",
+        lambda: jsonify({
+            "email_logs_routes": True,
+            "commit_hint": "backend-app-direct-email-logs",
+            "start_command": "backend.app:create_app()",
+        }),
+        methods=["GET"],
+    )
     # app.register_blueprint(bulk_import_optimized.bulk_import_bp, url_prefix='/api')
     # app.register_blueprint(async_bulk_routes.async_bulk_bp, url_prefix='/api')
     logging.info("CRM Blueprint registered successfully") 
@@ -156,11 +197,16 @@ def create_app():
     try:
         from backend.crm.repositories.tenant_repository import TenantRepository
         test_repo = TenantRepository()
-        test_tenant = test_repo.get_tenant_by_id(1)
+        test_tenant_id = (
+            os.getenv("LOGIN_ALLOWED_TENANT_ID")
+            or os.getenv("RENEWAL_EMAIL_CRON_TENANT_ID")
+            or "1"
+        )
+        test_tenant = test_repo.get_tenant_by_id(str(test_tenant_id))
         if test_tenant:
             logging.info(f"✅ CRM Supabase connection test: SUCCESS - Found tenant '{test_tenant.get('tenant_company_name')}'")
         else:
-            logging.warning("CRM Supabase connection test: Tenant ID 1 not found")
+            logging.warning("CRM Supabase connection test: Tenant ID %s not found", test_tenant_id)
     except Exception as e:
         logging.error("CRM Supabase connection test FAILED: %s", e)
 

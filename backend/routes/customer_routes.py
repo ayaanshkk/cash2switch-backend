@@ -35,6 +35,26 @@ from backend.models import (
 )
 
 energy_customer_bp = Blueprint('energy_customers', __name__)
+FIELD_SALES_ROLE_ID = 7
+
+
+def _is_field_sales_user(session, user) -> bool:
+    role = str(getattr(user, "role", "") or "").strip().lower()
+    if role in ("field sales", "fieldsales", "field_sales") or getattr(user, "role_id", None) == FIELD_SALES_ROLE_ID:
+        return True
+
+    user_id = getattr(user, "user_id", None)
+    if not user_id:
+        return False
+
+    row = session.execute(text("""
+        SELECT 1
+        FROM "StreemLyne_MT"."User_Role_Mapping"
+        WHERE user_id = :user_id
+          AND role_id = :role_id
+        LIMIT 1
+    """), {"user_id": user_id, "role_id": FIELD_SALES_ROLE_ID}).first()
+    return row is not None
 
 
 def _renewals_clients_see_entire_tenant(user) -> bool:
@@ -165,6 +185,7 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'end_date': safe_date_to_iso(contract.contract_end_date if contract else None),
         'unit_rate': float(contract.unit_rate) if contract and contract.unit_rate else None,
         'terms_of_sale': contract.terms_of_sale if contract else None,
+        'comments': contract.terms_of_sale if contract else None,
         'standing_charge': float(contract.standing_charge) if contract and hasattr(contract, 'standing_charge') and contract.standing_charge else None,
         'aggregator': getattr(contract, 'aggregator', None) if contract else None,
         'rate_1': float(contract.rate_1) if contract and hasattr(contract, 'rate_1') and contract.rate_1 else None,
@@ -204,6 +225,35 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
     }
  
     return response
+
+
+SCHEDULED_CALLBACK_EXCLUDED_STEPS = (
+    'End Date Reminder',
+    'End Date',
+    'Field Update',
+    'Migration',
+    'Restored',
+    'Priced Accepted',
+    'Assignment',
+)
+
+
+def latest_scheduled_interaction_subquery(session):
+    return (
+        session.query(
+            Client_Interactions.client_id,
+            func.max(Client_Interactions.interaction_id).label('max_id')
+        )
+        .filter(Client_Interactions.reminder_date.isnot(None))
+        .filter(
+            or_(
+                Client_Interactions.next_steps.is_(None),
+                ~Client_Interactions.next_steps.in_(SCHEDULED_CALLBACK_EXCLUDED_STEPS),
+            )
+        )
+        .group_by(Client_Interactions.client_id)
+        .subquery()
+    )
 
 
 def get_user_role_name(user, session):
@@ -450,15 +500,8 @@ def get_energy_customer(client_id):
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
 
-        # Subquery: get only the latest interaction_id per client
-        latest_interaction_sq = (
-            session.query(
-                Client_Interactions.client_id,
-                func.max(Client_Interactions.interaction_id).label('max_id')
-            )
-            .group_by(Client_Interactions.client_id)
-            .subquery()
-        )
+        # Use the latest scheduled callback, not the latest interaction of any type.
+        latest_interaction_sq = latest_scheduled_interaction_subquery(session)
 
         LatestInteraction = aliased(Client_Interactions)
 
@@ -842,6 +885,7 @@ def update_energy_customer(client_id):
                 if 'comms_paid' in data and data['comms_paid'] is not None:
                     contract.comms_paid = data['comms_paid']
                 if 'terms_of_sale' in data: contract.terms_of_sale = data['terms_of_sale']
+                if 'comments' in data: contract.terms_of_sale = data['comments']
                 if 'payment_type' in data: contract.payment_type = data['payment_type']
                 if 'aggregator' in data: contract.aggregator = data['aggregator']
                 contract.updated_at = datetime.utcnow()
@@ -914,15 +958,8 @@ def update_energy_customer(client_id):
         session.commit()
         session.expire_all()
  
-        # Fetch updated data
-        latest_sq = (
-            session.query(
-                Client_Interactions.client_id,
-                func.max(Client_Interactions.interaction_id).label('max_id')
-            )
-            .group_by(Client_Interactions.client_id)
-            .subquery()
-        )
+        # Fetch updated data with the latest scheduled callback.
+        latest_sq = latest_scheduled_interaction_subquery(session)
         LatestInteraction = aliased(Client_Interactions)
 
         updated = session.query(
@@ -1440,6 +1477,10 @@ def search_all_energy_customers():
  
     session = SessionLocal()
     try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found for user'}), 400
+
         query_param = request.args.get('q', '').strip()
         service_param = request.args.get('service', 'utilities').strip().lower()
  
@@ -1447,8 +1488,10 @@ def search_all_energy_customers():
             return jsonify([]), 200
  
         service_id = {'utilities': 1, 'electricity': 1, 'water': 2, 'gas': 3}.get(service_param, 1)
+        restrict_to_own_records = _is_field_sales_user(session, request.current_user)
+        current_employee_id = getattr(request.current_user, 'employee_id', None)
  
-        results = session.query(
+        query = session.query(
             Client_Master,
             Project_Details,
             Energy_Contract_Master,
@@ -1467,6 +1510,7 @@ def search_all_energy_customers():
             Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id
         ).filter(
             and_(
+                Client_Master.tenant_id == tenant_id,
                 Client_Master.is_deleted == False,
                 or_(
                     Energy_Contract_Master.service_id == service_id,
@@ -1484,7 +1528,12 @@ def search_all_energy_customers():
                     Supplier_Master.supplier_company_name.ilike(f'%{query_param}%')
                 )
             )
-        ).order_by(Client_Master.client_id.desc()).limit(50).all()
+        )
+
+        if restrict_to_own_records:
+            query = query.filter(Project_Details.assigned_employee_id == current_employee_id)
+
+        results = query.order_by(Client_Master.client_id.desc()).limit(50).all()
  
         customers = []
         seen_clients = set()
@@ -1751,13 +1800,28 @@ def restore_customer(client_id):
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
-        client = (
-            session.query(Client_Master).filter_by(display_order=client_id, tenant_id=tenant_id).first() or
-            session.query(Client_Master).filter_by(tenant_client_id=client_id, tenant_id=tenant_id).first() or
-            session.query(Client_Master).filter_by(client_id=client_id, tenant_id=tenant_id).first()
-        )
-        if client and not client.is_deleted:
-            client = None
+        # The recycle-bin UI sends the real primary key. Resolve that first and
+        # only look at deleted rows so display IDs cannot collide with client_id.
+        client = session.query(Client_Master).filter_by(
+            client_id=client_id,
+            tenant_id=tenant_id,
+            is_deleted=True,
+        ).first()
+
+        if not client:
+            client = session.query(Client_Master).filter_by(
+                display_order=client_id,
+                tenant_id=tenant_id,
+                is_deleted=True,
+            ).first()
+
+        if not client:
+            client = session.query(Client_Master).filter_by(
+                tenant_client_id=client_id,
+                tenant_id=tenant_id,
+                is_deleted=True,
+            ).first()
+
         if not client:
             return jsonify({'error': 'Customer not found in recycle bin'}), 404
 
@@ -1765,11 +1829,14 @@ def restore_customer(client_id):
         actual_client_id = client.client_id
 
         assigned_employee_id = client.assigned_employee_id
+        project = session.query(Project_Details).filter_by(client_id=actual_client_id).first()
+        if not assigned_employee_id and project:
+            assigned_employee_id = project.assigned_employee_id
+
         client.is_deleted = False
         client.deleted_at = None
         client.deleted_reason = None
 
-        project = session.query(Project_Details).filter_by(client_id=actual_client_id).first()
         if project and project.status:
             project.status = None
  

@@ -15,6 +15,15 @@ import logging
 
 calendar_bp = Blueprint('calendar', __name__, url_prefix='/api/calendar')
 
+
+def _parse_ymd(value, field_name):
+    if value in (None, ''):
+        return None, None
+    try:
+        return datetime.strptime(str(value)[:10], '%Y-%m-%d').date(), None
+    except ValueError:
+        return None, f'{field_name} must be YYYY-MM-DD'
+
 # ✅ Add CORS support for all calendar routes
 @calendar_bp.after_request
 def after_request(response):
@@ -95,6 +104,7 @@ def get_renewals_calendar():
             WHERE cm.tenant_id = :tenant_id
             AND cm.client_company_name != '[IMPORTED LEADS]'
             AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
+            AND (cm.is_archived IS NULL OR cm.is_archived = FALSE)
             AND ecm.contract_end_date IS NOT NULL
             AND (pd.status IS NULL OR LOWER(pd.status) NOT IN ('priced', 'lost', 'lost cot', 'dead', 'invalid number', 'incorrect supplier', 'broker in place', 'complaint'))
             {employee_filter}
@@ -118,6 +128,17 @@ def get_renewals_calendar():
                     ) AS rn
                 FROM "StreemLyne_MT"."Client_Interactions" ci
                 WHERE ci.reminder_date IS NOT NULL
+                AND (
+                    ci.next_steps IS NULL
+                    OR ci.next_steps NOT IN ('End Date Reminder', 'End Date', 'Field Update', 'Migration', 'Restored')
+                )
+                AND (
+                    ci.notes IS NULL
+                    OR (
+                        ci.notes NOT LIKE '[Migration]%'
+                        AND ci.notes NOT LIKE '[Field Update]%'
+                    )
+                )
             ),
             latest_project AS (
                 SELECT DISTINCT ON (pd.client_id)
@@ -165,8 +186,9 @@ def get_renewals_calendar():
             AND cm.tenant_id = :tenant_id
             AND cm.client_company_name != '[IMPORTED LEADS]'
             AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
+            AND (cm.is_archived IS NULL OR cm.is_archived = FALSE)
             AND lci.reminder_date IS NOT NULL
-            AND (lp.status IS NULL OR LOWER(lp.status) NOT IN ('priced', 'lost', 'lost cot', 'dead', 'invalid number', 'incorrect supplier', 'broker in place', 'complaint'))
+            AND (lp.status IS NULL OR LOWER(lp.status) NOT IN ('priced', 'lost', 'lost cot', 'dead', 'invalid number', 'incorrect supplier', 'complaint'))
             {callback_employee_filter}
             ORDER BY cm.client_id
         ''')
@@ -271,6 +293,134 @@ def get_renewals_calendar():
         }), 500
     finally:
         session.close()
+
+@calendar_bp.route('/renewals/<int:client_id>/schedule', methods=['PUT', 'OPTIONS'])
+@token_required
+@tenant_from_jwt
+def update_renewal_schedule(client_id):
+    """Update calendar dates without changing the customer's workflow status."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    from backend.db import SessionLocal, safe_add_with_sequence_retry
+    from backend.models import Client_Interactions, Client_Master, Energy_Contract_Master, Project_Details
+    from datetime import timedelta
+
+    payload = request.get_json(force=True, silent=True) or {}
+    notes_provided = 'notes' in payload
+    notes_value = (payload.get('notes') or '').strip()
+    callback_date, callback_error = _parse_ymd(payload.get('callback_date'), 'callback_date')
+    contract_end_date, end_error = _parse_ymd(payload.get('contract_end_date'), 'contract_end_date')
+    if callback_error:
+        return jsonify({'success': False, 'error': callback_error}), 400
+    if end_error:
+        return jsonify({'success': False, 'error': end_error}), 400
+    if callback_date is None and contract_end_date is None and not notes_provided:
+        return jsonify({'success': False, 'error': 'No schedule update provided'}), 400
+
+    session = SessionLocal()
+    try:
+        tenant_id = str(g.tenant_id)
+        client = (
+            session.query(Client_Master)
+            .filter(Client_Master.client_id == client_id, Client_Master.tenant_id == tenant_id)
+            .first()
+        )
+        if not client:
+            return jsonify({'success': False, 'error': 'Customer not found'}), 404
+
+        updated = {}
+        now = datetime.utcnow()
+
+        if callback_date is not None or notes_provided:
+            latest_interaction = (
+                session.query(Client_Interactions)
+                .filter(
+                    Client_Interactions.client_id == client.client_id,
+                    Client_Interactions.reminder_date.isnot(None),
+                )
+                .order_by(Client_Interactions.created_at.desc().nullslast(), Client_Interactions.interaction_id.desc())
+                .first()
+            )
+
+            if callback_date is not None:
+                if latest_interaction:
+                    existing_is_callback = latest_interaction.next_steps not in (
+                        None, 'End Date Reminder', 'End Date'
+                    )
+                    next_steps = latest_interaction.next_steps or 'Callback' if existing_is_callback else 'Callback'
+                else:
+                    next_steps = 'Callback'
+
+                # ✅ Always insert a new row — never mutate existing history
+                safe_add_with_sequence_retry(
+                    session,
+                    Client_Interactions(
+                        client_id=client.client_id,
+                        contact_date=now.date(),
+                        contact_method=1,
+                        reminder_date=callback_date,
+                        notes=notes_value if notes_provided else f"[Calendar Update] Callback rescheduled to {callback_date.strftime('%d/%m/%Y')}",
+                        next_steps=next_steps,
+                        created_at=now,
+                    ),
+                )
+                updated['callback_date'] = callback_date.isoformat()
+
+            elif notes_provided and latest_interaction:
+                # Notes-only update — still insert new row for history
+                safe_add_with_sequence_retry(
+                    session,
+                    Client_Interactions(
+                        client_id=client.client_id,
+                        contact_date=now.date(),
+                        contact_method=1,
+                        reminder_date=latest_interaction.reminder_date,
+                        notes=f"[Calendar Update] Notes updated: {notes_value}",
+                        next_steps=latest_interaction.next_steps or 'Callback',
+                        created_at=now,
+                    ),
+                )
+                updated['notes'] = notes_value
+
+        if contract_end_date is not None:
+            contract = (
+                session.query(Energy_Contract_Master)
+                .join(Project_Details, Energy_Contract_Master.project_id == Project_Details.project_id)
+                .filter(Project_Details.client_id == client.client_id)
+                .order_by(Energy_Contract_Master.energy_contract_master_id.desc())
+                .first()
+            )
+            if not contract:
+                return jsonify({'success': False, 'error': 'Contract not found'}), 404
+            old_end = contract.contract_end_date
+            contract.contract_end_date = contract_end_date
+            contract.updated_at = now
+            updated['contract_end_date'] = contract_end_date.isoformat()
+
+            # ✅ Log end date change as separate history row
+            safe_add_with_sequence_retry(
+                session,
+                Client_Interactions(
+                    client_id=client.client_id,
+                    contact_date=now.date(),
+                    contact_method=1,
+                    reminder_date=None,
+                    notes=f"[Calendar Update] Contract end date: {old_end.strftime('%d/%m/%Y') if old_end else 'None'} → {contract_end_date.strftime('%d/%m/%Y')}",
+                    next_steps='Field Update',
+                    created_at=now + timedelta(seconds=1),
+                ),
+            )
+
+        session.commit()
+        return jsonify({'success': True, 'updated': updated}), 200
+    except Exception as e:
+        session.rollback()
+        logging.exception("Failed to update renewal schedule")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        session.close()
+
 
 @calendar_bp.route('/leads', methods=['GET', 'OPTIONS'])
 @token_required
@@ -381,9 +531,10 @@ def get_leads_calendar():
             WHERE (od."tenant_id" = :tenant_id OR (od."client_id" IS NOT NULL AND cm."tenant_id" = :tenant_id))
             AND od."service_id" = :service_id
             AND (cm."is_deleted" IS NULL OR cm."is_deleted" = FALSE)
+            AND (cm."client_id" IS NULL OR cm."is_archived" IS NULL OR cm."is_archived" = FALSE)
             AND (sm."stage_name" IS NULL OR LOWER(sm."stage_name") NOT IN (
                 \'lost\', \'lost cot\', \'dead\', \'invalid number\', 
-                \'incorrect supplier\', \'broker in place\', \'complaint\'
+                \'incorrect supplier\', \'broker in place\', \'complaint\', \'debt\'
             ))
             AND NOT EXISTS (
                 SELECT 1 FROM "StreemLyne_MT"."Project_Details" pd

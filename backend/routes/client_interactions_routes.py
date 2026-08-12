@@ -7,10 +7,11 @@ Updated Callback Route - backend/routes/client_interactions_routes.py
  
 from flask import Blueprint, request, jsonify, current_app
 from datetime import datetime, timedelta
-from sqlalchemy import and_, text
+from sqlalchemy import and_, or_, text
 from backend.models import Client_Interactions, Client_Master, Energy_Contract_Master, Project_Details, Supplier_Master
 from backend.db import SessionLocal, safe_add_with_sequence_retry
 from backend.routes.auth_routes import token_required
+from backend.utils.commission_schedule import generate_commission_schedule_for_project
  
 client_interaction_bp = Blueprint('client_interactions', __name__)
  
@@ -26,13 +27,27 @@ def get_tenant_id_from_user(user):
             if 'tenant' in k.lower() and v is not None:
                 return v
     return None
+
+
+def resolve_client_for_tenant(session, raw_client_id, tenant_id):
+    query = session.query(Client_Master).filter(
+        or_(
+            Client_Master.client_id == raw_client_id,
+            Client_Master.tenant_client_id == raw_client_id,
+            Client_Master.display_id == raw_client_id,
+            Client_Master.display_order == raw_client_id,
+        )
+    )
+    if tenant_id:
+        query = query.filter(Client_Master.tenant_id == tenant_id)
+    return query.first()
  
  
 # ── Statuses that go to Cleansing page (soft-delete with is_cleansing=True) ──
 CLEANSING_STATUSES = {"Invalid Number", "Incorrect Supplier"}
  
 # ── Statuses that go to Recycle Bin (soft-delete with is_cleansing=False) ────
-RECYCLE_BIN_STATUSES = {"Lost", "Lost COT", "Meter De-energised", "Complaint", "Duplicate"}
+RECYCLE_BIN_STATUSES = {"Lost", "Lost COT", "Meter De-energised", "Complaint", "Duplicate", "Dead"}
 
 
 # ── Helper: return CORS preflight response immediately (before auth check) ──
@@ -63,14 +78,13 @@ def add_callback(client_id):
         new_supplier = data.get('new_supplier')
         new_address = data.get('new_address')
         renewed_by = data.get('renewed_by')
+        commission_generation_result = None
 
         print(f"📥 Callback for client_id param {client_id} — status: {status}")
 
         # ✅ Resolve real client — URL param may be display_order or tenant_client_id
-        client = session.query(Client_Master).filter(
-            Client_Master.client_id == client_id
-        ).first()
-
+        requested_client_id = client_id
+        client = resolve_client_for_tenant(session, requested_client_id, tenant_id)
         if not client:
             row = session.execute(text("""
                 SELECT client_id FROM "StreemLyne_MT"."Client_Master"
@@ -109,7 +123,7 @@ def add_callback(client_id):
             "Callback":           {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Not Answered":       {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Priced":             {"requires_date": False, "requires_sold": True,  "deletes_record": False, "requires_notes": False},
-            "Sold":               {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
+            "Sold":               {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Lost":               {"requires_date": True,  "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Lost COT":           {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Already Renewed":    {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
@@ -119,11 +133,11 @@ def add_callback(client_id):
             "End Date Changed":   {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Complaint":          {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Email Only":         {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
-            "Renewed Directly":   {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": True},
+            "Renewed Directly":   {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Incorrect Supplier": {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Converted":          {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Not Called":         {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
-            "Dead":               {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": True},
+            "Dead":               {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Duplicate":          {"requires_date": False, "requires_sold": False, "deletes_record": True, "requires_notes": False},
         }
 
@@ -136,7 +150,10 @@ def add_callback(client_id):
         config = status_config[status]
 
         if config["requires_notes"] and not notes.strip():
-            return jsonify({'error': 'Please enter the reason why it was lost'}), 400
+            return jsonify({'error': f'Please enter the reason for {status}'}), 400
+
+        if status == "Renewed Directly" and not new_end_date_str:
+            return jsonify({'error': 'Please enter the new contract end date'}), 400
 
         date_required = False
         if config["requires_sold"]:
@@ -148,6 +165,51 @@ def add_callback(client_id):
 
         if date_required and not callback_date:
             return jsonify({'error': 'Callback date is required for this status'}), 400
+
+        is_schedule_only_update = (
+            status in ("Already Renewed", "Sold")
+            and not renewed_by
+            and callback_date
+            and not new_end_date_str
+            and not (new_supplier or "").strip()
+            and not (new_address or "").strip()
+        )
+        if is_schedule_only_update:
+            parsed_callback_date = datetime.strptime(callback_date, '%Y-%m-%d').date()
+            notes_value = notes.strip()
+            now = datetime.utcnow()
+
+            # ✅ Always insert a new row — never mutate existing history
+            safe_add_with_sequence_retry(
+                session,
+                Client_Interactions(
+                    client_id=real_client_id,
+                    contact_date=now.date(),
+                    contact_method=1,
+                    reminder_date=parsed_callback_date,
+                    notes=notes_value or f"[{status}] Callback rescheduled to {parsed_callback_date.strftime('%d/%m/%Y')}",
+                    next_steps=status,
+                    created_at=now,
+                ),
+            )
+            session.commit()
+            return jsonify({
+                'success': True,
+                'message': 'Callback date updated successfully',
+                'status': status,
+                'callback_date': callback_date,
+                'notes': notes_value,
+                'schedule_only': True,
+            }), 200
+
+        if status in ("Already Renewed", "Sold") and not renewed_by:
+            return jsonify({
+                'error': 'Please select if sold by supplier or agent' if status == "Sold" else 'Please select if renewed by customer or agent'
+            }), 400
+        if status == "Sold" and renewed_by not in ("supplier", "agent"):
+            return jsonify({'error': 'Please select if sold by supplier or agent'}), 400
+        if status == "Already Renewed" and renewed_by not in ("customer", "agent"):
+            return jsonify({'error': 'Please select if renewed by customer or agent'}), 400
 
         # ── Fetch project once, used throughout ───────────────────────────────
         project = session.query(Project_Details).filter_by(client_id=real_client_id).first()
@@ -210,9 +272,10 @@ def add_callback(client_id):
                 return jsonify({'error': f'Failed to move record: {str(e)}'}), 500
 
         # ── Already Renewed ────────────────────────────────────────────────────
-        if status == "Already Renewed":
+        if status in ("Already Renewed", "Sold"):
             try:
                 changes_made = []
+                now = datetime.utcnow()
 
                 contract = session.query(Energy_Contract_Master).select_from(Client_Master).join(
                     Project_Details, Client_Master.client_id == Project_Details.client_id
@@ -223,16 +286,17 @@ def add_callback(client_id):
                 if not contract:
                     return jsonify({'error': 'Contract not found'}), 404
 
+                end_date_change_summary = None
                 if new_end_date_str:
                     new_end_date = datetime.strptime(new_end_date_str, '%Y-%m-%d').date()
                     old_end_date = contract.contract_end_date
                     contract.contract_end_date = new_end_date
-                    contract.updated_at = datetime.utcnow()
+                    contract.updated_at = now
                     session.flush()
-                    changes_made.append(
-                        f"End date: {old_end_date.strftime('%d/%m/%Y') if old_end_date else 'None'} → {new_end_date.strftime('%d/%m/%Y')}"
-                    )
+                    end_date_change_summary = f"End date: {old_end_date.strftime('%d/%m/%Y') if old_end_date else 'None'} → {new_end_date.strftime('%d/%m/%Y')}"
+                    changes_made.append(end_date_change_summary)
 
+                supplier_change_summary = None
                 if new_supplier and new_supplier.strip():
                     supplier = session.query(Supplier_Master).filter(
                         Supplier_Master.supplier_company_name.ilike(new_supplier.strip())
@@ -242,7 +306,7 @@ def add_callback(client_id):
                             supplier_company_name=new_supplier.strip(),
                             supplier_contact_name=new_supplier.strip(),
                             supplier_provisions=0,
-                            created_at=datetime.utcnow()
+                            created_at=now
                         )
                         session.add(supplier)
                         session.flush()
@@ -251,11 +315,11 @@ def add_callback(client_id):
                         supplier_id=contract.supplier_id
                     ).first() if contract.supplier_id else None
                     old_supplier_name = old_sup.supplier_company_name if old_sup else 'None'
-
                     contract.supplier_id = supplier.supplier_id
-                    contract.updated_at = datetime.utcnow()
+                    contract.updated_at = now
                     session.flush()
-                    changes_made.append(f"Supplier: {old_supplier_name} → {new_supplier}")
+                    supplier_change_summary = f"Supplier: {old_supplier_name} → {new_supplier}"
+                    changes_made.append(supplier_change_summary)
 
                 if new_address and new_address.strip():
                     client.address = new_address.strip()
@@ -265,17 +329,20 @@ def add_callback(client_id):
 
                 session.flush()
 
-                if changes_made:
-                    summary = " | ".join(changes_made)
-                    notes = f"{notes.strip()} | {summary}".strip(" |") if notes.strip() else summary
-
                 final_status = None
-                if renewed_by == 'customer':
+                action_notes = notes.strip() if notes else ""
+                if status == "Sold" and renewed_by == 'supplier':
+                    final_status = 'Sold'
+                    action_notes = f"[Sold by Supplier] {action_notes}".strip() if action_notes else "[Sold by Supplier]"
+                elif status == "Sold" and renewed_by == 'agent':
+                    final_status = 'Sold'
+                    action_notes = f"[Sold by Agent] {action_notes}".strip() if action_notes else "[Sold by Agent]"
+                elif renewed_by == 'customer':
                     final_status = 'Renewed Directly'
-                    notes = f"[Renewed by Customer] {notes}".strip() if notes else "[Renewed by Customer]"
+                    action_notes = f"[Renewed by Customer] {action_notes}".strip() if action_notes else "[Renewed by Customer]"
                 elif renewed_by == 'agent':
                     final_status = 'Already Renewed'
-                    notes = f"[Renewed by Agent] {notes}".strip() if notes else "[Renewed by Agent]"
+                    action_notes = f"[Renewed by Agent] {action_notes}".strip() if action_notes else "[Renewed by Agent]"
                 else:
                     final_status = 'Already Renewed'
 
@@ -284,18 +351,54 @@ def add_callback(client_id):
                     if old_status != final_status:
                         changes_made.append(f"Status: {old_status or 'None'} → {final_status}")
 
-                formatted_notes = f"[{final_status}] {notes}" if notes else f"[{final_status}]"
+                    if final_status in ('Already Renewed', 'Sold') and renewed_by == 'agent':
+                        commission_generation_result = generate_commission_schedule_for_project(
+                            session,
+                            project.project_id,
+                        ).to_dict()
+                        print(f"Commission schedule generation: {commission_generation_result}")
+
+                # ✅ Log 1: Status/callback row
+                formatted_notes = f"[{final_status}] {action_notes}" if action_notes else f"[{final_status}]"
                 safe_add_with_sequence_retry(
                     session,
                     Client_Interactions(
                         client_id=real_client_id,
-                        contact_date=datetime.utcnow().date(),
+                        contact_date=now.date(),
                         contact_method=1,
                         reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
                         notes=formatted_notes,
                         next_steps=final_status,
-                        created_at=datetime.utcnow()
+                        created_at=now
                     ))
+
+                # ✅ Log 2: End date change (separate row)
+                if end_date_change_summary:
+                    safe_add_with_sequence_retry(
+                        session,
+                        Client_Interactions(
+                            client_id=real_client_id,
+                            contact_date=now.date(),
+                            contact_method=1,
+                            reminder_date=None,
+                            notes=f"[Field Update] {end_date_change_summary}",
+                            next_steps='Field Update',
+                            created_at=now + timedelta(seconds=1)
+                        ))
+
+                # ✅ Log 3: Supplier change (separate row)
+                if supplier_change_summary:
+                    safe_add_with_sequence_retry(
+                        session,
+                        Client_Interactions(
+                            client_id=real_client_id,
+                            contact_date=now.date(),
+                            contact_method=1,
+                            reminder_date=None,
+                            notes=f"[Field Update] {supplier_change_summary}",
+                            next_steps='Field Update',
+                            created_at=now + timedelta(seconds=2)
+                        ))
 
                 session.commit()
                 print(f"✅ Callback saved for real_client_id {real_client_id}, status: {final_status}")
@@ -303,7 +406,8 @@ def add_callback(client_id):
                     'success': True,
                     'message': 'Callback saved successfully',
                     'status': final_status,
-                    'callback_date': callback_date
+                    'callback_date': callback_date,
+                    'commission_generation': commission_generation_result,
                 }), 200
 
             except Exception as e:
@@ -312,7 +416,7 @@ def add_callback(client_id):
                 return jsonify({'error': f'Failed to update information: {str(e)}'}), 500
 
         # ── End Date Changed ───────────────────────────────────────────────────
-        elif status == "End Date Changed" and new_end_date_str:
+        elif status in ("End Date Changed", "Renewed Directly") and new_end_date_str:
             try:
                 new_end_date = datetime.strptime(new_end_date_str, '%Y-%m-%d').date()
 
@@ -335,7 +439,8 @@ def add_callback(client_id):
                     if data.get('notes', '').strip():
                         notes = f"{data.get('notes').strip()} | {notes}"
 
-                    callback_date = new_end_date_str
+                    if status == "End Date Changed":
+                        callback_date = new_end_date_str
 
             except Exception as e:
                 session.rollback()
@@ -394,7 +499,8 @@ def add_callback(client_id):
             'success': True,
             'message': 'Callback saved successfully',
             'status': status,
-            'callback_date': callback_date
+            'callback_date': callback_date,
+            'commission_generation': commission_generation_result,
         }), 200
 
     except Exception as e:
