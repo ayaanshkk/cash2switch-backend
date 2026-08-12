@@ -15,6 +15,15 @@ import logging
 
 calendar_bp = Blueprint('calendar', __name__, url_prefix='/api/calendar')
 
+
+def _parse_ymd(value, field_name):
+    if value in (None, ''):
+        return None, None
+    try:
+        return datetime.strptime(str(value)[:10], '%Y-%m-%d').date(), None
+    except ValueError:
+        return None, f'{field_name} must be YYYY-MM-DD'
+
 # ✅ Add CORS support for all calendar routes
 @calendar_bp.after_request
 def after_request(response):
@@ -284,6 +293,102 @@ def get_renewals_calendar():
         }), 500
     finally:
         session.close()
+
+@calendar_bp.route('/renewals/<int:client_id>/schedule', methods=['PUT', 'OPTIONS'])
+@token_required
+@tenant_from_jwt
+def update_renewal_schedule(client_id):
+    """Update calendar dates without changing the customer's workflow status."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    from backend.db import SessionLocal, safe_add_with_sequence_retry
+    from backend.models import Client_Interactions, Client_Master, Energy_Contract_Master, Project_Details
+
+    payload = request.get_json(force=True, silent=True) or {}
+    notes_provided = 'notes' in payload
+    notes_value = (payload.get('notes') or '').strip()
+    callback_date, callback_error = _parse_ymd(payload.get('callback_date'), 'callback_date')
+    contract_end_date, end_error = _parse_ymd(payload.get('contract_end_date'), 'contract_end_date')
+    if callback_error:
+        return jsonify({'success': False, 'error': callback_error}), 400
+    if end_error:
+        return jsonify({'success': False, 'error': end_error}), 400
+    if callback_date is None and contract_end_date is None and not notes_provided:
+        return jsonify({'success': False, 'error': 'No schedule update provided'}), 400
+
+    session = SessionLocal()
+    try:
+        tenant_id = str(g.tenant_id)
+        client = (
+            session.query(Client_Master)
+            .filter(Client_Master.client_id == client_id, Client_Master.tenant_id == tenant_id)
+            .first()
+        )
+        if not client:
+            return jsonify({'success': False, 'error': 'Customer not found'}), 404
+
+        updated = {}
+        if callback_date is not None or notes_provided:
+            latest_interaction = (
+                session.query(Client_Interactions)
+                .filter(
+                    Client_Interactions.client_id == client.client_id,
+                    Client_Interactions.reminder_date.isnot(None),
+                )
+                .order_by(Client_Interactions.created_at.desc().nullslast(), Client_Interactions.interaction_id.desc())
+                .first()
+            )
+            if latest_interaction:
+                if callback_date is not None:
+                    latest_interaction.reminder_date = callback_date
+                if notes_provided:
+                    latest_interaction.notes = notes_value
+                if not latest_interaction.created_at:
+                    latest_interaction.created_at = datetime.utcnow()
+            else:
+                if callback_date is None:
+                    return jsonify({'success': False, 'error': 'Callback interaction not found'}), 404
+                safe_add_with_sequence_retry(
+                    session,
+                    Client_Interactions(
+                        client_id=client.client_id,
+                        contact_date=datetime.utcnow().date(),
+                        contact_method=1,
+                        reminder_date=callback_date,
+                        notes=notes_value if notes_provided else '[Callback] Rescheduled from calendar',
+                        next_steps='Callback',
+                        created_at=datetime.utcnow(),
+                    ),
+                )
+            if callback_date is not None:
+                updated['callback_date'] = callback_date.isoformat()
+            if notes_provided:
+                updated['notes'] = notes_value
+
+        if contract_end_date is not None:
+            contract = (
+                session.query(Energy_Contract_Master)
+                .join(Project_Details, Energy_Contract_Master.project_id == Project_Details.project_id)
+                .filter(Project_Details.client_id == client.client_id)
+                .order_by(Energy_Contract_Master.energy_contract_master_id.desc())
+                .first()
+            )
+            if not contract:
+                return jsonify({'success': False, 'error': 'Contract not found'}), 404
+            contract.contract_end_date = contract_end_date
+            contract.updated_at = datetime.utcnow()
+            updated['contract_end_date'] = contract_end_date.isoformat()
+
+        session.commit()
+        return jsonify({'success': True, 'updated': updated}), 200
+    except Exception as e:
+        session.rollback()
+        logging.exception("Failed to update renewal schedule")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        session.close()
+
 
 @calendar_bp.route('/leads', methods=['GET', 'OPTIONS'])
 @token_required

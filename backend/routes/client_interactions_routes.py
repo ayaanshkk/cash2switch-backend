@@ -166,6 +166,53 @@ def add_callback(client_id):
         if date_required and not callback_date:
             return jsonify({'error': 'Callback date is required for this status'}), 400
 
+        is_schedule_only_update = (
+            status in ("Already Renewed", "Sold")
+            and not renewed_by
+            and callback_date
+            and not new_end_date_str
+            and not (new_supplier or "").strip()
+            and not (new_address or "").strip()
+        )
+        if is_schedule_only_update:
+            latest_interaction = (
+                session.query(Client_Interactions)
+                .filter(
+                    Client_Interactions.client_id == real_client_id,
+                    Client_Interactions.reminder_date.isnot(None),
+                )
+                .order_by(Client_Interactions.created_at.desc().nullslast(), Client_Interactions.interaction_id.desc())
+                .first()
+            )
+            parsed_callback_date = datetime.strptime(callback_date, '%Y-%m-%d').date()
+            notes_value = notes.strip()
+            if latest_interaction:
+                latest_interaction.reminder_date = parsed_callback_date
+                if notes_value:
+                    latest_interaction.notes = notes_value
+            else:
+                safe_add_with_sequence_retry(
+                    session,
+                    Client_Interactions(
+                        client_id=real_client_id,
+                        contact_date=datetime.utcnow().date(),
+                        contact_method=1,
+                        reminder_date=parsed_callback_date,
+                        notes=notes_value or f"[{status}] Callback date updated",
+                        next_steps=status,
+                        created_at=datetime.utcnow(),
+                    ),
+                )
+            session.commit()
+            return jsonify({
+                'success': True,
+                'message': 'Callback date updated successfully',
+                'status': status,
+                'callback_date': callback_date,
+                'notes': notes_value,
+                'schedule_only': True,
+            }), 200
+
         if status in ("Already Renewed", "Sold") and not renewed_by:
             return jsonify({
                 'error': 'Please select if sold by supplier or agent' if status == "Sold" else 'Please select if renewed by customer or agent'
