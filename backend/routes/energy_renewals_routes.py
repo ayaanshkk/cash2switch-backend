@@ -248,7 +248,7 @@ def get_renewal_stats():
                     contacted_count += 1
                 elif status_lower in ['not contacted']:
                     not_contacted_count += 1
-                elif status_lower in ['priced', 'renewed', 'already renewed', 'end date changed']:
+                elif status_lower in ['priced', 'renewed', 'already renewed', 'sold', 'end date changed']:
                     renewed_count += 1
                 elif status_lower == 'lost':
                     lost_count += 1
@@ -852,7 +852,7 @@ def get_renewal_performance():
                     end_date_changed_count += 1
                 elif status_lower == 'priced':
                     priced_count += 1
-                elif status_lower in ['renewed', 'already renewed']:
+                elif status_lower in ['renewed', 'already renewed', 'sold']:
                     renewed_count += 1
                 elif status_lower in ['called', 'callback', 'contacted', 'not answered',
                                        'broker in place', 'email only', 'renewed directly']:
@@ -952,9 +952,9 @@ def get_staff_status_counts():
                 SELECT 
                     COUNT(*) as total_contacts,
                     
-                    -- Renewed: ONLY "Already Renewed" (not including other success statuses)
+                    -- Renewed: Already Renewed or Sold
                     SUM(CASE 
-                        WHEN pd.status = 'Already Renewed'
+                        WHEN pd.status IN ('Already Renewed', 'Sold')
                         THEN 1 ELSE 0 
                     END) as renewed_count,
                     
@@ -998,7 +998,7 @@ def get_staff_status_counts():
             not_contacted = stats_result.not_contacted_count or 0
             lost = stats_result.lost_count or 0
             
-            # Conversion = Renewed / Total (only counting "Already Renewed")
+            # Conversion = Renewed / Total
             conversion_rate = round((renewed / total * 100), 1) if total > 0 else 0
             
             print(f"   📊 {emp_name}:")

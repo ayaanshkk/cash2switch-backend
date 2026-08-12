@@ -123,7 +123,7 @@ def add_callback(client_id):
             "Callback":           {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Not Answered":       {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Priced":             {"requires_date": False, "requires_sold": True,  "deletes_record": False, "requires_notes": False},
-            "Sold":               {"requires_date": False, "requires_sold": False, "deletes_record": False, "requires_notes": False},
+            "Sold":               {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
             "Lost":               {"requires_date": True,  "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Lost COT":           {"requires_date": False, "requires_sold": False, "deletes_record": True,  "requires_notes": True},
             "Already Renewed":    {"requires_date": True,  "requires_sold": False, "deletes_record": False, "requires_notes": False},
@@ -165,6 +165,15 @@ def add_callback(client_id):
 
         if date_required and not callback_date:
             return jsonify({'error': 'Callback date is required for this status'}), 400
+
+        if status in ("Already Renewed", "Sold") and not renewed_by:
+            return jsonify({
+                'error': 'Please select if sold by supplier or agent' if status == "Sold" else 'Please select if renewed by customer or agent'
+            }), 400
+        if status == "Sold" and renewed_by not in ("supplier", "agent"):
+            return jsonify({'error': 'Please select if sold by supplier or agent'}), 400
+        if status == "Already Renewed" and renewed_by not in ("customer", "agent"):
+            return jsonify({'error': 'Please select if renewed by customer or agent'}), 400
 
         # ── Fetch project once, used throughout ───────────────────────────────
         project = session.query(Project_Details).filter_by(client_id=real_client_id).first()
@@ -227,7 +236,7 @@ def add_callback(client_id):
                 return jsonify({'error': f'Failed to move record: {str(e)}'}), 500
 
         # ── Already Renewed ────────────────────────────────────────────────────
-        if status == "Already Renewed":
+        if status in ("Already Renewed", "Sold"):
             try:
                 changes_made = []
 
@@ -287,7 +296,13 @@ def add_callback(client_id):
                     notes = f"{notes.strip()} | {summary}".strip(" |") if notes.strip() else summary
 
                 final_status = None
-                if renewed_by == 'customer':
+                if status == "Sold" and renewed_by == 'supplier':
+                    final_status = 'Sold'
+                    notes = f"[Sold by Supplier] {notes}".strip() if notes else "[Sold by Supplier]"
+                elif status == "Sold" and renewed_by == 'agent':
+                    final_status = 'Sold'
+                    notes = f"[Sold by Agent] {notes}".strip() if notes else "[Sold by Agent]"
+                elif renewed_by == 'customer':
                     final_status = 'Renewed Directly'
                     notes = f"[Renewed by Customer] {notes}".strip() if notes else "[Renewed by Customer]"
                 elif renewed_by == 'agent':
@@ -301,7 +316,7 @@ def add_callback(client_id):
                     if old_status != final_status:
                         changes_made.append(f"Status: {old_status or 'None'} → {final_status}")
 
-                    if final_status == 'Already Renewed':
+                    if final_status in ('Already Renewed', 'Sold') and renewed_by == 'agent':
                         commission_generation_result = generate_commission_schedule_for_project(
                             session,
                             project.project_id,

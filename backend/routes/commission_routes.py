@@ -14,8 +14,10 @@ from backend.models import (
     Commission_Payment,
     Commission_Payment_Receipt,
     Employee_Master,
+    Energy_Contract_Master,
     Opportunity_Details,
     Project_Details,
+    Services_Master,
     Supplier_Master,
 )
 from backend.routes.auth_helpers import token_required
@@ -101,10 +103,18 @@ def _payment_base_query(session):
             Opportunity_Details.business_name.label('business_name'),
             Supplier_Master.supplier_company_name.label('supplier_name'),
             Employee_Master.employee_name.label('agent_name'),
+            Energy_Contract_Master.mpan_number.label('mpan_number'),
+            Energy_Contract_Master.mpan_bottom.label('mpan_bottom'),
+            Energy_Contract_Master.contract_start_date.label('contract_start_date'),
+            Energy_Contract_Master.contract_end_date.label('contract_end_date'),
+            Energy_Contract_Master.service_id.label('contract_service_id'),
+            Services_Master.service_title.label('service_title'),
         )
         .outerjoin(Client_Master, Commission_Payment.client_id == Client_Master.client_id)
         .outerjoin(Project_Details, Commission_Payment.project_id == Project_Details.project_id)
         .outerjoin(Opportunity_Details, Project_Details.opportunity_id == Opportunity_Details.opportunity_id)
+        .outerjoin(Energy_Contract_Master, Commission_Payment.contract_id == Energy_Contract_Master.energy_contract_master_id)
+        .outerjoin(Services_Master, Energy_Contract_Master.service_id == Services_Master.service_id)
         .outerjoin(Supplier_Master, Commission_Payment.supplier_id == Supplier_Master.supplier_id)
         .outerjoin(Employee_Master, Commission_Payment.employee_id == Employee_Master.employee_id)
     )
@@ -130,6 +140,16 @@ def _payment_payload(row) -> dict:
         'customer_name': customer_name,
         'business_name': row.business_name or customer_name,
         'supplier_name': row.supplier_name,
+        'mpan_number': row.mpan_number,
+        'mpan_bottom': row.mpan_bottom,
+        'contract_start_date': _date(row.contract_start_date),
+        'contract_end_date': _date(row.contract_end_date),
+        'service_id': row.contract_service_id,
+        'service_title': (
+            'Water' if row.contract_service_id == 2 else
+            'Utilities' if row.contract_service_id == 1 else
+            row.service_title
+        ),
         'aggregator': payment.aggregator,
         'agent_name': row.agent_name,
         'expected_gross_amount': _money(payment.expected_gross_amount),
@@ -1361,6 +1381,9 @@ def list_commission_payments():
                 Opportunity_Details.business_name.ilike(search_pattern),
                 Supplier_Master.supplier_company_name.ilike(search_pattern),
                 Employee_Master.employee_name.ilike(search_pattern),
+                Energy_Contract_Master.mpan_number.ilike(search_pattern),
+                Energy_Contract_Master.mpan_bottom.ilike(search_pattern),
+                Services_Master.service_title.ilike(search_pattern),
                 cast(Commission_Payment.contract_id, String).ilike(search_pattern),
             ))
 
