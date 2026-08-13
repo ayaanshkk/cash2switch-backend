@@ -5,6 +5,8 @@ Updated Callback Route - backend/routes/client_interactions_routes.py
 ✅ FIX: OPTIONS preflight requests pass through before @token_required check
 """
  
+from logging import config
+
 from flask import Blueprint, request, jsonify, current_app
 from datetime import datetime, timedelta
 from sqlalchemy import and_, or_, text
@@ -30,17 +32,33 @@ def get_tenant_id_from_user(user):
 
 
 def resolve_client_for_tenant(session, raw_client_id, tenant_id):
-    query = session.query(Client_Master).filter(
-        or_(
-            Client_Master.client_id == raw_client_id,
-            Client_Master.tenant_client_id == raw_client_id,
-            Client_Master.display_id == raw_client_id,
-            Client_Master.display_order == raw_client_id,
-        )
-    )
+    # ✅ Try client_id first (exact PK match takes priority)
+    filters = []
     if tenant_id:
-        query = query.filter(Client_Master.tenant_id == tenant_id)
-    return query.first()
+        filters.append(Client_Master.tenant_id == tenant_id)
+
+    # 1. Try exact client_id match first
+    result = session.query(Client_Master).filter(
+        Client_Master.client_id == raw_client_id,
+        *filters
+    ).first()
+    if result:
+        return result
+
+    # 2. Try display_order
+    result = session.query(Client_Master).filter(
+        Client_Master.display_order == raw_client_id,
+        *filters
+    ).first()
+    if result:
+        return result
+
+    # 3. Try tenant_client_id last
+    result = session.query(Client_Master).filter(
+        Client_Master.tenant_client_id == raw_client_id,
+        *filters
+    ).first()
+    return result
  
  
 # ── Statuses that go to Cleansing page (soft-delete with is_cleansing=True) ──
@@ -212,8 +230,16 @@ def add_callback(client_id):
             return jsonify({'error': 'Please select if renewed by customer or agent'}), 400
 
         # ── Fetch project once, used throughout ───────────────────────────────
+        proj_row = session.execute(text("""
+            SELECT project_id, status FROM "StreemLyne_MT"."Project_Details"
+            WHERE client_id = :cid
+            LIMIT 1
+        """), {'cid': real_client_id}).fetchone()
+
         project = session.query(Project_Details).filter_by(client_id=real_client_id).first()
-        old_status = project.status if project else None
+        old_status = proj_row[1] if proj_row else None
+        project_id_for_update = proj_row[0] if proj_row else None
+        print(f"🔍 project found: {proj_row is not None}, project_id: {project_id_for_update}, old_status: {old_status}, new status: {status}")
 
         # ── Soft delete: Cleansing OR Recycle Bin ─────────────────────────────
         if config["deletes_record"]:
@@ -226,24 +252,34 @@ def add_callback(client_id):
                 if hasattr(client, 'is_cleansing'):
                     client.is_cleansing = is_cleansing
 
-                if project:
+                print(f"🔍 ABOUT TO SET project.status = '{status}' (project is None: {project is None})")
+                if project_id_for_update:
+                    session.execute(text("""
+                        UPDATE "StreemLyne_MT"."Project_Details"
+                        SET status = :new_status
+                        WHERE project_id = :pid
+                    """), {'new_status': status, 'pid': project_id_for_update})
+                elif project:
                     project.status = status
 
                 formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
                 if old_status != status:
-                    formatted_notes = f"[{status}] Status: {old_status or 'None'} → {status}" + (f" | {notes}" if notes else "")
+                    transition = f"Status: {old_status or 'None'} → {status}"
+                    formatted_notes = f"[{status}] {transition}" + (f" | {notes}" if notes else "")
 
-                safe_add_with_sequence_retry(
-                    session,
-                    Client_Interactions(
-                        client_id=real_client_id,
-                        contact_date=datetime.utcnow().date(),
-                        contact_method=1,
-                        reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
-                        notes=formatted_notes,
-                        next_steps=status,
-                        created_at=datetime.utcnow()
-                    ))
+                print(f"📥 Inserting interaction: client={real_client_id}, status={status}, callback_date={callback_date!r}")
+                session.execute(text("""
+                    INSERT INTO "StreemLyne_MT"."Client_Interactions"
+                    (client_id, contact_date, contact_method, reminder_date, notes, next_steps, created_at)
+                    VALUES (:client_id, CURRENT_DATE, 1, :reminder_date, :notes, :next_steps, :created_at)
+                """), {
+                    'client_id': real_client_id,
+                    'reminder_date': callback_date if callback_date else None,
+                    'notes': formatted_notes,
+                    'next_steps': status,
+                    'created_at': datetime.utcnow(),
+                })
+                print(f"✅ Interaction inserted via raw SQL")
 
                 session.commit()
 
@@ -360,17 +396,17 @@ def add_callback(client_id):
 
                 # ✅ Log 1: Status/callback row
                 formatted_notes = f"[{final_status}] {action_notes}" if action_notes else f"[{final_status}]"
-                safe_add_with_sequence_retry(
-                    session,
-                    Client_Interactions(
-                        client_id=real_client_id,
-                        contact_date=now.date(),
-                        contact_method=1,
-                        reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
-                        notes=formatted_notes,
-                        next_steps=final_status,
-                        created_at=now
-                    ))
+                session.execute(text("""
+                    INSERT INTO "StreemLyne_MT"."Client_Interactions"
+                    (client_id, contact_date, contact_method, reminder_date, notes, next_steps, created_at)
+                    VALUES (:client_id, CURRENT_DATE, 1, :reminder_date, :notes, :next_steps, :created_at)
+                """), {
+                    'client_id': real_client_id,
+                    'reminder_date': callback_date if callback_date else None,
+                    'notes': formatted_notes,
+                    'next_steps': status,
+                    'created_at': datetime.utcnow(),
+                })
 
                 # ✅ Log 2: End date change (separate row)
                 if end_date_change_summary:
@@ -448,7 +484,14 @@ def add_callback(client_id):
                 return jsonify({'error': f'Failed to update end date: {str(e)}'}), 500
 
         # ── Update Project_Details.status for all remaining statuses ──────────
-        if project:
+        if project_id_for_update:
+            result = session.execute(text("""
+                UPDATE "StreemLyne_MT"."Project_Details"
+                SET status = :new_status
+                WHERE project_id = :pid
+            """), {'new_status': status, 'pid': project_id_for_update})
+            print(f"✅ Raw SQL updated {result.rowcount} rows: project_id={project_id_for_update} status → '{status}'")
+        elif project:
             project.status = status
 
         # ── Priced with No (move to priced page) ──────────────────────────────
@@ -456,16 +499,16 @@ def add_callback(client_id):
             formatted_notes = f"[{status}] {notes}" if notes else f"[{status}]"
             if old_status != status:
                 formatted_notes = f"[{status}] Status: {old_status or 'None'} → {status}" + (f" | {notes}" if notes else "")
-            safe_add_with_sequence_retry(
-                session,
-                Client_Interactions(
-                    client_id=real_client_id,
-                    contact_date=datetime.utcnow().date(),
-                    contact_method=1,
-                    notes=formatted_notes,
-                    next_steps=status,
-                    created_at=datetime.utcnow()
-                ))
+            session.execute(text("""
+                INSERT INTO "StreemLyne_MT"."Client_Interactions"
+                (client_id, contact_date, contact_method, notes, next_steps, created_at)
+                VALUES (:client_id, CURRENT_DATE, 1, :notes, :next_steps, :created_at)
+            """), {
+                'client_id': real_client_id,
+                'notes': formatted_notes,
+                'next_steps': status,
+                'created_at': datetime.utcnow(),
+            })
             session.commit()
             return jsonify({
                 'success': True,
@@ -479,28 +522,50 @@ def add_callback(client_id):
             transition = f"Status: {old_status or 'None'} → {status}"
             formatted_notes = f"[{status}] {transition}" + (f" | {notes}" if notes else "")
 
-        safe_add_with_sequence_retry(
-            session,
-            Client_Interactions(
-                client_id=real_client_id,
-                contact_date=datetime.utcnow().date(),
-                contact_method=1,
-                reminder_date=datetime.strptime(callback_date, '%Y-%m-%d').date() if callback_date else None,
-                notes=formatted_notes,
-                next_steps=status,
-                created_at=datetime.utcnow()
-            )
-        )
+        print(f"📥 Inserting interaction: client={real_client_id}, status={status}, callback_date={callback_date!r}")
+        session.execute(text("""
+            INSERT INTO "StreemLyne_MT"."Client_Interactions"
+            (client_id, contact_date, contact_method, reminder_date, notes, next_steps, created_at)
+            VALUES (:client_id, CURRENT_DATE, 1, :reminder_date, :notes, :next_steps, :created_at)
+        """), {
+            'client_id': real_client_id,
+            'reminder_date': callback_date if callback_date else None,
+            'notes': formatted_notes,
+            'next_steps': status,
+            'created_at': datetime.utcnow(),
+        })
+        print(f"✅ Interaction inserted via raw SQL")
 
-        session.commit()
-        print(f"✅ Callback saved for real_client_id {real_client_id}, status: {status}")
+        try:
+            session.commit()
+        except Exception as commit_err:
+            session.rollback()
+            print(f"❌ COMMIT FAILED: {commit_err}")
+            import traceback; traceback.print_exc()
+            return jsonify({'error': str(commit_err)}), 500
+
+        # ✅ Verify via raw SQL in a fresh connection
+        verify_session = SessionLocal()
+        try:
+            verify_row = verify_session.execute(text("""
+                SELECT status FROM "StreemLyne_MT"."Project_Details"
+                WHERE project_id = :pid
+            """), {'pid': project_id_for_update}).fetchone()
+            verified_status = verify_row[0] if verify_row else status
+            print(f"✅ VERIFIED in fresh session: project_id={project_id_for_update} status = '{verified_status}'")
+        finally:
+            verify_session.close()
 
         return jsonify({
             'success': True,
             'message': 'Callback saved successfully',
-            'status': status,
+            'status': verified_status,
             'callback_date': callback_date,
             'commission_generation': commission_generation_result,
+            'customer': {
+                'status': verified_status,
+                'callback_date': callback_date,
+            }
         }), 200
 
     except Exception as e:
@@ -704,20 +769,30 @@ def get_interaction_history(client_id):
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
- 
-        query = session.query(Client_Interactions)
+
+        # ✅ Resolve display_order / tenant_client_id → real client_id
+        filters = []
         if tenant_id:
-            query = query.join(
-                Client_Master, Client_Interactions.client_id == Client_Master.client_id
-            ).filter(and_(
-                Client_Interactions.client_id == client_id,
-                Client_Master.tenant_id == tenant_id
-            ))
-        else:
-            query = query.filter(Client_Interactions.client_id == client_id)
- 
-        interactions = query.order_by(Client_Interactions.created_at.desc()).all()
- 
+            filters.append(Client_Master.tenant_id == tenant_id)
+
+        real_client = (
+            session.query(Client_Master).filter(Client_Master.client_id == client_id, *filters).first()
+            or session.query(Client_Master).filter(Client_Master.display_order == client_id, *filters).first()
+            or session.query(Client_Master).filter(Client_Master.tenant_client_id == client_id, *filters).first()
+        )
+
+        if not real_client:
+            return jsonify({'interactions': []}), 200
+
+        real_client_id = real_client.client_id
+
+        interactions = (
+            session.query(Client_Interactions)
+            .filter(Client_Interactions.client_id == real_client_id)
+            .order_by(Client_Interactions.created_at.desc())
+            .all()
+        )
+
         return jsonify({'interactions': [{
             'interaction_id': i.interaction_id,
             'interaction_type': i.next_steps or 'Unknown',
@@ -727,7 +802,7 @@ def get_interaction_history(client_id):
             'employee_id': None,
             'created_at': i.created_at.isoformat() if i.created_at else None
         } for i in interactions]}), 200
- 
+
     except Exception as e:
         current_app.logger.exception(f"❌ Error fetching interaction history: {e}")
         return jsonify({'error': str(e)}), 500
@@ -745,16 +820,22 @@ def delete_interaction(client_id, interaction_id):
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
  
-        query = session.query(Client_Interactions).filter(
-            Client_Interactions.interaction_id == interaction_id,
-            Client_Interactions.client_id == client_id
-        )
+        filters = []
         if tenant_id:
-            query = query.join(
-                Client_Master, Client_Interactions.client_id == Client_Master.client_id
-            ).filter(Client_Master.tenant_id == tenant_id)
- 
-        interaction = query.first()
+            filters.append(Client_Master.tenant_id == tenant_id)
+
+        real_client = (
+            session.query(Client_Master).filter(Client_Master.client_id == client_id, *filters).first()
+            or session.query(Client_Master).filter(Client_Master.display_order == client_id, *filters).first()
+            or session.query(Client_Master).filter(Client_Master.tenant_client_id == client_id, *filters).first()
+        )
+        real_cid = real_client.client_id if real_client else client_id
+
+        interaction = session.query(Client_Interactions).filter(
+            Client_Interactions.interaction_id == interaction_id,
+            Client_Interactions.client_id == real_cid
+        ).first()
+        
         if not interaction:
             return jsonify({'error': 'Interaction not found'}), 404
  

@@ -559,7 +559,7 @@ def get_energy_customer(client_id):
         return jsonify({'error': 'Failed to fetch customer'}), 500
     finally:
         session.close()
-
+        
 # ==========================================
 # CREATE CUSTOMER
 # ==========================================
@@ -696,7 +696,7 @@ def create_energy_customer():
 def update_energy_customer(client_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
- 
+
     session = SessionLocal()
     try:
         data = request.get_json() or {}
@@ -704,7 +704,22 @@ def update_energy_customer(client_id):
         print(f"🔧 UPDATE REQUEST for client {client_id}")
         print(f"   Data: {data}")
         print(f"   User: {request.current_user.employee_id}")
-        
+
+        tenant_id = get_tenant_id_from_user(request.current_user)
+
+        # ✅ Resolve display_order / tenant_client_id → real client_id
+        real_client = (
+            session.query(Client_Master).filter_by(client_id=client_id, tenant_id=tenant_id).first() or
+            session.query(Client_Master).filter_by(display_order=client_id, tenant_id=tenant_id).first() or
+            session.query(Client_Master).filter_by(tenant_client_id=client_id, tenant_id=tenant_id).first()
+        )
+        if not real_client:
+            return jsonify({'error': 'Customer not found'}), 404
+
+        # ✅ Override client_id with real PK for all downstream ops
+        client_id = real_client.client_id
+        client = real_client
+
         # ✅ CHECK DATABASE BEFORE ANY CHANGES
         check_query = session.execute(text("""
             SELECT cm.assigned_employee_id, pd.assigned_employee_id, cm.is_allocated
@@ -715,18 +730,7 @@ def update_energy_customer(client_id):
         print(f"   DB BEFORE: client_assigned={check_query[0]}, project_assigned={check_query[1]}, is_allocated={check_query[2]}")
         print(f"{'='*60}\n")
         print(f"🔧 UPDATE REQUEST for client {client_id}: {data}")
-        tenant_id = get_tenant_id_from_user(request.current_user)
- 
-        client = session.query(Client_Master).filter_by(
-            client_id=client_id,
-            tenant_id=tenant_id
-        ).first()
-        if not client:
-            return jsonify({'error': 'Customer not found'}), 404
 
-        # Resolve actual client_id for downstream use
-        client_id = client.client_id
- 
         # Update Client_Master fields
         for field, col in [('business_name', 'client_company_name'), ('contact_person', 'client_contact_name'),
                             ('phone', 'client_phone'), ('mobile_no', 'client_mobile'),
@@ -737,7 +741,7 @@ def update_energy_customer(client_id):
 
         # Update Project_Details
         project = session.query(Project_Details).filter_by(client_id=client_id).first()
-        old_status_for_log = project.status if project else None  # ✅ always initialize
+        old_status_for_log = project.status if project else None
         if project:
             for field, col in [('site_address', 'address'), ('annual_usage', 'Misc_Col2'),
                                 ('site_name', 'site_name'), ('month_sold', 'month_sold'),
@@ -746,52 +750,45 @@ def update_energy_customer(client_id):
                 if field in data:
                     setattr(project, col, data[field])
 
-            # ✅ Status now on Project_Details
-            old_status_for_log = project.status  
+            old_status_for_log = project.status
             if 'status' in data:
                 status_value = data['status']
                 project.status = None if status_value in ['None', 'null', '', None] else status_value
 
-            # ✅ CRITICAL: Handle assignment SEPARATELY - query fresh data
             if 'assigned_to_id' in data:
-                # Flush any pending changes FIRST
                 session.flush()
-                
-                # ✅ RE-QUERY to get fresh assignment data from DB
                 fresh_project = session.query(Project_Details).filter_by(client_id=client_id).first()
                 old_assigned_to = fresh_project.assigned_employee_id
                 new_assigned_to = data['assigned_to_id']
                 current_user_employee_id = request.current_user.employee_id
                 assignment_notes = data.get('assignment_notes')
-                
+
                 print(f"\n📝 Assignment check:")
                 print(f"   Old: {old_assigned_to}")
                 print(f"   New: {new_assigned_to}")
                 print(f"   Current user: {current_user_employee_id}")
-                
-                # Update assignment on BOTH tables
+
                 project.assigned_employee_id = new_assigned_to
                 project.updated_at = datetime.utcnow()
                 client.assigned_employee_id = new_assigned_to
-                
-                # ✅ Determine is_allocated flag
+
                 if new_assigned_to is None:
                     client.is_allocated = False
                     print(f"   ✅ Unassigned - is_allocated = False")
                 elif old_assigned_to == new_assigned_to:
                     print(f"   ℹ️  No change in assignment")
                 elif new_assigned_to == current_user_employee_id:
-                    client.is_allocated = False  # ✅ Assigning to SELF
+                    client.is_allocated = False
                     print(f"   ✅ Assigned to self - is_allocated = False")
                 else:
-                    client.is_allocated = True  # ✅ Assigning to SOMEONE ELSE
+                    client.is_allocated = True
                     print(f"   ✅ Assigned to someone else ({new_assigned_to}) - is_allocated = True")
             else:
                 project.updated_at = datetime.utcnow()
                 old_assigned_to = None
                 new_assigned_to = None
                 assignment_notes = None
- 
+
         elif data.get('site_address') or data.get('annual_usage'):
             project = Project_Details(
                 client_id=client_id,
@@ -813,18 +810,16 @@ def update_energy_customer(client_id):
             new_assigned_to = None
             assignment_notes = None
             old_status_for_log = None
- 
+
         # Update Energy_Contract_Master
         if project:
             contract = session.query(Energy_Contract_Master).filter_by(
                 project_id=project.project_id
             ).first()
             if contract:
-                # ✅ CAPTURE OLD VALUES BEFORE ANY UPDATES
                 old_net_notch = contract.net_notch
                 old_aggregator = contract.aggregator
-                
-                # Now do all the updates
+
                 if 'mpan_mpr' in data: contract.mpan_number = data['mpan_mpr']
                 if 'mpan_top' in data: contract.mpan_number = data['mpan_top']
                 if 'mpan_bottom' in data: contract.mpan_bottom = data['mpan_bottom']
@@ -860,36 +855,24 @@ def update_energy_customer(client_id):
                     contract.contract_end_date = datetime.fromisoformat(
                         data['end_date'].replace('Z', '')
                     ).date() if isinstance(data['end_date'], str) else data['end_date']
-                if 'unit_rate' in data and data['unit_rate'] is not None:
-                    contract.unit_rate = data['unit_rate']
-                if 'rate_1' in data and data['rate_1'] is not None:
-                    contract.rate_1 = data['rate_1']
-                if 'rate_2' in data and data['rate_2'] is not None:
-                    contract.rate_2 = data['rate_2']
-                if 'rate_3' in data and data['rate_3'] is not None:
-                    contract.rate_3 = data['rate_3']
-                if 'standing_charge' in data and data['standing_charge'] is not None:
-                    contract.standing_charge = data['standing_charge']
-                if 'night_charge' in data and data['night_charge'] is not None:
-                    contract.night_charge = data['night_charge']
-                if 'eve_weekend_charge' in data and data['eve_weekend_charge'] is not None:
-                    contract.eve_weekend_charge = data['eve_weekend_charge']
-                if 'other_charges_1' in data and data['other_charges_1'] is not None:
-                    contract.other_charges_1 = data['other_charges_1']
-                if 'other_charges_2' in data and data['other_charges_2'] is not None:
-                    contract.other_charges_2 = data['other_charges_2']
-                if 'other_charges_3' in data and data['other_charges_3'] is not None:
-                    contract.other_charges_3 = data['other_charges_3']
-                if 'net_notch' in data and data['net_notch'] is not None:
-                    contract.net_notch = data['net_notch']
-                if 'comms_paid' in data and data['comms_paid'] is not None:
-                    contract.comms_paid = data['comms_paid']
+                if 'unit_rate' in data and data['unit_rate'] is not None: contract.unit_rate = data['unit_rate']
+                if 'rate_1' in data and data['rate_1'] is not None: contract.rate_1 = data['rate_1']
+                if 'rate_2' in data and data['rate_2'] is not None: contract.rate_2 = data['rate_2']
+                if 'rate_3' in data and data['rate_3'] is not None: contract.rate_3 = data['rate_3']
+                if 'standing_charge' in data and data['standing_charge'] is not None: contract.standing_charge = data['standing_charge']
+                if 'night_charge' in data and data['night_charge'] is not None: contract.night_charge = data['night_charge']
+                if 'eve_weekend_charge' in data and data['eve_weekend_charge'] is not None: contract.eve_weekend_charge = data['eve_weekend_charge']
+                if 'other_charges_1' in data and data['other_charges_1'] is not None: contract.other_charges_1 = data['other_charges_1']
+                if 'other_charges_2' in data and data['other_charges_2'] is not None: contract.other_charges_2 = data['other_charges_2']
+                if 'other_charges_3' in data and data['other_charges_3'] is not None: contract.other_charges_3 = data['other_charges_3']
+                if 'net_notch' in data and data['net_notch'] is not None: contract.net_notch = data['net_notch']
+                if 'comms_paid' in data and data['comms_paid'] is not None: contract.comms_paid = data['comms_paid']
                 if 'terms_of_sale' in data: contract.terms_of_sale = data['terms_of_sale']
                 if 'comments' in data: contract.terms_of_sale = data['comments']
                 if 'payment_type' in data: contract.payment_type = data['payment_type']
                 if 'aggregator' in data: contract.aggregator = data['aggregator']
                 contract.updated_at = datetime.utcnow()
- 
+
         # Create assignment interaction if assignment changed
         if 'assigned_to_id' in data and old_assigned_to != new_assigned_to:
             emp = session.query(Employee_Master).filter_by(employee_id=new_assigned_to).first() if new_assigned_to else None
@@ -905,7 +888,7 @@ def update_energy_customer(client_id):
                 next_steps="Assignment",
                 created_at=datetime.utcnow()
             ))
- 
+
         # Handle callback_date / interaction_notes
         if data.get('callback_date') or data.get('interaction_notes'):
             session.execute(text("""
@@ -913,36 +896,26 @@ def update_energy_customer(client_id):
                 (client_id, contact_date, contact_method, notes, reminder_date, created_at)
                 VALUES (:cid, CURRENT_DATE, 1, :n, :rd, :ca)
             """), {
-                'cid': client_id, 
+                'cid': client_id,
                 'n': data.get('interaction_notes', ''),
-                'rd': data.get('callback_date'), 
+                'rd': data.get('callback_date'),
                 'ca': datetime.utcnow()
             })
-        
-        # ✅ FIX: Track field changes in history for renewals
-        # Compare old values (captured before update) with new values
 
+        # Track field changes in history
         changes = []
-
-        # ── Capture old status BEFORE the status update above committed ───────
-        # (old_status_for_log was set before the project.status assignment)
-
         if 'net_notch' in data and contract:
             new_val = data['net_notch']
             if str(old_net_notch or '') != str(new_val or ''):
                 changes.append(f"Net Notch: {old_net_notch or 'None'} → {new_val}")
-
         if 'aggregator' in data and contract:
             new_val = data['aggregator']
             if str(old_aggregator or '') != str(new_val or ''):
                 changes.append(f"Aggregator: {old_aggregator or 'None'} → {new_val}")
-
-        # ✅ Log status change if it happened
         if 'status' in data and project:
-            new_status = project.status  # already set above
+            new_status = project.status
             if old_status_for_log != new_status:
                 changes.append(f"Status: {old_status_for_log or 'None'} → {new_status or 'None'}")
-
         if changes:
             change_summary = " | ".join(changes)
             session.execute(text("""
@@ -954,14 +927,13 @@ def update_energy_customer(client_id):
                 'notes': f"[Field Update] {change_summary}",
                 'ca': datetime.utcnow()
             })
-        
+
         session.commit()
         session.expire_all()
- 
-        # Fetch updated data with the latest scheduled callback.
+
+        # Fetch updated data
         latest_sq = latest_scheduled_interaction_subquery(session)
         LatestInteraction = aliased(Client_Interactions)
-
         updated = session.query(
             Client_Master, Project_Details, Energy_Contract_Master,
             LatestInteraction, Supplier_Master, Employee_Master
@@ -974,19 +946,19 @@ def update_energy_customer(client_id):
         ).filter(Client_Master.client_id == client_id).first()
 
         client, project, contract, interaction, supplier, employee = updated
- 
+
         old_supplier = None
         if contract and hasattr(contract, 'old_supplier_id') and contract.old_supplier_id:
             old_supplier = session.query(Supplier_Master).filter_by(
                 supplier_id=contract.old_supplier_id
             ).first()
- 
+
         response_data = build_customer_response(
             client, project, contract, None, interaction, supplier, employee, old_supplier
         )
- 
+
         return jsonify({'success': True, 'message': 'Customer updated successfully', 'customer': response_data}), 200
- 
+
     except Exception as e:
         session.rollback()
         current_app.logger.exception(f"❌ Error updating energy customer {client_id}: {e}")

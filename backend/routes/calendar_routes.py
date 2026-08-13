@@ -106,7 +106,12 @@ def get_renewals_calendar():
             AND (cm.is_deleted IS NULL OR cm.is_deleted = FALSE)
             AND (cm.is_archived IS NULL OR cm.is_archived = FALSE)
             AND ecm.contract_end_date IS NOT NULL
-            AND (pd.status IS NULL OR LOWER(pd.status) NOT IN ('priced', 'lost', 'lost cot', 'dead', 'invalid number', 'incorrect supplier', 'broker in place', 'complaint'))
+            AND (pd.status IS NULL OR LOWER(pd.status) NOT IN (
+                'priced', 'lost', 'lost cot', 'dead', 'invalid number', 
+                'incorrect supplier', 'broker in place', 'complaint',
+                'callback', 'not answered', 'email only', 'renewed directly',
+                'already renewed', 'sold'
+            ))
             {employee_filter}
         ''')
         
