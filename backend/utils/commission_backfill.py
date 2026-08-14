@@ -83,6 +83,7 @@ def backfill_commission_schedules(
         'payment_rows_created': rows_created,
         'projects_existing': counts['skipped_existing'],
         'projects_missing_data': counts['skipped_missing_data'],
+        'projects_before_2022': counts['skipped_before_2022'],
         'projects_not_found': counts['not_found'],
         'projects_excluded': counts['excluded'],
         'details': details,
