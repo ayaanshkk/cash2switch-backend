@@ -188,6 +188,39 @@ def _receipt_payload(receipt: Commission_Payment_Receipt, logged_by_name: str = 
     }
 
 
+def _refresh_payment_totals_from_receipts(session, payment: Commission_Payment) -> None:
+    total_received = (
+        session.query(func.coalesce(func.sum(Commission_Payment_Receipt.amount_received), 0))
+        .filter(Commission_Payment_Receipt.commission_payment_id == payment.id)
+        .scalar()
+    )
+    expected_net = Decimal(payment.expected_net_amount or 0)
+    outstanding = max(expected_net - Decimal(total_received or 0), Decimal('0.00'))
+
+    payment.amount_received = total_received
+    payment.outstanding_amount = outstanding
+    payment.status = 'Received' if outstanding == 0 else 'Partially Paid'
+    payment.last_checked_at = datetime.utcnow()
+    payment.updated_at = datetime.utcnow()
+
+
+def _sync_agent_commission_items_for_receipt(session, receipt: Commission_Payment_Receipt) -> None:
+    items = (
+        session.query(Agent_Commission_Batch_Item, Agent_Commission_Batch)
+        .outerjoin(Agent_Commission_Batch, Agent_Commission_Batch_Item.batch_id == Agent_Commission_Batch.id)
+        .filter(Agent_Commission_Batch_Item.commission_payment_receipt_id == receipt.id)
+        .all()
+    )
+    for item, batch in items:
+        previous_commission = Decimal(str(item.commission_amount or 0))
+        new_commission = _commission_amount(receipt.amount_received, item.commission_rate_snapshot)
+
+        item.receipt_amount = Decimal(str(receipt.amount_received or 0))
+        item.commission_amount = new_commission
+        if batch:
+            batch.total_amount = Decimal(str(batch.total_amount or 0)) - previous_commission + new_commission
+
+
 def _commission_amount(receipt_amount, commission_rate) -> Decimal:
     amount = Decimal(str(receipt_amount or 0))
     rate = Decimal(str(commission_rate or 0))
@@ -1576,19 +1609,7 @@ def create_commission_payment_receipt(payment_id: str):
         session.add(receipt)
         session.flush()
 
-        total_received = (
-            session.query(func.coalesce(func.sum(Commission_Payment_Receipt.amount_received), 0))
-            .filter(Commission_Payment_Receipt.commission_payment_id == payment.id)
-            .scalar()
-        )
-        expected_net = Decimal(payment.expected_net_amount or 0)
-        outstanding = max(expected_net - Decimal(total_received or 0), Decimal('0.00'))
-
-        payment.amount_received = total_received
-        payment.outstanding_amount = outstanding
-        payment.status = 'Received' if outstanding == 0 else 'Partially Paid'
-        payment.last_checked_at = datetime.utcnow()
-        payment.updated_at = datetime.utcnow()
+        _refresh_payment_totals_from_receipts(session, payment)
 
         session.commit()
 
@@ -1604,6 +1625,88 @@ def create_commission_payment_receipt(payment_id: str):
             'payment': _payment_payload(row),
             'receipt': _receipt_payload(receipt),
         }), 201
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+@commission_bp.route('/payments/<payment_id>/receipts/<receipt_id>', methods=['PATCH'])
+@token_required
+def update_commission_payment_receipt(payment_id: str, receipt_id: str):
+    admin_error = _require_admin()
+    if admin_error:
+        return admin_error
+    tenant_id, tenant_error = _require_tenant_id()
+    if tenant_error:
+        return tenant_error
+
+    data = request.get_json(force=True, silent=True) or {}
+
+    try:
+        amount_received = Decimal(str(data.get('amount_received', '')).strip())
+    except Exception:
+        return jsonify({'error': 'amount_received must be a valid number'}), 400
+
+    if amount_received <= 0:
+        return jsonify({'error': 'amount_received must be greater than 0'}), 400
+
+    date_received, date_error = _parse_date(data.get('date_received'), 'date_received')
+    if date_error:
+        return jsonify({'error': date_error}), 400
+    if date_received is None:
+        date_received = datetime.utcnow().date()
+
+    session = SessionLocal()
+    try:
+        payment = (
+            session.query(Commission_Payment)
+            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
+            .first()
+        )
+        if not payment:
+            return jsonify({'error': 'Commission payment not found'}), 404
+
+        receipt = (
+            session.query(Commission_Payment_Receipt)
+            .filter(
+                Commission_Payment_Receipt.id == receipt_id,
+                Commission_Payment_Receipt.commission_payment_id == payment.id,
+                Commission_Payment_Receipt.tenant_id == tenant_id,
+            )
+            .first()
+        )
+        if not receipt:
+            return jsonify({'error': 'Receipt not found'}), 404
+
+        receipt.amount_received = amount_received
+        receipt.date_received = date_received
+        receipt.notes = (data.get('notes') or '').strip() or None
+
+        _sync_agent_commission_items_for_receipt(session, receipt)
+        _refresh_payment_totals_from_receipts(session, payment)
+
+        session.commit()
+
+        row = (
+            _payment_base_query(session)
+            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
+            .first()
+        )
+        logged_by_name = (
+            session.query(Employee_Master.employee_name)
+            .filter(Employee_Master.employee_id == receipt.logged_by)
+            .scalar()
+            if receipt.logged_by else None
+        )
+        session.refresh(receipt)
+
+        return jsonify({
+            'success': True,
+            'payment': _payment_payload(row),
+            'receipt': _receipt_payload(receipt, logged_by_name),
+        }), 200
     except Exception:
         session.rollback()
         raise
