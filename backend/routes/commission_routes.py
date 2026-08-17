@@ -4,13 +4,14 @@ from io import BytesIO
 import uuid
 
 from flask import Blueprint, jsonify, request, send_file
-from sqlalchemy import String, asc, case, cast, desc, func, or_
+from sqlalchemy import String, and_, asc, case, cast, desc, exists, func, or_
 
 from backend.db import SessionLocal
 from backend.models import (
     Agent_Commission_Batch,
     Agent_Commission_Batch_Item,
     Client_Master,
+    Client_Interactions,
     Commission_Payment,
     Commission_Payment_Receipt,
     Employee_Master,
@@ -1402,7 +1403,19 @@ def list_commission_payments():
     try:
         query = _payment_base_query(session).filter(Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
         if contract_status == 'already_renewed':
-            query = query.filter(func.lower(Project_Details.status).in_(('already renewed', 'renewed directly')))
+            agent_renewed_interaction = exists().where(and_(
+                Client_Interactions.client_id == Project_Details.client_id,
+                Client_Interactions.notes.ilike('%[Renewed by Agent]%'),
+            ))
+            query = query.filter(
+                func.lower(Project_Details.status).in_(('already renewed', 'renewed directly')),
+                agent_renewed_interaction,
+            )
+        else:
+            query = query.filter(or_(
+                Project_Details.status.is_(None),
+                ~func.lower(Project_Details.status).in_(('already renewed', 'renewed directly')),
+            ))
 
         if status:
             query = query.filter(Commission_Payment.status == status)
