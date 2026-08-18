@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO
 import uuid
@@ -127,6 +127,10 @@ def _not_old_payment_filter():
         Commission_Payment.due_date.is_(None),
         Commission_Payment.due_date >= COMMISSION_PAYMENT_CUTOFF_DATE,
     )
+
+
+def _three_year_start_cutoff() -> date:
+    return date.today() - timedelta(days=365 * 3)
 
 
 def _payment_payload(row) -> dict:
@@ -1410,6 +1414,7 @@ def list_commission_payments():
             query = query.filter(
                 func.lower(Project_Details.status).in_(('already renewed', 'renewed directly')),
                 agent_renewed_interaction,
+                Energy_Contract_Master.contract_start_date >= _three_year_start_cutoff(),
             )
         else:
             query = query.filter(or_(

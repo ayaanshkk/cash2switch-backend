@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import date, timedelta
 from typing import Any, Callable
 
 from sqlalchemy import String, and_, cast, exists
 
-from backend.models import Client_Interactions, Client_Master, Project_Details
+from backend.models import Client_Interactions, Client_Master, Energy_Contract_Master, Project_Details
 from backend.utils.commission_schedule import generate_commission_schedule_for_project
 
 
@@ -30,6 +31,10 @@ def backfill_commission_schedules(
         .filter(
             cast(Client_Master.tenant_id, String) == str(tenant_id),
             Project_Details.status == 'Already Renewed',
+            exists().where(and_(
+                Energy_Contract_Master.project_id == Project_Details.project_id,
+                Energy_Contract_Master.contract_start_date >= date.today() - timedelta(days=365 * 3),
+            )),
             exists().where(and_(
                 Client_Interactions.client_id == Project_Details.client_id,
                 Client_Interactions.notes.ilike('%[Renewed by Agent]%'),

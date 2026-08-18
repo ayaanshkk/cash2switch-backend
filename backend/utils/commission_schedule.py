@@ -20,6 +20,22 @@ RATE_PLACES = Decimal("0.0001")
 COMMISSION_PAYMENT_CUTOFF_DATE = date(2022, 1, 1)
 
 
+def _normalized_supplier_name(supplier: Supplier_Master | None) -> str:
+    if not supplier or not supplier.supplier_company_name:
+        return ""
+    return "".join(ch for ch in supplier.supplier_company_name.lower() if ch.isalnum())
+
+
+def _is_bgb_supplier(supplier: Supplier_Master | None) -> bool:
+    normalized = _normalized_supplier_name(supplier)
+    return (
+        normalized == "bgb"
+        or normalized.startswith("bgblite")
+        or normalized.startswith("britishgasbusiness")
+        or normalized.startswith("britishgas")
+    )
+
+
 @dataclass
 class CommissionGenerationResult:
     success: bool
@@ -213,6 +229,11 @@ def generate_commission_schedule_for_project(session, project_id: int) -> Commis
     payment_mode = supplier.multi_year_commission_payment_mode if supplier else None
     payment_type = supplier.commission_payment_type if supplier else None
     effective_policy = payment_type
+    if _is_bgb_supplier(supplier):
+        payment_mode = "annual"
+        payment_type = "annual"
+        effective_policy = "annual"
+        delay_days = 0
 
     # Preserve schedules for suppliers configured before the policy migration.
     if not effective_policy and payment_mode == "annual":
