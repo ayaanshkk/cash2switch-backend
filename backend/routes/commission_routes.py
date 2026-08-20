@@ -1271,6 +1271,8 @@ def get_customer_commission_log(client_id: int):
                 'payment_period_start': _date(payment.payment_period_start),
                 'payment_period_end': _date(payment.payment_period_end),
                 'supplier_name': row.supplier_name,
+                'mpan_number': row.mpan_number,
+                'mpan_bottom': row.mpan_bottom,
                 'aggregator': payment.aggregator,
                 'agent_name': row.agent_name,
                 'due_date': _date(payment.due_date),
@@ -1391,6 +1393,7 @@ def list_commission_payments():
     status = (request.args.get('status') or '').strip()
     supplier_id = request.args.get('supplier')
     employee_id = request.args.get('agent')
+    aggregator = (request.args.get('aggregator') or '').strip()
     contract_status = (request.args.get('contract_status') or '').strip().lower()
     search = (request.args.get('search') or '').strip()
     due_from, due_from_error = _parse_date(request.args.get('due_from'), 'due_from')
@@ -1434,6 +1437,8 @@ def list_commission_payments():
                 query = query.filter(Commission_Payment.employee_id == int(employee_id))
             except ValueError:
                 return jsonify({'error': 'agent must be an integer employee_id'}), 400
+        if aggregator and aggregator != 'all':
+            query = query.filter(Commission_Payment.aggregator == aggregator)
         if due_from:
             query = query.filter(Commission_Payment.due_date >= due_from)
         if due_to:
@@ -1504,6 +1509,18 @@ def list_commission_payments():
             .order_by(asc(Employee_Master.employee_name), asc(Employee_Master.employee_id))
             .all()
         )
+        aggregators = (
+            session.query(Commission_Payment.aggregator)
+            .filter(
+                Commission_Payment.tenant_id == tenant_id,
+                _not_old_payment_filter(),
+                Commission_Payment.aggregator.isnot(None),
+                func.length(func.trim(Commission_Payment.aggregator)) > 0,
+            )
+            .group_by(Commission_Payment.aggregator)
+            .order_by(asc(Commission_Payment.aggregator))
+            .all()
+        )
 
         return jsonify({
             'success': True,
@@ -1529,6 +1546,10 @@ def list_commission_payments():
                 'agents': [
                     {'employee_id': employee_id, 'employee_name': employee_name}
                     for employee_id, employee_name in agents
+                ],
+                'aggregators': [
+                    {'aggregator': aggregator}
+                    for (aggregator,) in aggregators
                 ],
             },
         }), 200
