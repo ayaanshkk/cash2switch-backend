@@ -5,7 +5,7 @@ Flask-Session==0.8.0
 Flask-SQLAlchemy==3.1.1
 SQLAlchemy==2.0.43
 psycopg2-binary
-gunicorn
+gunicorn==21.2.0
 python-dotenv==1.1.1
 bcrypt==4.1.2
 PyJWT==2.8.0
