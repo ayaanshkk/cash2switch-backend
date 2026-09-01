@@ -976,6 +976,20 @@ class CRMService:
             }
 
         import re
+        from backend.db import SessionLocal
+        from backend.models import Stage_Master
+        from sqlalchemy import func
+
+        # ✅ Resolve "Not Called" stage_id once, fall back to stage_id=6
+        try:
+            _session = SessionLocal()
+            not_called = _session.query(Stage_Master).filter(
+                func.lower(Stage_Master.stage_name) == 'not called'
+            ).first()
+            default_stage_id = not_called.stage_id if not_called else 6
+            _session.close()
+        except Exception:
+            default_stage_id = 6
 
         def normalise_key(k):
             return re.sub(r'\s+', '_', k.lower().strip().replace(' ', '_'))
@@ -1021,21 +1035,22 @@ class CRMService:
         }
 
         def normalise_row(data: dict) -> dict:
-            """Convert Excel-header-keyed dict to repository-field-keyed dict."""
             out = {}
             for raw_key, val in data.items():
                 norm = normalise_key(raw_key)
                 repo_key = FIELD_MAP.get(norm, norm)
-                # Don't overwrite a field already set by a higher-priority key
                 if repo_key not in out or out[repo_key] is None:
                     out[repo_key] = val
 
-            # business_name fallback: prefer trading_name over client_name
             if not out.get('business_name'):
                 for raw_key, val in data.items():
                     if normalise_key(raw_key) == 'trading_name' and val:
                         out['business_name'] = val
                         break
+
+            # ✅ Always inject the correct default stage — repo method will use this
+            out.setdefault('stage_id', default_stage_id)
+            out['stage_id'] = default_stage_id  # force override regardless of file content
 
             return out
 

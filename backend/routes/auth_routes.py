@@ -1484,6 +1484,88 @@ def list_invites():
         session.close()
 
 
+@auth_bp.route('/invite/update-role/<int:employee_id>', methods=['PATCH', 'OPTIONS'])
+@platform_admin_required
+def update_team_member_role(employee_id):
+    """
+    Platform Admin - update an existing team member role/permission.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        admin = request.current_user
+        data = request.get_json() or {}
+        role_id = data.get('role_id')
+
+        if not role_id:
+            return jsonify({'error': 'role_id is required'}), 400
+
+        try:
+            role_id = int(role_id)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'Invalid role_id'}), 400
+
+        admin_tenant_id = get_tenant_id_from_token()
+        if not admin_tenant_id:
+            return jsonify({'error': 'Tenant not found in token'}), 400
+
+        if admin.employee_id == employee_id:
+            return jsonify({'error': 'You cannot change your own role'}), 400
+
+        role_row = session.execute(text("""
+            SELECT role_name
+            FROM "StreemLyne_MT"."Role_Master"
+            WHERE role_id = :role_id
+            LIMIT 1
+        """), {'role_id': role_id}).mappings().first()
+        if not role_row:
+            return jsonify({'error': 'Invalid role_id'}), 400
+
+        member = session.execute(text("""
+            SELECT e.employee_id, e.tenant_id, u.user_id
+            FROM "StreemLyne_MT"."Employee_Master" e
+            LEFT JOIN "StreemLyne_MT"."User_Master" u ON e.employee_id = u.employee_id
+            WHERE e.employee_id = :employee_id
+            LIMIT 1
+        """), {'employee_id': employee_id}).mappings().first()
+
+        if not member:
+            return jsonify({'error': 'Employee not found'}), 404
+        if member['tenant_id'] != admin_tenant_id:
+            return jsonify({'error': 'Cannot update employee from another tenant'}), 403
+        if not member['user_id']:
+            return jsonify({'error': 'Employee does not have a user account'}), 400
+
+        session.execute(text("""
+            DELETE FROM "StreemLyne_MT"."User_Role_Mapping"
+            WHERE user_id = :user_id
+        """), {'user_id': member['user_id']})
+
+        session.execute(text("""
+            INSERT INTO "StreemLyne_MT"."User_Role_Mapping" (user_id, role_id)
+            VALUES (:user_id, :role_id)
+        """), {'user_id': member['user_id'], 'role_id': role_id})
+
+        session.commit()
+
+        return jsonify({
+            'success': True,
+            'employee_id': employee_id,
+            'user_id': member['user_id'],
+            'role_id': role_id,
+            'role': role_row['role_name'],
+        }), 200
+
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"Error updating team member role: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
 @auth_bp.route('/invite/resend/<int:user_id>', methods=['POST', 'OPTIONS'])
 @platform_admin_required
 def resend_invite(user_id):

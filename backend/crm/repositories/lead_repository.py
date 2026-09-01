@@ -459,25 +459,17 @@ class LeadRepository:
         try:
             default_stage = self.db.execute_query(
                 'SELECT "stage_id" FROM "StreemLyne_MT"."Stage_Master" WHERE LOWER("stage_name") = %s LIMIT 1',
-                ('lead',),
+                ('not called',),
                 fetch_one=True
             )
             default_stage_id = default_stage.get('stage_id') if default_stage else None
         except Exception as e:
-            logger.exception('Failed to resolve default stage_id for Lead: %s', e)
+            logger.exception('Failed to resolve default stage_id for Not Called: %s', e)
 
         if not default_stage_id:
-            # Fallback: create "Lead" stage if missing
-            try:
-                result = self.db.execute_insert(
-                    'INSERT INTO "StreemLyne_MT"."Stage_Master" ("stage_name", "stage_description") VALUES (%s, %s) RETURNING "stage_id"',
-                    ('Lead', 'Imported lead - not yet contacted'),
-                    returning=True
-                )
-                default_stage_id = result.get('stage_id') if result else 1
-                logger.info('✨ Created "Lead" stage with ID %s', default_stage_id)
-            except Exception:
-                default_stage_id = 1
+            # Fallback: hardcode known stage_id=6 for "Not Called"
+            default_stage_id = 6
+            logger.warning('⚠️ Could not find "Not Called" stage — defaulting to stage_id=6')
 
         # ✅ NEW: Get current max display_id for this employee
         next_display_id = 1
@@ -1534,101 +1526,106 @@ class LeadRepository:
             return []
 
     def bulk_assign_leads(self, tenant_id: int, lead_ids: List[int], employee_id: int) -> Dict[str, Any]:
-        """
-        Bulk assign leads to an employee and recalculate display_ids for affected employees.
-        
-        Args:
-            tenant_id: Tenant identifier for isolation
-            lead_ids: List of opportunity IDs to assign
-            employee_id: Employee ID to assign leads to (or None to unassign)
-        
-        Returns:
-            Dictionary with success status and updated count
-        """
         if not lead_ids:
             return {'success': False, 'updated': 0, 'error': 'No lead IDs provided'}
 
+        import math
+
+        tenant_id_str = str(tenant_id).strip()
+        CHUNK_SIZE = 500  # safe batch size for ANY($1) arrays
+        total_updated = 0
+        affected_employee_ids = set()
+
         try:
-            # Validate employee if not None/0
+            # ── 1. Collect old employee IDs in chunks ──────────────────────────
+            for i in range(0, len(lead_ids), CHUNK_SIZE):
+                chunk = lead_ids[i:i + CHUNK_SIZE]
+                rows = self.db.execute_query(
+                    '''
+                    SELECT DISTINCT "opportunity_owner_employee_id"
+                    FROM "StreemLyne_MT"."Opportunity_Details"
+                    WHERE TRIM("tenant_id") = %s
+                    AND "opportunity_id" = ANY(%s)
+                    AND "opportunity_owner_employee_id" IS NOT NULL
+                    ''',
+                    (tenant_id_str, chunk)
+                )
+                for row in (rows or []):
+                    eid = row.get('opportunity_owner_employee_id')
+                    if eid:
+                        affected_employee_ids.add(eid)
+
+            # ── 2. Validate employee exists (once) ─────────────────────────────
             if employee_id:
                 emp_check = self.db.execute_query(
-                    'SELECT 1 FROM "StreemLyne_MT"."Employee_Master" WHERE "employee_id" = %s AND "tenant_id" = %s LIMIT 1',
-                    (employee_id, tenant_id),
+                    'SELECT 1 FROM "StreemLyne_MT"."Employee_Master" WHERE "employee_id" = %s LIMIT 1',
+                    (employee_id,),
                     fetch_one=True
                 )
                 if not emp_check:
-                    logger.warning('bulk_assign_leads: employee_id=%s not found for tenant_id=%s', employee_id, tenant_id)
                     return {
                         'success': False,
                         'updated': 0,
                         'error': 'Employee not found',
-                        'message': 'assigned_to_id must be an existing employee in your tenant'
                     }
 
-            # ✅ Track old employees for display_id recalculation
-            old_employees_query = '''
-                SELECT DISTINCT "opportunity_owner_employee_id"
-                FROM "StreemLyne_MT"."Opportunity_Details"
-                WHERE "tenant_id" = %s AND "opportunity_id" = ANY(%s)
-                AND "opportunity_owner_employee_id" IS NOT NULL
-            '''
-            old_employees_result = self.db.execute_query(old_employees_query, (tenant_id, lead_ids))
-            old_employee_ids = {row.get('opportunity_owner_employee_id') for row in old_employees_result if row.get('opportunity_owner_employee_id')}
-            
-            # Verify all leads belong to the tenant
-            verify_query = '''
-                SELECT COUNT(*) as cnt FROM "StreemLyne_MT"."Opportunity_Details"
-                WHERE "tenant_id" = %s AND "opportunity_id" = ANY(%s)
-            '''
-            verify_result = self.db.execute_query(verify_query, (tenant_id, lead_ids), fetch_one=True)
-            verified_count = verify_result.get('cnt', 0) if verify_result else 0
-            
-            if verified_count != len(lead_ids):
-                logger.warning(f'bulk_assign_leads: tenant={tenant_id} requested={len(lead_ids)} but found={verified_count}')
-                return {
-                    'success': False,
-                    'updated': 0,
-                    'error': 'Some leads do not belong to tenant or do not exist'
-                }
-            
-            # ✅ Update assignment and set is_allocated
-            update_query = '''
-                UPDATE "StreemLyne_MT"."Opportunity_Details"
-                SET "opportunity_owner_employee_id" = %s,
-                    "is_allocated" = CASE WHEN %s IS NOT NULL THEN TRUE ELSE FALSE END
-                WHERE "tenant_id" = %s AND "opportunity_id" = ANY(%s)
-            '''
-            updated = self.db.execute_update(
-                update_query, 
-                (employee_id if employee_id else None, employee_id if employee_id else None, tenant_id, lead_ids)
+            # ── 3. Update in chunks ────────────────────────────────────────────
+            for i in range(0, len(lead_ids), CHUNK_SIZE):
+                chunk = lead_ids[i:i + CHUNK_SIZE]
+                updated = self.db.execute_update(
+                    '''
+                    UPDATE "StreemLyne_MT"."Opportunity_Details"
+                    SET "opportunity_owner_employee_id" = %s,
+                        "is_allocated" = CASE WHEN %s IS NOT NULL THEN TRUE ELSE FALSE END
+                    WHERE TRIM("tenant_id") = %s
+                    AND "opportunity_id" = ANY(%s)
+                    ''',
+                    (
+                        employee_id if employee_id else None,
+                        employee_id if employee_id else None,
+                        tenant_id_str,
+                        chunk,
+                    )
+                )
+                total_updated += (updated or 0)
+                logger.info(
+                    'bulk_assign_leads: chunk %d-%d → %d updated',
+                    i, i + len(chunk), updated or 0
+                )
+
+            # ── 4. Recalculate display_ids for affected employees ──────────────
+            # Skip recalculation for very large sets — too slow; let a background
+            # job or next natural operation handle it.
+            if len(lead_ids) <= 1000:
+                for old_emp_id in affected_employee_ids:
+                    if old_emp_id != employee_id:
+                        self.recalculate_display_ids_for_employee(tenant_id_str, old_emp_id)
+                if employee_id:
+                    self.recalculate_display_ids_for_employee(tenant_id_str, employee_id)
+            else:
+                logger.info(
+                    'bulk_assign_leads: skipping display_id recalculation for large batch (%d leads)',
+                    len(lead_ids)
+                )
+
+            logger.info(
+                'bulk_assign_leads: total=%d assigned to employee_id=%s tenant=%s',
+                total_updated, employee_id, tenant_id_str
             )
-            
-            # ✅ Recalculate display_ids for all affected employees
-            for old_emp_id in old_employee_ids:
-                if old_emp_id != employee_id:  # Don't recalculate twice
-                    self.recalculate_display_ids_for_employee(tenant_id, old_emp_id)
-                    logger.info('✅ Recalculated display_ids for employee %s after losing leads', old_emp_id)
-            
-            # Recalculate for new employee
-            if employee_id:
-                self.recalculate_display_ids_for_employee(tenant_id, employee_id)
-                logger.info('✅ Recalculated display_ids for employee %s after gaining leads', employee_id)
-            
-            logger.info(f'bulk_assign_leads: assigned {updated} leads to employee_id={employee_id} tenant={tenant_id}')
-            
+
             return {
                 'success': True,
-                'updated': updated,
+                'updated': total_updated,
                 'employee_id': employee_id,
-                'lead_ids': lead_ids
+                'lead_ids': lead_ids,
             }
-            
+
         except Exception as e:
-            logger.exception(f'bulk_assign_leads failed tenant={tenant_id} employee={employee_id}: %s', e)
+            logger.exception('bulk_assign_leads failed tenant=%s employee=%s: %s', tenant_id_str, employee_id, e)
             return {
                 'success': False,
                 'updated': 0,
-                'error': str(e)
+                'error': str(e),
             }
 
     def bulk_delete_leads(self, tenant_id: int, opportunity_ids: List[int]) -> Dict[str, Any]:

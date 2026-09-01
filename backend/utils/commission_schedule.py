@@ -17,6 +17,23 @@ from backend.models import (
 
 MONEY_PLACES = Decimal("0.01")
 RATE_PLACES = Decimal("0.0001")
+COMMISSION_PAYMENT_CUTOFF_DATE = date(2022, 1, 1)
+
+
+def _normalized_supplier_name(supplier: Supplier_Master | None) -> str:
+    if not supplier or not supplier.supplier_company_name:
+        return ""
+    return "".join(ch for ch in supplier.supplier_company_name.lower() if ch.isalnum())
+
+
+def _is_bgb_supplier(supplier: Supplier_Master | None) -> bool:
+    normalized = _normalized_supplier_name(supplier)
+    return (
+        normalized == "bgb"
+        or normalized.startswith("bgblite")
+        or normalized.startswith("britishgasbusiness")
+        or normalized.startswith("britishgas")
+    )
 
 
 @dataclass
@@ -212,6 +229,11 @@ def generate_commission_schedule_for_project(session, project_id: int) -> Commis
     payment_mode = supplier.multi_year_commission_payment_mode if supplier else None
     payment_type = supplier.commission_payment_type if supplier else None
     effective_policy = payment_type
+    if _is_bgb_supplier(supplier):
+        payment_mode = "annual"
+        payment_type = "annual"
+        effective_policy = "annual"
+        delay_days = 0
 
     # Preserve schedules for suppliers configured before the policy migration.
     if not effective_policy and payment_mode == "annual":
@@ -401,15 +423,28 @@ def generate_commission_schedule_for_project(session, project_id: int) -> Commis
             ))
 
     for row in rows_to_create:
+        if row.due_date and row.due_date < COMMISSION_PAYMENT_CUTOFF_DATE:
+            continue
         session.add(row)
     session.flush()
+
+    created_rows = [row for row in rows_to_create if row.due_date is None or row.due_date >= COMMISSION_PAYMENT_CUTOFF_DATE]
+    if not created_rows:
+        return CommissionGenerationResult(
+            success=True,
+            status="skipped_before_2022",
+            message="Commission schedule was not created because all payment rows are before 2022",
+            project_id=project.project_id,
+            contract_id=contract.energy_contract_master_id,
+            warnings=["payment rows before 2022 are excluded"],
+        )
 
     return CommissionGenerationResult(
         success=True,
         status="created",
-        message=f"Created {len(rows_to_create)} commission payment row(s)",
+        message=f"Created {len(created_rows)} commission payment row(s)",
         project_id=project.project_id,
         contract_id=contract.energy_contract_master_id,
-        rows_created=len(rows_to_create),
-        payments=[_payment_payload(row) for row in rows_to_create],
+        rows_created=len(created_rows),
+        payments=[_payment_payload(row) for row in created_rows],
     )

@@ -2842,33 +2842,27 @@ def delete_expired_lost_leads():
 @token_required
 @tenant_from_jwt
 def import_leads():
-    """
-    POST /api/crm/leads/import
-    Single-step import: accepts file, validates, and imports in one request.
-    """
     session = SessionLocal()
     try:
         tenant_id = g.tenant_id
-
-        # Map service query param to service_id
         service_param = request.args.get('service', 'electricity')
         service_value = service_param.strip().lower() if isinstance(service_param, str) else 'electricity'
         service_id = 2 if service_value == 'water' else 1
 
-        # Check if file is provided
+        # ✅ Resolve "Not Called" stage_id at import time
+        not_called_stage = session.query(Stage_Master).filter(
+            func.lower(Stage_Master.stage_name) == 'not called'
+        ).first()
+        default_stage_id = not_called_stage.stage_id if not_called_stage else 6
+
         if 'file' not in request.files:
             return jsonify({
-                'success': False,
-                'message': 'No file provided',
-                'total_rows': 0,
-                'successful': 0,
-                'failed': 1,
+                'success': False, 'message': 'No file provided',
+                'total_rows': 0, 'successful': 0, 'failed': 1,
                 'errors': ['No file uploaded']
             }), 400
 
         file = request.files.get('file')
-
-        # Step 1: Validate and preview
         preview_result = crm_controller.crm_service.preview_lead_import(tenant_id, file)
 
         if not preview_result.get('success'):
@@ -2881,25 +2875,24 @@ def import_leads():
                 'errors': preview_result.get('errors', ['Validation failed'])
             }), 400
 
-        # If no valid rows, return early
         valid_rows = preview_result.get('valid_rows', 0)
         if valid_rows == 0:
             return jsonify({
-                'success': False,
-                'message': 'No valid rows to import',
+                'success': False, 'message': 'No valid rows to import',
                 'total_rows': preview_result.get('total_rows', 0),
-                'successful': 0,
-                'failed': preview_result.get('invalid_rows', 0),
+                'successful': 0, 'failed': preview_result.get('invalid_rows', 0),
                 'errors': preview_result.get('errors', ['No valid data found'])
             }), 400
 
-        # Step 2: Import the validated rows
         all_rows = preview_result.get('rows', [])
         validated_data = [row['data'] for row in all_rows if row.get('is_valid', False)]
-
         created_by = getattr(request.current_user, 'id', None)
 
-        confirm_result = crm_controller.crm_service.confirm_lead_import(tenant_id, validated_data, created_by, service_id)
+        # ✅ Pass default_stage_id so the service uses "Not Called" on every inserted row
+        confirm_result = crm_controller.crm_service.confirm_lead_import(
+            tenant_id, validated_data, created_by, service_id,
+            default_stage_id=default_stage_id  # ← add this kwarg
+        )
 
         # Check if confirm returned an error
         if 'success' in confirm_result and not confirm_result['success']:
@@ -3933,7 +3926,11 @@ def leads_callback(opportunity_id):
 
         status = data.get('status')
         callback_date = data.get('callback_date')
+        new_start_date_str = data.get('new_start_date')
         new_end_date_str = data.get('new_end_date')
+        new_supplier = data.get('new_supplier')
+        new_address = data.get('new_address')
+        renewed_by = data.get('renewed_by')
         notes = data.get('notes', '')
 
         current_app.logger.info(
@@ -3988,6 +3985,23 @@ def leads_callback(opportunity_id):
             except ValueError:
                 return jsonify({'error': 'Invalid new_end_date format. Expected YYYY-MM-DD'}), 400
 
+        parsed_new_start_date = None
+        if new_start_date_str:
+            try:
+                parsed_new_start_date = datetime.strptime(str(new_start_date_str)[:10], '%Y-%m-%d').date()
+            except ValueError:
+                return jsonify({'error': 'Invalid new_start_date format. Expected YYYY-MM-DD'}), 400
+
+        if status in ('Already Renewed', 'Sold'):
+            if not renewed_by:
+                return jsonify({
+                    'error': 'Please select if sold by supplier or agent' if status == 'Sold' else 'Please select if renewed by customer or agent'
+                }), 400
+            if status == 'Sold' and renewed_by not in ('supplier', 'agent'):
+                return jsonify({'error': 'Please select if sold by supplier or agent'}), 400
+            if status == 'Already Renewed' and renewed_by not in ('customer', 'agent'):
+                return jsonify({'error': 'Please select if renewed by customer or agent'}), 400
+
         if status == 'Renewed Directly' and not parsed_new_end_date:
             return jsonify({'error': 'Please enter the new contract end date'}), 400
 
@@ -4012,6 +4026,26 @@ def leads_callback(opportunity_id):
             current_app.logger.info(f'✅ Created client_id={lead_client_id} for lead {real_id}')
 
         lead.stage_id = stage_id
+        if parsed_new_start_date:
+            lead.start_date = parsed_new_start_date
+        if new_supplier and str(new_supplier).strip():
+            supplier_name = str(new_supplier).strip()
+            supplier = session.query(Supplier_Master).filter(
+                Supplier_Master.supplier_company_name.ilike(supplier_name)
+            ).first()
+            if not supplier:
+                supplier = Supplier_Master(
+                    supplier_company_name=supplier_name,
+                    supplier_contact_name=supplier_name,
+                    supplier_provisions=0,
+                    created_at=datetime.utcnow()
+                )
+                session.add(supplier)
+                session.flush()
+            lead.supplier_id = supplier.supplier_id
+        if new_address and str(new_address).strip():
+            lead.address = str(new_address).strip()
+
         old_end_date = lead.end_date
         updated_project_count = 0
         updated_contract_count = 0
@@ -4030,6 +4064,8 @@ def leads_callback(opportunity_id):
 
             project_ids = []
             for project in projects:
+                if parsed_new_start_date:
+                    project.start_date = parsed_new_start_date
                 project.end_date = parsed_new_end_date
                 project.updated_at = datetime.utcnow()
                 updated_project_count += 1
@@ -4041,7 +4077,34 @@ def leads_callback(opportunity_id):
                     Energy_Contract_Master.project_id.in_(project_ids)
                 ).all()
                 for contract in contracts:
+                    if parsed_new_start_date:
+                        contract.contract_start_date = parsed_new_start_date
                     contract.contract_end_date = parsed_new_end_date
+                    contract.updated_at = datetime.utcnow()
+                    updated_contract_count += 1
+        elif parsed_new_start_date:
+            projects = session.query(Project_Details).filter(
+                Project_Details.opportunity_id == real_id
+            ).all()
+
+            if not projects and lead_client_id:
+                projects = session.query(Project_Details).filter(
+                    Project_Details.client_id == lead_client_id
+                ).all()
+
+            project_ids = []
+            for project in projects:
+                project.start_date = parsed_new_start_date
+                project.updated_at = datetime.utcnow()
+                if project.project_id is not None:
+                    project_ids.append(project.project_id)
+
+            if project_ids:
+                contracts = session.query(Energy_Contract_Master).filter(
+                    Energy_Contract_Master.project_id.in_(project_ids)
+                ).all()
+                for contract in contracts:
+                    contract.contract_start_date = parsed_new_start_date
                     contract.updated_at = datetime.utcnow()
                     updated_contract_count += 1
 
@@ -4049,11 +4112,22 @@ def leads_callback(opportunity_id):
         current_app.logger.info(f'Updated lead {real_id} stage: {old_stage} → {status}')
 
         transition = f"Status: {old_stage or 'None'} → {status}"
+        if parsed_new_start_date:
+            transition = f"{transition} | Contract start date: {parsed_new_start_date.strftime('%d/%m/%Y')}"
         if parsed_new_end_date:
             old_end_text = old_end_date.strftime('%d/%m/%Y') if old_end_date else 'None'
             new_end_text = parsed_new_end_date.strftime('%d/%m/%Y')
             transition = f"{transition} | Contract end date: {old_end_text} -> {new_end_text}"
-        formatted_notes = f"[{status}] {transition}" + (f" | {notes}" if notes else "")
+        action_prefix = ""
+        if status == 'Sold' and renewed_by == 'supplier':
+            action_prefix = " [Sold by Supplier]"
+        elif status == 'Sold' and renewed_by == 'agent':
+            action_prefix = " [Sold by Agent]"
+        elif status == 'Already Renewed' and renewed_by == 'customer':
+            action_prefix = " [Renewed by Customer]"
+        elif status == 'Already Renewed' and renewed_by == 'agent':
+            action_prefix = " [Renewed by Agent]"
+        formatted_notes = f"[{status}]{action_prefix} {transition}" + (f" | {notes}" if notes else "")
 
         reminder_date = None
         if callback_date:
@@ -4147,6 +4221,7 @@ def leads_callback(opportunity_id):
                 'opportunity_id': real_id,
                 'stage_id': stage_id,
                 'stage_name': status,
+                'start_date': parsed_new_start_date.isoformat() if parsed_new_start_date else _iso(lead.start_date),
                 'end_date': parsed_new_end_date.isoformat() if parsed_new_end_date else _iso(lead.end_date),
             },
         }), 200
@@ -4302,3 +4377,8 @@ def get_archived_leads():
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
+
+
+from backend.routes.cleansing_routes import register_lead_cleanse
+
+register_lead_cleanse(crm_bp, token_required, tenant_from_jwt)

@@ -92,6 +92,7 @@ def add_callback(client_id):
         callback_date = data.get('callback_date')
         notes = data.get('notes', '')
         is_sold = data.get('is_sold')
+        new_start_date_str = data.get('new_start_date')
         new_end_date_str = data.get('new_end_date')
         new_supplier = data.get('new_supplier')
         new_address = data.get('new_address')
@@ -188,6 +189,7 @@ def add_callback(client_id):
             status in ("Already Renewed", "Sold")
             and not renewed_by
             and callback_date
+            and not new_start_date_str
             and not new_end_date_str
             and not (new_supplier or "").strip()
             and not (new_address or "").strip()
@@ -322,6 +324,18 @@ def add_callback(client_id):
                 if not contract:
                     return jsonify({'error': 'Contract not found'}), 404
 
+                start_date_change_summary = None
+                if new_start_date_str:
+                    new_start_date = datetime.strptime(new_start_date_str, '%Y-%m-%d').date()
+                    old_start_date = contract.contract_start_date
+                    contract.contract_start_date = new_start_date
+                    if project:
+                        project.start_date = new_start_date
+                    contract.updated_at = now
+                    session.flush()
+                    start_date_change_summary = f"Start date: {old_start_date.strftime('%d/%m/%Y') if old_start_date else 'None'} -> {new_start_date.strftime('%d/%m/%Y')}"
+                    changes_made.append(start_date_change_summary)
+
                 end_date_change_summary = None
                 if new_end_date_str:
                     new_end_date = datetime.strptime(new_end_date_str, '%Y-%m-%d').date()
@@ -409,6 +423,19 @@ def add_callback(client_id):
                 })
 
                 # ✅ Log 2: End date change (separate row)
+                if start_date_change_summary:
+                    safe_add_with_sequence_retry(
+                        session,
+                        Client_Interactions(
+                            client_id=real_client_id,
+                            contact_date=now.date(),
+                            contact_method=1,
+                            reminder_date=None,
+                            notes=f"[Field Update] {start_date_change_summary}",
+                            next_steps='Field Update',
+                            created_at=now + timedelta(seconds=1)
+                        ))
+
                 if end_date_change_summary:
                     safe_add_with_sequence_retry(
                         session,
@@ -419,7 +446,7 @@ def add_callback(client_id):
                             reminder_date=None,
                             notes=f"[Field Update] {end_date_change_summary}",
                             next_steps='Field Update',
-                            created_at=now + timedelta(seconds=1)
+                            created_at=now + timedelta(seconds=2)
                         ))
 
                 # ✅ Log 3: Supplier change (separate row)
@@ -433,7 +460,7 @@ def add_callback(client_id):
                             reminder_date=None,
                             notes=f"[Field Update] {supplier_change_summary}",
                             next_steps='Field Update',
-                            created_at=now + timedelta(seconds=2)
+                            created_at=now + timedelta(seconds=3)
                         ))
 
                 session.commit()
@@ -443,6 +470,7 @@ def add_callback(client_id):
                     'message': 'Callback saved successfully',
                     'status': final_status,
                     'callback_date': callback_date,
+                    'start_date': new_start_date_str,
                     'commission_generation': commission_generation_result,
                 }), 200
 

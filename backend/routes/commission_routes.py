@@ -1,16 +1,17 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO
 import uuid
 
 from flask import Blueprint, jsonify, request, send_file
-from sqlalchemy import String, asc, case, cast, desc, func, or_
+from sqlalchemy import String, and_, asc, case, cast, desc, exists, func, or_
 
 from backend.db import SessionLocal
 from backend.models import (
     Agent_Commission_Batch,
     Agent_Commission_Batch_Item,
     Client_Master,
+    Client_Interactions,
     Commission_Payment,
     Commission_Payment_Receipt,
     Employee_Master,
@@ -28,6 +29,7 @@ from backend.utils.commission_backfill import backfill_commission_schedules
 
 
 commission_bp = Blueprint('commission', __name__, url_prefix='/api/commission')
+COMMISSION_PAYMENT_CUTOFF_DATE = date(2022, 1, 1)
 
 PAYMENT_STATUSES = {
     'Scheduled',
@@ -120,6 +122,17 @@ def _payment_base_query(session):
     )
 
 
+def _not_old_payment_filter():
+    return or_(
+        Commission_Payment.due_date.is_(None),
+        Commission_Payment.due_date >= COMMISSION_PAYMENT_CUTOFF_DATE,
+    )
+
+
+def _three_year_start_cutoff() -> date:
+    return date.today() - timedelta(days=365 * 3)
+
+
 def _payment_payload(row) -> dict:
     payment = row.Commission_Payment
     customer_name = row.customer_name or row.customer_contact_name
@@ -178,6 +191,39 @@ def _receipt_payload(receipt: Commission_Payment_Receipt, logged_by_name: str = 
         'logged_by_name': logged_by_name,
         'created_at': _datetime(receipt.created_at),
     }
+
+
+def _refresh_payment_totals_from_receipts(session, payment: Commission_Payment) -> None:
+    total_received = (
+        session.query(func.coalesce(func.sum(Commission_Payment_Receipt.amount_received), 0))
+        .filter(Commission_Payment_Receipt.commission_payment_id == payment.id)
+        .scalar()
+    )
+    expected_net = Decimal(payment.expected_net_amount or 0)
+    outstanding = max(expected_net - Decimal(total_received or 0), Decimal('0.00'))
+
+    payment.amount_received = total_received
+    payment.outstanding_amount = outstanding
+    payment.status = 'Received' if outstanding == 0 else 'Partially Paid'
+    payment.last_checked_at = datetime.utcnow()
+    payment.updated_at = datetime.utcnow()
+
+
+def _sync_agent_commission_items_for_receipt(session, receipt: Commission_Payment_Receipt) -> None:
+    items = (
+        session.query(Agent_Commission_Batch_Item, Agent_Commission_Batch)
+        .outerjoin(Agent_Commission_Batch, Agent_Commission_Batch_Item.batch_id == Agent_Commission_Batch.id)
+        .filter(Agent_Commission_Batch_Item.commission_payment_receipt_id == receipt.id)
+        .all()
+    )
+    for item, batch in items:
+        previous_commission = Decimal(str(item.commission_amount or 0))
+        new_commission = _commission_amount(receipt.amount_received, item.commission_rate_snapshot)
+
+        item.receipt_amount = Decimal(str(receipt.amount_received or 0))
+        item.commission_amount = new_commission
+        if batch:
+            batch.total_amount = Decimal(str(batch.total_amount or 0)) - previous_commission + new_commission
 
 
 def _commission_amount(receipt_amount, commission_rate) -> Decimal:
@@ -575,7 +621,7 @@ def commission_report_summary():
                     )
                 ), 0).label('underpaid_count'),
             )
-            .filter(Commission_Payment.tenant_id == tenant_id)
+            .filter(Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
             .one()
         )
 
@@ -587,7 +633,7 @@ def commission_report_summary():
                 func.coalesce(func.sum(Commission_Payment.amount_received), 0),
                 func.coalesce(func.sum(Commission_Payment.outstanding_amount), 0),
             )
-            .filter(Commission_Payment.tenant_id == tenant_id)
+            .filter(Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
             .group_by(Commission_Payment.status)
             .order_by(asc(Commission_Payment.status))
             .all()
@@ -655,7 +701,7 @@ def commission_report_by_supplier():
                 ), 0).label('overdue_count'),
             )
             .outerjoin(Supplier_Master, Commission_Payment.supplier_id == Supplier_Master.supplier_id)
-            .filter(Commission_Payment.tenant_id == tenant_id)
+            .filter(Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
             .group_by(Commission_Payment.supplier_id, Supplier_Master.supplier_company_name)
             .order_by(desc(func.coalesce(func.sum(Commission_Payment.outstanding_amount), 0)))
             .all()
@@ -788,6 +834,7 @@ def commission_report_underpaid():
             _payment_base_query(session)
             .filter(
                 Commission_Payment.tenant_id == tenant_id,
+                _not_old_payment_filter(),
                 Commission_Payment.status.in_(('Partially Paid', 'Chasing Supplier')),
                 Commission_Payment.outstanding_amount > 0,
             )
@@ -954,6 +1001,7 @@ def generate_agent_commission_batches():
             .outerjoin(Agent_Commission_Batch_Item, Agent_Commission_Batch_Item.commission_payment_receipt_id == Commission_Payment_Receipt.id)
             .filter(
                 Commission_Payment.tenant_id == tenant_id,
+                _not_old_payment_filter(),
                 Commission_Payment_Receipt.date_received >= month_start,
                 Commission_Payment_Receipt.date_received < next_month,
                 Agent_Commission_Batch_Item.id.is_(None),
@@ -1193,6 +1241,7 @@ def get_customer_commission_log(client_id: int):
             .filter(
                 Commission_Payment.tenant_id == tenant_id,
                 Commission_Payment.client_id == client_id,
+                _not_old_payment_filter(),
             )
         )
         if not is_admin:
@@ -1222,6 +1271,8 @@ def get_customer_commission_log(client_id: int):
                 'payment_period_start': _date(payment.payment_period_start),
                 'payment_period_end': _date(payment.payment_period_end),
                 'supplier_name': row.supplier_name,
+                'mpan_number': row.mpan_number,
+                'mpan_bottom': row.mpan_bottom,
                 'aggregator': payment.aggregator,
                 'agent_name': row.agent_name,
                 'due_date': _date(payment.due_date),
@@ -1342,6 +1393,8 @@ def list_commission_payments():
     status = (request.args.get('status') or '').strip()
     supplier_id = request.args.get('supplier')
     employee_id = request.args.get('agent')
+    aggregator = (request.args.get('aggregator') or '').strip()
+    contract_status = (request.args.get('contract_status') or '').strip().lower()
     search = (request.args.get('search') or '').strip()
     due_from, due_from_error = _parse_date(request.args.get('due_from'), 'due_from')
     due_to, due_to_error = _parse_date(request.args.get('due_to'), 'due_to')
@@ -1355,7 +1408,22 @@ def list_commission_payments():
 
     session = SessionLocal()
     try:
-        query = _payment_base_query(session).filter(Commission_Payment.tenant_id == tenant_id)
+        query = _payment_base_query(session).filter(Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
+        if contract_status == 'already_renewed':
+            agent_renewed_interaction = exists().where(and_(
+                Client_Interactions.client_id == Project_Details.client_id,
+                Client_Interactions.notes.ilike('%[Renewed by Agent]%'),
+            ))
+            query = query.filter(
+                func.lower(Project_Details.status).in_(('already renewed', 'renewed directly')),
+                agent_renewed_interaction,
+                Energy_Contract_Master.contract_start_date >= _three_year_start_cutoff(),
+            )
+        else:
+            query = query.filter(or_(
+                Project_Details.status.is_(None),
+                ~func.lower(Project_Details.status).in_(('already renewed', 'renewed directly')),
+            ))
 
         if status:
             query = query.filter(Commission_Payment.status == status)
@@ -1369,6 +1437,8 @@ def list_commission_payments():
                 query = query.filter(Commission_Payment.employee_id == int(employee_id))
             except ValueError:
                 return jsonify({'error': 'agent must be an integer employee_id'}), 400
+        if aggregator and aggregator != 'all':
+            query = query.filter(Commission_Payment.aggregator == aggregator)
         if due_from:
             query = query.filter(Commission_Payment.due_date >= due_from)
         if due_to:
@@ -1426,7 +1496,7 @@ def list_commission_payments():
         suppliers = (
             session.query(Supplier_Master.supplier_id, Supplier_Master.supplier_company_name)
             .join(Commission_Payment, Commission_Payment.supplier_id == Supplier_Master.supplier_id)
-            .filter(Commission_Payment.tenant_id == tenant_id)
+            .filter(Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
             .group_by(Supplier_Master.supplier_id, Supplier_Master.supplier_company_name)
             .order_by(asc(Supplier_Master.supplier_company_name), asc(Supplier_Master.supplier_id))
             .all()
@@ -1434,9 +1504,21 @@ def list_commission_payments():
         agents = (
             session.query(Employee_Master.employee_id, Employee_Master.employee_name)
             .join(Commission_Payment, Commission_Payment.employee_id == Employee_Master.employee_id)
-            .filter(Commission_Payment.tenant_id == tenant_id)
+            .filter(Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
             .group_by(Employee_Master.employee_id, Employee_Master.employee_name)
             .order_by(asc(Employee_Master.employee_name), asc(Employee_Master.employee_id))
+            .all()
+        )
+        aggregators = (
+            session.query(Commission_Payment.aggregator)
+            .filter(
+                Commission_Payment.tenant_id == tenant_id,
+                _not_old_payment_filter(),
+                Commission_Payment.aggregator.isnot(None),
+                func.length(func.trim(Commission_Payment.aggregator)) > 0,
+            )
+            .group_by(Commission_Payment.aggregator)
+            .order_by(asc(Commission_Payment.aggregator))
             .all()
         )
 
@@ -1465,6 +1547,10 @@ def list_commission_payments():
                     {'employee_id': employee_id, 'employee_name': employee_name}
                     for employee_id, employee_name in agents
                 ],
+                'aggregators': [
+                    {'aggregator': aggregator}
+                    for (aggregator,) in aggregators
+                ],
             },
         }), 200
     finally:
@@ -1485,7 +1571,7 @@ def get_commission_payment(payment_id: str):
     try:
         row = (
             _payment_base_query(session)
-            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id)
+            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
             .first()
         )
         if not row:
@@ -1543,7 +1629,7 @@ def create_commission_payment_receipt(payment_id: str):
     try:
         payment = (
             session.query(Commission_Payment)
-            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id)
+            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
             .first()
         )
         if not payment:
@@ -1562,25 +1648,13 @@ def create_commission_payment_receipt(payment_id: str):
         session.add(receipt)
         session.flush()
 
-        total_received = (
-            session.query(func.coalesce(func.sum(Commission_Payment_Receipt.amount_received), 0))
-            .filter(Commission_Payment_Receipt.commission_payment_id == payment.id)
-            .scalar()
-        )
-        expected_net = Decimal(payment.expected_net_amount or 0)
-        outstanding = max(expected_net - Decimal(total_received or 0), Decimal('0.00'))
-
-        payment.amount_received = total_received
-        payment.outstanding_amount = outstanding
-        payment.status = 'Received' if outstanding == 0 else 'Partially Paid'
-        payment.last_checked_at = datetime.utcnow()
-        payment.updated_at = datetime.utcnow()
+        _refresh_payment_totals_from_receipts(session, payment)
 
         session.commit()
 
         row = (
             _payment_base_query(session)
-            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id)
+            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
             .first()
         )
         session.refresh(receipt)
@@ -1590,6 +1664,88 @@ def create_commission_payment_receipt(payment_id: str):
             'payment': _payment_payload(row),
             'receipt': _receipt_payload(receipt),
         }), 201
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+@commission_bp.route('/payments/<payment_id>/receipts/<receipt_id>', methods=['PATCH'])
+@token_required
+def update_commission_payment_receipt(payment_id: str, receipt_id: str):
+    admin_error = _require_admin()
+    if admin_error:
+        return admin_error
+    tenant_id, tenant_error = _require_tenant_id()
+    if tenant_error:
+        return tenant_error
+
+    data = request.get_json(force=True, silent=True) or {}
+
+    try:
+        amount_received = Decimal(str(data.get('amount_received', '')).strip())
+    except Exception:
+        return jsonify({'error': 'amount_received must be a valid number'}), 400
+
+    if amount_received <= 0:
+        return jsonify({'error': 'amount_received must be greater than 0'}), 400
+
+    date_received, date_error = _parse_date(data.get('date_received'), 'date_received')
+    if date_error:
+        return jsonify({'error': date_error}), 400
+    if date_received is None:
+        date_received = datetime.utcnow().date()
+
+    session = SessionLocal()
+    try:
+        payment = (
+            session.query(Commission_Payment)
+            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
+            .first()
+        )
+        if not payment:
+            return jsonify({'error': 'Commission payment not found'}), 404
+
+        receipt = (
+            session.query(Commission_Payment_Receipt)
+            .filter(
+                Commission_Payment_Receipt.id == receipt_id,
+                Commission_Payment_Receipt.commission_payment_id == payment.id,
+                Commission_Payment_Receipt.tenant_id == tenant_id,
+            )
+            .first()
+        )
+        if not receipt:
+            return jsonify({'error': 'Receipt not found'}), 404
+
+        receipt.amount_received = amount_received
+        receipt.date_received = date_received
+        receipt.notes = (data.get('notes') or '').strip() or None
+
+        _sync_agent_commission_items_for_receipt(session, receipt)
+        _refresh_payment_totals_from_receipts(session, payment)
+
+        session.commit()
+
+        row = (
+            _payment_base_query(session)
+            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
+            .first()
+        )
+        logged_by_name = (
+            session.query(Employee_Master.employee_name)
+            .filter(Employee_Master.employee_id == receipt.logged_by)
+            .scalar()
+            if receipt.logged_by else None
+        )
+        session.refresh(receipt)
+
+        return jsonify({
+            'success': True,
+            'payment': _payment_payload(row),
+            'receipt': _receipt_payload(receipt, logged_by_name),
+        }), 200
     except Exception:
         session.rollback()
         raise
@@ -1623,7 +1779,7 @@ def update_commission_payment_status(payment_id: str):
     try:
         payment = (
             session.query(Commission_Payment)
-            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id)
+            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
             .first()
         )
         if not payment:
@@ -1643,7 +1799,7 @@ def update_commission_payment_status(payment_id: str):
 
         row = (
             _payment_base_query(session)
-            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id)
+            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
             .first()
         )
         return jsonify({

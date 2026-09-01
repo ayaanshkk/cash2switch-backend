@@ -15,9 +15,6 @@ ENV_PATH = os.path.join(BASE_DIR, ".env")
 
 load_dotenv(ENV_PATH)
 
-print("DEBUG ENV PATH =", ENV_PATH)
-print("DEBUG DATABASE_URL =", os.getenv("DATABASE_URL"))
-
 if sys.platform == 'win32':
     try:
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
