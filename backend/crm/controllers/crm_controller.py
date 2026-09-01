@@ -264,16 +264,13 @@ class CRMController:
             }), 500
     
     def assign_leads(self) -> tuple:
-        """
-        PATCH /api/crm/leads/assign
-        Bulk assign leads to an employee.
-        """
         try:
             from flask import request, jsonify, g
             from backend.db import SessionLocal
             from sqlalchemy import text
+            from datetime import datetime
             import logging
-            
+
             logger = logging.getLogger(__name__)
 
             user = getattr(request, 'current_user', None)
@@ -288,100 +285,110 @@ class CRMController:
             lead_ids = payload.get('lead_ids')
             employee_id = payload.get('employee_id') or payload.get('assigned_to_id')
             assignment_notes = payload.get('assignment_notes', '')
-            
+
             if not lead_ids or not isinstance(lead_ids, list) or len(lead_ids) == 0:
                 return jsonify({'success': False, 'error': 'lead_ids must be a non-empty list'}), 400
             if employee_id is None:
-                return jsonify({'success': False, 'error': 'employee_id or assigned_to_id required'}), 400
+                return jsonify({'success': False, 'error': 'employee_id required'}), 400
             try:
                 employee_id = int(employee_id)
+                lead_ids = [int(x) for x in lead_ids]
             except (ValueError, TypeError):
-                return jsonify({'success': False, 'error': 'employee_id must be a number'}), 400
+                return jsonify({'success': False, 'error': 'employee_id and lead_ids must be numbers'}), 400
+
+            CHUNK_SIZE = 500
+            current_user_employee_id = getattr(user, 'employee_id', None)
+            is_allocated = (current_user_employee_id is None) or (employee_id != current_user_employee_id)
 
             session = SessionLocal()
-            
             try:
-                # ✅ Get employee name for response
+                # ── 1. Get employee name (once) ────────────────────────────────
                 employee_name = "Unassigned"
-                if employee_id:
-                    emp_result = session.execute(text("""
-                        SELECT employee_name FROM "StreemLyne_MT"."Employee_Master"
-                        WHERE employee_id = :id AND tenant_id = :tid
-                    """), {'id': employee_id, 'tid': tenant_id}).fetchone()
-                    if emp_result:
-                        employee_name = emp_result[0]
-                
-                # Determine is_allocated flag
-                current_user_employee_id = getattr(user, 'employee_id', None)
-                is_allocated = (current_user_employee_id is None) or (employee_id != current_user_employee_id)
-                
-                # Perform the assignment
-                for lead_id in lead_ids:
-                    session.execute(text("""
+                emp_result = session.execute(text("""
+                    SELECT employee_name FROM "StreemLyne_MT"."Employee_Master"
+                    WHERE employee_id = :id
+                    LIMIT 1
+                """), {'id': employee_id}).fetchone()
+                if emp_result:
+                    employee_name = emp_result[0]
+
+                total_updated = 0
+
+                # ── 2. Bulk UPDATE in chunks ───────────────────────────────────
+                for i in range(0, len(lead_ids), CHUNK_SIZE):
+                    chunk = lead_ids[i:i + CHUNK_SIZE]
+                    result = session.execute(text("""
                         UPDATE "StreemLyne_MT"."Opportunity_Details"
                         SET opportunity_owner_employee_id = :emp_id,
                             is_allocated = :is_allocated,
                             is_draft = FALSE
-                        WHERE opportunity_id = :id AND tenant_id = :tid
+                        WHERE TRIM(tenant_id) = :tid
+                        AND opportunity_id = ANY(:ids)
                     """), {
-                        'emp_id': employee_id, 
-                        'id': lead_id, 
+                        'emp_id': employee_id,
+                        'is_allocated': is_allocated,
                         'tid': tenant_id,
-                        'is_allocated': is_allocated
+                        'ids': chunk,
                     })
-                    
-                    # Log assignment in history
-                    if assignment_notes:
-                        from datetime import datetime
-                        try:
-                            lead_row = session.execute(text("""
-                                SELECT client_id FROM "StreemLyne_MT"."Opportunity_Details"
-                                WHERE opportunity_id = :id AND tenant_id = :tid
-                                LIMIT 1
-                            """), {'id': lead_id, 'tid': tenant_id}).fetchone()
-                            
-                            client_id = lead_row[0] if lead_row else None
-                            
-                            if client_id:
-                                session.execute(text("""
-                                    INSERT INTO "StreemLyne_MT"."Client_Interactions"
-                                        (client_id, contact_date, contact_method, notes, next_steps, created_at)
-                                    VALUES (:cid, CURRENT_DATE, 1, :notes, 'Assignment', :now)
-                                """), {
-                                    'cid': client_id,
-                                    'notes': f"[Assignment] Assigned to {employee_name}: {assignment_notes}",
-                                    'now': datetime.utcnow()
-                                })
-                        except Exception as e:
-                            logger.error(f'❌ Error logging assignment history: {e}')
-                
+                    total_updated += result.rowcount or 0
+                    logger.info('assign_leads: chunk %d-%d updated %d rows', i, i + len(chunk), result.rowcount or 0)
+
+                # ── 3. Log assignment notes in bulk (one INSERT per chunk) ─────
+                if assignment_notes and assignment_notes.strip():
+                    note_text = f"[Assignment] Assigned to {employee_name}: {assignment_notes}"
+                    now = datetime.utcnow()
+
+                    for i in range(0, len(lead_ids), CHUNK_SIZE):
+                        chunk = lead_ids[i:i + CHUNK_SIZE]
+                        # Get client_ids for this chunk in one query
+                        rows = session.execute(text("""
+                            SELECT client_id FROM "StreemLyne_MT"."Opportunity_Details"
+                            WHERE TRIM(tenant_id) = :tid
+                            AND opportunity_id = ANY(:ids)
+                            AND client_id IS NOT NULL
+                        """), {'tid': tenant_id, 'ids': chunk}).fetchall()
+
+                        client_ids = [r[0] for r in rows if r[0]]
+                        if not client_ids:
+                            continue
+
+                        # Bulk insert interactions using VALUES list
+                        values_sql = ", ".join(
+                            f"(:cid_{j}, CURRENT_DATE, 1, :note, 'Assignment', :now)"
+                            for j in range(len(client_ids))
+                        )
+                        params = {'note': note_text, 'now': now}
+                        for j, cid in enumerate(client_ids):
+                            params[f'cid_{j}'] = cid
+
+                        session.execute(text(f"""
+                            INSERT INTO "StreemLyne_MT"."Client_Interactions"
+                                (client_id, contact_date, contact_method, notes, next_steps, created_at)
+                            VALUES {values_sql}
+                        """), params)
+
                 session.commit()
-                
+                logger.info('assign_leads: committed %d updates for employee_id=%s', total_updated, employee_id)
+
                 return jsonify({
                     'success': True,
-                    'assigned_count': len(lead_ids),
-                    'message': f"Assigned {len(lead_ids)} lead(s) successfully",
-                    'employee_name': employee_name,  # ✅ ADDED
-                    'employee_id': employee_id,      # ✅ ADDED
+                    'assigned_count': total_updated,
+                    'message': f"Assigned {total_updated} lead(s) successfully",
+                    'employee_name': employee_name,
+                    'employee_id': employee_id,
                 }), 200
-                
+
             except Exception as e:
                 session.rollback()
-                logger.error(f"❌ Error in assign_leads: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
+                logger.exception('assign_leads DB error: %s', e)
+                return jsonify({'success': False, 'error': str(e)}), 500
             finally:
                 session.close()
-                
+
         except Exception as e:
             import traceback
             traceback.print_exc()
-            return jsonify({
-                'success': False,
-                'error': 'Internal server error',
-                'message': str(e)
-            }), 500
+            return jsonify({'success': False, 'error': str(e)}), 500
     
     def delete_lead(self, opportunity_id: int) -> tuple:
         """
