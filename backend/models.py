@@ -199,8 +199,8 @@ class Client_Master(Base):
     __tablename__ = 'Client_Master'
     __table_args__ = {'schema': SCHEMA}    
     
-    client_id = Column(SmallInteger, primary_key=True, autoincrement=True)
-    tenant_client_id = Column(SmallInteger, nullable=True)
+    client_id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_client_id = Column(Integer, nullable=True)
     tenant_id = Column(SmallInteger, nullable=True)
     display_id = Column(Integer, nullable=True)
     assigned_employee_id = Column(SmallInteger, nullable=True)
@@ -244,7 +244,7 @@ class Project_Details(Base):
     __table_args__ = {'schema': SCHEMA}
     
     project_id = Column(SmallInteger, primary_key=True, autoincrement=True)
-    client_id = Column(SmallInteger, nullable=True)
+    client_id = Column(Integer, nullable=True)
     opportunity_id = Column(SmallInteger)
     project_title = Column(String(255))
     project_description = Column(Text)
@@ -312,7 +312,7 @@ class Opportunity_Details(Base):
     tenant_opportunity_id = Column(SmallInteger, nullable=True)
     tenant_lead_id = Column(SmallInteger, nullable=True)  # Display ID for leads
     tenant_id = Column(SmallInteger, nullable=True)  # ✅ REQUIRED for tenant filtering
-    client_id = Column(SmallInteger, nullable=True)
+    client_id = Column(Integer, nullable=True)
     opportunity_title = Column(String(255))
     opportunity_description = Column(Text)
     opportunity_date = Column(Date)
@@ -391,10 +391,10 @@ class Client_Interactions(Base):
     __tablename__ = 'Client_Interactions'
     __table_args__ = {'schema': SCHEMA}
     
-    interaction_id = Column(SmallInteger, primary_key=True, autoincrement=True)
-    client_id = Column(SmallInteger, nullable=True)
+    interaction_id = Column(Integer, primary_key=True, autoincrement=True)
+    client_id = Column(Integer, nullable=True)
     contact_date = Column(Date)
-    contact_method = Column(SmallInteger)
+    contact_method = Column(Integer)
     notes = Column(String(1000))
     next_steps = Column(String(500))
     reminder_date = Column(Date)

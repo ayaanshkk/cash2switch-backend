@@ -583,16 +583,8 @@ def create_energy_customer():
         assigned_employee_id = data.get('assigned_to_id') or request.current_user.employee_id
         service_string = data.get('service', 'utilities')
         service_id = 1 if service_string == 'utilities' else 2
- 
-        should_archive, archive_reason = auto_archive_older_contracts(
-            session=session,
-            tenant_id=tenant_id,
-            business_name=data.get('business_name', ''),
-            mpan_top=data.get('mpan_top', ''),
-            mpan_bottom=data.get('mpan_bottom', ''),
-            new_end_date=data.get('end_date'),
-            service_id=service_id
-        )
+        should_archive = False
+        archive_reason = None
  
         # 1. Create Client_Master
         new_client = Client_Master(
@@ -686,6 +678,128 @@ def create_energy_customer():
         return jsonify({'error': f'Failed to create customer: {str(e)}'}), 500
     finally:
         session.close()
+
+
+def _duplicate_and_archive_for_contract_change(session, tenant_id, client, project, contract, new_start_date, new_end_date):
+    """
+    When a contract date changes:
+    1. Archive the existing client record (old dates)
+    2. Create a duplicate client with the new dates (active)
+    3. Both remain in Payment Checker via their Energy_Contract_Master rows
+    Returns: new_client_id
+    """
+    import copy
+    from datetime import datetime
+
+    # ── 1. Archive the OLD record ──────────────────────────────────────────
+    old_end = contract.contract_end_date
+    old_start = contract.contract_start_date
+
+    client.is_archived = True
+    client.archived_at = datetime.utcnow()
+    client.archived_reason = (
+        f"Contract updated: "
+        f"{old_start.strftime('%d/%m/%Y') if old_start else '?'} – "
+        f"{old_end.strftime('%d/%m/%Y') if old_end else '?'} "
+        f"→ superseded by new dates"
+    )
+    session.flush()
+
+    # ── 2. Duplicate Client_Master ─────────────────────────────────────────
+    new_client = Client_Master(
+        tenant_id=client.tenant_id,
+        assigned_employee_id=client.assigned_employee_id,
+        client_company_name=client.client_company_name,
+        client_contact_name=client.client_contact_name,
+        client_phone=client.client_phone,
+        client_mobile=getattr(client, 'client_mobile', None),
+        client_email=client.client_email,
+        client_website=getattr(client, 'client_website', None),
+        address=client.address,
+        post_code=client.post_code,
+        default_currency_id=getattr(client, 'default_currency_id', 1),
+        is_archived=False,
+        is_deleted=False,
+        is_draft=False,
+        is_allocated=getattr(client, 'is_allocated', False),
+        created_at=datetime.utcnow(),
+    )
+    session.add(new_client)
+    session.flush()
+
+    # ── 3. Duplicate Project_Details ──────────────────────────────────────
+    new_project = Project_Details(
+        client_id=new_client.client_id,
+        project_title=project.project_title,
+        project_description=getattr(project, 'project_description', None),
+        address=project.address,
+        Misc_Col2=project.Misc_Col2,
+        employee_id=project.employee_id,
+        assigned_employee_id=project.assigned_employee_id,
+        status=None,
+        start_date=new_start_date or project.start_date,
+        site_name=getattr(project, 'site_name', None),
+        month_sold=getattr(project, 'month_sold', None),
+        house_name=getattr(project, 'house_name', None),
+        house_number=getattr(project, 'house_number', None),
+        created_at=datetime.utcnow(),
+    )
+    session.add(new_project)
+    session.flush()
+
+    # ── 4. Duplicate Energy_Contract_Master with new dates ─────────────────
+    new_contract = Energy_Contract_Master(
+        project_id=new_project.project_id,
+        employee_id=contract.employee_id,
+        supplier_id=contract.supplier_id,
+        old_supplier_id=getattr(contract, 'old_supplier_id', None),
+        mpan_number=contract.mpan_number,
+        mpan_bottom=getattr(contract, 'mpan_bottom', None),
+        contract_start_date=new_start_date or contract.contract_start_date,
+        contract_end_date=new_end_date or contract.contract_end_date,
+        unit_rate=contract.unit_rate,
+        standing_charge=getattr(contract, 'standing_charge', None),
+        rate_1=getattr(contract, 'rate_1', None),
+        rate_2=getattr(contract, 'rate_2', None),
+        rate_3=getattr(contract, 'rate_3', None),
+        net_notch=getattr(contract, 'net_notch', None),
+        comms_paid=getattr(contract, 'comms_paid', None),
+        term_sold=getattr(contract, 'term_sold', None),
+        payment_type=getattr(contract, 'payment_type', None),
+        aggregator=getattr(contract, 'aggregator', None),
+        terms_of_sale=getattr(contract, 'terms_of_sale', None),
+        currency_id=getattr(contract, 'currency_id', 1),
+        service_id=contract.service_id,
+        created_at=datetime.utcnow(),
+    )
+    session.add(new_contract)
+    session.flush()
+
+    # ── 5. Log history on both records ────────────────────────────────────
+    note = (
+        f"[Contract Date Change] "
+        f"Old: {old_start.strftime('%d/%m/%Y') if old_start else '?'} – {old_end.strftime('%d/%m/%Y') if old_end else '?'} | "
+        f"New: {new_start_date.strftime('%d/%m/%Y') if new_start_date else '?'} – {new_end_date.strftime('%d/%m/%Y') if new_end_date else '?'}"
+    )
+    for cid in [client.client_id, new_client.client_id]:
+        session.add(Client_Interactions(
+            client_id=cid,
+            contact_date=datetime.utcnow().date(),
+            contact_method=1,
+            notes=note,
+            next_steps='Field Update',
+            created_at=datetime.utcnow(),
+        ))
+
+    # ── 6. Recalculate display order ───────────────────────────────────────
+    if new_client.assigned_employee_id:
+        recalculate_display_order(session, tenant_id, new_client.assigned_employee_id)
+
+    current_app.logger.info(
+        '✅ Contract date change: archived client_id=%s, new client_id=%s',
+        client.client_id, new_client.client_id
+    )
+    return new_client.client_id
         
 # ==========================================
 # UPDATE CUSTOMER
@@ -716,7 +830,6 @@ def update_energy_customer(client_id):
         if not real_client:
             return jsonify({'error': 'Customer not found'}), 404
 
-        # ✅ Override client_id with real PK for all downstream ops
         client_id = real_client.client_id
         client = real_client
 
@@ -729,13 +842,14 @@ def update_energy_customer(client_id):
         """), {'cid': client_id}).fetchone()
         print(f"   DB BEFORE: client_assigned={check_query[0]}, project_assigned={check_query[1]}, is_allocated={check_query[2]}")
         print(f"{'='*60}\n")
-        print(f"🔧 UPDATE REQUEST for client {client_id}: {data}")
 
         # Update Client_Master fields
-        for field, col in [('business_name', 'client_company_name'), ('contact_person', 'client_contact_name'),
-                            ('phone', 'client_phone'), ('mobile_no', 'client_mobile'),
-                            ('email', 'client_email'), ('address', 'address'),
-                            ('post_code', 'post_code'), ('website', 'client_website')]:
+        for field, col in [
+            ('business_name', 'client_company_name'), ('contact_person', 'client_contact_name'),
+            ('phone', 'client_phone'), ('mobile_no', 'client_mobile'),
+            ('email', 'client_email'), ('address', 'address'),
+            ('post_code', 'post_code'), ('website', 'client_website')
+        ]:
             if field in data:
                 setattr(client, col, data[field])
 
@@ -743,10 +857,12 @@ def update_energy_customer(client_id):
         project = session.query(Project_Details).filter_by(client_id=client_id).first()
         old_status_for_log = project.status if project else None
         if project:
-            for field, col in [('site_address', 'address'), ('annual_usage', 'Misc_Col2'),
-                                ('site_name', 'site_name'), ('month_sold', 'month_sold'),
-                                ('house_name', 'house_name'), ('house_number', 'house_number'),
-                                ('door_number', 'door_number'), ('town', 'town'), ('county', 'county')]:
+            for field, col in [
+                ('site_address', 'address'), ('annual_usage', 'Misc_Col2'),
+                ('site_name', 'site_name'), ('month_sold', 'month_sold'),
+                ('house_name', 'house_name'), ('house_number', 'house_number'),
+                ('door_number', 'door_number'), ('town', 'town'), ('county', 'county')
+            ]:
                 if field in data:
                     setattr(project, col, data[field])
 
@@ -763,26 +879,18 @@ def update_energy_customer(client_id):
                 current_user_employee_id = request.current_user.employee_id
                 assignment_notes = data.get('assignment_notes')
 
-                print(f"\n📝 Assignment check:")
-                print(f"   Old: {old_assigned_to}")
-                print(f"   New: {new_assigned_to}")
-                print(f"   Current user: {current_user_employee_id}")
-
                 project.assigned_employee_id = new_assigned_to
                 project.updated_at = datetime.utcnow()
                 client.assigned_employee_id = new_assigned_to
 
                 if new_assigned_to is None:
                     client.is_allocated = False
-                    print(f"   ✅ Unassigned - is_allocated = False")
                 elif old_assigned_to == new_assigned_to:
-                    print(f"   ℹ️  No change in assignment")
+                    pass
                 elif new_assigned_to == current_user_employee_id:
                     client.is_allocated = False
-                    print(f"   ✅ Assigned to self - is_allocated = False")
                 else:
                     client.is_allocated = True
-                    print(f"   ✅ Assigned to someone else ({new_assigned_to}) - is_allocated = True")
             else:
                 project.updated_at = datetime.utcnow()
                 old_assigned_to = None
@@ -811,15 +919,52 @@ def update_energy_customer(client_id):
             assignment_notes = None
             old_status_for_log = None
 
-        # Update Energy_Contract_Master
+        # ── Contract update with date-change detection ─────────────────────
+        old_net_notch = None
+        old_aggregator = None
+        contract = None
+
         if project:
             contract = session.query(Energy_Contract_Master).filter_by(
                 project_id=project.project_id
             ).first()
+
             if contract:
                 old_net_notch = contract.net_notch
                 old_aggregator = contract.aggregator
 
+                # ── Capture old dates BEFORE any changes ──────────────────
+                old_start = contract.contract_start_date
+                old_end   = contract.contract_end_date
+
+                # ── Parse incoming dates ───────────────────────────────────
+                new_start_parsed = None
+                new_end_parsed   = None
+
+                if 'start_date' in data and data['start_date']:
+                    try:
+                        new_start_parsed = (
+                            datetime.fromisoformat(data['start_date'].replace('Z', '')).date()
+                            if isinstance(data['start_date'], str)
+                            else data['start_date']
+                        )
+                    except (ValueError, AttributeError):
+                        pass
+
+                if 'end_date' in data and data['end_date']:
+                    try:
+                        new_end_parsed = (
+                            datetime.fromisoformat(data['end_date'].replace('Z', '')).date()
+                            if isinstance(data['end_date'], str)
+                            else data['end_date']
+                        )
+                    except (ValueError, AttributeError):
+                        pass
+
+                start_changed = new_start_parsed and new_start_parsed != old_start
+                end_changed   = new_end_parsed   and new_end_parsed   != old_end
+
+                # ── Apply all non-date contract fields first ───────────────
                 if 'mpan_mpr' in data: contract.mpan_number = data['mpan_mpr']
                 if 'mpan_top' in data: contract.mpan_number = data['mpan_top']
                 if 'mpan_bottom' in data: contract.mpan_bottom = data['mpan_bottom']
@@ -847,14 +992,6 @@ def update_energy_customer(client_id):
                 if 'old_supplier_id' in data:
                     val = data['old_supplier_id']
                     contract.old_supplier_id = None if (val is None or val == 0) else val
-                if 'start_date' in data and data['start_date']:
-                    contract.contract_start_date = datetime.fromisoformat(
-                        data['start_date'].replace('Z', '')
-                    ).date() if isinstance(data['start_date'], str) else data['start_date']
-                if 'end_date' in data and data['end_date']:
-                    contract.contract_end_date = datetime.fromisoformat(
-                        data['end_date'].replace('Z', '')
-                    ).date() if isinstance(data['end_date'], str) else data['end_date']
                 if 'unit_rate' in data and data['unit_rate'] is not None: contract.unit_rate = data['unit_rate']
                 if 'rate_1' in data and data['rate_1'] is not None: contract.rate_1 = data['rate_1']
                 if 'rate_2' in data and data['rate_2'] is not None: contract.rate_2 = data['rate_2']
@@ -872,8 +1009,140 @@ def update_energy_customer(client_id):
                 if 'payment_type' in data: contract.payment_type = data['payment_type']
                 if 'aggregator' in data: contract.aggregator = data['aggregator']
                 contract.updated_at = datetime.utcnow()
+                session.flush()
 
-        # Create assignment interaction if assignment changed
+                # ── If a date changed → duplicate + archive ────────────────
+                if start_changed or end_changed:
+                    effective_new_start = new_start_parsed if start_changed else old_start
+                    effective_new_end   = new_end_parsed   if end_changed   else old_end
+
+                    old_start_str = old_start.strftime('%d/%m/%Y') if old_start else '?'
+                    old_end_str   = old_end.strftime('%d/%m/%Y')   if old_end   else '?'
+                    new_start_str = effective_new_start.strftime('%d/%m/%Y') if effective_new_start else '?'
+                    new_end_str   = effective_new_end.strftime('%d/%m/%Y')   if effective_new_end   else '?'
+
+                    # 1. Archive the OLD client record
+                    client.is_archived = True
+                    client.archived_at = datetime.utcnow()
+                    client.archived_reason = (
+                        f"Contract dates updated: {old_start_str} – {old_end_str} "
+                        f"→ superseded by {new_start_str} – {new_end_str}"
+                    )
+                    session.flush()
+
+                    # 2. Create new Client_Master (active, same details)
+                    new_client = Client_Master(
+                        tenant_id=client.tenant_id,
+                        assigned_employee_id=client.assigned_employee_id,
+                        client_company_name=client.client_company_name,
+                        client_contact_name=client.client_contact_name,
+                        client_phone=client.client_phone,
+                        client_mobile=getattr(client, 'client_mobile', None),
+                        client_email=client.client_email,
+                        client_website=getattr(client, 'client_website', None),
+                        address=client.address,
+                        post_code=client.post_code,
+                        default_currency_id=getattr(client, 'default_currency_id', 1),
+                        is_archived=False,
+                        is_deleted=False,
+                        is_draft=False,
+                        is_allocated=getattr(client, 'is_allocated', False),
+                        created_at=datetime.utcnow(),
+                    )
+                    session.add(new_client)
+                    session.flush()
+
+                    # 3. Create new Project_Details
+                    new_project = Project_Details(
+                        client_id=new_client.client_id,
+                        project_title=project.project_title,
+                        project_description=getattr(project, 'project_description', None),
+                        address=project.address,
+                        Misc_Col2=project.Misc_Col2,
+                        employee_id=project.employee_id,
+                        assigned_employee_id=project.assigned_employee_id,
+                        status=None,
+                        start_date=effective_new_start,
+                        site_name=getattr(project, 'site_name', None),
+                        month_sold=getattr(project, 'month_sold', None),
+                        house_name=getattr(project, 'house_name', None),
+                        house_number=getattr(project, 'house_number', None),
+                        created_at=datetime.utcnow(),
+                    )
+                    session.add(new_project)
+                    session.flush()
+
+                    # 4. Create new Energy_Contract_Master with updated dates
+                    new_contract = Energy_Contract_Master(
+                        project_id=new_project.project_id,
+                        employee_id=contract.employee_id,
+                        supplier_id=contract.supplier_id,
+                        old_supplier_id=getattr(contract, 'old_supplier_id', None),
+                        mpan_number=contract.mpan_number,
+                        mpan_bottom=getattr(contract, 'mpan_bottom', None),
+                        contract_start_date=effective_new_start,
+                        contract_end_date=effective_new_end,
+                        unit_rate=contract.unit_rate,
+                        standing_charge=getattr(contract, 'standing_charge', None),
+                        rate_1=getattr(contract, 'rate_1', None),
+                        rate_2=getattr(contract, 'rate_2', None),
+                        rate_3=getattr(contract, 'rate_3', None),
+                        net_notch=getattr(contract, 'net_notch', None),
+                        comms_paid=getattr(contract, 'comms_paid', None),
+                        term_sold=getattr(contract, 'term_sold', None),
+                        payment_type=getattr(contract, 'payment_type', None),
+                        aggregator=getattr(contract, 'aggregator', None),
+                        terms_of_sale=getattr(contract, 'terms_of_sale', None),
+                        currency_id=getattr(contract, 'currency_id', 1),
+                        service_id=contract.service_id,
+                        created_at=datetime.utcnow(),
+                    )
+                    session.add(new_contract)
+                    session.flush()
+
+                    # 5. Log history on both old and new records
+                    change_note = (
+                        f"[Contract Date Change] "
+                        f"Old: {old_start_str} – {old_end_str} | "
+                        f"New: {new_start_str} – {new_end_str}"
+                    )
+                    for cid in [client.client_id, new_client.client_id]:
+                        session.add(Client_Interactions(
+                            client_id=cid,
+                            contact_date=datetime.utcnow().date(),
+                            contact_method=1,
+                            notes=change_note,
+                            next_steps='Field Update',
+                            created_at=datetime.utcnow(),
+                        ))
+
+                    # 6. Recalculate display order for the employee
+                    if new_client.assigned_employee_id:
+                        recalculate_display_order(session, tenant_id, new_client.assigned_employee_id)
+
+                    session.commit()
+
+                    current_app.logger.info(
+                        '✅ Contract date change: archived client_id=%s, new client_id=%s',
+                        client.client_id, new_client.client_id
+                    )
+
+                    return jsonify({
+                        'success': True,
+                        'message': 'Contract dates updated — old record archived, new record created',
+                        'new_client_id': new_client.client_id,
+                        'archived_client_id': client.client_id,
+                        'date_change': True,
+                    }), 200
+
+                else:
+                    # ── No date change — apply dates normally ──────────────
+                    if new_start_parsed:
+                        contract.contract_start_date = new_start_parsed
+                    if new_end_parsed:
+                        contract.contract_end_date = new_end_parsed
+
+        # ── Create assignment interaction if assignment changed ─────────────
         if 'assigned_to_id' in data and old_assigned_to != new_assigned_to:
             emp = session.query(Employee_Master).filter_by(employee_id=new_assigned_to).first() if new_assigned_to else None
             emp_name = emp.employee_name if emp else "Unassigned"
@@ -2205,6 +2474,311 @@ def auto_archive_older_contracts(session, tenant_id, business_name, mpan_top, mp
                 current_app.logger.info(f"✅ Recalculated display_order for employee_id={employee_id} after auto-archive")
     
     return False, None
+
+@energy_customer_bp.route('/energy-clients/<int:client_id>/callback', methods=['POST', 'OPTIONS'])
+@token_required
+def energy_client_callback(client_id):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        data = request.get_json() or {}
+
+        status = data.get('status', '')
+        new_end_date_str = data.get('new_end_date')
+        new_start_date_str = data.get('new_start_date')
+        callback_date = data.get('callback_date')
+        called_date = data.get('called_date')
+        notes = data.get('notes', '')
+        renewed_by = data.get('renewed_by', '')
+        new_supplier_name = data.get('new_supplier', '').strip()
+        new_address = data.get('new_address', '').strip()
+        is_sold = data.get('is_sold', False)
+
+        client = (
+            session.query(Client_Master)
+            .filter_by(client_id=client_id, tenant_id=tenant_id)
+            .first()
+        )
+        if not client:
+            return jsonify({'error': 'Customer not found'}), 404
+
+        project = session.query(Project_Details).filter_by(client_id=client_id).first()
+        if not project:
+            return jsonify({'error': 'Project not found'}), 404
+
+        contract = session.query(Energy_Contract_Master).filter_by(
+            project_id=project.project_id
+        ).first()
+
+        # ✅ Capture old dates IMMEDIATELY before anything mutates contract
+        old_start = contract.contract_start_date if contract else None
+        old_end = contract.contract_end_date if contract else None
+
+        # ── Parse new dates ────────────────────────────────────────────────
+        parsed_new_start = None
+        parsed_new_end = None
+
+        if new_start_date_str:
+            try:
+                parsed_new_start = datetime.strptime(str(new_start_date_str)[:10], '%Y-%m-%d').date()
+            except ValueError:
+                pass
+
+        if new_end_date_str:
+            try:
+                parsed_new_end = datetime.strptime(str(new_end_date_str)[:10], '%Y-%m-%d').date()
+            except ValueError:
+                pass
+
+        # ── Handle supplier change (AFTER capturing old dates) ─────────────
+        if new_supplier_name and contract:
+            matched = session.query(Supplier_Master).filter(
+                Supplier_Master.supplier_company_name.ilike(f'%{new_supplier_name}%')
+            ).first()
+            if matched:
+                contract.old_supplier_id = contract.supplier_id
+                contract.supplier_id = matched.supplier_id
+            else:
+                new_sup = Supplier_Master(
+                    supplier_company_name=new_supplier_name,
+                    supplier_contact_name='Auto-created',
+                    supplier_provisions=3,
+                    created_at=datetime.utcnow()
+                )
+                session.add(new_sup)
+                session.flush()
+                contract.old_supplier_id = contract.supplier_id
+                contract.supplier_id = new_sup.supplier_id
+
+        # ── Handle address change ──────────────────────────────────────────
+        if new_address:
+            client.address = new_address
+            if project:
+                project.address = new_address
+
+        # ── Date change → duplicate + archive ─────────────────────────────
+        DATE_CHANGE_STATUSES = {'Already Renewed', 'Sold', 'End Date Changed', 'Renewed Directly'}
+        RECYCLE_BIN_STATUSES = {'Lost', 'Lost COT', 'Meter De-energised', 'Complaint', 'Duplicate'}
+        CLEANSING_STATUSES = {'Invalid Number', 'Incorrect Supplier'}
+
+        if status in DATE_CHANGE_STATUSES and parsed_new_end and contract:
+            end_changed = parsed_new_end != old_end
+            start_changed = parsed_new_start and parsed_new_start != old_start
+
+            if end_changed or start_changed:
+                effective_new_start = parsed_new_start if start_changed else old_start
+                effective_new_end = parsed_new_end
+
+                # ✅ Use captured old dates (not mutated)
+                old_start_str = old_start.strftime('%d/%m/%Y') if old_start else '?'
+                old_end_str = old_end.strftime('%d/%m/%Y') if old_end else '?'
+                new_start_str = effective_new_start.strftime('%d/%m/%Y') if effective_new_start else '?'
+                new_end_str = effective_new_end.strftime('%d/%m/%Y')
+
+                # 1. Archive old client
+                client.is_archived = True
+                client.archived_at = datetime.utcnow()
+                client.archived_reason = (
+                    f"Contract updated via {status}: "
+                    f"{old_start_str} – {old_end_str} → {new_start_str} – {new_end_str}"
+                )
+                session.flush()
+
+                # 2. New Client_Master
+                new_client = Client_Master(
+                    tenant_id=client.tenant_id,
+                    assigned_employee_id=client.assigned_employee_id,
+                    client_company_name=client.client_company_name,
+                    client_contact_name=client.client_contact_name,
+                    client_phone=client.client_phone,
+                    client_mobile=getattr(client, 'client_mobile', None),
+                    client_email=client.client_email,
+                    client_website=getattr(client, 'client_website', None),
+                    address=new_address or client.address,
+                    post_code=client.post_code,
+                    default_currency_id=getattr(client, 'default_currency_id', 1),
+                    is_archived=False,
+                    is_deleted=False,
+                    is_draft=False,
+                    is_allocated=getattr(client, 'is_allocated', False),
+                    created_at=datetime.utcnow(),
+                )
+                session.add(new_client)
+                session.flush()
+
+                # 3. New Project_Details with new status
+                new_project = Project_Details(
+                    client_id=new_client.client_id,
+                    project_title=project.project_title,
+                    project_description=getattr(project, 'project_description', None),
+                    address=new_address or project.address,
+                    Misc_Col2=project.Misc_Col2,
+                    employee_id=project.employee_id,
+                    assigned_employee_id=project.assigned_employee_id,
+                    status=status,
+                    start_date=effective_new_start,
+                    site_name=getattr(project, 'site_name', None),
+                    month_sold=getattr(project, 'month_sold', None),
+                    house_name=getattr(project, 'house_name', None),
+                    house_number=getattr(project, 'house_number', None),
+                    created_at=datetime.utcnow(),
+                )
+                session.add(new_project)
+                session.flush()
+
+                # 4. New Energy_Contract_Master with new dates
+                new_contract = Energy_Contract_Master(
+                    project_id=new_project.project_id,
+                    employee_id=contract.employee_id,
+                    supplier_id=contract.supplier_id,
+                    old_supplier_id=getattr(contract, 'old_supplier_id', None),
+                    mpan_number=contract.mpan_number,
+                    mpan_bottom=getattr(contract, 'mpan_bottom', None),
+                    contract_start_date=effective_new_start,
+                    contract_end_date=effective_new_end,
+                    unit_rate=contract.unit_rate,
+                    standing_charge=getattr(contract, 'standing_charge', None),
+                    rate_1=getattr(contract, 'rate_1', None),
+                    rate_2=getattr(contract, 'rate_2', None),
+                    rate_3=getattr(contract, 'rate_3', None),
+                    net_notch=getattr(contract, 'net_notch', None),
+                    comms_paid=getattr(contract, 'comms_paid', None),
+                    term_sold=getattr(contract, 'term_sold', None),
+                    payment_type=getattr(contract, 'payment_type', None),
+                    aggregator=getattr(contract, 'aggregator', None),
+                    terms_of_sale=getattr(contract, 'terms_of_sale', None),
+                    currency_id=getattr(contract, 'currency_id', 1),
+                    service_id=contract.service_id,
+                    created_at=datetime.utcnow(),
+                )
+                session.add(new_contract)
+                session.flush()
+
+                # 5. Log interactions using raw SQL to avoid SMALLINT cast
+                change_note = (
+                    f"[{renewed_by.title() if renewed_by else status}] "
+                    f"Contract dates updated: "
+                    f"{old_start_str} – {old_end_str} → {new_start_str} – {new_end_str}"
+                )
+                if notes:
+                    change_note += f" | {notes}"
+
+                reminder_date_val = (
+                    datetime.strptime(callback_date, '%Y-%m-%d').date()
+                    if callback_date else None
+                )
+                now = datetime.utcnow()
+
+                for cid in [client.client_id, new_client.client_id]:
+                    session.execute(text("""
+                        INSERT INTO "StreemLyne_MT"."Client_Interactions"
+                            (client_id, contact_date, contact_method, notes,
+                             next_steps, reminder_date, created_at)
+                        VALUES
+                            (CAST(:cid AS INTEGER), :contact_date, 1,
+                             :notes, :next_steps, :reminder_date, :created_at)
+                    """), {
+                        'cid': int(cid),
+                        'contact_date': now.date(),
+                        'notes': change_note,
+                        'next_steps': status,
+                        'reminder_date': reminder_date_val,
+                        'created_at': now,
+                    })
+
+                if new_client.assigned_employee_id:
+                    recalculate_display_order(session, tenant_id, new_client.assigned_employee_id)
+
+                session.commit()
+
+                return jsonify({
+                    'success': True,
+                    'message': f'{status} saved — old record archived, new record created',
+                    'date_change': True,
+                    'new_client_id': new_client.client_id,
+                    'archived_client_id': client.client_id,
+                    'customer': {'status': status, 'client_id': new_client.client_id},
+                }), 200
+
+        # ── No date change — just update status ───────────────────────────
+        project.status = status
+        session.flush()
+
+        interaction_notes = f"[{status}]"
+        if renewed_by:
+            interaction_notes += f" [{renewed_by.title()}]"
+        if notes:
+            interaction_notes += f" {notes}"
+
+        reminder_date_val = (
+            datetime.strptime(callback_date, '%Y-%m-%d').date()
+            if callback_date else None
+        )
+        now = datetime.utcnow()
+
+        session.execute(text("""
+            INSERT INTO "StreemLyne_MT"."Client_Interactions"
+                (client_id, contact_date, contact_method, notes,
+                 next_steps, reminder_date, created_at)
+            VALUES
+                (CAST(:cid AS INTEGER), :contact_date, 1,
+                 :notes, :next_steps, :reminder_date, :created_at)
+        """), {
+            'cid': int(client_id),
+            'contact_date': now.date(),
+            'notes': interaction_notes,
+            'next_steps': status,
+            'reminder_date': reminder_date_val,
+            'created_at': now,
+        })
+
+        if status in RECYCLE_BIN_STATUSES:
+            client.is_deleted = True
+            client.deleted_at = datetime.utcnow()
+            client.deleted_reason = status
+            session.commit()
+            return jsonify({
+                'success': True,
+                'moved_to_recycle_bin': True,
+                'message': f'Moved to recycle bin ({status})',
+            }), 200
+
+        if status in CLEANSING_STATUSES:
+            client.is_deleted = True
+            client.deleted_at = datetime.utcnow()
+            client.deleted_reason = status
+            session.commit()
+            return jsonify({
+                'success': True,
+                'moved_to_cleansing': True,
+                'message': f'Moved to cleansing ({status})',
+            }), 200
+
+        if status == 'Priced' and not is_sold:
+            session.commit()
+            return jsonify({
+                'success': True,
+                'moved_to_priced': True,
+                'message': 'Moved to Priced page',
+                'customer': {'status': status, 'client_id': client_id},
+            }), 200
+
+        session.commit()
+        return jsonify({
+            'success': True,
+            'message': f'{status} saved successfully',
+            'customer': {'status': status, 'client_id': client_id},
+        }), 200
+
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f'❌ Error in energy_client_callback: {e}')
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
 
 @energy_customer_bp.route('/energy-clients/allocated', methods=['GET', 'OPTIONS'])
 @token_required
