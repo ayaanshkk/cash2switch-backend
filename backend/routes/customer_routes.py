@@ -222,10 +222,12 @@ def build_customer_response(client, project=None, contract=None, opportunity=Non
         'last_contact_date': safe_date_to_iso(interaction.contact_date if interaction else None),
         'interaction_notes': interaction.notes if interaction else None,
         'is_allocated': getattr(client, 'is_allocated', False) or False,
+        'is_archived': getattr(client, 'is_archived', False) or False,
+        'archived_at': safe_date_to_iso(getattr(client, 'archived_at', None)),
+        'archived_reason': getattr(client, 'archived_reason', None),
     }
- 
-    return response
 
+    return response
 
 SCHEDULED_CALLBACK_EXCLUDED_STEPS = (
     'End Date Reminder',
@@ -283,206 +285,78 @@ def get_user_role_name(user, session):
 # GET ALL CUSTOMERS
 # ==========================================
 
-@energy_customer_bp.route('/energy-clients', methods=['GET', 'OPTIONS'])
+@energy_customer_bp.route('/energy-clients', methods=['GET'])
 @token_required
 def get_energy_customers():
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
- 
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
-        user = request.current_user
- 
-        if not tenant_id:
-            return jsonify({'error': 'Tenant not found for user'}), 400
+        service_param = request.args.get('service', 'electricity').strip().lower()
+        service_id = 2 if service_param == 'water' else 1
+        include_payments = request.args.get('include_payments', 'false').lower() == 'true'
 
-        see_all_tenant_clients = _renewals_clients_see_entire_tenant(user)
-        if getattr(user, 'employee_id', None) is None and not see_all_tenant_clients:
-            return jsonify({'error': 'User has no employee_id; cannot load renewals assignments'}), 400
-
-        # Align with /energy-clients/stats-by-employee and recycle-bin (utilities = 1, water = 2, gas = 3).
-        service_param = request.args.get('service') or 'utilities'
-        svc = service_param.strip().lower() if isinstance(service_param, str) else 'utilities'
-        service_id_map = {'utilities': 1, 'water': 2, 'gas': 3, 'electricity': 1}
-        _service_id = service_id_map.get(svc, 1)
-
-        _nm = Energy_Contract_Master
-        _ecm_sq = (
-            session.query(
-                _nm.energy_contract_master_id,
-                _nm.project_id,
-                _nm.service_id,
-                _nm.supplier_id,
-                _nm.contract_start_date,
-                _nm.contract_end_date,
-                _nm.mpan_number,
-                _nm.mpan_bottom,
-                _nm.terms_of_sale,
-                _nm.aggregator,
-                _nm.payment_type,
-                _nm.old_supplier_id,
-                cast(_nm.unit_rate, String).label("unit_rate_s"),
-                cast(_nm.standing_charge, String).label("standing_charge_s"),
-                cast(_nm.rate_1, String).label("rate_1_s"),
-                cast(_nm.rate_2, String).label("rate_2_s"),
-                cast(_nm.rate_3, String).label("rate_3_s"),
-                cast(_nm.net_notch, String).label("net_notch_s"),
-                cast(_nm.comms_paid, String).label("comms_paid_s"),
-                cast(_nm.term_sold, String).label("term_sold_s"),
-            ).subquery("ecm_cast")
-        )
-        _ecm_cols = (
-            _ecm_sq.c.energy_contract_master_id,
-            _ecm_sq.c.project_id,
-            _ecm_sq.c.service_id,
-            _ecm_sq.c.supplier_id,
-            _ecm_sq.c.contract_start_date,
-            _ecm_sq.c.contract_end_date,
-            _ecm_sq.c.mpan_number,
-            _ecm_sq.c.mpan_bottom,
-            _ecm_sq.c.terms_of_sale,
-            _ecm_sq.c.aggregator,
-            _ecm_sq.c.payment_type,
-            _ecm_sq.c.old_supplier_id,
-            _ecm_sq.c.unit_rate_s,
-            _ecm_sq.c.standing_charge_s,
-            _ecm_sq.c.rate_1_s,
-            _ecm_sq.c.rate_2_s,
-            _ecm_sq.c.rate_3_s,
-            _ecm_sq.c.net_notch_s,
-            _ecm_sq.c.comms_paid_s,
-            _ecm_sq.c.term_sold_s,
+        current_app.logger.info(
+            f"🔍 get_energy_customers: tenant={tenant_id} service={service_param} include_payments={include_payments}"
         )
 
-        latest_sq = (
-            session.query(
-                Client_Interactions.client_id,
-                func.max(Client_Interactions.interaction_id).label('max_id')
-            )
-            .group_by(Client_Interactions.client_id)
-            .subquery()
-        )
+        latest_sq = latest_scheduled_interaction_subquery(session)
         LatestInteraction = aliased(Client_Interactions)
 
-        # ✅ EVERYONE (including admins) only sees their own NON-ALLOCATED contacts
-        query = session.query(
-            Client_Master,
-            Project_Details,
-            *_ecm_cols,
-            LatestInteraction,
-            Supplier_Master,
-            Employee_Master,
-        ).join(
-            Project_Details,
-            Client_Master.client_id == Project_Details.client_id
-        ).outerjoin(
-            _ecm_sq,
-            and_(
-                Project_Details.project_id == _ecm_sq.c.project_id,
-                _ecm_sq.c.service_id == _service_id,
-            ),
-        ).outerjoin(
-            latest_sq,
-            Client_Master.client_id == latest_sq.c.client_id
-        ).outerjoin(
-            LatestInteraction,
-            LatestInteraction.interaction_id == latest_sq.c.max_id
-        ).outerjoin(
-            Supplier_Master,
-            _ecm_sq.c.supplier_id == Supplier_Master.supplier_id
-        ).outerjoin(
-            Employee_Master,
-            Project_Details.assigned_employee_id == Employee_Master.employee_id
-        ).filter(
-            and_(
-                cast(Client_Master.tenant_id, String) == str(tenant_id),
-                Client_Master.is_deleted == False,  # ✅ CRITICAL: Filter out deleted records
-                Client_Master.is_archived == False,
-                or_(  # ✅ Fixed: use or_() instead of |
-                    Client_Master.is_draft == False,
-                    Client_Master.is_draft == None
-                ),
-                *(
-                    ()
-                    if see_all_tenant_clients
-                    else (Project_Details.assigned_employee_id == user.employee_id,)
-                ),
-                or_(
-                    Client_Master.is_allocated == False,
-                    Client_Master.is_allocated == None
-                ),
-                or_(
-                    Project_Details.status == None,
-                    ~func.lower(Project_Details.status).in_([
-                        'priced', 'lost', 'lost_cot', 'lost cot',
-                        'invalid number',
-                        'incorrect supplier',
-                        'meter de-energised',
-                        'complaint',
-                        'dead'          # ✅ Added
-                    ])
-                ),
+        query = (
+            session.query(
+                Client_Master,
+                Project_Details,
+                Energy_Contract_Master,
+                LatestInteraction,
+                Supplier_Master,
+                Employee_Master,
             )
-        ).order_by(Client_Master.created_at.desc())
- 
-        results = query.all()
- 
-        client_ids = list(set(r[0].client_id for r in results))
-        assignment_notes_map = {}
-        if client_ids:
-            try:
-                notes_rows = (
-                    session.query(Client_Interactions)
-                    .filter(
-                        Client_Interactions.client_id.in_(client_ids),
-                        Client_Interactions.next_steps == 'Assignment',
-                    )
-                    .order_by(
-                        Client_Interactions.client_id,
-                        Client_Interactions.created_at.desc().nullslast(),
-                    )
-                    .all()
-                )
-                seen_nid = set()
-                for nrow in notes_rows:
-                    cid = nrow.client_id
-                    if cid in seen_nid:
-                        continue
-                    seen_nid.add(cid)
-                    if nrow.notes:
-                        parts = nrow.notes.split(' - ', 1)
-                        assignment_notes_map[cid] = parts[1] if len(parts) > 1 else nrow.notes
-            except Exception as notes_error:
-                current_app.logger.warning("assignment notes skipped: %s", notes_error)
- 
-        customers = []
-        seen_clients = set()
- 
-        n = _ECM_SELECT_LEN
-        for row in results:
-            client = row[0]
-            project = row[1]
-            ecm_flat = row[2 : 2 + n]
-            interaction = row[2 + n]
-            supplier = row[3 + n]
-            employee = row[4 + n]
-            if client.tenant_client_id in seen_clients:
-                continue
-            seen_clients.add(client.tenant_client_id)
+            .outerjoin(Project_Details,     Client_Master.client_id      == Project_Details.client_id)
+            .outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id)
+            .outerjoin(latest_sq,           Client_Master.client_id      == latest_sq.c.client_id)
+            .outerjoin(LatestInteraction,   LatestInteraction.interaction_id == latest_sq.c.max_id)
+            .outerjoin(Supplier_Master,     Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id)
+            .outerjoin(Employee_Master,     Project_Details.assigned_employee_id == Employee_Master.employee_id)
+        )
 
-            contract = _energy_contract_proxy_from_ecm_tuple(ecm_flat)
-            customer_data = build_customer_response(
-                client, project, contract, None, interaction, supplier, employee
-            )
-            customer_data['assignment_notes'] = assignment_notes_map.get(client.client_id)
-            customers.append(customer_data)
- 
-        return jsonify(customers), 200
- 
+        query = query.filter(
+            Client_Master.tenant_id  == tenant_id,
+            Client_Master.is_deleted == False,
+        )
+
+        # ✅ For payment checker — include archived records so old contracts show
+        # For normal renewals list — exclude archived
+        if not include_payments:
+            query = query.filter(Client_Master.is_archived == False)
+
+        if service_id:
+            query = query.filter(Energy_Contract_Master.service_id == service_id)
+
+        query = query.order_by(
+            Client_Master.display_order.asc().nullslast(),
+            Client_Master.created_at.desc()
+        )
+
+        rows = query.all()
+        current_app.logger.info(f"✅ get_energy_customers: {len(rows)} rows returned")
+
+        results = []
+        for client, project, contract, interaction, supplier, employee in rows:
+            old_supplier = None
+            if contract and getattr(contract, 'old_supplier_id', None):
+                old_supplier = session.query(Supplier_Master).filter_by(
+                    supplier_id=contract.old_supplier_id
+                ).first()
+
+            results.append(build_customer_response(
+                client, project, contract, None, interaction, supplier, employee, old_supplier
+            ))
+
+        return jsonify(results), 200
+
     except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({'error': 'Failed to fetch energy customers'}), 500
+        current_app.logger.exception(f"❌ get_energy_customers error: {e}")
+        return jsonify({'error': str(e)}), 500
     finally:
         session.close()
  
@@ -2115,8 +1989,8 @@ def permanent_delete_customer(client_id):
             session.query(Client_Master).filter_by(tenant_client_id=client_id, tenant_id=tenant_id).first() or
             session.query(Client_Master).filter_by(client_id=client_id, tenant_id=tenant_id).first()
         )
-        # For restore/permanent-delete, also verify the is_deleted flag:
-        if client and not client.is_deleted:
+        # Allow deletion from either recycle bin (is_deleted) or archives (is_archived)
+        if client and not client.is_deleted and not client.is_archived:
             client = None
 
         if not client:
@@ -2490,13 +2364,23 @@ def energy_client_callback(client_id):
         new_end_date_str = data.get('new_end_date')
         new_start_date_str = data.get('new_start_date')
         callback_date = data.get('callback_date')
-        called_date = data.get('called_date')
         notes = data.get('notes', '')
         renewed_by = data.get('renewed_by', '')
         new_supplier_name = data.get('new_supplier', '').strip()
         new_address = data.get('new_address', '').strip()
         is_sold = data.get('is_sold', False)
 
+        DATE_CHANGE_STATUSES = {'Already Renewed', 'Sold', 'End Date Changed', 'Renewed Directly'}
+        RECYCLE_BIN_STATUSES = {'Lost', 'Lost COT', 'Meter De-energised', 'Complaint', 'Duplicate'}
+        CLEANSING_STATUSES   = {'Invalid Number', 'Incorrect Supplier'}
+        POLICY_MAP = {
+            'Already Renewed':  'Renewed',
+            'Sold':             'Sold',
+            'End Date Changed': 'Updated',
+            'Renewed Directly': 'Renewed',
+        }
+
+        # ── Resolve client ─────────────────────────────────────────────────
         client = (
             session.query(Client_Master)
             .filter_by(client_id=client_id, tenant_id=tenant_id)
@@ -2513,13 +2397,13 @@ def energy_client_callback(client_id):
             project_id=project.project_id
         ).first()
 
-        # ✅ Capture old dates IMMEDIATELY before anything mutates contract
+        # ✅ Capture old dates BEFORE anything mutates contract
         old_start = contract.contract_start_date if contract else None
-        old_end = contract.contract_end_date if contract else None
+        old_end   = contract.contract_end_date   if contract else None
 
         # ── Parse new dates ────────────────────────────────────────────────
         parsed_new_start = None
-        parsed_new_end = None
+        parsed_new_end   = None
 
         if new_start_date_str:
             try:
@@ -2540,7 +2424,7 @@ def energy_client_callback(client_id):
             ).first()
             if matched:
                 contract.old_supplier_id = contract.supplier_id
-                contract.supplier_id = matched.supplier_id
+                contract.supplier_id     = matched.supplier_id
             else:
                 new_sup = Supplier_Master(
                     supplier_company_name=new_supplier_name,
@@ -2551,36 +2435,30 @@ def energy_client_callback(client_id):
                 session.add(new_sup)
                 session.flush()
                 contract.old_supplier_id = contract.supplier_id
-                contract.supplier_id = new_sup.supplier_id
+                contract.supplier_id     = new_sup.supplier_id
 
         # ── Handle address change ──────────────────────────────────────────
         if new_address:
-            client.address = new_address
-            if project:
-                project.address = new_address
+            client.address  = new_address
+            project.address = new_address
 
         # ── Date change → duplicate + archive ─────────────────────────────
-        DATE_CHANGE_STATUSES = {'Already Renewed', 'Sold', 'End Date Changed', 'Renewed Directly'}
-        RECYCLE_BIN_STATUSES = {'Lost', 'Lost COT', 'Meter De-energised', 'Complaint', 'Duplicate'}
-        CLEANSING_STATUSES = {'Invalid Number', 'Incorrect Supplier'}
-
         if status in DATE_CHANGE_STATUSES and parsed_new_end and contract:
-            end_changed = parsed_new_end != old_end
+            end_changed   = parsed_new_end != old_end
             start_changed = parsed_new_start and parsed_new_start != old_start
 
             if end_changed or start_changed:
                 effective_new_start = parsed_new_start if start_changed else old_start
-                effective_new_end = parsed_new_end
+                effective_new_end   = parsed_new_end
 
-                # ✅ Use captured old dates (not mutated)
                 old_start_str = old_start.strftime('%d/%m/%Y') if old_start else '?'
-                old_end_str = old_end.strftime('%d/%m/%Y') if old_end else '?'
+                old_end_str   = old_end.strftime('%d/%m/%Y')   if old_end   else '?'
                 new_start_str = effective_new_start.strftime('%d/%m/%Y') if effective_new_start else '?'
-                new_end_str = effective_new_end.strftime('%d/%m/%Y')
+                new_end_str   = effective_new_end.strftime('%d/%m/%Y')
 
                 # 1. Archive old client
-                client.is_archived = True
-                client.archived_at = datetime.utcnow()
+                client.is_archived    = True
+                client.archived_at    = datetime.utcnow()
                 client.archived_reason = (
                     f"Contract updated via {status}: "
                     f"{old_start_str} – {old_end_str} → {new_start_str} – {new_end_str}"
@@ -2609,7 +2487,7 @@ def energy_client_callback(client_id):
                 session.add(new_client)
                 session.flush()
 
-                # 3. New Project_Details with new status
+                # 3. New Project_Details
                 new_project = Project_Details(
                     client_id=new_client.client_id,
                     project_title=project.project_title,
@@ -2629,7 +2507,7 @@ def energy_client_callback(client_id):
                 session.add(new_project)
                 session.flush()
 
-                # 4. New Energy_Contract_Master with new dates
+                # 4. New Energy_Contract_Master with updated dates
                 new_contract = Energy_Contract_Master(
                     project_id=new_project.project_id,
                     employee_id=contract.employee_id,
@@ -2657,7 +2535,7 @@ def energy_client_callback(client_id):
                 session.add(new_contract)
                 session.flush()
 
-                # 5. Log interactions using raw SQL to avoid SMALLINT cast
+                # 5. Interaction notes on both records via raw SQL
                 change_note = (
                     f"[{renewed_by.title() if renewed_by else status}] "
                     f"Contract dates updated: "
@@ -2681,29 +2559,110 @@ def energy_client_callback(client_id):
                             (CAST(:cid AS INTEGER), :contact_date, 1,
                              :notes, :next_steps, :reminder_date, :created_at)
                     """), {
-                        'cid': int(cid),
+                        'cid':          int(cid),
                         'contact_date': now.date(),
-                        'notes': change_note,
-                        'next_steps': status,
-                        'reminder_date': reminder_date_val,
-                        'created_at': now,
+                        'notes':        change_note,
+                        'next_steps':   status,
+                        'reminder_date':reminder_date_val,
+                        'created_at':   now,
                     })
 
+                # 6. Auto-create commission payment for new contract
+                try:
+                    old_payment_row = session.execute(text("""
+                        SELECT * FROM "StreemLyne_MT"."Commission_Payment"
+                        WHERE contract_id = :old_contract_id
+                        LIMIT 1
+                    """), {'old_contract_id': contract.energy_contract_master_id}).fetchone()
+
+                    policy_type = POLICY_MAP.get(status, 'Renewed')
+
+                    if old_payment_row:
+                        p = old_payment_row._mapping
+                        new_payment_params = {
+                            'tenant_id':             int(tenant_id),
+                            'contract_id':           new_contract.energy_contract_master_id,
+                            'client_id':             new_client.client_id,
+                            'project_id':            new_project.project_id,
+                            'supplier_id':           p.get('supplier_id'),
+                            'employee_id':           p.get('employee_id'),
+                            'instalment_year':       p.get('instalment_year'),
+                            'aggregator':            p.get('aggregator'),
+                            'expected_gross_amount': p.get('expected_gross_amount'),
+                            'expected_net_amount':   p.get('expected_net_amount'),
+                            'payment_period_label':  p.get('payment_period_label'),
+                            'payment_period_start':  p.get('payment_period_start'),
+                            'payment_period_end':    p.get('payment_period_end'),
+                            'created_at': now,
+                            'updated_at': now,
+                        }
+                    else:
+                        new_payment_params = {
+                            'tenant_id':             int(tenant_id),
+                            'contract_id':           new_contract.energy_contract_master_id,
+                            'client_id':             new_client.client_id,
+                            'project_id':            new_project.project_id,
+                            'supplier_id':           contract.supplier_id,
+                            'employee_id':           contract.employee_id,
+                            'instalment_year':       effective_new_end.year if effective_new_end else None,
+                            'aggregator':            getattr(contract, 'aggregator', None),
+                            'expected_gross_amount': 0,
+                            'expected_net_amount':   0,
+                            'payment_period_label':  f'Year {effective_new_end.year}' if effective_new_end else None,
+                            'payment_period_start':  effective_new_start,
+                            'payment_period_end':    effective_new_end,
+                            'created_at': now,
+                            'updated_at': now,
+                        }
+
+                    session.execute(text("""
+                        INSERT INTO "StreemLyne_MT"."Commission_Payment"
+                            (tenant_id, contract_id, client_id, project_id,
+                             supplier_id, employee_id,
+                             instalment_year, aggregator,
+                             expected_gross_amount, expected_net_amount,
+                             amount_received, outstanding_amount,
+                             status, payment_period_label,
+                             payment_period_start, payment_period_end,
+                             created_at, updated_at)
+                        VALUES
+                            (:tenant_id, :contract_id, :client_id, :project_id,
+                             :supplier_id, :employee_id,
+                             :instalment_year, :aggregator,
+                             :expected_gross_amount, :expected_net_amount,
+                             0, :expected_net_amount,
+                             'Pending', :payment_period_label,
+                             :payment_period_start, :payment_period_end,
+                             :created_at, :updated_at)
+                    """), new_payment_params)
+
+                    current_app.logger.info(
+                        '✅ Commission payment auto-created for new contract_id=%s status=%s',
+                        new_contract.energy_contract_master_id, status
+                    )
+
+                except Exception as pay_err:
+                    session.rollback()
+                    current_app.logger.warning(
+                        '⚠️ Failed to auto-create commission payment: %s', pay_err
+                    )
+
+                # 7. Recalculate display order
                 if new_client.assigned_employee_id:
                     recalculate_display_order(session, tenant_id, new_client.assigned_employee_id)
 
                 session.commit()
 
                 return jsonify({
-                    'success': True,
-                    'message': f'{status} saved — old record archived, new record created',
-                    'date_change': True,
-                    'new_client_id': new_client.client_id,
-                    'archived_client_id': client.client_id,
-                    'customer': {'status': status, 'client_id': new_client.client_id},
+                    'success':           True,
+                    'message':           f'{status} saved — old record archived, new record created',
+                    'date_change':       True,
+                    'new_client_id':     new_client.client_id,
+                    'archived_client_id':client.client_id,
+                    'customer':          {'status': status, 'client_id': new_client.client_id},
                 }), 200
 
-        # ── No date change — just update status ───────────────────────────
+        # ── No date change — just update status and log ────────────────────
         project.status = status
         session.flush()
 
@@ -2727,49 +2686,49 @@ def energy_client_callback(client_id):
                 (CAST(:cid AS INTEGER), :contact_date, 1,
                  :notes, :next_steps, :reminder_date, :created_at)
         """), {
-            'cid': int(client_id),
+            'cid':          int(client_id),
             'contact_date': now.date(),
-            'notes': interaction_notes,
-            'next_steps': status,
-            'reminder_date': reminder_date_val,
-            'created_at': now,
+            'notes':        interaction_notes,
+            'next_steps':   status,
+            'reminder_date':reminder_date_val,
+            'created_at':   now,
         })
 
         if status in RECYCLE_BIN_STATUSES:
-            client.is_deleted = True
-            client.deleted_at = datetime.utcnow()
+            client.is_deleted     = True
+            client.deleted_at     = datetime.utcnow()
             client.deleted_reason = status
             session.commit()
             return jsonify({
-                'success': True,
-                'moved_to_recycle_bin': True,
-                'message': f'Moved to recycle bin ({status})',
+                'success':            True,
+                'moved_to_recycle_bin':True,
+                'message':            f'Moved to recycle bin ({status})',
             }), 200
 
         if status in CLEANSING_STATUSES:
-            client.is_deleted = True
-            client.deleted_at = datetime.utcnow()
+            client.is_deleted     = True
+            client.deleted_at     = datetime.utcnow()
             client.deleted_reason = status
             session.commit()
             return jsonify({
-                'success': True,
-                'moved_to_cleansing': True,
-                'message': f'Moved to cleansing ({status})',
+                'success':           True,
+                'moved_to_cleansing':True,
+                'message':           f'Moved to cleansing ({status})',
             }), 200
 
         if status == 'Priced' and not is_sold:
             session.commit()
             return jsonify({
-                'success': True,
-                'moved_to_priced': True,
-                'message': 'Moved to Priced page',
-                'customer': {'status': status, 'client_id': client_id},
+                'success':        True,
+                'moved_to_priced':True,
+                'message':        'Moved to Priced page',
+                'customer':       {'status': status, 'client_id': client_id},
             }), 200
 
         session.commit()
         return jsonify({
-            'success': True,
-            'message': f'{status} saved successfully',
+            'success':  True,
+            'message':  f'{status} saved successfully',
             'customer': {'status': status, 'client_id': client_id},
         }), 200
 

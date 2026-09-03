@@ -111,6 +111,8 @@ def _payment_base_query(session):
             Energy_Contract_Master.contract_end_date.label('contract_end_date'),
             Energy_Contract_Master.service_id.label('contract_service_id'),
             Services_Master.service_title.label('service_title'),
+            Client_Master.is_archived.label('is_archived'),
+            Client_Master.archived_reason.label('archived_reason'),
         )
         .outerjoin(Client_Master, Commission_Payment.client_id == Client_Master.client_id)
         .outerjoin(Project_Details, Commission_Payment.project_id == Project_Details.project_id)
@@ -176,6 +178,8 @@ def _payment_payload(row) -> dict:
         'follow_up_count': payment.follow_up_count,
         'created_at': _datetime(payment.created_at),
         'updated_at': _datetime(payment.updated_at),
+        'is_archived': bool(getattr(row, 'is_archived', False)),
+        'archived_reason': getattr(row, 'archived_reason', None),
     }
 
 
@@ -1422,7 +1426,7 @@ def list_commission_payments():
         else:
             query = query.filter(or_(
                 Project_Details.status.is_(None),
-                ~func.lower(Project_Details.status).in_(('already renewed', 'renewed directly')),
+                ~func.lower(Project_Details.status).in_(('renewed directly',)),
             ))
 
         if status:
@@ -1456,7 +1460,7 @@ def list_commission_payments():
                 Services_Master.service_title.ilike(search_pattern),
                 cast(Commission_Payment.contract_id, String).ilike(search_pattern),
             ))
-
+            
         summary_row = query.with_entities(
             func.coalesce(func.sum(Commission_Payment.expected_net_amount), 0).label('expected'),
             func.coalesce(func.sum(Commission_Payment.amount_received), 0).label('received'),
