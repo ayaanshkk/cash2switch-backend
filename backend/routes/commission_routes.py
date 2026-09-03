@@ -1460,7 +1460,7 @@ def list_commission_payments():
                 Services_Master.service_title.ilike(search_pattern),
                 cast(Commission_Payment.contract_id, String).ilike(search_pattern),
             ))
-            
+
         summary_row = query.with_entities(
             func.coalesce(func.sum(Commission_Payment.expected_net_amount), 0).label('expected'),
             func.coalesce(func.sum(Commission_Payment.amount_received), 0).label('received'),
