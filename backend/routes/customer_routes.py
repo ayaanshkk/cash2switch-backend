@@ -324,10 +324,16 @@ def get_energy_customers():
             Client_Master.is_deleted == False,
         )
 
-        # ✅ For payment checker — include archived records so old contracts show
-        # For normal renewals list — exclude archived
-        if not include_payments:
+        if include_payments:
+            # Payment checker: show all tenant records including archived, no employee restriction
+            pass
+        else:
+            # Normal renewals list: exclude archived, respect field sales restriction
             query = query.filter(Client_Master.is_archived == False)
+            if _is_field_sales_user(session, request.current_user):
+                query = query.filter(
+                    Project_Details.assigned_employee_id == request.current_user.employee_id
+                )
 
         if service_id:
             query = query.filter(Energy_Contract_Master.service_id == service_id)
@@ -2443,7 +2449,7 @@ def energy_client_callback(client_id):
             project.address = new_address
 
         # ── Date change → duplicate + archive ─────────────────────────────
-        if status in DATE_CHANGE_STATUSES and parsed_new_end and contract:
+        if parsed_new_end and contract:
             end_changed   = parsed_new_end != old_end
             start_changed = parsed_new_start and parsed_new_start != old_start
 

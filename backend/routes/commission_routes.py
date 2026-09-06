@@ -3,7 +3,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO
 import uuid
 
-from flask import Blueprint, jsonify, request, send_file
+from flask import Blueprint, jsonify, request, send_file, current_app
 from sqlalchemy import String, and_, asc, case, cast, desc, exists, func, or_
 
 from backend.db import SessionLocal
@@ -129,11 +129,6 @@ def _not_old_payment_filter():
         Commission_Payment.due_date.is_(None),
         Commission_Payment.due_date >= COMMISSION_PAYMENT_CUTOFF_DATE,
     )
-
-
-def _three_year_start_cutoff() -> date:
-    return date.today() - timedelta(days=365 * 3)
-
 
 def _payment_payload(row) -> dict:
     payment = row.Commission_Payment
@@ -351,11 +346,20 @@ def list_supplier_terms():
     admin_error = _require_admin()
     if admin_error:
         return admin_error
+    tenant_id, tenant_error = _require_tenant_id()
+    if tenant_error:
+        return tenant_error
 
     session = SessionLocal()
     try:
+        # Only return suppliers that have at least one contract for this tenant
         suppliers = (
             session.query(Supplier_Master)
+            .join(Energy_Contract_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id)
+            .join(Project_Details, Project_Details.project_id == Energy_Contract_Master.project_id)
+            .join(Client_Master, Client_Master.client_id == Project_Details.client_id)
+            .filter(Client_Master.tenant_id == tenant_id)
+            .group_by(Supplier_Master.supplier_id)
             .order_by(asc(Supplier_Master.supplier_company_name), asc(Supplier_Master.supplier_id))
             .all()
         )
@@ -366,7 +370,6 @@ def list_supplier_terms():
         }), 200
     finally:
         session.close()
-
 
 @commission_bp.route('/supplier-terms/<int:supplier_id>', methods=['PUT'])
 @token_required
@@ -1398,7 +1401,6 @@ def list_commission_payments():
     supplier_id = request.args.get('supplier')
     employee_id = request.args.get('agent')
     aggregator = (request.args.get('aggregator') or '').strip()
-    contract_status = (request.args.get('contract_status') or '').strip().lower()
     search = (request.args.get('search') or '').strip()
     due_from, due_from_error = _parse_date(request.args.get('due_from'), 'due_from')
     due_to, due_to_error = _parse_date(request.args.get('due_to'), 'due_to')
@@ -1413,22 +1415,8 @@ def list_commission_payments():
     session = SessionLocal()
     try:
         query = _payment_base_query(session).filter(Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
-        if contract_status == 'already_renewed':
-            agent_renewed_interaction = exists().where(and_(
-                Client_Interactions.client_id == Project_Details.client_id,
-                Client_Interactions.notes.ilike('%[Renewed by Agent]%'),
-            ))
-            query = query.filter(
-                func.lower(Project_Details.status).in_(('already renewed', 'renewed directly')),
-                agent_renewed_interaction,
-                Energy_Contract_Master.contract_start_date >= _three_year_start_cutoff(),
-            )
-        else:
-            query = query.filter(or_(
-                Project_Details.status.is_(None),
-                ~func.lower(Project_Details.status).in_(('renewed directly',)),
-            ))
 
+        # No project-status exclusion — all renewals with a commission payment are shown
         if status:
             query = query.filter(Commission_Payment.status == status)
         if supplier_id:
@@ -1513,11 +1501,15 @@ def list_commission_payments():
             .order_by(asc(Employee_Master.employee_name), asc(Employee_Master.employee_id))
             .all()
         )
+        s_expected, s_received, s_outstanding = summary_query.one()
+
         aggregators = (
             session.query(Commission_Payment.aggregator)
+            .join(Energy_Contract_Master, Commission_Payment.contract_id == Energy_Contract_Master.energy_contract_master_id)
+            .join(Project_Details, Energy_Contract_Master.project_id == Project_Details.project_id)
+            .join(Client_Master, Project_Details.client_id == Client_Master.client_id)
             .filter(
                 Commission_Payment.tenant_id == tenant_id,
-                _not_old_payment_filter(),
                 Commission_Payment.aggregator.isnot(None),
                 func.length(func.trim(Commission_Payment.aggregator)) > 0,
             )
@@ -1815,3 +1807,259 @@ def update_commission_payment_status(payment_id: str):
         raise
     finally:
         session.close()
+
+@commission_bp.route('/clients-with-payments', methods=['GET'])
+@token_required
+def list_clients_with_payments():
+    admin_error = _require_admin()
+    if admin_error:
+        return admin_error
+    tenant_id, tenant_error = _require_tenant_id()
+    if tenant_error:
+        return tenant_error
+
+    page = _parse_positive_int(request.args.get('page'), default=1, minimum=1, maximum=100000)
+    page_size = _parse_positive_int(request.args.get('page_size'), default=25, minimum=1, maximum=100)
+    search = (request.args.get('search') or '').strip()
+    supplier_id = request.args.get('supplier')
+    employee_id = request.args.get('agent')
+
+    session = SessionLocal()
+    try:
+        # Base query: all clients with contracts, left join commission payments
+        query = (
+            session.query(
+                Client_Master,
+                Project_Details,
+                Energy_Contract_Master,
+                Supplier_Master,
+                Employee_Master,
+            )
+            .outerjoin(Project_Details, Client_Master.client_id == Project_Details.client_id)
+            .outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id)
+            .outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id)
+            .outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id)
+            .filter(
+                Client_Master.tenant_id == tenant_id,
+                Energy_Contract_Master.energy_contract_master_id.isnot(None),
+            )
+        )
+
+        if supplier_id:
+            try:
+                query = query.filter(Energy_Contract_Master.supplier_id == int(supplier_id))
+            except ValueError:
+                return jsonify({'error': 'supplier must be an integer'}), 400
+        if employee_id:
+            try:
+                query = query.filter(Project_Details.assigned_employee_id == int(employee_id))
+            except ValueError:
+                return jsonify({'error': 'agent must be an integer'}), 400
+        if search:
+            search_pattern = f'%{search}%'
+            query = query.filter(or_(
+                Client_Master.client_company_name.ilike(search_pattern),
+                Client_Master.client_contact_name.ilike(search_pattern),
+                Supplier_Master.supplier_company_name.ilike(search_pattern),
+                Employee_Master.employee_name.ilike(search_pattern),
+                Energy_Contract_Master.mpan_number.ilike(search_pattern),
+                Energy_Contract_Master.mpan_bottom.ilike(search_pattern),
+            ))
+
+        total = query.count()
+        rows = (
+            query
+            .order_by(
+                Client_Master.is_archived.asc(),
+                Energy_Contract_Master.contract_end_date.asc().nullslast(),
+                Client_Master.client_id.asc(),
+            )
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
+
+        # Fetch commission payments for the contracts on this page
+        contract_ids = [
+            ecm.energy_contract_master_id
+            for _, _, ecm, _, _ in rows
+            if ecm
+        ]
+        payments_by_contract: dict = {}
+        if contract_ids:
+            payment_rows = (
+                session.query(Commission_Payment)
+                .filter(
+                    Commission_Payment.contract_id.in_(contract_ids),
+                    Commission_Payment.tenant_id == tenant_id,
+                    _not_old_payment_filter(),
+                )
+                .all()
+            )
+            for p in payment_rows:
+                payments_by_contract.setdefault(p.contract_id, []).append(p)
+
+        # Auto-generate commission schedules for contracts with no payments
+        for _, project, ecm, _, _ in rows:
+            if not ecm:
+                continue
+            if ecm.energy_contract_master_id in payments_by_contract:
+                continue
+            try:
+                result = generate_commission_schedule_for_project(session, project.project_id)
+                if result.status == "created":
+                    session.commit()
+                    new_payments = (
+                        session.query(Commission_Payment)
+                        .filter(
+                            Commission_Payment.contract_id == ecm.energy_contract_master_id,
+                            Commission_Payment.tenant_id == tenant_id,
+                        )
+                        .all()
+                    )
+                    if new_payments:
+                        payments_by_contract[ecm.energy_contract_master_id] = new_payments
+                else:
+                    session.rollback()
+            except Exception as gen_err:
+                session.rollback()
+                current_app.logger.warning(
+                    'Could not auto-generate commission schedule for project_id=%s: %s',
+                    project.project_id, gen_err
+                )
+
+        # Fetch suppliers for filter options
+        suppliers = (
+            session.query(Supplier_Master.supplier_id, Supplier_Master.supplier_company_name)
+            .join(Energy_Contract_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id)
+            .join(Project_Details, Energy_Contract_Master.project_id == Project_Details.project_id)
+            .join(Client_Master, Project_Details.client_id == Client_Master.client_id)
+            .filter(Client_Master.tenant_id == tenant_id)
+            .group_by(Supplier_Master.supplier_id, Supplier_Master.supplier_company_name)
+            .order_by(asc(Supplier_Master.supplier_company_name))
+            .all()
+        )
+        agents = (
+            session.query(Employee_Master.employee_id, Employee_Master.employee_name)
+            .join(Project_Details, Project_Details.assigned_employee_id == Employee_Master.employee_id)
+            .join(Client_Master, Project_Details.client_id == Client_Master.client_id)
+            .filter(Client_Master.tenant_id == tenant_id)
+            .group_by(Employee_Master.employee_id, Employee_Master.employee_name)
+            .order_by(asc(Employee_Master.employee_name))
+            .all()
+        )
+
+        results = []
+        for client, project, ecm, supplier, employee in rows:
+            if not ecm:
+                continue
+            contract_payments = payments_by_contract.get(ecm.energy_contract_master_id, [])
+            total_expected = sum(Decimal(str(p.expected_net_amount or 0)) for p in contract_payments)
+            total_received = sum(Decimal(str(p.amount_received or 0)) for p in contract_payments)
+            total_outstanding = sum(Decimal(str(p.outstanding_amount or 0)) for p in contract_payments)
+            statuses = list({p.status for p in contract_payments})
+            next_due = min((p.due_date for p in contract_payments if p.due_date), default=None)
+
+            results.append({
+                'client_id': client.client_id,
+                'contract_id': ecm.energy_contract_master_id,
+                'business_name': client.client_company_name or client.client_contact_name or f'Client #{client.client_id}',
+                'supplier_name': supplier.supplier_company_name if supplier else None,
+                'agent_name': employee.employee_name if employee else None,
+                'mpan_number': ecm.mpan_number,
+                'mpan_bottom': ecm.mpan_bottom,
+                'contract_start_date': _date(ecm.contract_start_date),
+                'contract_end_date': _date(ecm.contract_end_date),
+                'service_id': ecm.service_id,
+                'service_title': 'Water' if ecm.service_id == 2 else 'Utilities',
+                'aggregator': ecm.aggregator,
+                'is_archived': bool(client.is_archived),
+                'is_deleted': bool(client.is_deleted),
+                'project_status': project.status if project else None,
+                'expected': _money(total_expected),
+                'received': _money(total_received),
+                'outstanding': _money(total_outstanding),
+                'statuses': statuses,
+                'next_due': _date(next_due),
+                'has_payments': len(contract_payments) > 0,
+                'payments': [_payment_payload_minimal(p) for p in sorted(contract_payments, key=lambda p: p.instalment_year or 0)],
+            })
+
+        # Summary totals across all filtered records (not just this page)
+        summary_query = (
+            session.query(
+                func.coalesce(func.sum(Commission_Payment.expected_net_amount), 0),
+                func.coalesce(func.sum(Commission_Payment.amount_received), 0),
+                func.coalesce(func.sum(Commission_Payment.outstanding_amount), 0),
+            )
+            .join(Energy_Contract_Master, Commission_Payment.contract_id == Energy_Contract_Master.energy_contract_master_id)
+            .join(Project_Details, Energy_Contract_Master.project_id == Project_Details.project_id)
+            .join(Client_Master, Project_Details.client_id == Client_Master.client_id)
+            .filter(
+                Commission_Payment.tenant_id == tenant_id,
+                Client_Master.tenant_id == tenant_id,
+                Client_Master.is_deleted == False,
+                _not_old_payment_filter(),
+            )
+        )
+        s_expected, s_received, s_outstanding = summary_query.one()
+
+        aggregators = (
+            session.query(Commission_Payment.aggregator)
+            .join(Energy_Contract_Master, Commission_Payment.contract_id == Energy_Contract_Master.energy_contract_master_id)
+            .join(Project_Details, Energy_Contract_Master.project_id == Project_Details.project_id)
+            .join(Client_Master, Project_Details.client_id == Client_Master.client_id)
+            .filter(
+                Commission_Payment.tenant_id == tenant_id,
+                Commission_Payment.aggregator.isnot(None),
+                func.length(func.trim(Commission_Payment.aggregator)) > 0,
+            )
+            .group_by(Commission_Payment.aggregator)
+            .order_by(asc(Commission_Payment.aggregator))
+            .all()
+        )
+
+        return jsonify({
+            'success': True,
+            'clients': results,
+            'summary': {
+                'expected': _money(s_expected),
+                'received': _money(s_received),
+                'outstanding': _money(s_outstanding),
+            },
+            'pagination': {
+                'page': page,
+                'page_size': page_size,
+                'total': total,
+                'total_pages': (total + page_size - 1) // page_size,
+            },
+            'filters': {
+                'suppliers': [{'supplier_id': sid, 'supplier_name': sname} for sid, sname in suppliers],
+                'agents': [{'employee_id': eid, 'employee_name': ename} for eid, ename in agents],
+                'aggregators': [{'aggregator': agg} for (agg,) in aggregators],
+            },
+        }), 200
+    finally:
+        session.close()
+
+
+def _payment_payload_minimal(payment: Commission_Payment) -> dict:
+    return {
+        'id': payment.id,
+        'instalment_year': payment.instalment_year,
+        'payment_period_label': payment.payment_period_label or f'Year {payment.instalment_year}',
+        'payment_period_start': _date(payment.payment_period_start),
+        'payment_period_end': _date(payment.payment_period_end),
+        'expected_net_amount': _money(payment.expected_net_amount),
+        'amount_received': _money(payment.amount_received),
+        'outstanding_amount': _money(payment.outstanding_amount),
+        'due_date': _date(payment.due_date),
+        'status': payment.status,
+        'last_checked_at': _datetime(payment.last_checked_at),
+        'aggregator': payment.aggregator,
+        'supplier_id': payment.supplier_id,
+        'employee_id': payment.employee_id,
+        'client_id': payment.client_id,
+        'contract_id': payment.contract_id,
+        'project_id': payment.project_id,
+    }

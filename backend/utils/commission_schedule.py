@@ -275,7 +275,16 @@ def generate_commission_schedule_for_project(session, project_id: int) -> Commis
     uplift = _to_decimal(uplift_source, "uplift", warnings)
     term_months = _contract_term_months(contract, opportunity, warnings)
 
-    if warnings:
+    # Only block generation if we can't determine the contract structure
+    blocking_warnings = [w for w in warnings if any(kw in w for kw in (
+        'contract_start_date', 'contract end date is before', 'contract term',
+        'client is missing', 'supplier is missing',
+        'supplier commission payment policy is not configured',
+        'supplier commission payment delay is not configured',
+        'supplier upfront percentage is not configured',
+        'supplier invoice, customer payment or grace days are not configured',
+    ))]
+    if blocking_warnings or term_months is None:
         return CommissionGenerationResult(
             success=True,
             status="skipped_missing_data",
@@ -285,7 +294,14 @@ def generate_commission_schedule_for_project(session, project_id: int) -> Commis
             warnings=warnings,
         )
 
+    # If amounts are missing, default to zero — schedule structure still gets created
+    if annual_usage is None:
+        annual_usage = Decimal('0')
+    if uplift is None:
+        uplift = Decimal('0')
+
     live_date = contract.contract_start_date
+
     employee_id = contract.employee_id or project.assigned_employee_id or project.employee_id
     expected_gross_per_year = _money((annual_usage * uplift) / Decimal("100"))
     expected_net_per_year = _money(expected_gross_per_year * Decimal("0.80"))
