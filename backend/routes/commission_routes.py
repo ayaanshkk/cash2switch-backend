@@ -1842,6 +1842,10 @@ def list_clients_with_payments():
             .filter(
                 Client_Master.tenant_id == tenant_id,
                 Energy_Contract_Master.energy_contract_master_id.isnot(None),
+                or_(
+                    Energy_Contract_Master.contract_start_date.is_(None),
+                    Energy_Contract_Master.contract_start_date >= date(2022, 1, 1),
+                ),
             )
         )
 
