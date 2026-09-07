@@ -295,30 +295,22 @@ def get_energy_customers():
         service_id = 2 if service_param == 'water' else 1
         include_payments = request.args.get('include_payments', 'false').lower() == 'true'
         page = int(request.args.get('page', 1))
-        page_size = int(request.args.get('page_size', 50))
+        page_size_param = request.args.get('page_size')
+        page_size = int(page_size_param) if page_size_param else None
 
-        current_app.logger.info(
-            f"🔍 get_energy_customers: tenant={tenant_id} service={service_param} include_payments={include_payments}"
-        )
-
-        latest_sq = latest_scheduled_interaction_subquery(session)
-        LatestInteraction = aliased(Client_Interactions)
-
+        # ✅ Skip interaction subquery for list view — only needed on detail page
         query = (
             session.query(
                 Client_Master,
                 Project_Details,
                 Energy_Contract_Master,
-                LatestInteraction,
                 Supplier_Master,
                 Employee_Master,
             )
-            .outerjoin(Project_Details,     Client_Master.client_id      == Project_Details.client_id)
-            .outerjoin(Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id)
-            .outerjoin(latest_sq,           Client_Master.client_id      == latest_sq.c.client_id)
-            .outerjoin(LatestInteraction,   LatestInteraction.interaction_id == latest_sq.c.max_id)
-            .outerjoin(Supplier_Master,     Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id)
-            .outerjoin(Employee_Master,     Project_Details.assigned_employee_id == Employee_Master.employee_id)
+            .outerjoin(Project_Details,        Client_Master.client_id       == Project_Details.client_id)
+            .outerjoin(Energy_Contract_Master, Project_Details.project_id    == Energy_Contract_Master.project_id)
+            .outerjoin(Supplier_Master,        Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id)
+            .outerjoin(Employee_Master,        Project_Details.assigned_employee_id == Employee_Master.employee_id)
         )
 
         query = query.filter(
@@ -327,12 +319,9 @@ def get_energy_customers():
         )
 
         if include_payments:
-            # Payment checker: show all tenant records including archived, no employee restriction
             pass
         else:
-            # Normal renewals list: exclude archived
             query = query.filter(Client_Master.is_archived == False)
-            # Only platform admins see everyone's renewals — all others see only their own
             if not _renewals_clients_see_entire_tenant(request.current_user):
                 query = query.filter(
                     Project_Details.assigned_employee_id == request.current_user.employee_id
@@ -347,35 +336,41 @@ def get_energy_customers():
         )
 
         total = query.count()
-        rows = (
-            query
-            .order_by(
-                Client_Master.display_order.asc().nullslast(),
-                Client_Master.created_at.desc()
-            )
-            .offset((page - 1) * page_size)
-            .limit(page_size)
-            .all()
-        )
+
+        if page_size:
+            rows = query.offset((page - 1) * page_size).limit(page_size).all()
+        else:
+            rows = query.all()
+
+        # ✅ Fix N+1: batch load old suppliers in one query
+        old_supplier_ids = [
+            contract.old_supplier_id
+            for _, _, contract, _, _ in rows
+            if contract and getattr(contract, 'old_supplier_id', None)
+        ]
+        old_supplier_map = {}
+        if old_supplier_ids:
+            old_suppliers = session.query(Supplier_Master).filter(
+                Supplier_Master.supplier_id.in_(old_supplier_ids)
+            ).all()
+            old_supplier_map = {s.supplier_id: s for s in old_suppliers}
 
         results = []
-        for client, project, contract, interaction, supplier, employee in rows:
-            old_supplier = None
-            if contract and getattr(contract, 'old_supplier_id', None):
-                old_supplier = session.query(Supplier_Master).filter_by(
-                    supplier_id=contract.old_supplier_id
-                ).first()
+        for client, project, contract, supplier, employee in rows:
+            old_supplier = old_supplier_map.get(
+                getattr(contract, 'old_supplier_id', None)
+            ) if contract else None
             results.append(build_customer_response(
-                client, project, contract, None, interaction, supplier, employee, old_supplier
+                client, project, contract, None, None, supplier, employee, old_supplier
             ))
 
         return jsonify({
             'data': results,
             'pagination': {
                 'page': page,
-                'page_size': page_size,
+                'page_size': page_size or total,
                 'total': total,
-                'total_pages': (total + page_size - 1) // page_size,
+                'total_pages': 1 if not page_size else (total + page_size - 1) // page_size,
             }
         }), 200
 

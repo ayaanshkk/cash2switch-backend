@@ -760,131 +760,164 @@ def get_renewal_performance():
         current_user = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id = {'utilities': 1, 'water': 2, 'gas': 3}.get(service_param.strip().lower(), 1)
+        return_records = request.args.get('return_records', 'false').lower() == 'true'
+        stage_filter = request.args.get('stage_filter', '').strip().lower()
+        period = request.args.get('period', 'alltime').strip().lower()
 
-        # ✅ Import platform admin check
         from backend.crm.utils.role_helpers import is_platform_admin
-
         use_current_user = request.args.get('use_current_user', 'false').lower() == 'true'
 
         if is_platform_admin(current_user):
-            # ✅ Platform admin: see all tenant renewals unless ?employee_id=X specified
             requested_employee_id = request.args.get('employee_id', type=int)
-            employee_id = requested_employee_id  # None = all tenant
+            employee_id = requested_employee_id
         elif use_current_user:
             employee_id = getattr(current_user, 'employee_id', None) or getattr(current_user, 'id', None)
             if not employee_id:
                 return jsonify({'error': 'User employee_id not found'}), 400
         else:
-            # ✅ Non-admin: always scoped to their own employee_id
             employee_id = getattr(current_user, 'employee_id', None)
             if not employee_id:
                 return jsonify({'error': 'User employee_id not found'}), 400
 
-        today = datetime.utcnow().date()
+        # ── Period bounds ──────────────────────────────────────────────────
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        if period == 'weekly':
+            start_dt = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == 'monthly':
+            start_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        elif period == 'daily':
+            start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:  # alltime
+            start_dt = None
+        end_dt = now
 
-        sync_recycle_bin_renewal_statuses(session, tenant_id, employee_id)
+        def _bucket(status):
+            s = (status or '').strip().lower()
+            if s in ('already renewed', 'renewed', 'sold'):
+                return 'renewed'
+            if s == 'renewed directly':
+                return 'renewed_directly'
+            if s == 'end date changed':
+                return 'end_date_changed'
+            if s == 'priced':
+                return 'priced'
+            if s in ('callback', 'not answered', 'broker in place',
+                     'email only', 'complaint', 'duplicate', 'called', 'contacted'):
+                return 'in_progress'
+            if s in ('lost', 'lost cot', 'invalid number',
+                     'meter de-energised', 'incorrect supplier', 'dead'):
+                return 'lost'
+            return 'not_contacted'
 
-        base_query = session.query(
-            Project_Details,
-            Energy_Contract_Master,
-        ).join(
-            Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
-        ).join(
-            Client_Master, Project_Details.client_id == Client_Master.client_id
-        ).filter(
-            Client_Master.tenant_id == tenant_id,
-            Client_Master.is_deleted == False,
-            Client_Master.is_archived == False,
-            Energy_Contract_Master.service_id == service_id,
-        )
+        # ✅ Period filter using Client_Interactions when not alltime
+        period_filter = ""
+        if start_dt is not None:
+            period_filter = """
+                AND EXISTS (
+                    SELECT 1 FROM "StreemLyne_MT"."Client_Interactions" ci
+                    WHERE ci.client_id = cm.client_id
+                    AND ci.created_at >= :start_dt
+                    AND ci.created_at < :end_dt
+                )
+            """
 
-        # ✅ Only filter by employee if specified
+        employee_filter = "AND pd.assigned_employee_id = :employee_id" if employee_id else ""
+
+        sql = f"""
+            SELECT 
+                pd.status,
+                cm.client_id,
+                cm.client_company_name as client_name,
+                cm.client_contact_name as contact_person,
+                cm.client_phone as phone,
+                em.employee_name as assigned_to_name,
+                sm.supplier_company_name as supplier_name,
+                ecm.contract_end_date as end_date,
+                ecm.mpan_number,
+                pd."Misc_Col2" as annual_usage
+            FROM "StreemLyne_MT"."Client_Master" cm
+            JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
+            JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON pd.assigned_employee_id = em.employee_id
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
+            WHERE cm.tenant_id = :tenant_id
+            AND ecm.service_id = :service_id
+            {employee_filter}
+            {period_filter}
+        """
+
+        params = {'tenant_id': tenant_id, 'service_id': service_id}
         if employee_id:
-            base_query = base_query.filter(
-                Project_Details.assigned_employee_id == employee_id
-            )
+            params['employee_id'] = employee_id
+        if start_dt is not None:
+            params['start_dt'] = start_dt
+            params['end_dt'] = end_dt
 
-        all_results = base_query.all()
-
-        # ✅ Lost: query recycle bin separately
-        lost_query = session.query(
-            Project_Details,
-        ).join(
-            Client_Master, Project_Details.client_id == Client_Master.client_id
-        ).join(
-            Energy_Contract_Master, Project_Details.project_id == Energy_Contract_Master.project_id
-        ).filter(
-            Client_Master.tenant_id == tenant_id,
-            Client_Master.is_deleted == True,
-            Energy_Contract_Master.service_id == service_id,
-            func.lower(Client_Master.deleted_reason).in_(['lost', 'lost cot', 'dead']),
-        )
-
-        if employee_id:
-            lost_query = lost_query.filter(
-                Project_Details.assigned_employee_id == employee_id
-            )
-
-        lost_count = lost_query.count()
+        rows = session.execute(text(sql), params).mappings().all()
 
         renewed_count = 0
-        contacted_count = 0
+        in_progress_count = 0
         not_contacted_count = 0
+        lost_count = 0
         renewed_directly_count = 0
         end_date_changed_count = 0
         priced_count = 0
-        not_due_count = 0
+        matched_records = []
 
-        for project, contract in all_results:
-            days_until_renewal = (contract.contract_end_date - today).days if contract.contract_end_date else 0
+        for row in rows:
+            status = row['status']
+            bucket = _bucket(status)
 
-            if contract.contract_end_date and days_until_renewal > 365:
-                not_due_count += 1
-                continue
+            if bucket == 'renewed':                renewed_count += 1
+            elif bucket == 'renewed_directly':     renewed_directly_count += 1
+            elif bucket == 'end_date_changed':     end_date_changed_count += 1
+            elif bucket == 'priced':               priced_count += 1
+            elif bucket == 'in_progress':          in_progress_count += 1
+            elif bucket == 'lost':                 lost_count += 1
+            else:                                  not_contacted_count += 1
 
-            status = project.status
+            if return_records and stage_filter and bucket == stage_filter:
+                matched_records.append({
+                    'client_id':        row['client_id'],
+                    'client_name':      row['client_name'],
+                    'business_name':    row['client_name'],
+                    'contact_person':   row['contact_person'],
+                    'phone':            row['phone'],
+                    'status':           status,
+                    'assigned_to_name': row['assigned_to_name'],
+                    'supplier_name':    row['supplier_name'],
+                    'end_date':         row['end_date'].isoformat() if row['end_date'] else None,
+                    'mpan_mpr':         row['mpan_number'],
+                    'annual_usage':     float(row['annual_usage']) if row['annual_usage'] else None,
+                })
 
-            if status:
-                status_lower = status.lower()
-                if status_lower == 'renewed directly':
-                    renewed_directly_count += 1
-                elif status_lower == 'end date changed':
-                    end_date_changed_count += 1
-                elif status_lower == 'priced':
-                    priced_count += 1
-                elif status_lower in ['renewed', 'already renewed', 'sold']:
-                    renewed_count += 1
-                elif status_lower in ['called', 'callback', 'contacted', 'not answered',
-                                       'broker in place', 'email only', 'renewed directly']:
-                    contacted_count += 1
-                elif status_lower in ['not called', 'dead']:
-                    not_contacted_count += 1
-                else:
-                    not_contacted_count += 1
-            else:
-                not_contacted_count += 1
+        total = len(rows)
+        success_rate = round(
+            ((renewed_count + renewed_directly_count) / total * 100), 1
+        ) if total > 0 else 0
 
-        total_attempts = renewed_count + lost_count + contacted_count + not_contacted_count
-        success_rate = round((renewed_count / total_attempts * 100), 1) if total_attempts > 0 else 0
-
-        return jsonify({
-            'renewed_count': renewed_count,
-            'contacted_count': contacted_count,
-            'not_contacted_count': not_contacted_count,
-            'lost_count': lost_count,
-            'success_rate': success_rate,
-            'total_customers': len(all_results),
-            'employee_id': employee_id if employee_id else None,
+        response = {
+            'renewed_count':          renewed_count,
             'renewed_directly_count': renewed_directly_count,
             'end_date_changed_count': end_date_changed_count,
-            'priced_count': priced_count,
-            'not_due': not_due_count,
-        })
+            'priced_count':           priced_count,
+            'contacted_count':        in_progress_count,
+            'not_contacted_count':    not_contacted_count,
+            'lost_count':             lost_count,
+            'success_rate':           success_rate,
+            'total_customers':        total,
+            'period':                 period,
+        }
+
+        if return_records:
+            response['records'] = matched_records
+
+        return jsonify(response), 200
 
     except Exception as e:
         current_app.logger.error(f"Error getting performance stats: {e}")
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
@@ -892,144 +925,123 @@ def get_renewal_performance():
 @renewals_bp.route('/energy-renewals/staff-status-counts', methods=['GET'])
 @token_required
 def get_staff_status_counts():
-    """
-    Staff performance for renewals - role_id 2, 3 only
-    Returns 4 categories: Renewed, In Progress, Not Contacted, Lost
-    Each category is separate and NOT combined
-    """
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
         if not tenant_id:
             return jsonify({'error': 'Tenant not found'}), 400
- 
-        employee_id = request.args.get('employee_id', type=int)
 
-        sync_recycle_bin_renewal_statuses(session, tenant_id, employee_id)
-        
-        print(f"\n{'='*80}")
-        print(f"🔍 RENEWALS STAFF PERFORMANCE REQUEST")
-        print(f"{'='*80}")
-        print(f"Tenant ID: {tenant_id}")
-        print(f"Employee ID filter: {employee_id}")
-        print(f"{'='*80}\n")
- 
+        employee_id = request.args.get('employee_id', type=int)
+        period = request.args.get('period', 'alltime').strip().lower()
+
+        # ── Period bounds ──────────────────────────────────────────────────
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        if period == 'weekly':
+            start_dt = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == 'monthly':
+            start_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        elif period == 'daily':
+            start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:  # alltime
+            start_dt = None
+        end_dt = now
+
         employee_filter = ""
         if employee_id:
             employee_filter = " AND em.employee_id = :employee_id "
-        
-        # Get employees with role 2, 3
+
         all_emp_sql = """
-            SELECT DISTINCT
-                em.employee_id,
-                em.employee_name
+            SELECT DISTINCT em.employee_id, em.employee_name
             FROM "StreemLyne_MT"."Employee_Master" em
-            INNER JOIN "StreemLyne_MT"."User_Master" um
-                ON em.employee_id = um.employee_id
-            INNER JOIN "StreemLyne_MT"."User_Role_Mapping" urm
-                ON um.user_id = urm.user_id
+            INNER JOIN "StreemLyne_MT"."User_Master" um ON em.employee_id = um.employee_id
+            INNER JOIN "StreemLyne_MT"."User_Role_Mapping" urm ON um.user_id = urm.user_id
             WHERE em.tenant_id = :tenant_id
             AND urm.role_id IN (2, 3)
-        """ + employee_filter + """
-            ORDER BY em.employee_name
-        """
-        
+        """ + employee_filter + " ORDER BY em.employee_name"
+
         params = {'tenant_id': tenant_id}
         if employee_id:
             params['employee_id'] = employee_id
-            
+
         all_employees = session.execute(text(all_emp_sql), params).fetchall()
-        
-        print(f"✅ Found {len(all_employees)} employees with roles 2, 3\n")
-        
+
+        # ✅ Period filter clause
+        period_filter = ""
+        if start_dt is not None:
+            period_filter = """
+                AND EXISTS (
+                    SELECT 1 FROM "StreemLyne_MT"."Client_Interactions" ci
+                    WHERE ci.client_id = cm.client_id
+                    AND ci.created_at >= :start_dt
+                    AND ci.created_at < :end_dt
+                )
+            """
+
+        stats_query = f"""
+            SELECT 
+                COUNT(*) as total_contacts,
+                SUM(CASE WHEN pd.status IN (
+                    'Already Renewed', 'Sold', 'Renewed'
+                ) THEN 1 ELSE 0 END) as renewed_count,
+                SUM(CASE WHEN pd.status IN (
+                    'Callback', 'Called', 'Contacted', 'Not Answered',
+                    'Broker in Place', 'Email Only', 'Complaint', 'Duplicate'
+                ) THEN 1 ELSE 0 END) as in_progress_count,
+                SUM(CASE WHEN pd.status IS NULL OR pd.status = 'Not Called'
+                    THEN 1 ELSE 0 END) as not_contacted_count,
+                SUM(CASE WHEN pd.status IN (
+                    'Lost', 'Lost COT', 'Dead', 'Invalid Number',
+                    'Meter De-energised', 'Incorrect Supplier'
+                ) THEN 1 ELSE 0 END) as lost_count
+            FROM "StreemLyne_MT"."Client_Master" cm
+            INNER JOIN "StreemLyne_MT"."Project_Details" pd ON cm.client_id = pd.client_id
+            INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm ON pd.project_id = ecm.project_id
+            WHERE cm.tenant_id = :tenant_id
+            AND pd.assigned_employee_id = :emp_id
+            AND ecm.contract_end_date IS NOT NULL
+            {period_filter}
+        """
+
         results = []
         for emp in all_employees:
             emp_id = emp.employee_id
             emp_name = emp.employee_name
-            
-            # ✅ SEPARATE BREAKDOWN - DO NOT COMBINE
-            stats_query = """
-                SELECT 
-                    COUNT(*) as total_contacts,
-                    
-                    -- Renewed: Already Renewed or Sold
-                    SUM(CASE 
-                        WHEN pd.status IN ('Already Renewed', 'Sold')
-                        THEN 1 ELSE 0 
-                    END) as renewed_count,
-                    
-                    -- In Progress: Callback, Called, Contacted, Not Answered
-                    SUM(CASE 
-                        WHEN pd.status IN ('Callback', 'Called', 'Contacted', 'Not Answered')
-                        THEN 1 ELSE 0 
-                    END) as in_progress_count,
-                    
-                    -- Not Contacted: NULL status only
-                    SUM(CASE 
-                        WHEN pd.status IS NULL
-                        THEN 1 ELSE 0 
-                    END) as not_contacted_count,
-                    
-                    -- Lost: ONLY "Lost COT" (not including Meter De-energised)
-                    SUM(CASE 
-                        WHEN pd.status = 'Lost COT'
-                        THEN 1 ELSE 0 
-                    END) as lost_count
-                    
-                FROM "StreemLyne_MT"."Client_Master" cm
-                INNER JOIN "StreemLyne_MT"."Project_Details" pd 
-                    ON cm.client_id = pd.client_id
-                INNER JOIN "StreemLyne_MT"."Energy_Contract_Master" ecm 
-                    ON pd.project_id = ecm.project_id
-                WHERE cm.tenant_id = :tenant_id
-                AND cm.is_deleted = false
-                AND pd.assigned_employee_id = :emp_id
-                AND ecm.contract_end_date IS NOT NULL
-            """
-            
-            stats_result = session.execute(
-                text(stats_query), 
-                {'tenant_id': tenant_id, 'emp_id': emp_id}
-            ).fetchone()
-            
+
+            query_params = {'tenant_id': tenant_id, 'emp_id': emp_id}
+            if start_dt is not None:
+                query_params['start_dt'] = start_dt
+                query_params['end_dt'] = end_dt
+
+            stats_result = session.execute(text(stats_query), query_params).fetchone()
+
             total = stats_result.total_contacts or 0
             renewed = stats_result.renewed_count or 0
             in_progress = stats_result.in_progress_count or 0
             not_contacted = stats_result.not_contacted_count or 0
             lost = stats_result.lost_count or 0
-            
-            # Conversion = Renewed / Total
             conversion_rate = round((renewed / total * 100), 1) if total > 0 else 0
-            
-            print(f"   📊 {emp_name}:")
-            print(f"      Total: {total}")
-            print(f"      Renewed: {renewed} ({conversion_rate}%)")
-            print(f"      In Progress: {in_progress}")
-            print(f"      Not Contacted: {not_contacted}")
-            print(f"      Lost: {lost}")
-            
+
             results.append({
-                'employee_id': emp_id,
-                'employee_name': emp_name,
-                'total_contacts': total,
-                'renewed_count': renewed,
-                'conversion_rate': conversion_rate,
-                'in_progress_count': in_progress,
-                'not_contacted_count': not_contacted,
-                'lost_count': lost,
-                'total_value_touched': 0,
+                'employee_id':          emp_id,
+                'employee_name':        emp_name,
+                'total_contacts':       total,
+                'renewed_count':        renewed,
+                'conversion_rate':      conversion_rate,
+                'in_progress_count':    in_progress,
+                'not_contacted_count':  not_contacted,
+                'lost_count':           lost,
+                'total_value_touched':  0,
                 'renewed_directly_count': 0,
                 'end_date_changed_count': 0,
-                'priced_count': 0,
+                'priced_count':         0,
+                'period':               period,
             })
-        
-        print(f"\n✅ Returning {len(results)} staff performance records\n")
+
         return jsonify(results)
-        
+
     except Exception as e:
-        print(f"❌ Error in staff status counts: {e}")
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()

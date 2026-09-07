@@ -2279,6 +2279,7 @@ def get_leads_performance():
         service_id = 2 if service_param.strip().lower() == 'water' else 1
         return_records = request.args.get('return_records', 'false').lower() == 'true'
         stage_filter = request.args.get('stage_filter', '').strip().lower()
+        period = request.args.get('period', 'alltime').strip().lower()
 
         current_user = request.current_user
         role_name = getattr(current_user, 'role', None)
@@ -2291,27 +2292,34 @@ def get_leads_performance():
         else:
             employee_id = my_emp_id
 
-        query = (
-            session.query(
-                Opportunity_Details,
-                Stage_Master.stage_name,
-                Employee_Master.employee_name.label('assigned_to_name'),
-                func.coalesce(Opportunity_Details.business_name, Opportunity_Details.opportunity_title).label('business_name'),
-                Supplier_Master.supplier_company_name.label('supplier_name'),
-            )
-            .select_from(Opportunity_Details)
-            .outerjoin(Stage_Master, Opportunity_Details.stage_id == Stage_Master.stage_id)
-            .outerjoin(Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id)
-            .outerjoin(Supplier_Master, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
-            # ✅ No Client_Master join at all — use tenant_id directly from Opportunity_Details
-            .filter(Opportunity_Details.tenant_id == tenant_id)
-            .filter(Opportunity_Details.service_id == service_id)
-        )
+        # ── Period bounds ──────────────────────────────────────────────────
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        if period == 'weekly':
+            start_dt = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == 'monthly':
+            start_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        elif period == 'daily':
+            start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:  # alltime
+            start_dt = None
+        end_dt = now
 
+        # ── Period filter ──────────────────────────────────────────────────
+        period_filter = ""
+        if start_dt is not None:
+            period_filter = """
+                AND EXISTS (
+                    SELECT 1 FROM "StreemLyne_MT"."Client_Interactions" ci
+                    WHERE ci.client_id = od.client_id
+                    AND ci.created_at >= :start_dt
+                    AND ci.created_at < :end_dt
+                )
+            """
+
+        employee_filter = ""
         if employee_id:
-            query = query.filter(
-                Opportunity_Details.opportunity_owner_employee_id == employee_id
-            )
+            employee_filter = "AND od.opportunity_owner_employee_id = :employee_id"
         elif not admin_user:
             return jsonify({
                 'converted_count': 0, 'renewed_count': 0,
@@ -2321,40 +2329,67 @@ def get_leads_performance():
                 'success_rate': 0, 'total_customers': 0,
             }), 200
 
-        rows = query.all()
+        sql = f"""
+            SELECT
+                od.opportunity_id,
+                od.client_id,
+                od.business_name,
+                od.contact_person,
+                od.tel_number,
+                od.mobile_no,
+                od.email,
+                od.mpan_mpr,
+                od.start_date,
+                od.end_date,
+                od.service_id,
+                od.stage_id,
+                od.opportunity_owner_employee_id,
+                od.created_at,
+                od.supplier_id,
+                od.annual_usage,
+                od.tenant_lead_id,
+                sm.stage_name,
+                em.employee_name as assigned_to_name,
+                sup.supplier_company_name as supplier_name
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em ON od.opportunity_owner_employee_id = em.employee_id
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od.supplier_id = sup.supplier_id
+            WHERE od.tenant_id = :tenant_id
+            AND od.service_id = :service_id
+            {employee_filter}
+            {period_filter}
+        """
 
-        converted_count = 0
-        renewed_count = 0
-        in_progress_count = 0
-        not_contacted_count = 0
-        lost_count = 0
-        renewed_directly_count = 0
-        end_date_changed_count = 0
-        priced_count = 0
+        params = {'tenant_id': tenant_id, 'service_id': service_id}
+        if employee_id:
+            params['employee_id'] = employee_id
+        if start_dt is not None:
+            params['start_dt'] = start_dt
+            params['end_dt'] = end_dt
+
+        rows = session.execute(text(sql), params).mappings().all()
 
         def _bucket(stage):
             s = (stage or '').lower()
-            if s in ('converted', 'won'):
-                return 'converted'
-            if s in ('already renewed', 'renewed'):
-                return 'renewed'
-            if s == 'renewed directly':
-                return 'renewed_directly'
-            if s == 'end date changed':
-                return 'end_date_changed'
-            if s == 'priced':
-                return 'priced'
-            if s in ('callback', 'not answered', 'broker in place', 'email only', 'complaint'):
-                return 'in_progress'
-            if s in ('lost', 'lost cot', 'invalid number', 'meter de-energised', 'incorrect supplier'):
-                return 'lost'
+            if s in ('converted', 'won'):                return 'converted'
+            if s in ('already renewed', 'renewed'):      return 'renewed'
+            if s == 'renewed directly':                  return 'renewed_directly'
+            if s == 'end date changed':                  return 'end_date_changed'
+            if s == 'priced':                            return 'priced'
+            if s in ('callback', 'not answered', 'broker in place',
+                     'email only', 'complaint'):         return 'in_progress'
+            if s in ('lost', 'lost cot', 'invalid number',
+                     'meter de-energised', 'incorrect supplier'): return 'lost'
             return 'not_contacted'
 
+        converted_count = renewed_count = in_progress_count = 0
+        not_contacted_count = lost_count = renewed_directly_count = 0
+        end_date_changed_count = priced_count = 0
         matched_records = []
 
         for row in rows:
-            od = row[0]
-            stage_name = row.stage_name
+            stage_name = row['stage_name']
             bucket = _bucket(stage_name)
 
             if bucket == 'converted':           converted_count += 1
@@ -2368,25 +2403,25 @@ def get_leads_performance():
 
             if return_records and stage_filter and bucket == stage_filter:
                 matched_records.append({
-                    'opportunity_id': od.opportunity_id,
-                    'tenant_lead_id': od.tenant_lead_id,
-                    'business_name': row.business_name,
-                    'contact_person': od.contact_person,
-                    'tel_number': str(od.tel_number).replace('.0', '') if od.tel_number else None,
-                    'mobile_no': od.mobile_no,
-                    'email': od.email,
-                    'mpan_mpr': od.mpan_mpr,
-                    'start_date': _iso(od.start_date),
-                    'end_date': _iso(od.end_date),
-                    'service_id': od.service_id,
-                    'stage_id': od.stage_id,
-                    'stage_name': stage_name,
-                    'opportunity_owner_employee_id': od.opportunity_owner_employee_id,
-                    'assigned_to_name': row.assigned_to_name,
-                    'created_at': _iso(od.created_at),
-                    'supplier_id': od.supplier_id,
-                    'supplier_name': row.supplier_name,
-                    'annual_usage': od.annual_usage,
+                    'opportunity_id':                row['opportunity_id'],
+                    'tenant_lead_id':                row['tenant_lead_id'],
+                    'business_name':                 row['business_name'],
+                    'contact_person':                row['contact_person'],
+                    'tel_number':                    str(row['tel_number']).replace('.0', '') if row['tel_number'] else None,
+                    'mobile_no':                     row['mobile_no'],
+                    'email':                         row['email'],
+                    'mpan_mpr':                      row['mpan_mpr'],
+                    'start_date':                    row['start_date'].isoformat() if row['start_date'] else None,
+                    'end_date':                      row['end_date'].isoformat() if row['end_date'] else None,
+                    'service_id':                    row['service_id'],
+                    'stage_id':                      row['stage_id'],
+                    'stage_name':                    stage_name,
+                    'opportunity_owner_employee_id': row['opportunity_owner_employee_id'],
+                    'assigned_to_name':              row['assigned_to_name'],
+                    'created_at':                    row['created_at'].isoformat() if row['created_at'] else None,
+                    'supplier_id':                   row['supplier_id'],
+                    'supplier_name':                 row['supplier_name'],
+                    'annual_usage':                  row['annual_usage'],
                 })
 
         total = len(rows)
@@ -2395,16 +2430,17 @@ def get_leads_performance():
         ) if total > 0 else 0
 
         response = {
-            'converted_count': converted_count,
-            'renewed_count': renewed_count,
+            'converted_count':        converted_count,
+            'renewed_count':          renewed_count,
             'renewed_directly_count': renewed_directly_count,
             'end_date_changed_count': end_date_changed_count,
-            'priced_count': priced_count,
-            'contacted_count': in_progress_count,
-            'not_contacted_count': not_contacted_count,
-            'lost_count': lost_count,
-            'success_rate': success_rate,
-            'total_customers': total,
+            'priced_count':           priced_count,
+            'contacted_count':        in_progress_count,
+            'not_contacted_count':    not_contacted_count,
+            'lost_count':             lost_count,
+            'success_rate':           success_rate,
+            'total_customers':        total,
+            'period':                 period,
         }
 
         if return_records:
