@@ -144,6 +144,10 @@ def _staff_period_bounds(period: str):
         else:
             end = start.replace(month=start.month + 1)
         multiplier = 30
+    elif key == "alltime":
+        start = None
+        end = None
+        multiplier = 1
     else:
         key = "daily"
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1782,19 +1786,16 @@ def get_leads_stats():
         role_name = getattr(current_user, 'role', None)
         admin_user = is_crm_leads_admin_role(role_name)
         my_emp_id = getattr(current_user, 'employee_id', None)
-        
-        # ✅ For non-admins: always use their own employee_id
-        # ✅ For admins: allow ?employee_id=X to view specific user, otherwise show all
+
         if not admin_user:
             employee_id = my_emp_id
         else:
             requested_employee_id = request.args.get('employee_id', type=int)
-            employee_id = requested_employee_id  # Can be None (all) or specific employee
+            employee_id = requested_employee_id
 
         if local_demo_dashboard_enabled():
             return jsonify(dummy_leads_stats(employee_id)), 200
 
-        # Build query
         query = (
             session.query(
                 Opportunity_Details.opportunity_id,
@@ -1810,10 +1811,9 @@ def get_leads_stats():
                 ((Opportunity_Details.client_id.isnot(None)) & (Client_Master.tenant_id == tenant_id))
             )
             .filter(Opportunity_Details.service_id == service_id)
-            .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
+            # ✅ REMOVED is_allocated filter — count ALL leads
         )
 
-        # ✅ Always filter by employee_id for non-admins
         if employee_id:
             query = query.filter(Opportunity_Details.opportunity_owner_employee_id == employee_id)
 
@@ -1889,8 +1889,7 @@ def get_leads_stats():
         }), 200
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
@@ -1924,7 +1923,7 @@ def get_leads_stage_breakdown():
                 ((Opportunity_Details.client_id.isnot(None)) & (Client_Master.tenant_id == tenant_id))
             )
             .filter(Opportunity_Details.service_id == service_id)
-            .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
+            # ✅ REMOVED is_allocated filter
         )
 
         if employee_id:
@@ -1932,16 +1931,10 @@ def get_leads_stage_breakdown():
 
         query = query.group_by(func.coalesce(Stage_Master.stage_name, 'Unknown'))
         query = query.order_by(func.count(Opportunity_Details.opportunity_id).desc())
-
         rows = query.all()
 
         return jsonify([
-            {
-                'stage_id': i + 1,
-                'stage_name': r.stage_name or 'Unknown',
-                'count': int(r.count or 0),
-                'total_value': 0
-            }
+            {'stage_id': i + 1, 'stage_name': r.stage_name or 'Unknown', 'count': int(r.count or 0), 'total_value': 0}
             for i, r in enumerate(rows)
         ]), 200
 
@@ -1950,7 +1943,6 @@ def get_leads_stage_breakdown():
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
-
 
 @crm_bp.route('/leads/supplier-breakdown', methods=['GET'])
 @token_required
@@ -1980,7 +1972,7 @@ def get_leads_supplier_breakdown():
                 ((Opportunity_Details.client_id.isnot(None)) & (Client_Master.tenant_id == tenant_id))
             )
             .filter(Opportunity_Details.service_id == service_id)
-            .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
+            # ✅ REMOVED is_allocated filter
         )
 
         if employee_id:
@@ -1988,15 +1980,10 @@ def get_leads_supplier_breakdown():
 
         query = query.group_by(func.coalesce(Supplier_Master.supplier_company_name, 'Unknown'))
         query = query.order_by(func.count(Opportunity_Details.opportunity_id).desc())
-
         rows = query.all()
 
         return jsonify([
-            {
-                'supplier_name': r.supplier_name or 'Unknown',
-                'lead_count': int(r.lead_count or 0),
-                'total_value': 0
-            }
+            {'supplier_name': r.supplier_name or 'Unknown', 'lead_count': int(r.lead_count or 0), 'total_value': 0}
             for r in rows
         ]), 200
 
@@ -2005,7 +1992,6 @@ def get_leads_supplier_breakdown():
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
-
 
 @crm_bp.route('/leads/salesperson-breakdown', methods=['GET'])
 @token_required
@@ -2018,10 +2004,10 @@ def get_leads_salesperson_breakdown():
         service_id = 2 if service_param.strip().lower() == 'water' else 1
         current_user = request.current_user
         admin_user = is_crm_leads_admin_role(getattr(current_user, 'role', None))
-        
+
         if not admin_user:
             return jsonify([]), 200
-            
+
         if local_demo_dashboard_enabled():
             return jsonify(dummy_leads_salesperson_breakdown()), 200
 
@@ -2040,7 +2026,7 @@ def get_leads_salesperson_breakdown():
                 ((Opportunity_Details.client_id.isnot(None)) & (Client_Master.tenant_id == tenant_id))
             )
             .filter(Opportunity_Details.service_id == service_id)
-            .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
+            # ✅ REMOVED is_allocated filter
             .group_by(Employee_Master.employee_id, Employee_Master.employee_name, func.coalesce(Stage_Master.stage_name, 'Unknown'))
             .order_by(Employee_Master.employee_name.asc())
             .all()
@@ -2078,7 +2064,7 @@ def get_leads_salesperson_breakdown():
             total = v['total_leads'] or 0
             v['conversion_rate'] = round((v['converted_count'] / total) * 100, 1) if total else 0
             out.append(v)
-        
+
         out.sort(key=lambda x: x['total_leads'], reverse=True)
         return jsonify(out), 200
 
@@ -2087,7 +2073,6 @@ def get_leads_salesperson_breakdown():
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
-
 
 @crm_bp.route('/leads/by-stage', methods=['GET'])
 @token_required
@@ -2132,26 +2117,21 @@ def get_leads_by_stage():
                 ((Opportunity_Details.client_id.isnot(None)) & (Client_Master.tenant_id == tenant_id))
             )
             .filter(Opportunity_Details.service_id == service_id)
-            .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
+            # ✅ REMOVED is_allocated filter
         )
 
         if employee_id:
             query = query.filter(Opportunity_Details.opportunity_owner_employee_id == employee_id)
 
-        # Stage filtering
         if stage == 'in_progress':
-            query = query.filter(
-                func.lower(func.coalesce(Stage_Master.stage_name, '')).in_([
-                    'callback', 'not answered', 'broker in place', 'email only',
-                    'complaint', 'incorrect supplier', 'priced', 'end date changed'
-                ])
-            )
+            query = query.filter(func.lower(func.coalesce(Stage_Master.stage_name, '')).in_([
+                'callback', 'not answered', 'broker in place', 'email only',
+                'complaint', 'incorrect supplier', 'priced', 'end date changed'
+            ]))
         elif stage == 'lost':
-            query = query.filter(
-                func.lower(func.coalesce(Stage_Master.stage_name, '')).in_([
-                    'lost', 'lost cot', 'invalid number', 'meter de-energised'
-                ])
-            )
+            query = query.filter(func.lower(func.coalesce(Stage_Master.stage_name, '')).in_([
+                'lost', 'lost cot', 'invalid number', 'meter de-energised'
+            ]))
         elif stage:
             query = query.filter(func.lower(func.coalesce(Stage_Master.stage_name, '')) == stage)
 
@@ -2164,7 +2144,6 @@ def get_leads_by_stage():
             end_date = r.end_date
             end_d = end_date.date() if hasattr(end_date, 'date') else end_date
             days = (end_d - today).days if end_d else None
-            
             leads.append({
                 'opportunity_id': r.opportunity_id,
                 'business_name': r.business_name,
@@ -2189,7 +2168,6 @@ def get_leads_by_stage():
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
-
 
 @crm_bp.route('/leads/period-breakdown', methods=['GET'])
 @token_required
@@ -2234,7 +2212,7 @@ def get_leads_period_breakdown():
                 ((Opportunity_Details.client_id.isnot(None)) & (Client_Master.tenant_id == tenant_id))
             )
             .filter(Opportunity_Details.service_id == service_id)
-            .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
+            # ✅ REMOVED is_allocated filter
         )
 
         if employee_id:
@@ -2245,7 +2223,6 @@ def get_leads_period_breakdown():
 
         today = datetime.utcnow().date()
         leads = []
-        
         for r in rows:
             end_date = r.end_date
             end_d = end_date.date() if hasattr(end_date, 'date') else end_date
@@ -2291,7 +2268,6 @@ def get_leads_period_breakdown():
     finally:
         session.close()
 
-
 @crm_bp.route('/leads/performance', methods=['GET'])
 @token_required
 @tenant_from_jwt
@@ -2301,61 +2277,48 @@ def get_leads_performance():
         tenant_id = g.tenant_id
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
+        return_records = request.args.get('return_records', 'false').lower() == 'true'
+        stage_filter = request.args.get('stage_filter', '').strip().lower()
 
         current_user = request.current_user
         role_name = getattr(current_user, 'role', None)
         admin_user = is_crm_leads_admin_role(role_name)
         my_emp_id = getattr(current_user, 'employee_id', None)
 
-        # ✅ Admin sees ALL leads across tenant (no employee filter)
-        # ✅ Non-admin sees only their own
         if admin_user:
             requested_employee_id = request.args.get('employee_id', type=int)
-            employee_id = requested_employee_id  # None = all tenant, or specific employee
+            employee_id = requested_employee_id
         else:
-            employee_id = my_emp_id  # always scoped to themselves
-
-        current_app.logger.warning(
-            f'📊 get_leads_performance: tenant={tenant_id}, my_emp_id={my_emp_id}, '
-            f'is_admin={admin_user}, filtering_by_employee_id={employee_id}'
-        )
+            employee_id = my_emp_id
 
         query = (
-            session.query(Stage_Master.stage_name)
+            session.query(
+                Opportunity_Details,
+                Stage_Master.stage_name,
+                Employee_Master.employee_name.label('assigned_to_name'),
+                func.coalesce(Opportunity_Details.business_name, Opportunity_Details.opportunity_title).label('business_name'),
+                Supplier_Master.supplier_company_name.label('supplier_name'),
+            )
             .select_from(Opportunity_Details)
-            .outerjoin(Client_Master, Opportunity_Details.client_id == Client_Master.client_id)
             .outerjoin(Stage_Master, Opportunity_Details.stage_id == Stage_Master.stage_id)
-            .filter(
-                (Opportunity_Details.tenant_id == tenant_id) |
-                ((Opportunity_Details.client_id.isnot(None)) & (Client_Master.tenant_id == tenant_id))
-            )
+            .outerjoin(Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id)
+            .outerjoin(Supplier_Master, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
+            # ✅ No Client_Master join at all — use tenant_id directly from Opportunity_Details
+            .filter(Opportunity_Details.tenant_id == tenant_id)
             .filter(Opportunity_Details.service_id == service_id)
-            .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
-            # ✅ Exclude soft-deleted leads
-            .filter(
-                (Client_Master.is_deleted.is_(None)) |
-                (Client_Master.is_deleted == False)
-            )
         )
 
-        # ✅ Only filter by employee if non-admin OR admin specified ?employee_id=X
         if employee_id:
             query = query.filter(
                 Opportunity_Details.opportunity_owner_employee_id == employee_id
             )
         elif not admin_user:
-            # Non-admin with no employee_id - return zeros
             return jsonify({
-                'converted_count': 0,
-                'renewed_count': 0,
-                'renewed_directly_count': 0,
-                'end_date_changed_count': 0,
-                'priced_count': 0,
-                'contacted_count': 0,
-                'not_contacted_count': 0,
-                'lost_count': 0,
-                'success_rate': 0,
-                'total_customers': 0,
+                'converted_count': 0, 'renewed_count': 0,
+                'renewed_directly_count': 0, 'end_date_changed_count': 0,
+                'priced_count': 0, 'contacted_count': 0,
+                'not_contacted_count': 0, 'lost_count': 0,
+                'success_rate': 0, 'total_customers': 0,
             }), 200
 
         rows = query.all()
@@ -2369,37 +2332,69 @@ def get_leads_performance():
         end_date_changed_count = 0
         priced_count = 0
 
-        for r in rows:
-            stage = (r.stage_name or '').lower()
-            if stage == 'converted':
-                converted_count += 1
-            elif stage in ['already renewed', 'renewed']:
-                renewed_count += 1
-            elif stage == 'renewed directly':
-                renewed_directly_count += 1
-            elif stage == 'end date changed':
-                end_date_changed_count += 1
-            elif stage == 'priced':
-                priced_count += 1
-            elif stage in ['callback', 'not answered', 'broker in place', 'email only',
-                           'complaint', 'incorrect supplier']:
-                in_progress_count += 1
-            elif stage in ['lost', 'lost cot', 'invalid number', 'meter de-energised']:
-                lost_count += 1
-            else:
-                not_contacted_count += 1
+        def _bucket(stage):
+            s = (stage or '').lower()
+            if s in ('converted', 'won'):
+                return 'converted'
+            if s in ('already renewed', 'renewed'):
+                return 'renewed'
+            if s == 'renewed directly':
+                return 'renewed_directly'
+            if s == 'end date changed':
+                return 'end_date_changed'
+            if s == 'priced':
+                return 'priced'
+            if s in ('callback', 'not answered', 'broker in place', 'email only', 'complaint'):
+                return 'in_progress'
+            if s in ('lost', 'lost cot', 'invalid number', 'meter de-energised', 'incorrect supplier'):
+                return 'lost'
+            return 'not_contacted'
+
+        matched_records = []
+
+        for row in rows:
+            od = row[0]
+            stage_name = row.stage_name
+            bucket = _bucket(stage_name)
+
+            if bucket == 'converted':           converted_count += 1
+            elif bucket == 'renewed':            renewed_count += 1
+            elif bucket == 'renewed_directly':   renewed_directly_count += 1
+            elif bucket == 'end_date_changed':   end_date_changed_count += 1
+            elif bucket == 'priced':             priced_count += 1
+            elif bucket == 'in_progress':        in_progress_count += 1
+            elif bucket == 'lost':               lost_count += 1
+            else:                                not_contacted_count += 1
+
+            if return_records and stage_filter and bucket == stage_filter:
+                matched_records.append({
+                    'opportunity_id': od.opportunity_id,
+                    'tenant_lead_id': od.tenant_lead_id,
+                    'business_name': row.business_name,
+                    'contact_person': od.contact_person,
+                    'tel_number': str(od.tel_number).replace('.0', '') if od.tel_number else None,
+                    'mobile_no': od.mobile_no,
+                    'email': od.email,
+                    'mpan_mpr': od.mpan_mpr,
+                    'start_date': _iso(od.start_date),
+                    'end_date': _iso(od.end_date),
+                    'service_id': od.service_id,
+                    'stage_id': od.stage_id,
+                    'stage_name': stage_name,
+                    'opportunity_owner_employee_id': od.opportunity_owner_employee_id,
+                    'assigned_to_name': row.assigned_to_name,
+                    'created_at': _iso(od.created_at),
+                    'supplier_id': od.supplier_id,
+                    'supplier_name': row.supplier_name,
+                    'annual_usage': od.annual_usage,
+                })
 
         total = len(rows)
         success_rate = round(
             ((converted_count + renewed_count + renewed_directly_count) / total * 100), 1
         ) if total > 0 else 0
 
-        current_app.logger.warning(
-            f'✅ Performance for employee_id={employee_id}: total={total}, '
-            f'not_contacted={not_contacted_count}, converted={converted_count}'
-        )
-
-        return jsonify({
+        response = {
             'converted_count': converted_count,
             'renewed_count': renewed_count,
             'renewed_directly_count': renewed_directly_count,
@@ -2410,175 +2405,18 @@ def get_leads_performance():
             'lost_count': lost_count,
             'success_rate': success_rate,
             'total_customers': total,
-        }), 200
-
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
-    finally:
-        session.close()
-
-@crm_bp.route('/leads/staff-performance', methods=['GET'])
-@token_required
-@tenant_from_jwt
-def get_leads_staff_performance():
-    session = SessionLocal()
-    try:
-        tenant_id = g.tenant_id
-        service_param = request.args.get('service', 'utilities')
-        service_id = 2 if service_param.strip().lower() == 'water' else 1
-        period, start_dt, end_dt, goal_multiplier = _staff_period_bounds(request.args.get('period', 'daily'))
-
-        current_user = request.current_user
-        role_name = getattr(current_user, 'role', None)
-        admin_user = is_crm_leads_admin_role(role_name)
-        my_emp_id = getattr(current_user, 'employee_id', None)
-        only_employee_id = request.args.get('employee_id', type=int)
-
-        if not admin_user:
-            if my_emp_id is None:
-                return jsonify([]), 200
-            only_employee_id = my_emp_id
-
-        if local_demo_dashboard_enabled():
-            return jsonify(dummy_leads_staff_performance(period, only_employee_id)), 200
-
-        # Use raw SQL with text() because of complex subquery
-        ts_column = 'od."updated_at"'  # or resolve dynamically
-        
-        sql = text(f"""
-            SELECT
-                em."employee_id",
-                em."employee_name",
-                COALESCE(sm."stage_name", 'Unknown') AS stage_name,
-                COUNT(od."opportunity_id")::bigint AS cnt,
-                CASE
-                    WHEN EXISTS (
-                        SELECT 1
-                        FROM "StreemLyne_MT"."User_Master" um
-                        INNER JOIN "StreemLyne_MT"."User_Role_Mapping" urm
-                            ON urm."user_id" = um."user_id"
-                        WHERE um."employee_id" = em."employee_id"
-                            AND urm."role_id" = :offshore_role_id
-                    ) THEN 1 ELSE 0
-                END AS is_offshore
-            FROM "StreemLyne_MT"."Opportunity_Details" od
-            LEFT JOIN "StreemLyne_MT"."Client_Master" cm
-                ON od."client_id" = cm."client_id"
-            JOIN "StreemLyne_MT"."Employee_Master" em
-                ON od."opportunity_owner_employee_id" = em."employee_id"
-            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm
-                ON od."stage_id" = sm."stage_id"
-            WHERE (od."tenant_id" = :tenant_id OR (od."client_id" IS NOT NULL AND cm."tenant_id" = :tenant_id))
-                AND em."tenant_id" = :tenant_id
-                AND od."service_id" = :service_id
-                AND od."opportunity_owner_employee_id" IS NOT NULL
-                AND {ts_column} >= :start_dt
-                AND {ts_column} < :end_dt
-                AND (od."is_allocated" = FALSE OR od."is_allocated" IS NULL)
-                {' AND od."opportunity_owner_employee_id" = :employee_id' if only_employee_id else ''}
-            GROUP BY em."employee_id", em."employee_name", COALESCE(sm."stage_name", 'Unknown'), is_offshore
-            ORDER BY em."employee_name" ASC
-        """)
-
-        params = {
-            'tenant_id': tenant_id,
-            'service_id': service_id,
-            'start_dt': start_dt,
-            'end_dt': end_dt,
-            'offshore_role_id': OFFSHORE_ROLE_ID,
         }
-        if only_employee_id:
-            params['employee_id'] = only_employee_id
 
-        rows = session.execute(sql, params).mappings().all()
+        if return_records:
+            response['records'] = matched_records
 
-        employees = {}
-        for r in rows:
-            eid = r['employee_id']
-            if eid is None:
-                continue
-
-            if eid not in employees:
-                employees[eid] = {
-                    'employee_id': eid,
-                    'employee_name': r['employee_name'] or 'Unknown',
-                    'role_id': OFFSHORE_ROLE_ID if int(r['is_offshore'] or 0) == 1 else None,
-                    'converted_count': 0,
-                    'in_progress_count': 0,
-                    'not_contacted_count': 0,
-                    'lost_count': 0,
-                    'renewed_count': 0,
-                    'renewed_directly_count': 0,
-                    'end_date_changed_count': 0,
-                    'priced_count': 0,
-                    'total_contacts': 0,
-                }
-
-            stage = str(r['stage_name'] or '').strip().lower()
-            count = int(r['cnt'] or 0)
-            employees[eid]['total_contacts'] += count
-
-            if stage == 'converted':
-                employees[eid]['converted_count'] += count
-            elif stage in ('already renewed', 'renewed'):
-                employees[eid]['converted_count'] += count
-                employees[eid]['renewed_count'] += count
-            elif stage == 'renewed directly':
-                employees[eid]['converted_count'] += count
-                employees[eid]['renewed_directly_count'] += count
-            elif stage == 'end date changed':
-                employees[eid]['end_date_changed_count'] += count
-            elif stage == 'priced':
-                employees[eid]['priced_count'] += count
-                employees[eid]['in_progress_count'] += count
-            elif stage in ('callback', 'not answered', 'broker in place', 'email only', 'complaint', 'incorrect supplier'):
-                employees[eid]['in_progress_count'] += count
-            elif stage in ('lost', 'lost cot', 'invalid number', 'meter de-energised'):
-                employees[eid]['lost_count'] += count
-            else:
-                employees[eid]['not_contacted_count'] += count
-
-        output = []
-        for emp in employees.values():
-            total = emp['total_contacts'] or 0
-            converted = emp['converted_count'] or 0
-            conversion_rate = round((converted / total) * 100) if total > 0 else 0
-            daily_target = 180 if emp.get('role_id') == OFFSHORE_ROLE_ID else 100
-            goal_target = daily_target * goal_multiplier
-            goal_achieved = total
-            goal_progress_pct = round((goal_achieved / goal_target) * 100, 1) if goal_target > 0 else 0
-
-            output.append({
-                'employee_id': emp['employee_id'],
-                'employee_name': emp['employee_name'],
-                'role_id': emp.get('role_id'),
-                'total_contacts': total,
-                'converted_count': converted,
-                'renewed_count': converted,
-                'in_progress_count': emp['in_progress_count'],
-                'not_contacted_count': emp['not_contacted_count'],
-                'lost_count': emp['lost_count'],
-                'renewed_directly_count': emp['renewed_directly_count'],
-                'end_date_changed_count': emp['end_date_changed_count'],
-                'priced_count': emp['priced_count'],
-                'conversion_rate': conversion_rate,
-                'goal_target': goal_target,
-                'goal_achieved': goal_achieved,
-                'goal_progress_pct': min(100, max(0, goal_progress_pct)),
-                'goal_hit': goal_achieved >= goal_target,
-                'period': period,
-            })
-
-        output.sort(key=lambda x: x['employee_name'].lower())
-        return jsonify(output), 200
+        return jsonify(response), 200
 
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
-
 
 @crm_bp.route('/leads/stats-by-employee', methods=['GET'])
 @token_required
@@ -2590,7 +2428,6 @@ def get_leads_stats_by_employee():
         current_user = request.current_user
         role_name = getattr(current_user, 'role', None)
 
-        # ✅ Only platform admins can see team overview
         if not is_crm_leads_admin_role(role_name):
             return jsonify({'stats': []}), 200
 
@@ -2612,8 +2449,7 @@ def get_leads_stats_by_employee():
             .filter(Opportunity_Details.service_id == service_id)
             .filter(Opportunity_Details.opportunity_owner_employee_id.isnot(None))
             .filter((Opportunity_Details.is_draft == False) | (Opportunity_Details.is_draft.is_(None)))
-            .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
-            # ✅ Exclude soft-deleted
+            # ✅ REMOVED is_allocated filter
             .filter(
                 (Client_Master.is_deleted.is_(None)) |
                 (Client_Master.is_deleted == False)
@@ -2624,16 +2460,10 @@ def get_leads_stats_by_employee():
             .all()
         )
 
-        stats = [
-            {
-                'employee_id': r.employee_id,
-                'employee_name': r.employee_name,
-                'count': int(r.count or 0),
-            }
+        return jsonify({'stats': [
+            {'employee_id': r.employee_id, 'employee_name': r.employee_name, 'count': int(r.count or 0)}
             for r in rows
-        ]
-
-        return jsonify({'stats': stats}), 200
+        ]}), 200
 
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -2678,47 +2508,34 @@ def get_leads_stats_by_employee_detailed():
             )
             .filter(Opportunity_Details.service_id == service_id)
             .filter(Opportunity_Details.opportunity_owner_employee_id.isnot(None))
-            .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
+            # ✅ REMOVED is_allocated filter
         )
 
         if only_employee_id:
             query = query.filter(Opportunity_Details.opportunity_owner_employee_id == only_employee_id)
 
         query = query.group_by(
-            Employee_Master.employee_id,
-            Employee_Master.employee_name,
+            Employee_Master.employee_id, Employee_Master.employee_name,
             func.coalesce(Stage_Master.stage_name, 'Unknown')
-        )
-        query = query.having(func.count(Opportunity_Details.opportunity_id) > 0)
+        ).having(func.count(Opportunity_Details.opportunity_id) > 0)
         query = query.order_by(Employee_Master.employee_name.asc(), func.count(Opportunity_Details.opportunity_id).desc())
 
         rows = query.all()
-
         grouped = {}
         for r in rows:
             eid = r.employee_id
             if eid is None:
                 continue
             if eid not in grouped:
-                grouped[eid] = {
-                    'employee_id': eid,
-                    'employee_name': r.employee_name or '—',
-                    'total': 0,
-                    'by_stage': [],
-                }
+                grouped[eid] = {'employee_id': eid, 'employee_name': r.employee_name or '—', 'total': 0, 'by_stage': []}
             c = int(r.cnt or 0)
-            grouped[eid]['by_stage'].append({
-                'stage_name': r.stage_name or 'Unknown',
-                'count': c,
-            })
+            grouped[eid]['by_stage'].append({'stage_name': r.stage_name or 'Unknown', 'count': c})
             grouped[eid]['total'] += c
 
         for v in grouped.values():
             v['by_stage'].sort(key=lambda x: -x['count'])
 
-        employees = sorted(grouped.values(), key=lambda x: -x['total'])
-
-        return jsonify({'employees': employees}), 200
+        return jsonify({'employees': sorted(grouped.values(), key=lambda x: -x['total'])}), 200
 
     except Exception as e:
         import traceback; traceback.print_exc()

@@ -998,6 +998,7 @@ def update_energy_customer(client_id):
                     )
                     session.add(new_contract)
                     session.flush()
+                    new_contract.include_in_payment_checker = True
 
                     # 5. Log history on both old and new records
                     change_note = (
@@ -2559,6 +2560,7 @@ def energy_client_callback(client_id):
                 )
                 session.add(new_contract)
                 session.flush()
+                new_contract.include_in_payment_checker = True
 
                 # 5. Interaction notes on both records via raw SQL
                 change_note = (

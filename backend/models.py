@@ -297,6 +297,7 @@ class Energy_Contract_Master(Base):
     aggregator = Column(String(255))
     rate_1 = Column(Numeric(10, 4))
     payment_type = Column(String(50))
+    include_in_payment_checker = Column(Boolean, default=False)
 
 
 class Opportunity_Details(Base):

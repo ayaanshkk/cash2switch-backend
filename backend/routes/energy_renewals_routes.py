@@ -1078,138 +1078,107 @@ def debug_statuses():
 @renewals_bp.route('/api/crm/leads/staff-performance', methods=['GET'])
 @token_required
 def get_leads_staff_performance():
-    """
-    Leads staff performance - role_id 2, 3, 5 (local + offshore)
-    Returns 4 categories: Converted, In Progress, Not Contacted, Lost
-    Uses exact stage names from database
-    """
+    period = request.args.get('period', 'daily').strip().lower()
+    print(f"🚀 RENEWALS_BP CALLED - period={period}", flush=True)
     session = SessionLocal()
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
         if not tenant_id:
             return jsonify({'error': 'Tenant not found'}), 400
- 
+
         employee_id = request.args.get('employee_id', type=int)
-        
-        print(f"\n{'='*80}")
-        print(f"🔍 LEADS STAFF PERFORMANCE REQUEST")
-        print(f"{'='*80}")
-        print(f"Tenant ID: {tenant_id}")
-        print(f"Employee ID filter: {employee_id}")
-        print(f"{'='*80}\n")
- 
+        period = request.args.get('period', 'daily').strip().lower()
+
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        if period == 'weekly':
+            start_dt = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == 'monthly':
+            start_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        elif period == 'alltime':
+            start_dt = None  # ✅ no date filter
+        else:  # daily
+            start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt = now
+
         employee_filter = ""
         if employee_id:
             employee_filter = " AND em.employee_id = :employee_id "
-        
-        # Get employees with role 2, 3, 5 (includes offshore)
+
         all_emp_sql = """
-            SELECT DISTINCT
-                em.employee_id,
-                em.employee_name
+            SELECT DISTINCT em.employee_id, em.employee_name
             FROM "StreemLyne_MT"."Employee_Master" em
-            INNER JOIN "StreemLyne_MT"."User_Master" um
-                ON em.employee_id = um.employee_id
-            INNER JOIN "StreemLyne_MT"."User_Role_Mapping" urm
-                ON um.user_id = urm.user_id
+            INNER JOIN "StreemLyne_MT"."User_Master" um ON em.employee_id = um.employee_id
+            INNER JOIN "StreemLyne_MT"."User_Role_Mapping" urm ON um.user_id = urm.user_id
             WHERE em.tenant_id = :tenant_id
             AND urm.role_id IN (2, 3, 5)
-        """ + employee_filter + """
-            ORDER BY em.employee_name
-        """
-        
+        """ + employee_filter + " ORDER BY em.employee_name"
+
         params = {'tenant_id': tenant_id}
         if employee_id:
             params['employee_id'] = employee_id
-            
+
         all_employees = session.execute(text(all_emp_sql), params).fetchall()
-        
-        print(f"✅ Found {len(all_employees)} employees with roles 2, 3, 5\n")
-        
+
+        # ✅ Only add date filter when not alltime
+        period_filter = ""
+        if start_dt is not None:
+            period_filter = """
+                AND EXISTS (
+                    SELECT 1 FROM "StreemLyne_MT"."Client_Interactions" ci
+                    WHERE ci.client_id = od.client_id
+                    AND ci.created_at >= :start_dt
+                    AND ci.created_at < :end_dt
+                )
+            """
+
+        stats_query = f"""
+            SELECT 
+                COUNT(DISTINCT od.opportunity_id) as total_contacts,
+                SUM(CASE WHEN sm.stage_name IN (
+                    'Already Renewed', 'Renewed Directly', 'End Date Changed', 'Won', 'Priced'
+                ) THEN 1 ELSE 0 END) as converted_count,
+                SUM(CASE WHEN sm.stage_name IN (
+                    'Callback', 'Not Answered', 'Email Only'
+                ) THEN 1 ELSE 0 END) as in_progress_count,
+                SUM(CASE WHEN sm.stage_name IN ('Not Called', 'Lead') OR sm.stage_name IS NULL
+                    THEN 1 ELSE 0 END) as not_contacted_count,
+                SUM(CASE WHEN sm.stage_name IN (
+                    'Lost', 'Lost COT', 'Broker in Place', 'Invalid Number', 'Incorrect Supplier'
+                ) THEN 1 ELSE 0 END) as lost_count
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
+            WHERE od.tenant_id = :tenant_id
+            AND od.opportunity_owner_employee_id = :emp_id
+            AND (sm.stage_type = 1 OR sm.stage_type IS NULL)
+            {period_filter}
+        """
+
         results = []
         for emp in all_employees:
             emp_id = emp.employee_id
             emp_name = emp.employee_name
-            
-            # ✅ Using EXACT stage names from your database
-            stats_query = """
-                SELECT 
-                    COUNT(*) as total_contacts,
-                    
-                    -- Converted: All success outcomes
-                    SUM(CASE 
-                        WHEN sm.stage_name IN (
-                            'Already Renewed',
-                            'Renewed Directly',
-                            'End Date Changed',
-                            'Won',
-                            'Priced'
-                        )
-                        THEN 1 ELSE 0 
-                    END) as converted_count,
-                    
-                    -- In Progress: Active engagement
-                    SUM(CASE 
-                        WHEN sm.stage_name IN (
-                            'Callback',
-                            'Not Answered',
-                            'Email Only'
-                        )
-                        THEN 1 ELSE 0 
-                    END) as in_progress_count,
-                    
-                    -- Not Contacted: Never reached out or just imported
-                    SUM(CASE 
-                        WHEN sm.stage_name IN ('Not Called', 'Lead') OR sm.stage_name IS NULL
-                        THEN 1 ELSE 0 
-                    END) as not_contacted_count,
-                    
-                    -- Lost: All failure outcomes
-                    SUM(CASE 
-                        WHEN sm.stage_name IN (
-                            'Lost',
-                            'Lost COT',
-                            'Broker in Place',
-                            'Invalid Number',
-                            'Incorrect Supplier'
-                        )
-                        THEN 1 ELSE 0 
-                    END) as lost_count
-                    
-                FROM "StreemLyne_MT"."Opportunity_Details" od
-                LEFT JOIN "StreemLyne_MT"."Stage_Master" sm ON od.stage_id = sm.stage_id
-                WHERE od.tenant_id = :tenant_id
-                AND od.opportunity_owner_employee_id = :emp_id
-                AND (sm.stage_type = 1 OR sm.stage_type IS NULL)
-            """
-            
-            stats_result = session.execute(
-                text(stats_query), 
-                {'tenant_id': tenant_id, 'emp_id': emp_id}
-            ).fetchone()
-            
+
+            query_params = {'tenant_id': tenant_id, 'emp_id': emp_id}
+            if start_dt is not None:
+                query_params['start_dt'] = start_dt
+                query_params['end_dt'] = end_dt
+
+            stats_result = session.execute(text(stats_query), query_params).fetchone()
+
             total = stats_result.total_contacts or 0
             converted = stats_result.converted_count or 0
             in_progress = stats_result.in_progress_count or 0
             not_contacted = stats_result.not_contacted_count or 0
             lost = stats_result.lost_count or 0
-            
-            # ✅ FIX: Conversion = Converted / Total (with proper decimal handling)
             conversion_rate = round((converted / total * 100), 1) if total > 0 else 0.0
-            
-            print(f"   📊 {emp_name}:")
-            print(f"      Total: {total}")
-            print(f"      Converted: {converted} ({conversion_rate}%)")
-            print(f"      In Progress: {in_progress}")
-            print(f"      Not Contacted: {not_contacted}")
-            print(f"      Lost: {lost}")
-            
+
             results.append({
                 'employee_id': emp_id,
                 'employee_name': emp_name,
                 'total_contacts': total,
                 'converted_count': converted,
-                'renewed_count': converted,  # Frontend uses 'renewed_count'
+                'renewed_count': converted,
                 'conversion_rate': conversion_rate,
                 'in_progress_count': in_progress,
                 'not_contacted_count': not_contacted,
@@ -1218,15 +1187,13 @@ def get_leads_staff_performance():
                 'renewed_directly_count': 0,
                 'end_date_changed_count': 0,
                 'priced_count': 0,
+                'period': period,
             })
-        
-        print(f"\n✅ Returning {len(results)} leads performance records\n")
+
         return jsonify(results)
-        
+
     except Exception as e:
-        print(f"❌ Error in leads staff performance: {e}")
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
