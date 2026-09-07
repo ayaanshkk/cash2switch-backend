@@ -294,6 +294,8 @@ def get_energy_customers():
         service_param = request.args.get('service', 'electricity').strip().lower()
         service_id = 2 if service_param == 'water' else 1
         include_payments = request.args.get('include_payments', 'false').lower() == 'true'
+        page = int(request.args.get('page', 1))
+        page_size = int(request.args.get('page_size', 50))
 
         current_app.logger.info(
             f"🔍 get_energy_customers: tenant={tenant_id} service={service_param} include_payments={include_payments}"
@@ -328,9 +330,10 @@ def get_energy_customers():
             # Payment checker: show all tenant records including archived, no employee restriction
             pass
         else:
-            # Normal renewals list: exclude archived, respect field sales restriction
+            # Normal renewals list: exclude archived
             query = query.filter(Client_Master.is_archived == False)
-            if _is_field_sales_user(session, request.current_user):
+            # Only platform admins see everyone's renewals — all others see only their own
+            if not _renewals_clients_see_entire_tenant(request.current_user):
                 query = query.filter(
                     Project_Details.assigned_employee_id == request.current_user.employee_id
                 )
@@ -343,8 +346,17 @@ def get_energy_customers():
             Client_Master.created_at.desc()
         )
 
-        rows = query.all()
-        current_app.logger.info(f"✅ get_energy_customers: {len(rows)} rows returned")
+        total = query.count()
+        rows = (
+            query
+            .order_by(
+                Client_Master.display_order.asc().nullslast(),
+                Client_Master.created_at.desc()
+            )
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
 
         results = []
         for client, project, contract, interaction, supplier, employee in rows:
@@ -353,12 +365,19 @@ def get_energy_customers():
                 old_supplier = session.query(Supplier_Master).filter_by(
                     supplier_id=contract.old_supplier_id
                 ).first()
-
             results.append(build_customer_response(
                 client, project, contract, None, interaction, supplier, employee, old_supplier
             ))
 
-        return jsonify(results), 200
+        return jsonify({
+            'data': results,
+            'pagination': {
+                'page': page,
+                'page_size': page_size,
+                'total': total,
+                'total_pages': (total + page_size - 1) // page_size,
+            }
+        }), 200
 
     except Exception as e:
         current_app.logger.exception(f"❌ get_energy_customers error: {e}")
