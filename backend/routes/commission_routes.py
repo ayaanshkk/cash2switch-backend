@@ -1610,8 +1610,8 @@ def create_commission_payment_receipt(payment_id: str):
     except Exception:
         return jsonify({'error': 'amount_received must be a valid number'}), 400
 
-    if amount_received <= 0:
-        return jsonify({'error': 'amount_received must be greater than 0'}), 400
+    if amount_received == 0:
+        return jsonify({'error': 'amount_received cannot be zero'}), 400
 
     date_received, date_error = _parse_date(data.get('date_received'), 'date_received')
     if date_error:
@@ -1684,8 +1684,8 @@ def update_commission_payment_receipt(payment_id: str, receipt_id: str):
     except Exception:
         return jsonify({'error': 'amount_received must be a valid number'}), 400
 
-    if amount_received <= 0:
-        return jsonify({'error': 'amount_received must be greater than 0'}), 400
+    if amount_received == 0:
+        return jsonify({'error': 'amount_received cannot be zero'}), 400
 
     date_received, date_error = _parse_date(data.get('date_received'), 'date_received')
     if date_error:
@@ -1718,6 +1718,7 @@ def update_commission_payment_receipt(payment_id: str, receipt_id: str):
         receipt.amount_received = amount_received
         receipt.date_received = date_received
         receipt.notes = (data.get('notes') or '').strip() or None
+        session.flush()
 
         _sync_agent_commission_items_for_receipt(session, receipt)
         _refresh_payment_totals_from_receipts(session, payment)
