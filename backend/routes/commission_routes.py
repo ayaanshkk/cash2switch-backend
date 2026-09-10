@@ -1501,7 +1501,6 @@ def list_commission_payments():
             .order_by(asc(Employee_Master.employee_name), asc(Employee_Master.employee_id))
             .all()
         )
-        s_expected, s_received, s_outstanding = summary_query.one()
 
         aggregators = (
             session.query(Commission_Payment.aggregator)
@@ -1822,6 +1821,14 @@ def list_clients_with_payments():
     search = (request.args.get('search') or '').strip()
     supplier_id = request.args.get('supplier')
     employee_id = request.args.get('agent')
+    status_filter = (request.args.get('status') or '').strip()
+    aggregator_filter = (request.args.get('aggregator') or '').strip()
+    due_from, due_from_error = _parse_date(request.args.get('due_from'), 'due_from')
+    due_to, due_to_error = _parse_date(request.args.get('due_to'), 'due_to')
+    if due_from_error:
+        return jsonify({'error': due_from_error}), 400
+    if due_to_error:
+        return jsonify({'error': due_to_error}), 400
 
     session = SessionLocal()
     try:
@@ -1848,6 +1855,61 @@ def list_clients_with_payments():
                 ),
             )
         )
+
+        # Apply status/aggregator/date filters by restricting to contracts
+        # that have at least one matching Commission_Payment
+        if status_filter and status_filter in PAYMENT_STATUSES:
+            matching_contracts = (
+                session.query(Commission_Payment.contract_id)
+                .filter(
+                    Commission_Payment.tenant_id == tenant_id,
+                    Commission_Payment.status == status_filter,
+                    _not_old_payment_filter(),
+                )
+                .subquery()
+            )
+            query = query.filter(
+                Energy_Contract_Master.energy_contract_master_id.in_(matching_contracts)
+            )
+        if aggregator_filter:
+            matching_contracts_agg = (
+                session.query(Commission_Payment.contract_id)
+                .filter(
+                    Commission_Payment.tenant_id == tenant_id,
+                    Commission_Payment.aggregator == aggregator_filter,
+                    _not_old_payment_filter(),
+                )
+                .subquery()
+            )
+            query = query.filter(
+                Energy_Contract_Master.energy_contract_master_id.in_(matching_contracts_agg)
+            )
+        if due_from:
+            matching_contracts_from = (
+                session.query(Commission_Payment.contract_id)
+                .filter(
+                    Commission_Payment.tenant_id == tenant_id,
+                    Commission_Payment.due_date >= due_from,
+                    _not_old_payment_filter(),
+                )
+                .subquery()
+            )
+            query = query.filter(
+                Energy_Contract_Master.energy_contract_master_id.in_(matching_contracts_from)
+            )
+        if due_to:
+            matching_contracts_to = (
+                session.query(Commission_Payment.contract_id)
+                .filter(
+                    Commission_Payment.tenant_id == tenant_id,
+                    Commission_Payment.due_date <= due_to,
+                    _not_old_payment_filter(),
+                )
+                .subquery()
+            )
+            query = query.filter(
+                Energy_Contract_Master.energy_contract_master_id.in_(matching_contracts_to)
+            )
 
         if supplier_id:
             try:
@@ -1891,46 +1953,55 @@ def list_clients_with_payments():
         ]
         payments_by_contract: dict = {}
         if contract_ids:
-            payment_rows = (
+            payment_query = (
                 session.query(Commission_Payment)
                 .filter(
                     Commission_Payment.contract_id.in_(contract_ids),
                     Commission_Payment.tenant_id == tenant_id,
                     _not_old_payment_filter(),
                 )
-                .all()
             )
+            if status_filter and status_filter in PAYMENT_STATUSES:
+                payment_query = payment_query.filter(Commission_Payment.status == status_filter)
+            if aggregator_filter:
+                payment_query = payment_query.filter(Commission_Payment.aggregator == aggregator_filter)
+            if due_from:
+                payment_query = payment_query.filter(Commission_Payment.due_date >= due_from)
+            if due_to:
+                payment_query = payment_query.filter(Commission_Payment.due_date <= due_to)
+            payment_rows = payment_query.all()
             for p in payment_rows:
                 payments_by_contract.setdefault(p.contract_id, []).append(p)
 
         # Auto-generate commission schedules for contracts with no payments
-        for _, project, ecm, _, _ in rows:
-            if not ecm:
-                continue
-            if ecm.energy_contract_master_id in payments_by_contract:
-                continue
-            try:
-                result = generate_commission_schedule_for_project(session, project.project_id)
-                if result.status == "created":
-                    session.commit()
-                    new_payments = (
-                        session.query(Commission_Payment)
-                        .filter(
-                            Commission_Payment.contract_id == ecm.energy_contract_master_id,
-                            Commission_Payment.tenant_id == tenant_id,
+        if not status_filter and not aggregator_filter and not due_from and not due_to:
+            for _, project, ecm, _, _ in rows:
+                if not ecm:
+                    continue
+                if ecm.energy_contract_master_id in payments_by_contract:
+                    continue
+                try:
+                    result = generate_commission_schedule_for_project(session, project.project_id)
+                    if result.status == "created":
+                        session.commit()
+                        new_payments = (
+                            session.query(Commission_Payment)
+                            .filter(
+                                Commission_Payment.contract_id == ecm.energy_contract_master_id,
+                                Commission_Payment.tenant_id == tenant_id,
+                            )
+                            .all()
                         )
-                        .all()
-                    )
-                    if new_payments:
-                        payments_by_contract[ecm.energy_contract_master_id] = new_payments
-                else:
+                        if new_payments:
+                            payments_by_contract[ecm.energy_contract_master_id] = new_payments
+                    else:
+                        session.rollback()
+                except Exception as gen_err:
                     session.rollback()
-            except Exception as gen_err:
-                session.rollback()
-                current_app.logger.warning(
-                    'Could not auto-generate commission schedule for project_id=%s: %s',
-                    project.project_id, gen_err
-                )
+                    current_app.logger.warning(
+                        'Could not auto-generate commission schedule for project_id=%s: %s',
+                        project.project_id, gen_err
+                    )
 
         # Fetch suppliers for filter options
         suppliers = (
@@ -1958,6 +2029,9 @@ def list_clients_with_payments():
             if not ecm:
                 continue
             contract_payments = payments_by_contract.get(ecm.energy_contract_master_id, [])
+            # Skip contracts with no matching payments when filters are active
+            if (status_filter or aggregator_filter or due_from or due_to) and not contract_payments:
+                continue
             total_expected = sum(Decimal(str(p.expected_net_amount or 0)) for p in contract_payments)
             total_received = sum(Decimal(str(p.amount_received or 0)) for p in contract_payments)
             total_outstanding = sum(Decimal(str(p.outstanding_amount or 0)) for p in contract_payments)
@@ -2026,6 +2100,7 @@ def list_clients_with_payments():
                 Energy_Contract_Master.mpan_number.ilike(search_pattern),
                 Energy_Contract_Master.mpan_bottom.ilike(search_pattern),
             ))
+
         s_expected, s_received, s_outstanding = summary_query.one()
 
         aggregators = (
