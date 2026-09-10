@@ -1630,9 +1630,7 @@ def create_commission_payment_receipt(payment_id: str):
         )
         if not payment:
             return jsonify({'error': 'Commission payment not found'}), 404
-        if payment.status == 'Closed':
-            return jsonify({'error': 'Closed commission payments cannot receive receipts'}), 400
-
+            
         receipt = Commission_Payment_Receipt(
             commission_payment_id=payment.id,
             tenant_id=payment.tenant_id,
