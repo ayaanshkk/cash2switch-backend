@@ -1999,13 +1999,33 @@ def list_clients_with_payments():
             .join(Energy_Contract_Master, Commission_Payment.contract_id == Energy_Contract_Master.energy_contract_master_id)
             .join(Project_Details, Energy_Contract_Master.project_id == Project_Details.project_id)
             .join(Client_Master, Project_Details.client_id == Client_Master.client_id)
+            .outerjoin(Supplier_Master, Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id)
+            .outerjoin(Employee_Master, Project_Details.assigned_employee_id == Employee_Master.employee_id)
             .filter(
                 Commission_Payment.tenant_id == tenant_id,
                 Client_Master.tenant_id == tenant_id,
-                Client_Master.is_deleted == False,
+                Energy_Contract_Master.include_in_payment_checker == True,
+                or_(
+                    Energy_Contract_Master.contract_start_date.is_(None),
+                    Energy_Contract_Master.contract_start_date >= date(2022, 1, 1),
+                ),
                 _not_old_payment_filter(),
             )
         )
+        if supplier_id:
+            summary_query = summary_query.filter(Energy_Contract_Master.supplier_id == int(supplier_id))
+        if employee_id:
+            summary_query = summary_query.filter(Project_Details.assigned_employee_id == int(employee_id))
+        if search:
+            search_pattern = f'%{search}%'
+            summary_query = summary_query.filter(or_(
+                Client_Master.client_company_name.ilike(search_pattern),
+                Client_Master.client_contact_name.ilike(search_pattern),
+                Supplier_Master.supplier_company_name.ilike(search_pattern),
+                Employee_Master.employee_name.ilike(search_pattern),
+                Energy_Contract_Master.mpan_number.ilike(search_pattern),
+                Energy_Contract_Master.mpan_bottom.ilike(search_pattern),
+            ))
         s_expected, s_received, s_outstanding = summary_query.one()
 
         aggregators = (
