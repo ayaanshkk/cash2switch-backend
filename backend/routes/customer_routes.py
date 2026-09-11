@@ -1139,107 +1139,80 @@ def update_energy_customer(client_id):
 def delete_energy_customer(client_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
- 
+
     session = SessionLocal()
+
     try:
         tenant_id = get_tenant_id_from_user(request.current_user)
- 
-        # ✅ Try multiple ID fields (display_order, tenant_client_id, client_id)
+
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+
+        # Find customer using any of the supported ID fields
         client = (
-            session.query(Client_Master).filter(
-                and_(
+            session.query(Client_Master)
+            .filter(
+                Client_Master.tenant_id == tenant_id,
+                or_(
                     Client_Master.display_order == client_id,
-                    Client_Master.tenant_id == tenant_id
-                )
-            ).first() or
-            session.query(Client_Master).filter(
-                and_(
                     Client_Master.tenant_client_id == client_id,
-                    Client_Master.tenant_id == tenant_id
+                    Client_Master.client_id == client_id
                 )
-            ).first() or
-            session.query(Client_Master).filter(
-                and_(
-                    Client_Master.client_id == client_id,
-                    Client_Master.tenant_id == tenant_id
-                )
-            ).first()
+            )
+            .first()
         )
- 
+
         if not client:
-            current_app.logger.warning(f"Customer {client_id} not found for deletion")
-            return jsonify({'error': 'Customer not found'}), 404
-        
-        # ✅ Soft delete the customer (move to recycle bin)
+            current_app.logger.warning(
+                f"Customer {client_id} not found for deletion"
+            )
+            return jsonify({
+                'success': False,
+                'error': 'Customer not found'
+            }), 404
+
+        # Actual database client ID
         actual_client_id = client.client_id
-        
-        # Get reason from request body if provided
+
+        # Get deletion reason
         try:
             data = request.get_json(silent=True) or {}
-            deletion_reason = data.get('reason', 'Manually deleted')
+            deletion_reason = data.get(
+                'reason',
+                'Manually deleted'
+            )
         except Exception:
             deletion_reason = 'Manually deleted'
-        
+
         # Soft delete
         client.is_deleted = True
         client.deleted_at = datetime.utcnow()
         client.deleted_reason = deletion_reason
 
         session.commit()
-        
-        current_app.logger.info(f"✅ Soft deleted customer {actual_client_id}")
-        
+
+        current_app.logger.info(
+            f"✅ Soft deleted customer {actual_client_id}"
+        )
+
         return jsonify({
             'success': True,
-            'message': 'Customer moved to recycle bin successfully'
+            'message': 'Customer moved to recycle bin successfully',
+            'client_id': actual_client_id
         }), 200
-        
+
     except Exception as e:
         session.rollback()
-        current_app.logger.exception(f"❌ Error deleting customer {client_id}: {e}")
-        return jsonify({'error': f'Failed to delete customer: {str(e)}'}), 500
-    finally:
-        session.close()
 
-@energy_customer_bp.route('/energy-clients/init-data', methods=['GET', 'OPTIONS'])
-@token_required
-def get_init_data():
-    """Single endpoint to fetch suppliers, employees, and stages in one DB round-trip."""
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-
-    session = SessionLocal()
-    try:
-        tenant_id = get_tenant_id_from_user(request.current_user)
-        if not tenant_id:
-            return jsonify({'error': 'Tenant not found'}), 400
-
-        suppliers = session.query(Supplier_Master).order_by(Supplier_Master.supplier_company_name).all()
-        employees = session.query(Employee_Master).filter_by(tenant_id=tenant_id).order_by(Employee_Master.employee_name).all()
-        stages = session.query(Stage_Master).order_by(Stage_Master.stage_id).all()
+        current_app.logger.exception(
+            f"❌ Error deleting customer {client_id}: {e}"
+        )
 
         return jsonify({
-            'suppliers': [{
-                'supplier_id': s.supplier_id,
-                'supplier_name': s.supplier_company_name,
-                'provisions': s.supplier_provisions,
-                'provisions_text': {0: 'Generic', 1: 'Electricity Only', 2: 'Gas Only', 3: 'Electricity & Gas'}.get(s.supplier_provisions, 'Unknown')
-            } for s in suppliers],
-            'employees': [{
-                'employee_id': e.employee_id,
-                'employee_name': e.employee_name,
-                'email': e.email
-            } for e in employees],
-            'stages': [{
-                'stage_id': s.stage_id,
-                'stage_name': s.stage_name,
-                'description': s.stage_description
-            } for s in stages],
-        }), 200
+            'success': False,
+            'error': f'Failed to delete customer: {str(e)}'
+        }), 500
 
-    except Exception as e:
-        current_app.logger.exception(f"❌ Error fetching init data: {e}")
-        return jsonify({'error': 'Failed to fetch init data'}), 500
     finally:
         session.close()
 
