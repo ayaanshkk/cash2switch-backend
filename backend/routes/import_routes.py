@@ -108,10 +108,410 @@ def _get_raw_connection():
 
     return conn
 
+# ---------------------------------------------------------------------------
+# Missing field update — called when a duplicate MPAN is found
+# ---------------------------------------------------------------------------
+
+ENERGY_CLIENT_UPDATABLE_FIELDS = [
+    # (dict_key, Client_Master_column)
+    ('contact_person',  'client_contact_name'),
+    ('tel_no',          'client_phone'),
+    ('mobile_no',       'client_mobile'),
+    ('email',           'client_email'),
+    ('address',         'address'),
+    ('postcode',        'post_code'),
+    ('position',        'position'),
+    ('company_number',  'company_number'),
+    ('date_of_birth',   'date_of_birth'),
+    ('charity_ltd',     'charity_ltd_company_number'),
+    ('partner_details', 'partner_details'),
+    ('bank_name',       'bank_name'),
+    ('account_number',  'account_number'),
+    ('sort_code',       'sort_code'),
+    ('home_door',       'home_door_number'),
+    ('home_street',     'home_street'),
+    ('partner_dob',     'partner_dob'),
+    ('credit_score',    'credit_score'),
+]
+
+ENERGY_CONTRACT_UPDATABLE_FIELDS = [
+    # (dict_key, Energy_Contract_Master_column)
+    ('rate_1',        'rate_1'),
+    ('rate_2',        'rate_2'),
+    ('rate_3',        'rate_3'),
+    ('stand_charge',  'standing_charge'),
+    ('net_notch',     'net_notch'),
+    ('comms_paid',    'comms_paid'),
+    ('payment_type',  'payment_type'),
+    ('term_sold',     'term_sold'),
+    ('aggregator',    'aggregator'),
+    ('mpan_bottom',   'mpan_bottom'),
+]
+
+PROJECT_UPDATABLE_FIELDS = [
+    # (dict_key, Project_Details_column)
+    ('site_name',    'site_name'),
+    ('month_sold',   'month_sold'),
+    ('house_name',   'house_name'),
+    ('house_number', 'house_number'),
+    ('door_number',  'door_number'),
+    ('town',         'town'),
+    ('county',       'county'),
+    ('address',      'address'),
+    ('postcode',     'postcode'),
+]
+
+LEAD_UPDATABLE_FIELDS = [
+    # (dict_key, Opportunity_Details_column)
+    ('business',    'business_name'),
+    ('person',      'contact_person'),
+    ('tel',         'tel_number'),
+    ('mobile',      'mobile_no'),
+    ('email',       'email'),
+    ('postcode',    'postcode'),
+    ('address',     'address'),
+    ('start_d',     'start_date'),
+    ('end_d',       'end_date'),
+    ('payment',     'payment_type'),
+]
+
+LEAD_NUMERIC_UPDATABLE_FIELDS = [
+    # (list_key, Opportunity_Details_column)
+    ('usage',   'annual_usage'),
+    ('sc',      'stand_charge'),
+    ('r1',      'rate_1'),
+    ('r2',      'rate_2'),
+    ('r3',      'rate_3'),
+    ('nn',      'net_notch'),
+]
+
+
+def _update_missing_energy_fields(raw_conn, mpan_key: str, row: dict, tenant_id) -> bool:
+    """
+    For a duplicate MPAN, check Client_Master, Project_Details, and
+    Energy_Contract_Master for NULL/empty fields that the incoming row
+    has data for, and fill them in.
+    Returns True if any update was made.
+    """
+    cur = raw_conn.cursor()
+    updated = False
+
+    try:
+        # ── Fetch existing record ─────────────────────────────────────────────
+        cur.execute("""
+            SELECT
+                cm.client_id,
+                pd.project_id,
+                ecm.energy_contract_master_id,
+                cm.client_contact_name, cm.client_phone, cm.client_mobile,
+                cm.client_email, cm.address, cm.post_code, cm.position,
+                cm.company_number, cm.date_of_birth, cm.charity_ltd_company_number,
+                cm.partner_details, cm.bank_name, cm.account_number, cm.sort_code,
+                cm.home_door_number, cm.home_street, cm.partner_dob, cm.credit_score,
+                pd.site_name, pd.month_sold, pd.house_name, pd.house_number,
+                pd.door_number, pd.town, pd.county, pd.address, pd.postcode,
+                ecm.rate_1, ecm.rate_2, ecm.rate_3, ecm.standing_charge,
+                ecm.net_notch, ecm.comms_paid, ecm.payment_type, ecm.term_sold,
+                ecm.aggregator, ecm.mpan_bottom
+            FROM "StreemLyne_MT"."Energy_Contract_Master" ecm
+            JOIN "StreemLyne_MT"."Project_Details" pd
+                ON ecm.project_id = pd.project_id
+            JOIN "StreemLyne_MT"."Client_Master" cm
+                ON pd.client_id = cm.client_id
+            WHERE LOWER(TRIM(ecm.mpan_number)) = %s
+              AND cm.tenant_id = %s
+              AND cm.is_deleted = FALSE
+            LIMIT 1
+        """, (mpan_key, str(tenant_id)))
+
+        existing = cur.fetchone()
+        if not existing:
+            cur.close()
+            return False
+
+        (
+            client_id, project_id, contract_id,
+            db_contact, db_phone, db_mobile, db_email, db_address, db_postcode,
+            db_position, db_company_no, db_dob, db_charity, db_partner,
+            db_bank, db_account, db_sort, db_home_door, db_home_street,
+            db_partner_dob, db_credit,
+            db_site_name, db_month_sold, db_house_name, db_house_number,
+            db_door_number, db_town, db_county, db_proj_address, db_proj_postcode,
+            db_r1, db_r2, db_r3, db_sc, db_nn, db_comms,
+            db_payment, db_term, db_agg, db_mpan_bottom,
+        ) = existing
+
+        # ── Client_Master updates ─────────────────────────────────────────────
+        client_updates = {}
+        db_client_vals = {
+            'client_contact_name':       db_contact,
+            'client_phone':              db_phone,
+            'client_mobile':             db_mobile,
+            'client_email':              db_email,
+            'address':                   db_address,
+            'post_code':                 db_postcode,
+            'position':                  db_position,
+            'company_number':            db_company_no,
+            'date_of_birth':             db_dob,
+            'charity_ltd_company_number': db_charity,
+            'partner_details':           db_partner,
+            'bank_name':                 db_bank,
+            'account_number':            db_account,
+            'sort_code':                 db_sort,
+            'home_door_number':          db_home_door,
+            'home_street':               db_home_street,
+            'partner_dob':               db_partner_dob,
+            'credit_score':              db_credit,
+        }
+
+        for dict_key, col in ENERGY_CLIENT_UPDATABLE_FIELDS:
+            incoming = row.get(dict_key)
+            existing_val = db_client_vals.get(col)
+            if incoming and not existing_val:
+                client_updates[col] = incoming
+
+        if client_updates:
+            set_clause = ', '.join(f'"{k}" = %s' for k in client_updates)
+            vals = list(client_updates.values()) + [client_id]
+            cur.execute(
+                f'UPDATE "StreemLyne_MT"."Client_Master" SET {set_clause} WHERE client_id = %s',
+                vals
+            )
+            updated = True
+
+        # ── Project_Details updates ───────────────────────────────────────────
+        project_updates = {}
+        db_project_vals = {
+            'site_name':    db_site_name,
+            'month_sold':   db_month_sold,
+            'house_name':   db_house_name,
+            'house_number': db_house_number,
+            'door_number':  db_door_number,
+            'town':         db_town,
+            'county':       db_county,
+            'address':      db_proj_address,
+            'postcode':     db_proj_postcode,
+        }
+
+        for dict_key, col in PROJECT_UPDATABLE_FIELDS:
+            incoming = row.get(dict_key)
+            existing_val = db_project_vals.get(col)
+            if incoming and not existing_val:
+                project_updates[col] = incoming
+
+        if project_updates:
+            set_clause = ', '.join(f'"{k}" = %s' for k in project_updates)
+            vals = list(project_updates.values()) + [project_id]
+            cur.execute(
+                f'UPDATE "StreemLyne_MT"."Project_Details" SET {set_clause} WHERE project_id = %s',
+                vals
+            )
+            updated = True
+
+        # ── Energy_Contract_Master updates ────────────────────────────────────
+        contract_updates = {}
+        db_contract_vals = {
+            'rate_1':          db_r1,
+            'rate_2':          db_r2,
+            'rate_3':          db_r3,
+            'standing_charge': db_sc,
+            'net_notch':       db_nn,
+            'comms_paid':      db_comms,
+            'payment_type':    db_payment,
+            'term_sold':       db_term,
+            'aggregator':      db_agg,
+            'mpan_bottom':     db_mpan_bottom,
+        }
+
+        for dict_key, col in ENERGY_CONTRACT_UPDATABLE_FIELDS:
+            incoming = row.get(dict_key)
+            existing_val = db_contract_vals.get(col)
+            if incoming is not None and existing_val is None:
+                contract_updates[col] = incoming
+
+        if contract_updates:
+            set_clause = ', '.join(f'"{k}" = %s' for k in contract_updates)
+            vals = list(contract_updates.values()) + [contract_id]
+            cur.execute(
+                f'UPDATE "StreemLyne_MT"."Energy_Contract_Master" SET {set_clause} WHERE energy_contract_master_id = %s',
+                vals
+            )
+            updated = True
+
+        if updated:
+            raw_conn.commit()
+
+        cur.close()
+        return updated
+
+    except Exception as e:
+        raw_conn.rollback()
+        try:
+            cur.close()
+        except Exception:
+            pass
+        print(f"Missing field update failed for MPAN {mpan_key}: {str(e).split(chr(10))[0][:200]}")
+        return False
+
+
+def _update_missing_lead_fields(raw_conn, mpan_key: str, existing_entry: dict, row: dict, tenant_id) -> bool:
+    """
+    For a duplicate lead MPAN, check Opportunity_Details for NULL/empty
+    fields that the incoming row has data for, and fill them in.
+    Uses opportunity_id from the preloaded map for a precise update.
+    Returns True if any update was made.
+    """
+    cur = raw_conn.cursor()
+    updated = False
+
+    try:
+        # Use the preloaded opportunity_id if available, else fall back to MPAN lookup
+        opp_id = existing_entry.get('opportunity_id')
+
+        if opp_id:
+            cur.execute("""
+                SELECT
+                    opportunity_id,
+                    business_name, contact_person, tel_number, mobile_no,
+                    email, postcode, address, start_date, end_date,
+                    payment_type, annual_usage, stand_charge,
+                    rate_1, rate_2, rate_3, net_notch, supplier_id
+                FROM "StreemLyne_MT"."Opportunity_Details"
+                WHERE opportunity_id = %s
+                  AND tenant_id = %s
+                LIMIT 1
+            """, (opp_id, str(tenant_id)))
+        else:
+            cur.execute("""
+                SELECT
+                    opportunity_id,
+                    business_name, contact_person, tel_number, mobile_no,
+                    email, postcode, address, start_date, end_date,
+                    payment_type, annual_usage, stand_charge,
+                    rate_1, rate_2, rate_3, net_notch, supplier_id
+                FROM "StreemLyne_MT"."Opportunity_Details"
+                WHERE LOWER(TRIM(mpan_mpr)) = %s
+                  AND tenant_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (mpan_key, str(tenant_id)))
+
+        existing = cur.fetchone()
+        if not existing:
+            cur.close()
+            return False
+
+        (
+            opp_id,
+            db_business, db_contact, db_tel, db_mobile,
+            db_email, db_postcode, db_address, db_start, db_end,
+            db_payment, db_usage, db_sc,
+            db_r1, db_r2, db_r3, db_nn, db_supplier_id,
+        ) = existing
+
+        updates = {}
+
+        # String fields
+        str_field_map = {
+            'business_name':  (row.get('business'), db_business),
+            'contact_person': (row.get('person'),   db_contact),
+            'tel_number':     (row.get('tel'),       db_tel),
+            'mobile_no':      (row.get('mobile'),    db_mobile),
+            'email':          (row.get('email'),     db_email),
+            'postcode':       (row.get('postcode'),  db_postcode),
+            'address':        (row.get('address'),   db_address),
+            'payment_type':   (row.get('payment'),   db_payment),
+        }
+        for col, (incoming, existing_val) in str_field_map.items():
+            if incoming and not existing_val:
+                updates[col] = incoming
+
+        # Date fields
+        date_field_map = {
+            'start_date': (row.get('start_d'), db_start),
+            'end_date':   (row.get('end_d'),   db_end),
+        }
+        for col, (incoming, existing_val) in date_field_map.items():
+            if incoming and not existing_val:
+                updates[col] = incoming
+
+        # Numeric fields
+        numeric_field_map = {
+            'annual_usage': (row.get('usage'), db_usage),
+            'stand_charge': (row.get('sc'),    db_sc),
+            'rate_1':       (row.get('r1'),    db_r1),
+            'rate_2':       (row.get('r2'),    db_r2),
+            'rate_3':       (row.get('r3'),    db_r3),
+            'net_notch':    (row.get('nn'),    db_nn),
+        }
+        for col, (incoming, existing_val) in numeric_field_map.items():
+            if incoming is not None and existing_val is None:
+                updates[col] = incoming
+
+        # Supplier — only fill if missing
+        if row.get('supplier_id') and not db_supplier_id:
+            updates['supplier_id'] = row['supplier_id']
+
+        if updates:
+            set_clause = ', '.join(f'"{k}" = %s' for k in updates)
+            vals = list(updates.values()) + [opp_id]
+            cur.execute(
+                f'UPDATE "StreemLyne_MT"."Opportunity_Details" SET {set_clause} WHERE opportunity_id = %s',
+                vals
+            )
+            raw_conn.commit()
+            updated = True
+
+        cur.close()
+        return updated
+
+    except Exception as e:
+        raw_conn.rollback()
+        try:
+            cur.close()
+        except Exception:
+            pass
+        print(f"Missing lead field update failed for MPAN {mpan_key}: {str(e).split(chr(10))[0][:200]}")
+        return False
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _parse_address_components(addr1: str, addr2: str, addr3: str) -> dict:
+    """
+    Parse raw address lines into structured components.
+    
+    Rules:
+    - If addr1 starts with digits, the leading number becomes door_number
+      and the remainder becomes street
+    - addr2 and addr3 append to street if present
+    - Returns dict with keys: door_number, street
+    """
+    import re
+
+    door_number = ''
+    street_parts = []
+
+    if addr1:
+        # Check if addr1 starts with a number e.g. "119 MAIN ROAD"
+        m = re.match(r'^(\d+[A-Za-z]?)\s+(.+)$', addr1.strip())
+        if m:
+            door_number = m.group(1)
+            street_parts.append(m.group(2))
+        else:
+            street_parts.append(addr1)
+
+    if addr2:
+        street_parts.append(addr2)
+    if addr3:
+        street_parts.append(addr3)
+
+    street = ', '.join(p for p in street_parts if p and p.lower() != 'nan')
+
+    return {
+        'door_number': door_number or None,
+        'street':      street or None,
+    }
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -398,21 +798,26 @@ def _load_existing_mpans(raw_conn, tenant_id) -> dict:
 
 
 def _load_existing_lead_mpans(raw_conn, tenant_id) -> dict:
-    """Load existing lead MPANs AND energy contract MPANs for this tenant."""
+    """Load existing lead MPANs AND energy contract MPANs for this tenant.
+    Returns dict: mpan_lower -> { 'opportunity_id': int, 'owner_employee_id': int|None }
+    """
     cur = raw_conn.cursor()
     result = {}
 
     # From Opportunity_Details (leads)
     cur.execute("""
-        SELECT od.mpan_mpr
+        SELECT od.mpan_mpr, od.opportunity_id, od.opportunity_owner_employee_id
         FROM "StreemLyne_MT"."Opportunity_Details" od
         WHERE od.mpan_mpr IS NOT NULL 
           AND od.mpan_mpr != ''
           AND od.tenant_id = %s
     """, (str(tenant_id),))
-    for (mpan,) in cur.fetchall():
+    for (mpan, opp_id, owner_id) in cur.fetchall():
         if mpan:
-            result[mpan.strip().lower()] = True
+            result[mpan.strip().lower()] = {
+                'opportunity_id':      opp_id,
+                'owner_employee_id':   owner_id,
+            }
 
     # From Energy_Contract_Master (renewals) — cross-check against renewals DB too
     cur.execute("""
@@ -428,8 +833,11 @@ def _load_existing_lead_mpans(raw_conn, tenant_id) -> dict:
           AND cm.is_deleted = FALSE
     """, (str(tenant_id),))
     for (mpan,) in cur.fetchall():
-        if mpan:
-            result[mpan.strip().lower()] = True
+        if mpan and mpan.strip().lower() not in result:
+            result[mpan.strip().lower()] = {
+                'opportunity_id':    None,
+                'owner_employee_id': None,
+            }
 
     cur.close()
     return result
@@ -514,7 +922,7 @@ def _flush_energy_batch(
                 cid,
                 r['business_name'] or 'Renewal Contract',
                 'Imported renewal contract',
-                r['site_address'] or '',
+                r['street'] or r['site_address'] or r['address'] or '',
                 r['annual_usage'],
                 employee_id,
                 opportunity_owner_id,
@@ -527,7 +935,7 @@ def _flush_energy_batch(
                 r['door_number'],
                 r['town'],
                 r['county'],
-                None,   # status
+                None,
                 now,
                 now,
             )
@@ -744,6 +1152,21 @@ def _run_energy_import(
                 town           = safe_str(towns[i])
                 county         = safe_str(counties[i])
                 postcode       = safe_str(postcodes[i])
+
+                addr_components = _parse_address_components(addr1, addr2, addr3)
+                parsed_door     = addr_components['door_number']
+                parsed_street   = addr_components['street']
+
+                # Use parsed door number only if not already explicitly set
+                # from a dedicated door_number column in the sheet
+                if not door_number and parsed_door:
+                    door_number = parsed_door
+
+                # Full flat address for Client_Master.address (legacy joined string)
+                address_parts = [p for p in [parsed_street, town, county, postcode]
+                                 if p and p.lower() != 'nan']
+                address       = ', '.join(address_parts)
+                site_address  = site_name or parsed_street or address
                 mpan_top       = safe_str(mpan_tops[i])
                 mpan_bottom    = safe_str(mpan_bottoms[i])
                 supplier_name  = safe_str(suppliers[i])
@@ -799,6 +1222,49 @@ def _run_energy_import(
                             existing_end and end_date and end_date <= existing_end
                         )
                         if is_assigned_non_draft and (same_or_older or not end_date):
+                            # ── Try to fill missing fields before skipping ────
+                            _update_missing_energy_fields(
+                                raw_conn,
+                                mpan_top.strip().lower(),
+                                {
+                                    'contact_person':  contact_person,
+                                    'tel_no':          tel_no,
+                                    'mobile_no':       mobile_no,
+                                    'email':           email,
+                                    'address':         address,
+                                    'postcode':        postcode,
+                                    'position':        position,
+                                    'company_number':  company_number,
+                                    'date_of_birth':   dob,
+                                    'charity_ltd':     charity_no,
+                                    'partner_details': partner_det,
+                                    'bank_name':       bank_name,
+                                    'account_number':  ac_number,
+                                    'sort_code':       sort_code,
+                                    'home_door':       home_door,
+                                    'home_street':     home_street,
+                                    'partner_dob':     partner_dob,
+                                    'credit_score':    credit_score,
+                                    'site_name':       site_name,
+                                    'month_sold':      month_sold,
+                                    'house_name':      house_name,
+                                    'house_number':    house_number,
+                                    'door_number':     door_number,
+                                    'town':            town,
+                                    'county':          county,
+                                    'rate_1':          rate_1,
+                                    'rate_2':          rate_2,
+                                    'rate_3':          rate_3,
+                                    'stand_charge':    stand_charge,
+                                    'net_notch':       net_notch,
+                                    'comms_paid':      comms_paid,
+                                    'payment_type':    payment_type,
+                                    'term_sold':       term_sold,
+                                    'aggregator':      aggregator,
+                                    'mpan_bottom':     mpan_bottom,
+                                },
+                                tenant_id,
+                            )
                             duplicate_count += 1
                             continue
 
@@ -831,7 +1297,8 @@ def _run_energy_import(
                     'month_sold':      month_sold or None,
                     'house_name':      house_name or None,
                     'house_number':    house_number or None,
-                    'door_number':     door_number or None,
+                    'door_number':     door_number or parsed_door or None,   # ← explicit or parsed
+                    'street':          parsed_street or None,                # ← new
                     'town':            town or None,
                     'county':          county or None,
                     'supplier_id':     _resolve_supplier(supplier_name, suppliers_dict, raw_conn),
@@ -1018,6 +1485,11 @@ def _run_leads_import(
         l_supplier = vstr(col('supplier')).tolist()
         l_postcode = vstr(col('postcode')).tolist()
         l_payment  = vstr(col('payment_type')).tolist()
+        l_addr1    = vstr(col('address_line_1')).tolist()
+        l_addr2    = vstr(col('address_line_2')).tolist()
+        l_addr3    = vstr(col('address_line_3')).tolist()
+        l_town     = vstr(col('town')).tolist()
+        l_county   = vstr(col('county')).tolist()
 
         l_usage    = vnum(col('annual_usage')).tolist()
         l_sc       = vnum(col('stand_charge')).tolist()
@@ -1072,6 +1544,28 @@ def _run_leads_import(
                 payment     = l_payment[i]
                 start_d     = d_start[i]
                 end_d       = d_end[i]
+                addr1       = l_addr1[i]
+                addr2       = l_addr2[i]
+                addr3       = l_addr3[i]
+                town        = l_town[i]
+                county      = l_county[i]
+
+                # Build composite address string
+                addr1    = l_addr1[i]
+                addr2    = l_addr2[i]
+                addr3    = l_addr3[i]
+                town     = l_town[i]
+                county   = l_county[i]
+                postcode = l_postcode[i]
+
+                addr_components = _parse_address_components(addr1, addr2, addr3)
+                parsed_door     = addr_components['door_number']
+                parsed_street   = addr_components['street']
+
+                # Full flat address for storage
+                address_parts = [p for p in [parsed_street, town, county]
+                                 if p and p.lower() != 'nan']
+                address = ', '.join(address_parts)
 
                 # Skip empty rows
                 if not business and not tel and not mobile and not email and not mpan and not person:
@@ -1081,6 +1575,32 @@ def _run_leads_import(
                 if mpan:
                     mpan_key = mpan.strip().lower()
                     if mpan_key in existing_lead_mpans:
+                        # ── Try to fill missing fields before skipping ────────
+                        _update_missing_lead_fields(
+                            raw_conn,
+                            mpan_key,
+                            existing_lead_mpans[mpan_key],  # ← pass full entry, not just True
+                            {
+                                'business':    business,
+                                'person':      person,
+                                'tel':         tel,
+                                'mobile':      mobile,
+                                'email':       email,
+                                'postcode':    postcode,
+                                'address':     address,
+                                'start_d':     start_d,
+                                'end_d':       end_d,
+                                'payment':     payment,
+                                'usage':       nn_val(l_usage[i]),
+                                'sc':          nn_val(l_sc[i]),
+                                'r1':          nn_val(l_r1[i]),
+                                'r2':          nn_val(l_r2[i]),
+                                'r3':          nn_val(l_r3[i]),
+                                'nn':          nn_val(l_nn[i]),
+                                'supplier_id': suppliers_dict.get(sup_name.lower().strip()) if sup_name else None,
+                            },
+                            tenant_id,
+                        )
                         duplicate_count += 1
                         continue
 
@@ -1119,11 +1639,19 @@ def _run_leads_import(
                     ns(payment), ns(postcode),
                     is_draft_import,
                     tenant_opp_counter,
+                    ns(address) or None,
+                    ns(parsed_street) or None,  
+                    ns(town) or None,
+                    ns(county) or None,
+                    ns(parsed_door) or None,
                 ))
 
                 # Register MPAN immediately for intra-file dedup
                 if mpan:
-                    existing_lead_mpans[mpan.strip().lower()] = True
+                    existing_lead_mpans[mpan.strip().lower()] = {
+                        'opportunity_id':    None,   # not inserted yet at registration time
+                        'owner_employee_id': opportunity_owner_id,
+                    }
 
             except Exception as row_err:
                 error_count += 1
@@ -1219,7 +1747,7 @@ def _flush_leads_tuples(raw_conn, tuples):
              mpan_mpr, mpan_bottom, start_date, end_date, service_id,
              supplier_id, annual_usage, stand_charge, rate_1, rate_2,
              rate_3, net_notch, payment_type, postcode, is_draft,
-             tenant_opportunity_id)
+             tenant_opportunity_id, address, street, town, county, door_number)
             VALUES %s
             """,
             tuples,
@@ -1230,7 +1758,7 @@ def _flush_leads_tuples(raw_conn, tuples):
         cur.close()
 
         # ── DDL: re-enable trigger ────────────────────────────────────────────
-        raw_conn.commit()  # ensure clean state before autocommit switch
+        raw_conn.commit()
         raw_conn.autocommit = True
         cur = raw_conn.cursor()
         cur.execute("""
@@ -1243,7 +1771,6 @@ def _flush_leads_tuples(raw_conn, tuples):
         return len(tuples), 0
 
     except Exception as e:
-        # Restore safe state
         try:
             raw_conn.autocommit = False
         except Exception:
@@ -1252,7 +1779,6 @@ def _flush_leads_tuples(raw_conn, tuples):
             raw_conn.rollback()
         except Exception:
             pass
-        # Always re-enable trigger
         try:
             raw_conn.commit()
             raw_conn.autocommit = True
