@@ -3,6 +3,7 @@ import logging
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.pool import QueuePool
 
 load_dotenv()
 
@@ -37,23 +38,24 @@ if use_sqlite:
 else:
     engine = create_engine(
         DATABASE_URL,
-        pool_size=10,        # ✅ Increase from 2
-        max_overflow=10,     # ✅ Increase from 3 (20 total connections max)
-        pool_timeout=30,     # ✅ Increase from 20
-        pool_recycle=600,    # ✅ Recycle every 10 min
+        poolclass=QueuePool,
+        pool_size=5,
+        max_overflow=5,
+        pool_timeout=10,
+        pool_recycle=300,
         pool_pre_ping=True,
-
         connect_args={
-            "sslmode": "require",
-            "keepalives": 1,
-            "keepalives_idle": 30,
+            "sslmode":             "require",
+            "connect_timeout":     10,
+            "options":             "-c statement_timeout=20000",
+            "keepalives":          1,
+            "keepalives_idle":     30,
             "keepalives_interval": 10,
-            "keepalives_count": 3,
-            "connect_timeout": 10,
+            "keepalives_count":    3,
         },
-
         future=True,
     )
+
 
 @event.listens_for(engine, "connect")
 def set_search_path(dbapi_connection, connection_record):
@@ -80,22 +82,34 @@ Base = declarative_base()
 
 
 def get_db():
-    """Provide a transactional database session with automatic cleanup."""
     db = SessionLocal()
     try:
         yield db
     finally:
-        # Defensive close: session.close() itself can raise when the underlying
-        # connection is already dead (rollback on close fails). This prevents that
-        # from surfacing as a 500. With pool_pre_ping + pool_recycle this is rare.
         try:
             db.close()
         except Exception as e:
             logging.warning("Session close failed (stale connection — harmless): %s", e)
 
 
+def warmup_pool():
+    """Pre-open pool connections at startup so first requests aren't slow."""
+    if use_sqlite:
+        return
+    try:
+        conns = []
+        for _ in range(3):
+            conn = engine.connect()
+            conn.execute(text("SELECT 1"))
+            conns.append(conn)
+        for conn in conns:
+            conn.close()
+        logging.info("✅ DB connection pool warmed up (3 connections)")
+    except Exception as e:
+        logging.warning("Pool warmup failed (non-fatal): %s", e)
+
+
 def test_connection() -> bool:
-    """Quick DB connection test. Safe to call from /health endpoints."""
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -107,7 +121,6 @@ def test_connection() -> bool:
 
 
 def init_db():
-    """Initialize database tables."""
     try:
         from backend.models import (
             User, LoginAttempt, Session,
@@ -128,7 +141,6 @@ def init_db():
 
 
 def close_all_sessions():
-    """Close all active database sessions (for cleanup)."""
     try:
         engine.dispose()
         logging.info("All database connections closed")
@@ -141,26 +153,10 @@ def close_all_sessions():
 # ============================================
 
 def sync_sequence(table_name: str, column_name: str, schema: str = "StreemLyne_MT") -> int:
-    """
-    Synchronize a PostgreSQL sequence with the actual max ID in the table.
-    Fixes "duplicate key" errors caused by out-of-sync sequences after bulk imports.
-    
-    Args:
-        table_name: Name of the table (e.g., "Client_Interactions")
-        column_name: Name of the auto-increment column (e.g., "interaction_id")
-        schema: Database schema name (default: "StreemLyne_MT")
-    
-    Returns:
-        The new sequence value after sync
-    
-    Example:
-        >>> sync_sequence("Client_Interactions", "interaction_id")
-        3257
-    """
     if use_sqlite:
         logging.warning("Sequence sync not needed for SQLite")
         return 0
-    
+
     session = SessionLocal()
     try:
         result = session.execute(text(f"""
@@ -183,26 +179,10 @@ def sync_sequence(table_name: str, column_name: str, schema: str = "StreemLyne_M
 
 
 def sync_all_sequences() -> dict:
-    """
-    Sync all known sequences in the StreemLyne_MT schema.
-    Call this after bulk imports or when you encounter duplicate key errors.
-    
-    Returns:
-        Dictionary mapping table.column to new sequence values
-    
-    Example:
-        >>> results = sync_all_sequences()
-        >>> print(results)
-        {
-            'Client_Interactions.interaction_id': 3257,
-            'Opportunity_Details.opportunity_id': 12459,
-            ...
-        }
-    """
     if use_sqlite:
         logging.warning("Sequence sync not needed for SQLite")
         return {}
-    
+
     sequences_to_sync = [
         ("Client_Interactions", "interaction_id"),
         ("Opportunity_Details", "opportunity_id"),
@@ -216,7 +196,7 @@ def sync_all_sequences() -> dict:
         ("Role_Master", "role_id"),
         ("User_Master", "user_id"),
     ]
-    
+
     results = {}
     for table, column in sequences_to_sync:
         try:
@@ -225,62 +205,39 @@ def sync_all_sequences() -> dict:
         except Exception as e:
             results[f"{table}.{column}"] = f"ERROR: {str(e)}"
             logging.warning(f"Failed to sync {table}.{column}: {e}")
-    
+
     return results
 
 
 def safe_add_with_sequence_retry(session, obj, max_retries: int = 2):
-    """
-    Add an object to the session with automatic sequence sync on duplicate key errors.
-    
-    This is a safety wrapper for session.add() that handles the "duplicate key" error
-    by syncing the sequence and retrying the insert.
-    
-    Args:
-        session: SQLAlchemy session
-        obj: ORM object to add
-        max_retries: Maximum number of retry attempts (default: 2)
-    
-    Example:
-        >>> from backend.models import Client_Interactions
-        >>> interaction = Client_Interactions(client_id=123, ...)
-        >>> safe_add_with_sequence_retry(session, interaction)
-        >>> session.commit()
-    """
     if use_sqlite:
         session.add(obj)
         return
-    
+
     table_name = obj.__tablename__
-    
-    # Try to determine the primary key column
     pk_columns = [c.name for c in obj.__table__.primary_key.columns]
     if not pk_columns:
         session.add(obj)
         return
-    
-    pk_column = pk_columns[0]  # Assume first PK is the auto-increment
-    
+
+    pk_column = pk_columns[0]
+
     for attempt in range(max_retries + 1):
         try:
             session.add(obj)
             session.flush()
-            return  # Success
+            return
         except Exception as e:
             error_msg = str(e).lower()
             if 'duplicate key' in error_msg and attempt < max_retries:
                 logging.warning(f"⚠️ Duplicate key on {table_name} - syncing sequence (attempt {attempt + 1})")
                 session.rollback()
-                
-                # Sync the sequence
                 try:
                     sync_sequence(table_name, pk_column)
                 except Exception as sync_err:
                     logging.error(f"Sequence sync failed: {sync_err}")
-                    raise e  # Re-raise original error
-                
-                # Remove the object from the session and re-add it
+                    raise e
                 if obj in session:
                     session.expunge(obj)
             else:
-                raise  
+                raise

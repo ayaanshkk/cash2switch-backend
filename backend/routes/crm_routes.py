@@ -537,15 +537,26 @@ def get_leads():
         service_id = 2 if service_param.strip().lower() == 'water' else 1
         exclude_stage = request.args.get('exclude_stage', '')
 
-        user_id = getattr(current_user, 'id', None) or getattr(current_user, 'user_id', None)
+        # ── Pagination ──────────────────────────────────────────────────────
+        page      = max(int(request.args.get('page', 1) or 1), 1)
+        page_size = min(max(int(request.args.get('page_size', 50) or 50), 1), 200)
+        offset    = (page - 1) * page_size
+
+        # ── Server-side filters ─────────────────────────────────────────────
+        search_q        = (request.args.get('search', '') or '').strip().lower()
+        filter_supplier = request.args.get('supplier_id', type=int)
+        filter_status   = (request.args.get('status', '') or '').strip()
+        filter_end_date = (request.args.get('end_date_filter', '') or '').strip()
+        filter_employee = request.args.get('employee_id', type=int)
+
+        user_id     = getattr(current_user, 'id', None) or getattr(current_user, 'user_id', None)
         employee_id = getattr(current_user, 'employee_id', None)
-        role_name = getattr(current_user, 'role', None)
-        normalized_role = str(role_name).strip().lower() if role_name else None
-        admin_user = is_crm_leads_admin_role(role_name)
+        role_name   = getattr(current_user, 'role', None)
+        admin_user  = is_crm_leads_admin_role(role_name)
 
         current_app.logger.warning(
-            'crm.get_leads start tenant=%s user_id=%s employee_id=%s is_admin=%s role=%s service=%s exclude_stage=%s',
-            tenant_id, user_id, employee_id, admin_user, normalized_role, service_param, exclude_stage
+            'crm.get_leads start tenant=%s user_id=%s employee_id=%s is_admin=%s service=%s page=%s page_size=%s',
+            tenant_id, user_id, employee_id, admin_user, service_param, page, page_size
         )
 
         if local_demo_dashboard_enabled():
@@ -553,18 +564,129 @@ def get_leads():
             rows = dummy_leads_list(scoped_employee_id)
             if exclude_stage:
                 rows = [r for r in rows if (r.get('stage_name') or '').strip().lower() != exclude_stage.strip().lower()]
-            return jsonify(rows), 200
+            return jsonify({'data': rows, 'total': len(rows), 'page': 1, 'page_size': len(rows), 'team_stats': []}), 200
 
         if not admin_user and not employee_id:
-            current_app.logger.warning(
-                'crm.get_leads empty_result reason=no_employee_id tenant=%s user_id=%s',
-                tenant_id, user_id
-            )
-            return jsonify([]), 200
+            return jsonify({'data': [], 'total': 0, 'page': page, 'page_size': page_size, 'team_stats': []}), 200
 
         session = SessionLocal()
         try:
-            query = (
+            from datetime import date as pydate
+            from sqlalchemy import cast, Date as SADate
+
+            today = pydate.today()
+
+            def _apply_filters(q):
+                # Tenant scope
+                q = q.filter(
+                    (Opportunity_Details.tenant_id == tenant_id) |
+                    (
+                        (Opportunity_Details.client_id.isnot(None)) &
+                        (Client_Master.tenant_id == tenant_id)
+                    )
+                )
+                q = q.filter(Opportunity_Details.service_id == service_id)
+                q = q.filter(Opportunity_Details.opportunity_owner_employee_id.isnot(None))
+                q = q.filter((Opportunity_Details.is_draft == False) | (Opportunity_Details.is_draft.is_(None)))
+                q = q.filter((Client_Master.is_deleted.is_(None)) | (Client_Master.is_deleted == False))
+                q = q.filter(
+                    (Client_Master.client_id.is_(None)) |
+                    (Client_Master.is_archived.is_(None)) |
+                    (Client_Master.is_archived == False)
+                )
+
+                # Non-admin: own leads only
+                if not admin_user:
+                    q = q.filter(
+                        Opportunity_Details.opportunity_owner_employee_id == employee_id,
+                        (Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None))
+                    )
+
+                # Admin: optional salesperson filter
+                if admin_user and filter_employee:
+                    q = q.filter(Opportunity_Details.opportunity_owner_employee_id == filter_employee)
+
+                # Exclude stage using subquery (avoids full scan)
+                if exclude_stage:
+                    excluded_ids = (
+                        session.query(Stage_Master.stage_id)
+                        .filter(func.lower(Stage_Master.stage_name) == exclude_stage.lower())
+                        .scalar_subquery()
+                    )
+                    q = q.filter(
+                        (Opportunity_Details.stage_id.is_(None)) |
+                        (Opportunity_Details.stage_id != excluded_ids)
+                    )
+
+                # Status filter
+                if filter_status and filter_status != 'All':
+                    if filter_status.lower() in ('not called', 'lead'):
+                        q = q.filter(
+                            (Stage_Master.stage_name.is_(None)) |
+                            (func.lower(Stage_Master.stage_name).in_(['not called', 'lead']))
+                        )
+                    else:
+                        q = q.filter(func.lower(Stage_Master.stage_name) == filter_status.lower())
+
+                # Supplier filter
+                if filter_supplier:
+                    q = q.filter(Opportunity_Details.supplier_id == filter_supplier)
+
+                # End date filter
+                if filter_end_date and filter_end_date != 'all':
+                    if filter_end_date == 'expired':
+                        q = q.filter(
+                            Opportunity_Details.end_date.isnot(None),
+                            cast(Opportunity_Details.end_date, SADate) < today
+                        )
+                    elif filter_end_date == '30':
+                        q = q.filter(
+                            Opportunity_Details.end_date.isnot(None),
+                            cast(Opportunity_Details.end_date, SADate) >= today,
+                            cast(Opportunity_Details.end_date, SADate) <= today + timedelta(days=30)
+                        )
+                    elif filter_end_date == '60':
+                        q = q.filter(
+                            Opportunity_Details.end_date.isnot(None),
+                            cast(Opportunity_Details.end_date, SADate) > today + timedelta(days=30),
+                            cast(Opportunity_Details.end_date, SADate) <= today + timedelta(days=60)
+                        )
+                    elif filter_end_date == '90':
+                        q = q.filter(
+                            Opportunity_Details.end_date.isnot(None),
+                            cast(Opportunity_Details.end_date, SADate) > today + timedelta(days=60),
+                            cast(Opportunity_Details.end_date, SADate) <= today + timedelta(days=90)
+                        )
+                    elif filter_end_date == '90+':
+                        q = q.filter(
+                            Opportunity_Details.end_date.isnot(None),
+                            cast(Opportunity_Details.end_date, SADate) > today + timedelta(days=90),
+                            cast(Opportunity_Details.end_date, SADate) <= today + timedelta(days=365)
+                        )
+
+                # Text search
+                if search_q:
+                    like = f'%{search_q}%'
+                    q = q.filter(
+                        func.lower(func.coalesce(Opportunity_Details.business_name, Opportunity_Details.opportunity_title, '')).like(like) |
+                        func.lower(func.coalesce(Opportunity_Details.contact_person, '')).like(like) |
+                        func.lower(func.coalesce(func.cast(Opportunity_Details.tel_number, String), '')).like(like) |
+                        func.lower(func.coalesce(Opportunity_Details.email, '')).like(like) |
+                        func.lower(func.coalesce(Opportunity_Details.mpan_mpr, '')).like(like)
+                    )
+
+                return q
+
+            # ── Total count ─────────────────────────────────────────────────
+            count_q = (
+                session.query(func.count(Opportunity_Details.opportunity_id))
+                .outerjoin(Stage_Master,  Opportunity_Details.stage_id  == Stage_Master.stage_id)
+                .outerjoin(Client_Master, Opportunity_Details.client_id == Client_Master.client_id)
+            )
+            total = _apply_filters(count_q).scalar() or 0
+
+            # ── Data page ───────────────────────────────────────────────────
+            data_q = _apply_filters(
                 session.query(
                     Opportunity_Details,
                     Stage_Master.stage_name,
@@ -572,82 +694,61 @@ def get_leads():
                     func.coalesce(Opportunity_Details.business_name, Opportunity_Details.opportunity_title).label('business_name'),
                     Supplier_Master.supplier_company_name.label('supplier_name')
                 )
-                .outerjoin(Stage_Master, Opportunity_Details.stage_id == Stage_Master.stage_id)
+                .outerjoin(Stage_Master,    Opportunity_Details.stage_id    == Stage_Master.stage_id)
                 .outerjoin(Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id)
-                .outerjoin(Supplier_Master, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
-                .outerjoin(Client_Master, Opportunity_Details.client_id == Client_Master.client_id)
-                .filter(
-                    (Opportunity_Details.tenant_id == tenant_id) |
-                    ((Opportunity_Details.client_id.isnot(None)) & (Client_Master.tenant_id == tenant_id))
-                )
-                .filter(Opportunity_Details.service_id == service_id)
-                .filter(Opportunity_Details.opportunity_owner_employee_id.isnot(None))
-                .filter((Opportunity_Details.is_draft == False) | (Opportunity_Details.is_draft.is_(None)))
-                .filter(
-                    (Client_Master.is_deleted.is_(None)) |
-                    (Client_Master.is_deleted == False)
-                )
-                .filter(
-                    (Client_Master.client_id.is_(None)) |
-                    (Client_Master.is_archived.is_(None)) |
-                    (Client_Master.is_archived == False)
-                )
+                .outerjoin(Supplier_Master, Opportunity_Details.supplier_id  == Supplier_Master.supplier_id)
+                .outerjoin(Client_Master,   Opportunity_Details.client_id    == Client_Master.client_id)
             )
 
-            if not admin_user:
-                query = query.filter(
-                    Opportunity_Details.opportunity_owner_employee_id == employee_id,
-                    (Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None))
-                )
-
-            if exclude_stage:
-                query = query.filter(
-                    (Stage_Master.stage_name.is_(None)) |
-                    (func.lower(Stage_Master.stage_name) != exclude_stage.lower())
-                )
-
-            query = query.order_by(Opportunity_Details.created_at.desc())
-            rows = query.all()
+            rows = (
+                data_q
+                .order_by(Opportunity_Details.created_at.desc())
+                .limit(page_size)
+                .offset(offset)
+                .all()
+            )
 
             results = []
             for row in rows:
                 od = row[0]
                 results.append({
-                    'opportunity_id': od.opportunity_id,
-                    'tenant_lead_id': od.tenant_lead_id,
-                    'business_name': row.business_name,
-                    'contact_person': od.contact_person,
-                    'tel_number': str(od.tel_number).replace('.0', '') if od.tel_number else None,
-                    'mobile_no': od.mobile_no,
-                    'email': od.email,
-                    'mpan_mpr': od.mpan_mpr,
-                    'mpan_bottom': od.mpan_bottom,
-                    'start_date': _iso(od.start_date),
-                    'end_date': _iso(od.end_date),
-                    'service_id': od.service_id,
-                    'stage_id': od.stage_id,
-                    'stage_name': row.stage_name,
+                    'opportunity_id':                od.opportunity_id,
+                    'tenant_lead_id':                od.tenant_lead_id,
+                    'business_name':                 row.business_name,
+                    'contact_person':                od.contact_person,
+                    'tel_number':                    str(od.tel_number).replace('.0', '') if od.tel_number else None,
+                    'mobile_no':                     od.mobile_no,
+                    'email':                         od.email,
+                    'mpan_mpr':                      od.mpan_mpr,
+                    'mpan_bottom':                   od.mpan_bottom,
+                    'start_date':                    _iso(od.start_date),
+                    'end_date':                      _iso(od.end_date),
+                    'service_id':                    od.service_id,
+                    'stage_id':                      od.stage_id,
+                    'stage_name':                    row.stage_name,
                     'opportunity_owner_employee_id': od.opportunity_owner_employee_id,
-                    'assigned_to_name': row.assigned_to_name,
-                    'created_at': _iso(od.created_at),
-                    'supplier_id': od.supplier_id,
-                    'supplier_name': row.supplier_name,
-                    'annual_usage': od.annual_usage,
-                    'stand_charge': od.stand_charge,
-                    'rate_1': od.rate_1,
-                    'net_notch': od.net_notch,
-                    'payment_type': od.payment_type,
-                    'postcode': od.postcode,
+                    'assigned_to_name':              row.assigned_to_name,
+                    'created_at':                    _iso(od.created_at),
+                    'supplier_id':                   od.supplier_id,
+                    'supplier_name':                 row.supplier_name,
+                    'annual_usage':                  od.annual_usage,
+                    'stand_charge':                  od.stand_charge,
+                    'rate_1':                        od.rate_1,
+                    'net_notch':                     od.net_notch,
+                    'payment_type':                  od.payment_type,
+                    'postcode':                      od.postcode,
+                    'is_archived':                   getattr(od, 'is_archived', None),
+                    'is_allocated':                  getattr(od, 'is_allocated', None),
                 })
 
             current_app.logger.warning(
-                'crm.get_leads result tenant=%s user_id=%s employee_id=%s is_admin=%s returned=%s first_ids=%s',
-                tenant_id, user_id, employee_id, admin_user, len(results),
-                [r.get('tenant_lead_id') or r.get('opportunity_id') for r in results[:5]]
+                'crm.get_leads result tenant=%s is_admin=%s page=%s page_size=%s total=%s returned=%s',
+                tenant_id, admin_user, page, page_size, total, len(results)
             )
 
-            # ✅ Build team stats for admin
-            if admin_user:
+            # ── Team stats: admin, page 1 only ─────────────────────────────
+            team_stats = []
+            if admin_user and page == 1:
                 stats_rows = (
                     session.query(
                         Employee_Master.employee_id,
@@ -656,6 +757,7 @@ def get_leads():
                     )
                     .outerjoin(Client_Master, Opportunity_Details.client_id == Client_Master.client_id)
                     .join(Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id)
+                    .outerjoin(Stage_Master, Opportunity_Details.stage_id == Stage_Master.stage_id)
                     .filter(
                         (Opportunity_Details.tenant_id == tenant_id) |
                         ((Opportunity_Details.client_id.isnot(None)) & (Client_Master.tenant_id == tenant_id))
@@ -664,38 +766,24 @@ def get_leads():
                     .filter(Opportunity_Details.opportunity_owner_employee_id.isnot(None))
                     .filter((Opportunity_Details.is_draft == False) | (Opportunity_Details.is_draft.is_(None)))
                     .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
-                    .filter(
-                        (Client_Master.is_deleted.is_(None)) |
-                        (Client_Master.is_deleted == False)
-                    )
-                    .filter(
-                        (Client_Master.client_id.is_(None)) |
-                        (Client_Master.is_archived.is_(None)) |
-                        (Client_Master.is_archived == False)
-                    )
+                    .filter((Client_Master.is_deleted.is_(None)) | (Client_Master.is_deleted == False))
                     .group_by(Employee_Master.employee_id, Employee_Master.employee_name)
                     .having(func.count(Opportunity_Details.opportunity_id) > 0)
                     .order_by(Employee_Master.employee_name.asc())
                     .all()
                 )
-
                 team_stats = [
-                    {
-                        'employee_id': r.employee_id,
-                        'employee_name': r.employee_name,
-                        'count': int(r.count or 0),
-                    }
+                    {'employee_id': r.employee_id, 'employee_name': r.employee_name, 'count': int(r.count or 0)}
                     for r in stats_rows
                 ]
 
-                return jsonify({
-                    'data': results,
-                    'team_stats': team_stats,
-                    'total': len(results)
-                }), 200
-
-            # Non-admin: return plain array (frontend handles both formats)
-            return jsonify(results), 200
+            return jsonify({
+                'data':      results,
+                'team_stats': team_stats,
+                'total':     int(total),
+                'page':      page,
+                'page_size': page_size,
+            }), 200
 
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -1348,6 +1436,36 @@ def update_lead_status(opportunity_id):
         status = data.get('status')
 
         current_app.logger.info(f'🔧 PATCH /api/crm/leads/{opportunity_id}/status — data: {data}')
+
+        # ── Handle clear status (frontend sends { stage_id: null }) ─────
+        if 'stage_id' in data and data['stage_id'] is None and not status:
+            lead = (
+                session.query(Opportunity_Details)
+                .filter(Opportunity_Details.tenant_id == str(tenant_id))
+                .filter(
+                    (Opportunity_Details.opportunity_id == opportunity_id) |
+                    (Opportunity_Details.tenant_lead_id == opportunity_id)
+                )
+                .first()
+            )
+            if not lead:
+                return jsonify({'error': 'Lead not found'}), 404
+
+            not_called = session.query(Stage_Master).filter(
+                func.lower(Stage_Master.stage_name) == 'not called'
+            ).first()
+
+            if not not_called:
+                return jsonify({'error': 'Default stage "Not Called" not found in Stage_Master'}), 400
+
+            lead.stage_id = not_called.stage_id
+            session.commit()
+            return jsonify({
+                'success': True,
+                'message': 'Status reset to Not Called',
+                'stage_id': not_called.stage_id,
+                'stage_name': not_called.stage_name,
+            }), 200
 
         if not stage_id and not status:
             return jsonify({'error': 'Either stage_id or status is required'}), 400

@@ -183,29 +183,42 @@ def _receipt_payload(receipt: Commission_Payment_Receipt, logged_by_name: str = 
         'id': receipt.id,
         'commission_payment_id': receipt.commission_payment_id,
         'tenant_id': receipt.tenant_id,
-        'amount_received': _money(receipt.amount_received),
+        'amount_received': _money(receipt.amount_received) if receipt.amount_received is not None else None,
         'date_received': _date(receipt.date_received),
         'notes': receipt.notes,
         'logged_by': receipt.logged_by,
         'logged_by_name': logged_by_name,
         'created_at': _datetime(receipt.created_at),
+        'is_note_only': receipt.amount_received is None,
     }
 
 
 def _refresh_payment_totals_from_receipts(session, payment: Commission_Payment) -> None:
     total_received = (
         session.query(func.coalesce(func.sum(Commission_Payment_Receipt.amount_received), 0))
-        .filter(Commission_Payment_Receipt.commission_payment_id == payment.id)
+        .filter(
+            Commission_Payment_Receipt.commission_payment_id == payment.id,
+            Commission_Payment_Receipt.amount_received.isnot(None),
+        )
         .scalar()
     )
     expected_net = Decimal(payment.expected_net_amount or 0)
-    outstanding = max(expected_net - Decimal(total_received or 0), Decimal('0.00'))
+    total = Decimal(total_received or 0)
+    outstanding = max(expected_net - total, Decimal('0.00'))
 
-    payment.amount_received = total_received
+    payment.amount_received = total
     payment.outstanding_amount = outstanding
-    payment.status = 'Received' if outstanding == 0 else 'Partially Paid'
     payment.last_checked_at = datetime.utcnow()
     payment.updated_at = datetime.utcnow()
+
+    if total == 0:
+        # Revert to Scheduled regardless of due date
+        # Due status should only be set manually or by a scheduled job
+        payment.status = 'Scheduled'
+    elif outstanding == 0:
+        payment.status = 'Received'
+    else:
+        payment.status = 'Partially Paid'
 
 
 def _sync_agent_commission_items_for_receipt(session, receipt: Commission_Payment_Receipt) -> None:
@@ -1603,20 +1616,31 @@ def create_commission_payment_receipt(payment_id: str):
         return tenant_error
 
     data = request.get_json(force=True, silent=True) or {}
+    note_text = (data.get('notes') or '').strip()
+    raw_amount = str(data.get('amount_received', '') or '').strip()
+    is_note_only = raw_amount == '' or raw_amount is None
 
-    try:
-        amount_received = Decimal(str(data.get('amount_received', '')).strip())
-    except Exception:
-        return jsonify({'error': 'amount_received must be a valid number'}), 400
+    if not is_note_only:
+        try:
+            amount_received = Decimal(raw_amount)
+        except Exception:
+            return jsonify({'error': 'amount_received must be a valid number'}), 400
+        if amount_received <= 0:
+            return jsonify({'error': 'amount_received must be greater than zero'}), 400
+    else:
+        amount_received = None
 
-    if amount_received == 0:
-        return jsonify({'error': 'amount_received cannot be zero'}), 400
+    if not is_note_only:
+        date_received, date_error = _parse_date(data.get('date_received'), 'date_received')
+        if date_error:
+            return jsonify({'error': date_error}), 400
+        if date_received is None:
+            date_received = datetime.utcnow().date()
+    else:
+        date_received = None
 
-    date_received, date_error = _parse_date(data.get('date_received'), 'date_received')
-    if date_error:
-        return jsonify({'error': date_error}), 400
-    if date_received is None:
-        date_received = datetime.utcnow().date()
+    if is_note_only and not note_text:
+        return jsonify({'error': 'Either amount_received or notes is required'}), 400
 
     user = getattr(request, 'current_user', None)
 
@@ -1624,30 +1648,42 @@ def create_commission_payment_receipt(payment_id: str):
     try:
         payment = (
             session.query(Commission_Payment)
-            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
+            .filter(
+                Commission_Payment.id == payment_id,
+                Commission_Payment.tenant_id == tenant_id,
+                _not_old_payment_filter(),
+            )
             .first()
         )
         if not payment:
             return jsonify({'error': 'Commission payment not found'}), 404
-            
+
         receipt = Commission_Payment_Receipt(
+            id=str(uuid.uuid4()),
             commission_payment_id=payment.id,
             tenant_id=payment.tenant_id,
             amount_received=amount_received,
             date_received=date_received,
-            notes=(data.get('notes') or '').strip() or None,
+            notes=note_text or None,
             logged_by=getattr(user, 'employee_id', None),
+            created_at=datetime.utcnow(),
         )
         session.add(receipt)
         session.flush()
 
-        _refresh_payment_totals_from_receipts(session, payment)
+        # Only refresh payment totals for actual payments, not notes
+        if not is_note_only:
+            _refresh_payment_totals_from_receipts(session, payment)
 
         session.commit()
 
         row = (
             _payment_base_query(session)
-            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
+            .filter(
+                Commission_Payment.id == payment_id,
+                Commission_Payment.tenant_id == tenant_id,
+                _not_old_payment_filter(),
+            )
             .first()
         )
         session.refresh(receipt)
@@ -1655,97 +1691,16 @@ def create_commission_payment_receipt(payment_id: str):
         return jsonify({
             'success': True,
             'payment': _payment_payload(row),
-            'receipt': _receipt_payload(receipt),
+            'receipt': {
+                **_receipt_payload(receipt),
+                'is_note_only': is_note_only,
+            },
         }), 201
     except Exception:
         session.rollback()
         raise
     finally:
         session.close()
-
-
-@commission_bp.route('/payments/<payment_id>/receipts/<receipt_id>', methods=['PATCH'])
-@token_required
-def update_commission_payment_receipt(payment_id: str, receipt_id: str):
-    admin_error = _require_admin()
-    if admin_error:
-        return admin_error
-    tenant_id, tenant_error = _require_tenant_id()
-    if tenant_error:
-        return tenant_error
-
-    data = request.get_json(force=True, silent=True) or {}
-
-    try:
-        amount_received = Decimal(str(data.get('amount_received', '')).strip())
-    except Exception:
-        return jsonify({'error': 'amount_received must be a valid number'}), 400
-
-    if amount_received == 0:
-        return jsonify({'error': 'amount_received cannot be zero'}), 400
-
-    date_received, date_error = _parse_date(data.get('date_received'), 'date_received')
-    if date_error:
-        return jsonify({'error': date_error}), 400
-    if date_received is None:
-        date_received = datetime.utcnow().date()
-
-    session = SessionLocal()
-    try:
-        payment = (
-            session.query(Commission_Payment)
-            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
-            .first()
-        )
-        if not payment:
-            return jsonify({'error': 'Commission payment not found'}), 404
-
-        receipt = (
-            session.query(Commission_Payment_Receipt)
-            .filter(
-                Commission_Payment_Receipt.id == receipt_id,
-                Commission_Payment_Receipt.commission_payment_id == payment.id,
-                Commission_Payment_Receipt.tenant_id == tenant_id,
-            )
-            .first()
-        )
-        if not receipt:
-            return jsonify({'error': 'Receipt not found'}), 404
-
-        receipt.amount_received = amount_received
-        receipt.date_received = date_received
-        receipt.notes = (data.get('notes') or '').strip() or None
-        session.flush()
-
-        _sync_agent_commission_items_for_receipt(session, receipt)
-        _refresh_payment_totals_from_receipts(session, payment)
-
-        session.commit()
-
-        row = (
-            _payment_base_query(session)
-            .filter(Commission_Payment.id == payment_id, Commission_Payment.tenant_id == tenant_id, _not_old_payment_filter())
-            .first()
-        )
-        logged_by_name = (
-            session.query(Employee_Master.employee_name)
-            .filter(Employee_Master.employee_id == receipt.logged_by)
-            .scalar()
-            if receipt.logged_by else None
-        )
-        session.refresh(receipt)
-
-        return jsonify({
-            'success': True,
-            'payment': _payment_payload(row),
-            'receipt': _receipt_payload(receipt, logged_by_name),
-        }), 200
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
-
 
 @commission_bp.route('/payments/<payment_id>/status', methods=['PATCH'])
 @token_required
@@ -1832,6 +1787,8 @@ def list_clients_with_payments():
 
     session = SessionLocal()
     try:
+        today = date.today()
+
         # Base query: all clients with contracts, left join commission payments
         query = (
             session.query(
@@ -1933,10 +1890,38 @@ def list_clients_with_payments():
             ))
 
         total = query.count()
+
+        # ── Needs-chasing subquery for sort ────────────────────────────────
+        needs_chasing_subq = (
+            exists().where(
+                and_(
+                    Commission_Payment.contract_id == Energy_Contract_Master.energy_contract_master_id,
+                    Commission_Payment.tenant_id == tenant_id,
+                    Commission_Payment.outstanding_amount > 0,
+                    Commission_Payment.due_date < today,
+                    Commission_Payment.status.notin_(['Received', 'Closed']),
+                )
+            )
+        )
+
         rows = (
             query
             .order_by(
-                Client_Master.is_archived.asc(),
+                # Needs chasing first — overdue + outstanding + not closed/received
+                case(
+                    (
+                        and_(
+                            or_(
+                                Client_Master.is_archived.is_(None),
+                                Client_Master.is_archived == False,
+                            ),
+                            needs_chasing_subq,
+                        ),
+                        0,
+                    ),
+                    else_=1,
+                ).asc(),
+                Client_Master.is_archived.asc().nullslast(),
                 Energy_Contract_Master.contract_end_date.asc().nullslast(),
                 Client_Master.client_id.asc(),
             )
@@ -2032,35 +2017,48 @@ def list_clients_with_payments():
             # Skip contracts with no matching payments when filters are active
             if (status_filter or aggregator_filter or due_from or due_to) and not contract_payments:
                 continue
-            total_expected = sum(Decimal(str(p.expected_net_amount or 0)) for p in contract_payments)
-            total_received = sum(Decimal(str(p.amount_received or 0)) for p in contract_payments)
+            total_expected    = sum(Decimal(str(p.expected_net_amount or 0)) for p in contract_payments)
+            total_received    = sum(Decimal(str(p.amount_received or 0)) for p in contract_payments)
             total_outstanding = sum(Decimal(str(p.outstanding_amount or 0)) for p in contract_payments)
-            statuses = list({p.status for p in contract_payments})
-            next_due = min((p.due_date for p in contract_payments if p.due_date), default=None)
+            statuses  = list({p.status for p in contract_payments})
+            next_due  = min((p.due_date for p in contract_payments if p.due_date), default=None)
+
+            # ── Needs chasing flag ──────────────────────────────────────────
+            needs_chasing = any(
+                Decimal(str(p.outstanding_amount or 0)) > 0
+                and p.due_date is not None
+                and p.due_date < today
+                and p.status not in ('Received', 'Closed')
+                for p in contract_payments
+            )
 
             results.append({
-                'client_id': client.client_id,
-                'contract_id': ecm.energy_contract_master_id,
-                'business_name': client.client_company_name or client.client_contact_name or f'Client #{client.client_id}',
-                'supplier_name': supplier.supplier_company_name if supplier else None,
-                'agent_name': employee.employee_name if employee else None,
-                'mpan_number': ecm.mpan_number,
-                'mpan_bottom': ecm.mpan_bottom,
+                'client_id':           client.client_id,
+                'contract_id':         ecm.energy_contract_master_id,
+                'business_name':       client.client_company_name or client.client_contact_name or f'Client #{client.client_id}',
+                'supplier_name':       supplier.supplier_company_name if supplier else None,
+                'agent_name':          employee.employee_name if employee else None,
+                'mpan_number':         ecm.mpan_number,
+                'mpan_bottom':         ecm.mpan_bottom,
                 'contract_start_date': _date(ecm.contract_start_date),
-                'contract_end_date': _date(ecm.contract_end_date),
-                'service_id': ecm.service_id,
-                'service_title': 'Water' if ecm.service_id == 2 else 'Utilities',
-                'aggregator': ecm.aggregator,
-                'is_archived': bool(client.is_archived),
-                'is_deleted': bool(client.is_deleted),
-                'project_status': project.status if project else None,
-                'expected': _money(total_expected),
-                'received': _money(total_received),
-                'outstanding': _money(total_outstanding),
-                'statuses': statuses,
-                'next_due': _date(next_due),
-                'has_payments': len(contract_payments) > 0,
-                'payments': [_payment_payload_minimal(p) for p in sorted(contract_payments, key=lambda p: p.instalment_year or 0)],
+                'contract_end_date':   _date(ecm.contract_end_date),
+                'service_id':          ecm.service_id,
+                'service_title':       'Water' if ecm.service_id == 2 else 'Utilities',
+                'aggregator':          ecm.aggregator,
+                'is_archived':         bool(client.is_archived),
+                'is_deleted':          bool(client.is_deleted),
+                'project_status':      project.status if project else None,
+                'expected':            _money(total_expected),
+                'received':            _money(total_received),
+                'outstanding':         _money(total_outstanding),
+                'statuses':            statuses,
+                'next_due':            _date(next_due),
+                'has_payments':        len(contract_payments) > 0,
+                'needs_chasing':       needs_chasing,
+                'payments': [
+                    _payment_payload_minimal(p)
+                    for p in sorted(contract_payments, key=lambda p: p.instalment_year or 0)
+                ],
             })
 
         # Summary totals across all filtered records (not just this page)
@@ -2119,28 +2117,27 @@ def list_clients_with_payments():
         )
 
         return jsonify({
-            'success': True,
-            'clients': results,
+            'success':    True,
+            'clients':    results,
             'summary': {
-                'expected': _money(s_expected),
-                'received': _money(s_received),
+                'expected':    _money(s_expected),
+                'received':    _money(s_received),
                 'outstanding': _money(s_outstanding),
             },
             'pagination': {
-                'page': page,
-                'page_size': page_size,
-                'total': total,
+                'page':        page,
+                'page_size':   page_size,
+                'total':       total,
                 'total_pages': (total + page_size - 1) // page_size,
             },
             'filters': {
-                'suppliers': [{'supplier_id': sid, 'supplier_name': sname} for sid, sname in suppliers],
-                'agents': [{'employee_id': eid, 'employee_name': ename} for eid, ename in agents],
+                'suppliers':   [{'supplier_id': sid,  'supplier_name': sname} for sid,  sname in suppliers],
+                'agents':      [{'employee_id': eid,  'employee_name': ename} for eid,  ename in agents],
                 'aggregators': [{'aggregator': agg} for (agg,) in aggregators],
             },
         }), 200
     finally:
         session.close()
-
 
 def _payment_payload_minimal(payment: Commission_Payment) -> dict:
     return {
@@ -2162,3 +2159,212 @@ def _payment_payload_minimal(payment: Commission_Payment) -> dict:
         'contract_id': payment.contract_id,
         'project_id': payment.project_id,
     }
+
+@commission_bp.route('/payments/<int:payment_id>/notes', methods=['POST'])
+@token_required
+def add_payment_note(payment_id):
+    session = SessionLocal()
+    try:
+        data = request.get_json() or {}
+        note_text = (data.get('notes') or '').strip()
+        if not note_text:
+            return jsonify({'error': 'Note text is required'}), 400
+
+        current_user = request.current_user
+        logged_by = getattr(current_user, 'name', None) or getattr(current_user, 'username', None) or 'Unknown'
+
+        note = CommissionPaymentNote(
+            commission_payment_id=payment_id,
+            notes=note_text,
+            logged_by_name=logged_by,
+            created_at=datetime.utcnow(),
+        )
+        session.add(note)
+        session.commit()
+
+        return jsonify({
+            'note': {
+                'id': f"note-{note.id}",
+                'amount_received': None,
+                'date_received': None,
+                'notes': note.notes,
+                'logged_by_name': note.logged_by_name,
+                'created_at': note.created_at.isoformat(),
+                'is_note_only': True,
+            }
+        }), 201
+    except Exception as e:
+        session.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@commission_bp.route('/payments/<int:payment_id>/notes/<note_id>', methods=['PATCH'])
+@token_required
+def update_payment_note(payment_id, note_id):
+    session = SessionLocal()
+    try:
+        real_id = int(str(note_id).replace('note-', ''))
+        data = request.get_json() or {}
+        note = session.query(CommissionPaymentNote).filter_by(
+            id=real_id, commission_payment_id=payment_id
+        ).first()
+        if not note:
+            return jsonify({'error': 'Note not found'}), 404
+        note.notes = (data.get('notes') or '').strip()
+        session.commit()
+        return jsonify({
+            'note': {
+                'id': f"note-{note.id}",
+                'amount_received': None,
+                'date_received': None,
+                'notes': note.notes,
+                'logged_by_name': note.logged_by_name,
+                'created_at': note.created_at.isoformat(),
+                'is_note_only': True,
+            }
+        }), 200
+    except Exception as e:
+        session.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+
+@commission_bp.route('/payments/<int:payment_id>/notes/<note_id>', methods=['DELETE'])
+@token_required
+def delete_payment_note(payment_id, note_id):
+    session = SessionLocal()
+    try:
+        real_id = int(str(note_id).replace('note-', ''))
+        note = session.query(CommissionPaymentNote).filter_by(
+            id=real_id, commission_payment_id=payment_id
+        ).first()
+        if not note:
+            return jsonify({'error': 'Note not found'}), 404
+        session.delete(note)
+        session.commit()
+        return jsonify({'success': True}), 200
+    except Exception as e:
+        session.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        session.close()
+
+@commission_bp.route('/payments/<payment_id>/receipts/<receipt_id>', methods=['PATCH', 'DELETE'])
+@token_required
+def manage_commission_payment_receipt(payment_id: str, receipt_id: str):
+    admin_error = _require_admin()
+    if admin_error:
+        return admin_error
+    tenant_id, tenant_error = _require_tenant_id()
+    if tenant_error:
+        return tenant_error
+
+    session = SessionLocal()
+    try:
+        payment = (
+            session.query(Commission_Payment)
+            .filter(
+                Commission_Payment.id == payment_id,
+                Commission_Payment.tenant_id == tenant_id,
+                _not_old_payment_filter(),
+            )
+            .first()
+        )
+        if not payment:
+            return jsonify({'error': 'Commission payment not found'}), 404
+
+        receipt = (
+            session.query(Commission_Payment_Receipt)
+            .filter(
+                Commission_Payment_Receipt.id == receipt_id,
+                Commission_Payment_Receipt.commission_payment_id == payment.id,
+                Commission_Payment_Receipt.tenant_id == tenant_id,
+            )
+            .first()
+        )
+        if not receipt:
+            return jsonify({'error': 'Receipt not found'}), 404
+
+        # ── DELETE ──────────────────────────────────────────────────────────
+        if request.method == 'DELETE':
+            was_payment = receipt.amount_received is not None
+            session.delete(receipt)
+            session.flush()
+
+            # Only recalculate totals if it was an actual payment, not a note
+            if was_payment:
+                _refresh_payment_totals_from_receipts(session, payment)
+
+            session.commit()
+            return jsonify({'success': True}), 200
+
+        # ── PATCH ───────────────────────────────────────────────────────────
+        data = request.get_json(force=True, silent=True) or {}
+        note_text = (data.get('notes') or '').strip()
+        raw_amount = str(data.get('amount_received', '') or '').strip()
+        is_note_only = raw_amount == ''
+
+        if not is_note_only:
+            try:
+                amount_received = Decimal(raw_amount)
+            except Exception:
+                return jsonify({'error': 'amount_received must be a valid number'}), 400
+            if amount_received <= 0:
+                return jsonify({'error': 'amount_received must be greater than zero'}), 400
+        else:
+            amount_received = None
+
+        if not is_note_only:
+            date_received, date_error = _parse_date(data.get('date_received'), 'date_received')
+            if date_error:
+                return jsonify({'error': date_error}), 400
+            if date_received is None:
+                date_received = datetime.utcnow().date()
+        else:
+            date_received = None
+
+        receipt.amount_received = amount_received
+        receipt.date_received = date_received
+        receipt.notes = note_text or None
+        session.flush()
+
+        if not is_note_only:
+            _sync_agent_commission_items_for_receipt(session, receipt)
+            _refresh_payment_totals_from_receipts(session, payment)
+
+        session.commit()
+
+        row = (
+            _payment_base_query(session)
+            .filter(
+                Commission_Payment.id == payment_id,
+                Commission_Payment.tenant_id == tenant_id,
+                _not_old_payment_filter(),
+            )
+            .first()
+        )
+        logged_by_name = (
+            session.query(Employee_Master.employee_name)
+            .filter(Employee_Master.employee_id == receipt.logged_by)
+            .scalar()
+            if receipt.logged_by else None
+        )
+        session.refresh(receipt)
+
+        return jsonify({
+            'success': True,
+            'payment': _payment_payload(row),
+            'receipt': {
+                **_receipt_payload(receipt, logged_by_name),
+                'is_note_only': is_note_only,
+            },
+        }), 200
+
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()

@@ -471,14 +471,14 @@ class Commission_Payment_Receipt(Base):
     __tablename__ = 'Commission_Payment_Receipt'
     __table_args__ = {'schema': SCHEMA}
 
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    id                    = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     commission_payment_id = Column(String(36), ForeignKey(f'{SCHEMA}.Commission_Payment.id'), nullable=False)
-    tenant_id = Column(String(50), nullable=True)
-    amount_received = Column(Numeric(14, 2), nullable=False)
-    date_received = Column(Date, nullable=False)
-    notes = Column(Text, nullable=True)
-    logged_by = Column(Integer, ForeignKey(f'{SCHEMA}.Employee_Master.employee_id'), nullable=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    tenant_id             = Column(String(50), nullable=True)
+    amount_received       = Column(Numeric(14, 2), nullable=True)   
+    date_received         = Column(Date, nullable=True)              
+    notes                 = Column(Text, nullable=True)
+    logged_by             = Column(Integer, ForeignKey(f'{SCHEMA}.Employee_Master.employee_id'), nullable=True)
+    created_at            = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
 class Agent_Commission_Batch(Base):

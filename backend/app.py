@@ -105,6 +105,32 @@ def create_app():
         traceback.print_exc()
 
     # ============================================
+    # ⚙️ DATABASE INITIALIZATION (NEW LOCATION)
+    # ============================================
+    logging.info("Initializing database schema...")
+
+    try:
+        from backend import models
+        
+        # ... all your existing model logging ...
+        
+        if "sqlite" in str(engine.url):
+            Base.metadata.create_all(bind=engine, checkfirst=True)
+        
+        # ... all your existing inspector/enum checks ...
+        
+    except Exception as e:
+        logging.error("Database initialization failed: %s", e)
+        import traceback
+        traceback.print_exc()
+
+    # ============================================
+    # 🔥 CONNECTION POOL WARMUP
+    # ============================================
+    from backend.db import warmup_pool
+    warmup_pool()
+
+    # ============================================
     # CORS
     # ============================================
     CORS(
