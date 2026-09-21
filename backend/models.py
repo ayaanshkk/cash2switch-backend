@@ -8,7 +8,7 @@ import secrets
 from datetime import datetime, timedelta
 from sqlalchemy import (
     Column, Integer, BigInteger, SmallInteger, String, Boolean, DateTime, Date,
-    ForeignKey, Text, Float, Numeric, UniqueConstraint, CheckConstraint
+    ForeignKey, Text, Float, Numeric, UniqueConstraint, CheckConstraint,func
 )
 from sqlalchemy.orm import relationship
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -154,6 +154,105 @@ class UserMaster(Base):
             'is_active': self.is_active,
         }
 
+class UserCRMSearchPermission(Base):
+    __tablename__ = 'User_Search_Permission'
+    __table_args__ = {'schema': 'StreemLyne_MT'}
+
+    user_id = Column(
+        Integer,
+        ForeignKey('StreemLyne_MT.User_Master.user_id'),
+        primary_key=True
+    )
+
+    can_search_all_leads = Column(
+        Boolean,
+        nullable=False,
+        default=False
+    )
+
+    can_search_all_renewals = Column(
+        Boolean,
+        nullable=False,
+        default=False
+    )
+
+    updated_by_user_id = Column(
+        Integer,
+        ForeignKey('StreemLyne_MT.User_Master.user_id'),
+        nullable=False
+    )
+
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now()
+    )
+
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now()
+    )
+
+
+class CRMSearchPermissionAudit(Base):
+    __tablename__ = 'Search_Permission_Audit'
+    __table_args__ = {'schema': 'StreemLyne_MT'}
+
+    audit_id = Column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True
+    )
+
+    tenant_id = Column(
+        Integer,
+        nullable=False
+    )
+
+    target_user_id = Column(
+        Integer,
+        ForeignKey('StreemLyne_MT.User_Master.user_id'),
+        nullable=False
+    )
+
+    old_search_all_leads = Column(
+        Boolean,
+        nullable=False
+    )
+
+    new_search_all_leads = Column(
+        Boolean,
+        nullable=False
+    )
+
+    old_search_all_renewals = Column(
+        Boolean,
+        nullable=False
+    )
+
+    new_search_all_renewals = Column(
+        Boolean,
+        nullable=False
+    )
+
+    changed_by_user_id = Column(
+        Integer,
+        ForeignKey('StreemLyne_MT.User_Master.user_id'),
+        nullable=False
+    )
+
+    changed_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now()
+    )
+
+    request_ip = Column(
+        String(64),
+        nullable=True
+    )
+
 
 # ==========================================
 # CRM MODELS (StreemLyne_MT Schema)
@@ -193,6 +292,7 @@ class Employee_Master(Base):
     created_on = Column(DateTime)
     updated_on = Column(DateTime)
     commission_percentage = Column(Float)
+
 
 
 class Client_Master(Base):
@@ -304,6 +404,7 @@ class Opportunity_Details(Base):
     """
     ✅ CORRECTED: Added all missing columns that are queried in crm_routes.py
     This model now matches the actual database schema after ALTER TABLE migrations.
+    
     """
     __tablename__ = 'Opportunity_Details'
     __table_args__ = {'schema': SCHEMA}

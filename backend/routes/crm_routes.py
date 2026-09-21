@@ -20,6 +20,11 @@ from backend.models import (
 from backend.crm.controllers.crm_controller import CRMController
 from backend.crm.middleware.tenant_middleware import require_tenant
 from backend.crm.utils.role_helpers import is_crm_leads_admin_role
+
+def _get_leads_access(session, employee_id):
+    return "partial"
+
+from backend.services.search_permission_service import can_search_all_leads
 from .auth_helpers import token_required
 from backend.crm.utils.display_order_helpers import recalculate_display_order
 from ..dummy_local_dashboard_data import (
@@ -543,9 +548,25 @@ def get_leads():
         normalized_role = str(role_name).strip().lower() if role_name else None
         admin_user = is_crm_leads_admin_role(role_name)
 
+        session = SessionLocal()
+        try:
+            leads_access = _get_leads_access(session, employee_id)
+        finally:
+            session.close()
+
+        can_view_all_leads = admin_user or leads_access == "full"
+
         current_app.logger.warning(
-            'crm.get_leads start tenant=%s user_id=%s employee_id=%s is_admin=%s role=%s service=%s exclude_stage=%s',
-            tenant_id, user_id, employee_id, admin_user, normalized_role, service_param, exclude_stage
+            'crm.get_leads start tenant=%s user_id=%s employee_id=%s is_admin=%s leads_access=%s can_view_all=%s role=%s service=%s exclude_stage=%s',
+            tenant_id,
+            user_id,
+            employee_id,
+            admin_user,
+            leads_access,
+            can_view_all_leads,
+            normalized_role,
+            service_param,
+            exclude_stage
         )
 
         if local_demo_dashboard_enabled():
@@ -594,7 +615,7 @@ def get_leads():
                 )
             )
 
-            if not admin_user:
+            if not can_view_all_leads:
                 query = query.filter(
                     Opportunity_Details.opportunity_owner_employee_id == employee_id,
                     (Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None))
@@ -647,7 +668,7 @@ def get_leads():
             )
 
             # ✅ Build team stats for admin
-            if admin_user:
+            if can_view_all_leads:
                 stats_rows = (
                     session.query(
                         Employee_Master.employee_id,
@@ -719,6 +740,15 @@ def get_lead_detail(opportunity_id):
     session = SessionLocal()
     try:
         tenant_id = g.tenant_id
+        current_user = request.current_user
+
+        employee_id = getattr(current_user, 'employee_id', None)
+        role_name = getattr(current_user, 'role', None)
+        admin_user = is_crm_leads_admin_role(role_name)
+
+        leads_access = _get_leads_access(session, employee_id)
+        can_view_all_leads = admin_user or leads_access == "full"
+
         use_display_id = request.args.get('use_display_id', 'false').lower() == 'true'
  
         # Build base query
@@ -734,6 +764,11 @@ def get_lead_detail(opportunity_id):
             .outerjoin(Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id)
             .outerjoin(Supplier_Master, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
             .filter(Opportunity_Details.tenant_id == str(tenant_id))
+        )
+
+        if not can_view_all_leads:
+            base_query = base_query.filter(
+                Opportunity_Details.opportunity_owner_employee_id == employee_id
         )
  
         # Choose filter based on query parameter
@@ -799,7 +834,18 @@ def get_lead_history(opportunity_id):
         print(f"\n🔍 get_lead_history called for opportunity_id={opportunity_id}")
         
         tenant_id = g.tenant_id
+        current_user = request.current_user
+
+        employee_id = getattr(current_user, 'employee_id', None)
+        role_name = getattr(current_user, 'role', None)
+        admin_user = is_crm_leads_admin_role(role_name)
+
+        leads_access = _get_leads_access(session, employee_id)
+        can_view_all_leads = admin_user or leads_access == "full"
+
         use_display_id = request.args.get('use_display_id', 'false').lower() == 'true'
+
+        
         print(f"   tenant_id: {tenant_id}, use_display_id: {use_display_id}")
         
         # Resolve lead
@@ -819,6 +865,18 @@ def get_lead_history(opportunity_id):
  
         if not lead:
             return jsonify({'error': 'Lead not found'}), 404
+
+        if not can_view_all_leads:
+            owner_check = (
+                session.query(Opportunity_Details.opportunity_id)
+                .filter(Opportunity_Details.tenant_id == str(tenant_id))
+                .filter(Opportunity_Details.opportunity_id == lead.opportunity_id)
+                .filter(Opportunity_Details.opportunity_owner_employee_id == employee_id)
+                .first()
+            )
+
+            if not owner_check:
+                return jsonify({'error': 'Lead not found'}), 404
  
         client_id = lead.client_id
         if not client_id:
@@ -889,8 +947,31 @@ def delete_lead_history(opportunity_id, interaction_id):
  
         if not lead:
             return jsonify({'error': 'Lead not found'}), 404
- 
+
+        # Access restriction
+        current_user = request.current_user
+        employee_id = getattr(current_user, 'employee_id', None)
+        role_name = getattr(current_user, 'role', None)
+
+        admin_user = is_crm_leads_admin_role(role_name)
+        leads_access = _get_leads_access(session, employee_id)
+        can_view_all_leads = admin_user or leads_access == "full"
+
+        if not can_view_all_leads:
+            owner_check = (
+                session.query(Opportunity_Details.opportunity_id)
+                .filter(Opportunity_Details.tenant_id == str(tenant_id))
+                .filter(Opportunity_Details.opportunity_id == lead.opportunity_id)
+                .filter(Opportunity_Details.opportunity_owner_employee_id == employee_id)
+                .first()
+            )
+
+            if not owner_check:
+                return jsonify({'error': 'Lead not found'}), 404
+
         client_id = lead.client_id
+
+
         if not client_id:
             return jsonify({'error': 'No client for this lead'}), 400
  
@@ -1074,6 +1155,19 @@ def update_lead(opportunity_id):
 
             if not lead_obj:
                 return jsonify({'error': 'Lead not found'}), 404
+
+            # Access restriction
+            current_user = request.current_user
+            employee_id = getattr(current_user, 'employee_id', None)
+            role_name = getattr(current_user, 'role', None)
+
+            admin_user = is_crm_leads_admin_role(role_name)
+            leads_access = _get_leads_access(session, employee_id)
+            can_view_all_leads = admin_user or leads_access == "full"
+
+            if not can_view_all_leads:
+                if lead_obj.opportunity_owner_employee_id != employee_id:
+                    return jsonify({'error': 'Lead not found'}), 404
 
             real_id = lead_obj.opportunity_id
             client_id = lead_obj.client_id
@@ -1341,7 +1435,17 @@ def update_lead(opportunity_id):
 def update_lead_status(opportunity_id):
     session = SessionLocal()
     try:
+
         tenant_id = g.tenant_id
+        current_user = request.current_user
+
+        employee_id = getattr(current_user, 'employee_id', None)
+        role_name = getattr(current_user, 'role', None)
+        admin_user = is_crm_leads_admin_role(role_name)
+
+        leads_access = _get_leads_access(session, employee_id)
+        can_view_all_leads = admin_user or leads_access == "full"
+
         data = request.get_json() or {}
 
         stage_id = data.get('stage_id')
@@ -1377,6 +1481,19 @@ def update_lead_status(opportunity_id):
 
         if not lead:
             return jsonify({'error': 'Lead not found'}), 404
+
+        # Access restriction
+        current_user = request.current_user
+        employee_id = getattr(current_user, 'employee_id', None)
+        role_name = getattr(current_user, 'role', None)
+
+        admin_user = is_crm_leads_admin_role(role_name)
+        leads_access = _get_leads_access(session, employee_id)
+        can_view_all_leads = admin_user or leads_access == "full"
+
+        if not can_view_all_leads:
+            if lead.opportunity_owner_employee_id != employee_id:
+                return jsonify({'error': 'Lead not found'}), 404
 
         real_id = lead.opportunity_id
         lead_client_id = lead.client_id
@@ -1516,20 +1633,62 @@ def assign_leads():
 @tenant_from_jwt
 def delete_lead(opportunity_id):
     """
-    Delete a lead
-
-    Path Parameters:
-        - opportunity_id: Opportunity identifier
-
-    Authentication:
-        - JWT (token must include `tenant_id`)
-
-    Returns:
-        200: Lead deleted successfully
-        404: Lead not found
-        500: Internal server error
+    Delete a lead.
+    Full access/admin can delete any tenant lead.
+    Partial access can delete only their own lead.
     """
-    return crm_controller.delete_lead(opportunity_id)
+    session = SessionLocal()
+
+    try:
+        tenant_id = g.tenant_id
+        current_user = request.current_user
+
+        employee_id = getattr(current_user, 'employee_id', None)
+        role_name = getattr(current_user, 'role', None)
+
+        admin_user = is_crm_leads_admin_role(role_name)
+        leads_access = _get_leads_access(session, employee_id)
+        can_view_all_leads = admin_user or leads_access == "full"
+
+        lead = (
+            session.query(Opportunity_Details)
+            .filter(
+                Opportunity_Details.opportunity_id == opportunity_id
+            )
+            .filter(
+                Opportunity_Details.tenant_id == tenant_id
+            )
+            .first()
+        )
+
+        if not lead:
+            return jsonify({
+                'success': False,
+                'error': 'Lead not found'
+            }), 404
+
+        # Partial access → only own leads
+        if not can_view_all_leads:
+            if lead.opportunity_owner_employee_id != employee_id:
+                return jsonify({
+                    'success': False,
+                    'error': 'You do not have access to delete this lead'
+                }), 403
+
+        return crm_controller.delete_lead(opportunity_id)
+
+    except Exception as e:
+        current_app.logger.exception(
+            "delete_lead access check failed: %s", e
+        )
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+    finally:
+        session.close()
 
 
 @crm_bp.route('/leads/drafts', methods=['DELETE', 'OPTIONS'])
@@ -1697,9 +1856,10 @@ def search_all_leads():
             return jsonify([]), 200
 
         like_q = f'%{q.lower()}%'
-        current_user = getattr(request, 'current_user', None)
-        restrict_to_own_records = _is_field_sales_user(session, current_user)
-        current_employee_id = getattr(current_user, 'employee_id', None)
+
+        current_user = request.current_user
+
+        search_all_allowed = can_search_all_leads(current_user, session)
 
         query = (
             session.query(
@@ -1728,8 +1888,10 @@ def search_all_leads():
             )
         )
 
-        if restrict_to_own_records:
-            query = query.filter(Opportunity_Details.opportunity_owner_employee_id == current_employee_id)
+        if not search_all_allowed:
+            query = query.filter(
+                Opportunity_Details.opportunity_owner_employee_id == current_user.employee_id
+        )
 
         rows = query.order_by(Opportunity_Details.created_at.desc()).all()
 
@@ -1787,11 +1949,14 @@ def get_leads_stats():
         admin_user = is_crm_leads_admin_role(role_name)
         my_emp_id = getattr(current_user, 'employee_id', None)
 
-        if not admin_user:
-            employee_id = my_emp_id
-        else:
+        leads_access = _get_leads_access(session, my_emp_id)
+        can_view_all_leads = admin_user or leads_access == "full"
+
+        if can_view_all_leads:
             requested_employee_id = request.args.get('employee_id', type=int)
             employee_id = requested_employee_id
+        else:
+            employee_id = my_emp_id
 
         if local_demo_dashboard_enabled():
             return jsonify(dummy_leads_stats(employee_id)), 200
@@ -1905,8 +2070,17 @@ def get_leads_stage_breakdown():
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
         current_user = request.current_user
+        employee_id_current = getattr(current_user, 'employee_id', None)
         admin_user = is_crm_leads_admin_role(getattr(current_user, 'role', None))
-        employee_id = request.args.get('employee_id', type=int) if admin_user else getattr(current_user, 'employee_id', None)
+
+        leads_access = _get_leads_access(session, employee_id_current)
+        can_view_all_leads = admin_user or leads_access == "full"
+
+        employee_id = (
+            request.args.get('employee_id', type=int)
+            if can_view_all_leads
+            else employee_id_current
+        )
 
         if local_demo_dashboard_enabled():
             return jsonify(dummy_leads_stage_breakdown(employee_id)), 200
@@ -1954,8 +2128,18 @@ def get_leads_supplier_breakdown():
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
         current_user = request.current_user
+
+        employee_id_current = getattr(current_user, 'employee_id', None)
         admin_user = is_crm_leads_admin_role(getattr(current_user, 'role', None))
-        employee_id = request.args.get('employee_id', type=int) if admin_user else getattr(current_user, 'employee_id', None)
+
+        leads_access = _get_leads_access(session, employee_id_current)
+        can_view_all_leads = admin_user or leads_access == "full"
+
+        employee_id = (
+            request.args.get('employee_id', type=int)
+            if can_view_all_leads
+            else employee_id_current
+        )
 
         if local_demo_dashboard_enabled():
             return jsonify(dummy_leads_supplier_breakdown(employee_id)), 200
@@ -2002,10 +2186,17 @@ def get_leads_salesperson_breakdown():
         tenant_id = g.tenant_id
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
-        current_user = request.current_user
-        admin_user = is_crm_leads_admin_role(getattr(current_user, 'role', None))
 
-        if not admin_user:
+
+        current_user = request.current_user
+        current_employee_id = getattr(current_user, 'employee_id', None)
+
+        admin_user = is_crm_leads_admin_role(getattr(current_user, 'role', None))
+        leads_access = _get_leads_access(session, current_employee_id)
+
+        can_view_all_leads = admin_user or leads_access == "full"
+
+        if not can_view_all_leads:
             return jsonify([]), 200
 
         if local_demo_dashboard_enabled():
@@ -2085,8 +2276,19 @@ def get_leads_by_stage():
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
         current_user = request.current_user
+
+        current_employee_id = getattr(current_user, 'employee_id', None)
+
         admin_user = is_crm_leads_admin_role(getattr(current_user, 'role', None))
-        employee_id = request.args.get('employee_id', type=int) if admin_user else getattr(current_user, 'employee_id', None)
+        leads_access = _get_leads_access(session, current_employee_id)
+
+        can_view_all_leads = admin_user or leads_access == "full"
+
+        employee_id = (
+            request.args.get('employee_id', type=int)
+            if can_view_all_leads
+            else current_employee_id
+        )
 
         if local_demo_dashboard_enabled():
             return jsonify(dummy_leads_by_stage(stage, employee_id)), 200
@@ -2180,8 +2382,19 @@ def get_leads_period_breakdown():
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
         current_user = request.current_user
+
+        current_employee_id = getattr(current_user, 'employee_id', None)
+
         admin_user = is_crm_leads_admin_role(getattr(current_user, 'role', None))
-        employee_id = request.args.get('employee_id', type=int) if admin_user else getattr(current_user, 'employee_id', None)
+        leads_access = _get_leads_access(session, current_employee_id)
+
+        can_view_all_leads = admin_user or leads_access == "full"
+
+        employee_id = (
+            request.args.get('employee_id', type=int)
+            if can_view_all_leads
+            else current_employee_id
+        )
 
         if local_demo_dashboard_enabled():
             return jsonify(dummy_leads_period_breakdown(period, employee_id)), 200
@@ -2286,7 +2499,10 @@ def get_leads_performance():
         admin_user = is_crm_leads_admin_role(role_name)
         my_emp_id = getattr(current_user, 'employee_id', None)
 
-        if admin_user:
+        leads_access = _get_leads_access(session, my_emp_id)
+        can_view_all_leads = admin_user or leads_access == "full"
+
+        if can_view_all_leads:
             requested_employee_id = request.args.get('employee_id', type=int)
             employee_id = requested_employee_id
         else:
@@ -2320,7 +2536,7 @@ def get_leads_performance():
         employee_filter = ""
         if employee_id:
             employee_filter = "AND od.opportunity_owner_employee_id = :employee_id"
-        elif not admin_user:
+        elif not can_view_all_leads:
             return jsonify({
                 'converted_count': 0, 'renewed_count': 0,
                 'renewed_directly_count': 0, 'end_date_changed_count': 0,
@@ -2464,7 +2680,14 @@ def get_leads_stats_by_employee():
         current_user = request.current_user
         role_name = getattr(current_user, 'role', None)
 
-        if not is_crm_leads_admin_role(role_name):
+        employee_id = getattr(current_user, 'employee_id', None)
+
+        admin_user = is_crm_leads_admin_role(role_name)
+        leads_access = _get_leads_access(session, employee_id)
+
+        can_view_all_leads = admin_user or leads_access == "full"
+
+        if not can_view_all_leads:
             return jsonify({'stats': []}), 200
 
         service_param = request.args.get('service', 'utilities')
@@ -2519,13 +2742,19 @@ def get_leads_stats_by_employee_detailed():
 
         current_user = request.current_user
         role_name = getattr(current_user, 'role', None)
+
         admin_user = is_crm_leads_admin_role(role_name)
         my_emp_id = getattr(current_user, 'employee_id', None)
 
+        leads_access = _get_leads_access(session, my_emp_id)
+        can_view_all_leads = admin_user or leads_access == "full"
+
         only_employee_id = request.args.get('employee_id', type=int)
-        if not admin_user:
+
+        if not can_view_all_leads:
             if my_emp_id is None:
                 return jsonify({'employees': []}), 200
+
             only_employee_id = my_emp_id
 
         query = (
@@ -2583,7 +2812,104 @@ def get_leads_stats_by_employee_detailed():
 @token_required
 @tenant_from_jwt
 def bulk_delete_leads():
-    return crm_controller.bulk_delete_leads()
+    """
+    Bulk delete leads.
+
+    Admin/Full Access:
+        Can delete any leads within the tenant.
+
+    Partial Access:
+        Can delete only their own leads.
+        If even one selected lead belongs to another employee,
+        the whole request is rejected.
+    """
+    session = SessionLocal()
+
+    try:
+        tenant_id = g.tenant_id
+        current_user = request.current_user
+
+        employee_id = getattr(current_user, 'employee_id', None)
+        role_name = getattr(current_user, 'role', None)
+
+        admin_user = is_crm_leads_admin_role(role_name)
+        leads_access = _get_leads_access(session, employee_id)
+        can_view_all_leads = admin_user or leads_access == "full"
+
+        data = request.get_json(silent=True) or {}
+        lead_ids = data.get('opportunity_ids', [])
+
+        if not isinstance(lead_ids, list) or not lead_ids:
+            return jsonify({
+                'success': False,
+                'error': 'opportunity_ids must be a non-empty list'
+            }), 400
+
+        try:
+            lead_ids = list({int(lead_id) for lead_id in lead_ids})
+        except (TypeError, ValueError):
+            return jsonify({
+                'success': False,
+                'error': 'opportunity_ids must contain valid numbers'
+            }), 400
+
+        # Full Access / Admin → allow all tenant leads
+        if can_view_all_leads:
+            return crm_controller.bulk_delete_leads()
+
+        # Partial Access → verify every selected lead belongs to current user
+        leads = (
+            session.query(Opportunity_Details)
+            .filter(
+                Opportunity_Details.opportunity_id.in_(lead_ids)
+            )
+            .filter(
+                Opportunity_Details.tenant_id == tenant_id
+            )
+            .all()
+        )
+
+        found_ids = {
+            lead.opportunity_id
+            for lead in leads
+        }
+
+        # Check for missing leads
+        missing_ids = set(lead_ids) - found_ids
+
+        if missing_ids:
+            return jsonify({
+                'success': False,
+                'error': 'One or more selected leads were not found'
+            }), 404
+
+        # Check ownership
+        unauthorized_ids = [
+            lead.opportunity_id
+            for lead in leads
+            if lead.opportunity_owner_employee_id != employee_id
+        ]
+
+        if unauthorized_ids:
+            return jsonify({
+                'success': False,
+                'error': 'You do not have access to delete one or more selected leads'
+            }), 403
+
+        return crm_controller.bulk_delete_leads()
+
+    except Exception as e:
+        current_app.logger.exception(
+            "bulk_delete_leads access check failed: %s", e
+        )
+        return jsonify({
+            'success': False,
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+    finally:
+        session.close()
 
 
 @crm_bp.route('/leads/table', methods=['GET'])
@@ -4101,7 +4427,11 @@ def get_allocated_leads():
 
         employee_id = getattr(current_user, 'employee_id', None)
         role_name = getattr(current_user, 'role', None)
+
         admin_user = is_crm_leads_admin_role(role_name)
+        leads_access = _get_leads_access(session, employee_id)
+
+        can_view_all_leads = admin_user or leads_access == "full"
 
         import logging
         logging.getLogger(__name__).warning(
@@ -4109,7 +4439,7 @@ def get_allocated_leads():
             employee_id, admin_user, tenant_id, service_param
         )
 
-        if not employee_id:
+        if not employee_id and not can_view_all_leads:
             return jsonify([]), 200
 
         query = (
@@ -4132,8 +4462,10 @@ def get_allocated_leads():
             .filter(Opportunity_Details.is_allocated == True)
         )
 
-        if not admin_user:
-            query = query.filter(Opportunity_Details.opportunity_owner_employee_id == employee_id)
+        if not can_view_all_leads:
+            query = query.filter(
+                Opportunity_Details.opportunity_owner_employee_id == employee_id
+        )
 
         query = query.order_by(Opportunity_Details.created_at.desc())
         rows = query.all()
@@ -4174,9 +4506,13 @@ def get_archived_leads():
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
 
-        from backend.crm.utils.role_helpers import is_admin_user
-        is_admin = is_admin_user(current_user)
         employee_id = getattr(current_user, 'employee_id', None)
+        role_name = getattr(current_user, 'role', None)
+
+        admin_user = is_crm_leads_admin_role(role_name)
+        leads_access = _get_leads_access(session, employee_id)
+
+        can_view_all_leads = admin_user or leads_access == "full"
 
         import logging
         logging.getLogger(__name__).warning(
@@ -4200,7 +4536,7 @@ def get_archived_leads():
             .filter(Opportunity_Details.is_archived == True)
         )
 
-        if not is_admin and employee_id:
+        if not can_view_all_leads and employee_id:
             query = query.filter(Opportunity_Details.opportunity_owner_employee_id == employee_id)
 
         query = query.order_by(Opportunity_Details.created_at.desc())

@@ -330,6 +330,96 @@ def _load_suppliers(raw_conn) -> dict:
     cur.close()
     return result
 
+def _load_existing_lead_mpans(raw_conn, tenant_id) -> dict:
+    """Load existing Lead and Renewal MPANs for this tenant."""
+    cur = raw_conn.cursor()
+    result = {}
+
+    # Existing Leads
+    cur.execute("""
+        SELECT od.mpan_mpr
+        FROM "StreemLyne_MT"."Opportunity_Details" od
+        WHERE od.mpan_mpr IS NOT NULL
+          AND od.mpan_mpr != ''
+          AND od.tenant_id = %s
+    """, (str(tenant_id),))
+
+    for (mpan,) in cur.fetchall():
+        if mpan:
+            result[mpan.strip().lower()] = True
+
+    # Existing Renewals
+    cur.execute("""
+        SELECT ecm.mpan_number
+        FROM "StreemLyne_MT"."Energy_Contract_Master" ecm
+        JOIN "StreemLyne_MT"."Project_Details" pd
+            ON ecm.project_id = pd.project_id
+        JOIN "StreemLyne_MT"."Client_Master" cm
+            ON pd.client_id = cm.client_id
+        WHERE ecm.mpan_number IS NOT NULL
+          AND ecm.mpan_number != ''
+          AND cm.tenant_id = %s
+          AND cm.is_deleted = FALSE
+    """, (str(tenant_id),))
+
+    for (mpan,) in cur.fetchall():
+        if mpan:
+            result[mpan.strip().lower()] = True
+
+    cur.close()
+    return result
+
+
+def _load_existing_lead_duplicate_keys(raw_conn, tenant_id) -> dict:
+    """
+    Load existing lead duplicate keys.
+
+    Rules:
+    1. MPAN exists -> MPAN is the duplicate key.
+    2. MPAN missing -> Client Name + Company Name + Start Date + End Date.
+    """
+    cur = raw_conn.cursor()
+
+    result = {
+        'mpans': set(),
+        'details': set(),
+    }
+
+    cur.execute("""
+        SELECT
+            od.mpan_mpr,
+            od.contact_person,
+            od.business_name,
+            od.start_date,
+            od.end_date
+        FROM "StreemLyne_MT"."Opportunity_Details" od
+        WHERE od.tenant_id = %s
+    """, (str(tenant_id),))
+
+    for mpan, client_name, company_name, start_date, end_date in cur.fetchall():
+
+        if mpan:
+            mpan_key = str(mpan).strip().lower()
+
+            if mpan_key:
+                result['mpans'].add(mpan_key)
+
+        else:
+            client_key = str(client_name or '').strip().lower()
+            company_key = str(company_name or '').strip().lower()
+
+            # Only create fallback key when all four values exist
+            if client_key and company_key and start_date and end_date:
+                result['details'].add((
+                    client_key,
+                    company_key,
+                    start_date,
+                    end_date,
+                ))
+
+    cur.close()
+    return result
+
 
 def _resolve_supplier(name: str, suppliers_dict: dict, raw_conn) -> int | None:
     if not name:
@@ -1207,6 +1297,7 @@ def _run_leads_import(
         success_count   = 0
         error_count     = 0
         duplicate_count = 0
+        duplicate_details = []
         pending_tuples  = []   # ← pre-built tuples, not dicts
         start_time      = time.time()
         now             = datetime.utcnow()
@@ -1236,8 +1327,18 @@ def _run_leads_import(
                 # In-memory MPAN duplicate check
                 if mpan:
                     mpan_key = mpan.strip().lower()
+
                     if mpan_key in existing_lead_mpans:
                         duplicate_count += 1
+
+                        duplicate_details.append({
+                            'row': i + 2,
+                            'mpan': mpan,
+                            'company': business,
+                            'assigned_to': assigned_employee_name or 'Unassigned',
+                            'action': 'Duplicate MPAN - skipped',
+                        })
+
                         continue
                 else:
                     # MPAN Top is missing -> use Client + Company + Start + End
@@ -1253,6 +1354,15 @@ def _run_leads_import(
 
                     if duplicate_key in existing_lead_duplicate_keys['details']:
                         duplicate_count += 1
+
+                        duplicate_details.append({
+                            'row': i + 2,
+                            'mpan': '',
+                            'company': business,
+                            'assigned_to': assigned_employee_name or 'Unassigned',
+                            'action': 'Duplicate details - skipped',
+                        })
+
                         continue
 
                 # Supplier lookup — already pre-resolved, pure dict lookup
@@ -1354,6 +1464,7 @@ def _run_leads_import(
             processed=total_rows,
             successful=success_count,
             duplicates=duplicate_count,
+            duplicate_details=duplicate_details,
         )
 
     except Exception as fatal:
@@ -1587,7 +1698,10 @@ def import_leads():
         session.close()
 
     file_ext = filename.rsplit('.', 1)[1].lower()
-    tmp_path = f'/tmp/import_{uuid.uuid4().hex}.{file_ext}'
+    tmp_path = os.path.join(
+        tempfile.gettempdir(),
+        f"import_{uuid.uuid4().hex}.{file_ext}"
+    )
     file.save(tmp_path)
 
     total_rows = _count_rows(tmp_path, file_ext)

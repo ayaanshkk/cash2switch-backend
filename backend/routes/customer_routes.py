@@ -20,6 +20,7 @@ from ..db import SessionLocal
 from ..numeric_parse import safe_float
 from ..dummy_local_dashboard_data import dummy_employees_list, local_demo_dashboard_enabled
 from backend.crm.utils.display_order_helpers import recalculate_display_order
+from backend.services.search_permission_service import can_search_all_renewals
 
 # ✅ Import all models directly from backend.models
 from backend.models import (
@@ -1597,8 +1598,19 @@ def search_all_energy_customers():
             return jsonify([]), 200
  
         service_id = {'utilities': 1, 'electricity': 1, 'water': 2, 'gas': 3}.get(service_param, 1)
-        restrict_to_own_records = _is_field_sales_user(session, request.current_user)
-        current_employee_id = getattr(request.current_user, 'employee_id', None)
+
+        search_all_allowed = can_search_all_renewals(
+            request.current_user,
+            session
+        )
+
+        current_app.logger.warning(
+            "SEARCH PERMISSION DEBUG: "
+            f"user_id={getattr(request.current_user, 'user_id', None)}, "
+            f"employee_id={getattr(request.current_user, 'employee_id', None)}, "
+            f"role={getattr(request.current_user, 'role', None)}, "
+            f"search_all_renewals={search_all_allowed}"
+        )
  
         query = session.query(
             Client_Master,
@@ -1639,8 +1651,11 @@ def search_all_energy_customers():
             )
         )
 
-        if restrict_to_own_records:
-            query = query.filter(Project_Details.assigned_employee_id == current_employee_id)
+        if not search_all_allowed:
+            query = query.filter(
+                Project_Details.assigned_employee_id
+                == request.current_user.employee_id
+            )
 
         results = query.order_by(Client_Master.client_id.desc()).limit(50).all()
  
