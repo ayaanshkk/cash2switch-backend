@@ -149,7 +149,6 @@ ENERGY_CONTRACT_UPDATABLE_FIELDS = [
 ]
 
 PROJECT_UPDATABLE_FIELDS = [
-    # (dict_key, Project_Details_column)
     ('site_name',    'site_name'),
     ('month_sold',   'month_sold'),
     ('house_name',   'house_name'),
@@ -158,7 +157,6 @@ PROJECT_UPDATABLE_FIELDS = [
     ('town',         'town'),
     ('county',       'county'),
     ('address',      'address'),
-    ('postcode',     'postcode'),
 ]
 
 LEAD_UPDATABLE_FIELDS = [
@@ -478,35 +476,41 @@ def _update_missing_lead_fields(raw_conn, mpan_key: str, existing_entry: dict, r
 # Helpers
 # ---------------------------------------------------------------------------
 def _parse_address_components(addr1: str, addr2: str, addr3: str) -> dict:
-    """
-    Parse raw address lines into structured components.
-    
-    Rules:
-    - If addr1 starts with digits, the leading number becomes door_number
-      and the remainder becomes street
-    - addr2 and addr3 append to street if present
-    - Returns dict with keys: door_number, street
-    """
     import re
+
+    # UK postcode pattern — strip from any address line if it appears
+    POSTCODE_RE = re.compile(
+        r'\b[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}\b', re.IGNORECASE
+    )
 
     door_number = ''
     street_parts = []
 
+    def clean(s):
+        """Strip postcode from a string and trim."""
+        return POSTCODE_RE.sub('', s).strip().strip(',').strip()
+
     if addr1:
-        # Check if addr1 starts with a number e.g. "119 MAIN ROAD"
-        m = re.match(r'^(\d+[A-Za-z]?)\s+(.+)$', addr1.strip())
-        if m:
-            door_number = m.group(1)
-            street_parts.append(m.group(2))
-        else:
-            street_parts.append(addr1)
+        a1 = clean(addr1.strip())
+        if a1:
+            m = re.match(r'^(\d+[A-Za-z]?)\s+(.+)$', a1)
+            if m:
+                door_number = m.group(1)
+                street_parts.append(m.group(2).strip())
+            else:
+                street_parts.append(a1)
 
-    if addr2:
-        street_parts.append(addr2)
-    if addr3:
-        street_parts.append(addr3)
+    if addr2 and addr2.strip().lower() not in ('', 'nan'):
+        a2 = clean(addr2.strip())
+        if a2:
+            street_parts.append(a2)
 
-    street = ', '.join(p for p in street_parts if p and p.lower() != 'nan')
+    if addr3 and addr3.strip().lower() not in ('', 'nan'):
+        a3 = clean(addr3.strip())
+        if a3:
+            street_parts.append(a3)
+
+    street = ', '.join(p for p in street_parts if p)
 
     return {
         'door_number': door_number or None,
@@ -798,50 +802,36 @@ def _load_existing_mpans(raw_conn, tenant_id) -> dict:
 
 
 def _load_existing_lead_mpans(raw_conn, tenant_id) -> dict:
-    """Load existing lead MPANs AND energy contract MPANs for this tenant.
-    Returns dict: mpan_lower -> { 'opportunity_id': int, 'owner_employee_id': int|None }
-    """
+    import os
+    import logging
+    _log = logging.getLogger(__name__)
+    
+    _log.warning(f"[DEBUG] _load_existing_lead_mpans called from {os.path.abspath(__file__)}")
+    
     cur = raw_conn.cursor()
     result = {}
 
-    # From Opportunity_Details (leads)
     cur.execute("""
         SELECT od.mpan_mpr, od.opportunity_id, od.opportunity_owner_employee_id
         FROM "StreemLyne_MT"."Opportunity_Details" od
-        WHERE od.mpan_mpr IS NOT NULL 
+        WHERE od.mpan_mpr IS NOT NULL
           AND od.mpan_mpr != ''
           AND od.tenant_id = %s
     """, (str(tenant_id),))
+
     for (mpan, opp_id, owner_id) in cur.fetchall():
         if mpan:
             result[mpan.strip().lower()] = {
-                'opportunity_id':      opp_id,
-                'owner_employee_id':   owner_id,
+                'opportunity_id':    opp_id,
+                'owner_employee_id': owner_id,
             }
 
-    # From Energy_Contract_Master (renewals) — cross-check against renewals DB too
-    cur.execute("""
-        SELECT ecm.mpan_number
-        FROM "StreemLyne_MT"."Energy_Contract_Master" ecm
-        JOIN "StreemLyne_MT"."Project_Details" pd
-            ON ecm.project_id = pd.project_id
-        JOIN "StreemLyne_MT"."Client_Master" cm
-            ON pd.client_id = cm.client_id
-        WHERE ecm.mpan_number IS NOT NULL
-          AND ecm.mpan_number != ''
-          AND cm.tenant_id = %s
-          AND cm.is_deleted = FALSE
-    """, (str(tenant_id),))
-    for (mpan,) in cur.fetchall():
-        if mpan and mpan.strip().lower() not in result:
-            result[mpan.strip().lower()] = {
-                'opportunity_id':    None,
-                'owner_employee_id': None,
-            }
+    _log.warning(f"[DEBUG] loaded {len(result)} MPANs for tenant {tenant_id}")
+    for test in ['1100012314490', '1100012314491', '1100012314492']:
+        _log.warning(f"[DEBUG] {test}: {'FOUND' if test.lower() in result else 'not found'}")
 
     cur.close()
     return result
-
 
 def _get_default_stage(raw_conn) -> int:
     cur = raw_conn.cursor()
@@ -1152,21 +1142,21 @@ def _run_energy_import(
                 town           = safe_str(towns[i])
                 county         = safe_str(counties[i])
                 postcode       = safe_str(postcodes[i])
+                door_number    = safe_str(door_numbers[i])
 
                 addr_components = _parse_address_components(addr1, addr2, addr3)
                 parsed_door     = addr_components['door_number']
                 parsed_street   = addr_components['street']
 
-                # Use parsed door number only if not already explicitly set
-                # from a dedicated door_number column in the sheet
                 if not door_number and parsed_door:
                     door_number = parsed_door
 
-                # Full flat address for Client_Master.address (legacy joined string)
+                # parsed_street = street lines only, no town/county/postcode
+                # address = full flat string for Client_Master.address legacy field
                 address_parts = [p for p in [parsed_street, town, county, postcode]
                                  if p and p.lower() != 'nan']
-                address       = ', '.join(address_parts)
-                site_address  = site_name or parsed_street or address
+                address      = ', '.join(address_parts)
+                site_address = site_name or parsed_street or address
                 mpan_top       = safe_str(mpan_tops[i])
                 mpan_bottom    = safe_str(mpan_bottoms[i])
                 supplier_name  = safe_str(suppliers[i])
@@ -1189,7 +1179,6 @@ def _run_energy_import(
                 month_sold     = safe_str(month_solds[i])
                 house_name     = safe_str(house_names[i])
                 house_number   = safe_str(house_numbers[i])
-                door_number    = safe_str(door_numbers[i])
                 partner_det    = safe_str(partner_dets[i])
                 bank_name      = safe_str(bank_names[i])
                 ac_number      = safe_str(ac_numbers[i])
@@ -1199,10 +1188,6 @@ def _run_energy_import(
                 partner_dob    = parse_date(partner_dobs[i])
                 credit_score   = parse_number(credit_scores[i])
 
-                address_parts = [p for p in [addr1, addr2, addr3, town, county]
-                                 if p and p.lower() != 'nan']
-                address       = ', '.join(address_parts)
-                site_address  = site_name or address
                 business_name  = trading_name or client_name
                 contact_person = main_contact or client_name
 
@@ -1222,7 +1207,6 @@ def _run_energy_import(
                             existing_end and end_date and end_date <= existing_end
                         )
                         if is_assigned_non_draft and (same_or_older or not end_date):
-                            # ── Try to fill missing fields before skipping ────
                             _update_missing_energy_fields(
                                 raw_conn,
                                 mpan_top.strip().lower(),
@@ -1297,8 +1281,8 @@ def _run_energy_import(
                     'month_sold':      month_sold or None,
                     'house_name':      house_name or None,
                     'house_number':    house_number or None,
-                    'door_number':     door_number or parsed_door or None,   # ← explicit or parsed
-                    'street':          parsed_street or None,                # ← new
+                    'door_number':     door_number or parsed_door or None,
+                    'street':          parsed_street or None,
                     'town':            town or None,
                     'county':          county or None,
                     'supplier_id':     _resolve_supplier(supplier_name, suppliers_dict, raw_conn),
@@ -1562,8 +1546,8 @@ def _run_leads_import(
                 parsed_door     = addr_components['door_number']
                 parsed_street   = addr_components['street']
 
-                # Full flat address for storage
-                address_parts = [p for p in [parsed_street, town, county]
+                # parsed_street = street lines only, no town/county/postcode
+                address_parts = [p for p in [parsed_street, town, county, postcode]
                                  if p and p.lower() != 'nan']
                 address = ', '.join(address_parts)
 
@@ -1575,6 +1559,7 @@ def _run_leads_import(
                 if mpan:
                     mpan_key = mpan.strip().lower()
                     if mpan_key in existing_lead_mpans:
+                        print(f"[DEBUG] Duplicate hit: mpan={mpan_key}, existing={existing_lead_mpans[mpan_key]}")
                         # ── Try to fill missing fields before skipping ────────
                         _update_missing_lead_fields(
                             raw_conn,

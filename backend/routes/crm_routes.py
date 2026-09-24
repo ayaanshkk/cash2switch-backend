@@ -663,6 +663,12 @@ def get_leads():
                             cast(Opportunity_Details.end_date, SADate) > today + timedelta(days=90),
                             cast(Opportunity_Details.end_date, SADate) <= today + timedelta(days=365)
                         )
+                    elif filter_end_date == '365':
+                        q = q.filter(
+                            Opportunity_Details.end_date.isnot(None),
+                            cast(Opportunity_Details.end_date, SADate) >= today,
+                            cast(Opportunity_Details.end_date, SADate) <= today + timedelta(days=365)
+                        )
 
                 # Text search
                 if search_q:
