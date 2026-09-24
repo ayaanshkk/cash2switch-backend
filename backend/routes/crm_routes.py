@@ -771,7 +771,6 @@ def get_leads():
                     .filter(Opportunity_Details.service_id == service_id)
                     .filter(Opportunity_Details.opportunity_owner_employee_id.isnot(None))
                     .filter((Opportunity_Details.is_draft == False) | (Opportunity_Details.is_draft.is_(None)))
-                    .filter((Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None)))
                     .filter((Client_Master.is_deleted.is_(None)) | (Client_Master.is_deleted == False))
                     .group_by(Employee_Master.employee_id, Employee_Master.employee_name)
                     .having(func.count(Opportunity_Details.opportunity_id) > 0)
