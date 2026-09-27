@@ -79,7 +79,7 @@ def _lead_stage_bucket(stage_name: str) -> str:
         return "lost"
     if s in ("callback", "not answered", "broker in place", "email only", "complaint", "incorrect supplier", "priced", "end date changed"):
         return "in_progress"
-    return "not_contacted"
+    return "not_contacted"  # includes "not called", "no contact", "dead", "duplicate", etc.
 
 # Lightweight helper: attach tenant_id from decoded JWT to `g` (no new auth logic)
 def tenant_from_jwt(f):
@@ -273,7 +273,7 @@ def _lead_stage_bucket(stage_name: str) -> str:
         return "lost"
     if s in ("callback", "not answered", "broker in place", "email only", "complaint", "incorrect supplier", "priced", "end date changed"):
         return "in_progress"
-    return "not_contacted"
+    return "not_contacted"  # includes "not called", "no contact", "dead", "duplicate", etc.
 
 # ========================================
 # LEAD ROUTES
