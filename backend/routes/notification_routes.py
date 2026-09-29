@@ -4,6 +4,7 @@ from sqlalchemy import text
 from ..models import Notification_Master, Energy_Contract_Master, Client_Master, Project_Details, Employee_Master
 from .auth_helpers import token_required
 from ..db import SessionLocal
+from ..utils.commission_reminders import run_commission_reminders
 import logging
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,7 @@ def get_production_notifications():
         if not last_run or (now - last_run).total_seconds() > 3600:
             try:
                 _generate_notifications_for_tenant(session, tenant_id)
+                run_commission_reminders(session, tenant_id=str(tenant_id))
                 session.commit()
                 _last_auto_generate[tenant_id] = now
             except Exception as gen_err:

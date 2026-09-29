@@ -539,15 +539,18 @@ def get_leads():
 
         # ── Pagination ──────────────────────────────────────────────────────
         page      = max(int(request.args.get('page', 1) or 1), 1)
-        page_size = min(max(int(request.args.get('page_size', 50) or 50), 1), 200)
+        page_size = max(int(request.args.get('page_size', 50) or 50), 1)
         offset    = (page - 1) * page_size
 
         # ── Server-side filters ─────────────────────────────────────────────
         search_q        = (request.args.get('search', '') or '').strip().lower()
         filter_supplier = request.args.get('supplier_id', type=int)
         filter_status   = (request.args.get('status', '') or '').strip()
-        filter_end_date = (request.args.get('end_date_filter', '') or '').strip()
-        filter_employee = request.args.get('employee_id', type=int)
+        filter_end_date     = (request.args.get('end_date_filter', '') or '').strip()
+        filter_employee     = request.args.get('employee_id', type=int)
+        filter_uploaded_from = (request.args.get('uploaded_from', '') or '').strip()
+        filter_uploaded_to   = (request.args.get('uploaded_to',   '') or '').strip()
+        filter_upload_sort   = (request.args.get('upload_sort',   '') or '').strip().lower()  # 'asc' | 'desc' | ''
 
         user_id     = getattr(current_user, 'id', None) or getattr(current_user, 'user_id', None)
         employee_id = getattr(current_user, 'employee_id', None)
@@ -681,6 +684,22 @@ def get_leads():
                         func.lower(func.coalesce(Opportunity_Details.mpan_mpr, '')).like(like)
                     )
 
+                # Recently uploaded date range filter
+                if filter_uploaded_from:
+                    try:
+                        from datetime import datetime as _dt
+                        date_from = _dt.strptime(filter_uploaded_from, '%Y-%m-%d').date()
+                        q = q.filter(cast(Opportunity_Details.created_at, SADate) >= date_from)
+                    except ValueError:
+                        pass
+                if filter_uploaded_to:
+                    try:
+                        from datetime import datetime as _dt
+                        date_to = _dt.strptime(filter_uploaded_to, '%Y-%m-%d').date()
+                        q = q.filter(cast(Opportunity_Details.created_at, SADate) <= date_to)
+                    except ValueError:
+                        pass
+
                 return q
 
             # ── Total count ─────────────────────────────────────────────────
@@ -706,9 +725,13 @@ def get_leads():
                 .outerjoin(Client_Master,   Opportunity_Details.client_id    == Client_Master.client_id)
             )
 
+            if filter_upload_sort == 'asc':
+                upload_order = [Opportunity_Details.created_at.asc(), Opportunity_Details.opportunity_id.asc()]
+            else:
+                upload_order = [Opportunity_Details.created_at.desc(), Opportunity_Details.opportunity_id.desc()]
             rows = (
                 data_q
-                .order_by(Opportunity_Details.created_at.desc())
+                .order_by(*upload_order)
                 .limit(page_size)
                 .offset(offset)
                 .all()

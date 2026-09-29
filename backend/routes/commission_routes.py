@@ -1761,6 +1761,53 @@ def update_commission_payment_status(payment_id: str):
     finally:
         session.close()
 
+@commission_bp.route('/chasing-summary', methods=['GET'])
+@token_required
+def get_chasing_summary():
+    """Per-supplier overdue outstanding summary — accessible to all authenticated users."""
+    tenant_id, tenant_error = _require_tenant_id()
+    if tenant_error:
+        return tenant_error
+
+    today = date.today()
+    session = SessionLocal()
+    try:
+        rows = (
+            session.query(
+                Commission_Payment.supplier_id,
+                Supplier_Master.supplier_company_name.label('supplier_name'),
+                func.count(func.distinct(Commission_Payment.contract_id)).label('overdue_count'),
+                func.coalesce(func.sum(Commission_Payment.outstanding_amount), 0).label('total_outstanding'),
+            )
+            .outerjoin(Supplier_Master, Commission_Payment.supplier_id == Supplier_Master.supplier_id)
+            .filter(
+                Commission_Payment.tenant_id == tenant_id,
+                Commission_Payment.outstanding_amount > 0,
+                Commission_Payment.due_date < today,
+                Commission_Payment.status.notin_(['Received', 'Closed']),
+                _not_old_payment_filter(),
+            )
+            .group_by(Commission_Payment.supplier_id, Supplier_Master.supplier_company_name)
+            .order_by(desc(func.coalesce(func.sum(Commission_Payment.outstanding_amount), 0)))
+            .all()
+        )
+
+        return jsonify({
+            'success': True,
+            'suppliers': [
+                {
+                    'supplier_id': supplier_id,
+                    'supplier_name': supplier_name or (f'Supplier #{supplier_id}' if supplier_id else 'Unknown'),
+                    'overdue_count': int(overdue_count or 0),
+                    'total_outstanding': _money(total_outstanding),
+                }
+                for supplier_id, supplier_name, overdue_count, total_outstanding in rows
+            ],
+        }), 200
+    finally:
+        session.close()
+
+
 @commission_bp.route('/clients-with-payments', methods=['GET'])
 @token_required
 def list_clients_with_payments():
@@ -1878,6 +1925,24 @@ def list_clients_with_payments():
                 query = query.filter(Project_Details.assigned_employee_id == int(employee_id))
             except ValueError:
                 return jsonify({'error': 'agent must be an integer'}), 400
+
+        needs_chasing_param = request.args.get('needs_chasing', '').lower()
+        if needs_chasing_param == 'true':
+            chasing_subq = (
+                session.query(Commission_Payment.contract_id)
+                .filter(
+                    Commission_Payment.tenant_id == tenant_id,
+                    Commission_Payment.outstanding_amount > 0,
+                    Commission_Payment.due_date < today,
+                    Commission_Payment.status.notin_(['Received', 'Closed']),
+                    _not_old_payment_filter(),
+                )
+                .subquery()
+            )
+            query = query.filter(
+                Energy_Contract_Master.energy_contract_master_id.in_(chasing_subq)
+            )
+
         if search:
             search_pattern = f'%{search}%'
             query = query.filter(or_(
