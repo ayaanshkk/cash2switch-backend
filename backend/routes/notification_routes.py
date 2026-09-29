@@ -6,6 +6,7 @@ from .auth_helpers import token_required
 from ..db import SessionLocal
 from ..utils.commission_reminders import run_commission_reminders
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 notification_bp = Blueprint('notification', __name__, url_prefix='/notifications')
@@ -103,18 +104,24 @@ def get_production_notifications():
         tenant_id = get_tenant_id_from_user(request.current_user)
         employee_id = getattr(request.current_user, 'employee_id', None)
 
-        # ✅ Throttle: only auto-generate once per hour per tenant
+        # Throttle: only auto-generate once per hour per tenant.
+        # Runs in a background thread so the notification fetch never blocks.
         now = datetime.utcnow()
         last_run = _last_auto_generate.get(tenant_id)
         if not last_run or (now - last_run).total_seconds() > 3600:
-            try:
-                _generate_notifications_for_tenant(session, tenant_id)
-                run_commission_reminders(session, tenant_id=str(tenant_id))
-                session.commit()
-                _last_auto_generate[tenant_id] = now
-            except Exception as gen_err:
-                session.rollback()
-                logger.warning('Auto-generate notifications failed (non-fatal): %s', gen_err)
+            _last_auto_generate[tenant_id] = now  # mark immediately so parallel requests don't double-fire
+            def _bg_generate(tid):
+                bg_session = SessionLocal()
+                try:
+                    _generate_notifications_for_tenant(bg_session, tid)
+                    run_commission_reminders(bg_session, tenant_id=str(tid))
+                    bg_session.commit()
+                except Exception as gen_err:
+                    bg_session.rollback()
+                    logger.warning('Background auto-generate failed (non-fatal): %s', gen_err)
+                finally:
+                    bg_session.close()
+            threading.Thread(target=_bg_generate, args=(tenant_id,), daemon=True).start()
 
         # ✅ Everyone sees only their own notifications — no admin catch-all
         notifications = session.execute(text('''
