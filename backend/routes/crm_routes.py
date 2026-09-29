@@ -539,7 +539,7 @@ def get_leads():
 
         # ── Pagination ──────────────────────────────────────────────────────
         page      = max(int(request.args.get('page', 1) or 1), 1)
-        page_size = max(int(request.args.get('page_size', 50) or 50), 1)
+        page_size = min(max(int(request.args.get('page_size', 50) or 50), 1), 500)
         offset    = (page - 1) * page_size
 
         # ── Server-side filters ─────────────────────────────────────────────
@@ -1655,6 +1655,135 @@ def assign_leads():
     Request body: { lead_ids: [...], employee_id: N }
     """
     return crm_controller.assign_leads()
+
+
+@crm_bp.route('/leads/assign-by-filter', methods=['POST'])
+@token_required
+@tenant_from_jwt
+def assign_leads_by_filter():
+    """
+    POST /api/crm/leads/assign-by-filter
+    Assign up to `count` leads matching the given filters to an employee,
+    entirely server-side — no need to fetch IDs first.
+    Body: { employee_id, count, service, salesperson_filter, assignment_notes }
+    """
+    from sqlalchemy import text as _text
+    from datetime import datetime as _dt
+
+    user = getattr(request, 'current_user', None)
+    if not user:
+        return jsonify({'success': False, 'error': 'Authentication required'}), 401
+
+    tenant_id = str(g.tenant_id)
+    payload = request.get_json() or {}
+
+    try:
+        employee_id   = int(payload['employee_id'])
+        count         = int(payload.get('count') or 0) or None   # None = no limit
+        service_param = str(payload.get('service', 'energy')).strip().lower()
+        service_id    = 2 if service_param == 'water' else 1
+        salesperson   = payload.get('salesperson_filter')         # employee_id to take leads from
+        notes         = (payload.get('assignment_notes') or '').strip()
+        exclude_stage = (payload.get('exclude_stage') or 'Lost').strip()
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({'success': False, 'error': f'Invalid payload: {exc}'}), 400
+
+    current_user_employee_id = getattr(user, 'employee_id', None)
+    is_allocated = (current_user_employee_id is None) or (employee_id != current_user_employee_id)
+
+    session = SessionLocal()
+    try:
+        # Resolve employee name
+        emp = session.execute(_text("""
+            SELECT employee_name FROM "StreemLyne_MT"."Employee_Master"
+            WHERE employee_id = :id LIMIT 1
+        """), {'id': employee_id}).fetchone()
+        employee_name = emp[0] if emp else 'Unknown'
+
+        # Build the subquery that selects which opportunity_ids to update
+        filter_clauses = [
+            'TRIM(od.tenant_id) = :tid',
+            'od.service_id = :svc',
+            'COALESCE(od.is_draft, FALSE) = FALSE',
+        ]
+        params = {'tid': tenant_id, 'svc': service_id, 'emp_id': employee_id, 'is_alloc': is_allocated}
+
+        if exclude_stage:
+            filter_clauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM "StreemLyne_MT"."Stage_Master" sm
+                    WHERE sm.stage_id = od.stage_id
+                      AND LOWER(sm.stage_name) = LOWER(:excl_stage)
+                )
+            """)
+            params['excl_stage'] = exclude_stage
+
+        if salesperson and salesperson != 'All':
+            try:
+                filter_clauses.append('od.opportunity_owner_employee_id = :sp_id')
+                params['sp_id'] = int(salesperson)
+            except (ValueError, TypeError):
+                pass
+
+        where_sql = ' AND '.join(filter_clauses)
+        limit_sql  = f'LIMIT {int(count)}' if count else ''
+
+        result = session.execute(_text(f"""
+            UPDATE "StreemLyne_MT"."Opportunity_Details" od
+            SET opportunity_owner_employee_id = :emp_id,
+                is_allocated = :is_alloc,
+                is_draft     = FALSE
+            WHERE od.opportunity_id IN (
+                SELECT od2.opportunity_id
+                FROM   "StreemLyne_MT"."Opportunity_Details" od2
+                WHERE  {where_sql}
+                ORDER  BY od2.created_at ASC, od2.opportunity_id ASC
+                {limit_sql}
+            )
+        """), params)
+        total_updated = result.rowcount or 0
+
+        if notes and total_updated:
+            note_text = f"[Assignment] Assigned to {employee_name}: {notes}"
+            now = _dt.utcnow()
+            rows = session.execute(_text(f"""
+                SELECT od.client_id
+                FROM   "StreemLyne_MT"."Opportunity_Details" od
+                WHERE  {where_sql}
+                  AND  od.opportunity_owner_employee_id = :emp_id
+                  AND  od.client_id IS NOT NULL
+                {limit_sql}
+            """), params).fetchall()
+            client_ids = [r[0] for r in rows if r[0]]
+            if client_ids:
+                CHUNK = 500
+                for i in range(0, len(client_ids), CHUNK):
+                    chunk = client_ids[i:i + CHUNK]
+                    vals  = ', '.join(f'(:c{j}, CURRENT_DATE, 1, :note, \'Assignment\', :now)' for j, _ in enumerate(chunk))
+                    p2    = {'note': note_text, 'now': now}
+                    for j, cid in enumerate(chunk):
+                        p2[f'c{j}'] = cid
+                    session.execute(_text(f"""
+                        INSERT INTO "StreemLyne_MT"."Client_Interactions"
+                            (client_id, contact_date, contact_method, notes, next_steps, created_at)
+                        VALUES {vals}
+                    """), p2)
+
+        session.commit()
+        return jsonify({
+            'success': True,
+            'assigned_count': total_updated,
+            'message': f'Assigned {total_updated} lead(s) to {employee_name}',
+            'employee_name': employee_name,
+            'employee_id': employee_id,
+        }), 200
+
+    except Exception as exc:
+        session.rollback()
+        current_app.logger.exception('assign_leads_by_filter failed: %s', exc)
+        return jsonify({'success': False, 'error': str(exc)}), 500
+    finally:
+        session.close()
 
 
 @crm_bp.route('/leads/<int:opportunity_id>', methods=['DELETE'])
