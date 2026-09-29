@@ -2392,7 +2392,7 @@ def energy_client_callback(client_id):
         is_sold = data.get('is_sold', False)
 
         DATE_CHANGE_STATUSES = {'Already Renewed', 'Sold', 'End Date Changed', 'Renewed Directly'}
-        RECYCLE_BIN_STATUSES = {'Lost', 'Lost COT', 'Meter De-energised', 'Complaint', 'Duplicate'}
+        RECYCLE_BIN_STATUSES = {'Lost', 'Lost COT', 'Meter De-energised', 'Complaint', 'Duplicate', 'Dead'}
         CLEANSING_STATUSES   = {'Invalid Number', 'Incorrect Supplier'}
         POLICY_MAP = {
             'Already Renewed':  'Renewed',

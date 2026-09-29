@@ -1552,7 +1552,7 @@ def update_lead_status(opportunity_id):
         session.flush()
 
         CLEANSING_STATUSES = {'Invalid Number', 'Incorrect Supplier'}
-        RECYCLE_BIN_STATUSES = {'Lost', 'Lost COT', 'Meter De-energised', 'Complaint'}
+        RECYCLE_BIN_STATUSES = {'Lost', 'Lost COT', 'Meter De-energised', 'Complaint', 'Dead'}
 
         if status in CLEANSING_STATUSES:
             client = session.query(Client_Master).filter(
@@ -4133,7 +4133,7 @@ def leads_callback(opportunity_id):
         )
 
         CLEANSING_STATUSES = {'Invalid Number', 'Incorrect Supplier'}
-        RECYCLE_BIN_STATUSES = {'Lost', 'Lost COT', 'Meter De-energised', 'Complaint', 'Duplicate'}
+        RECYCLE_BIN_STATUSES = {'Lost', 'Lost COT', 'Meter De-energised', 'Complaint', 'Duplicate', 'Dead'}
 
         if status in CLEANSING_STATUSES:
             client = session.query(Client_Master).filter(
