@@ -756,6 +756,7 @@ class LeadRepository:
             AND (cm."is_cleansing" = FALSE OR cm."is_cleansing" IS NULL)
         '''
         
+        
         params = [tenant_id_str]  # ✅ STRING tenant_id
         
         if service_id is not None:

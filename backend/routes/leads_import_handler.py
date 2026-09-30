@@ -273,6 +273,39 @@ def import_leads_handler():
         errors = []
         duplicate_details = []
         cross_tenant_duplicates = []
+
+        # Track duplicates within the current import file
+        seen_mpans = set()
+        seen_detail_keys = set()
+
+        # Pre-load existing Lead details for fallback duplicate checking
+        existing_detail_keys = set()
+
+        for opp, client, project in session.query(
+             Opportunity_Details,
+             Client_Master,
+             Project_Details
+        ).join(
+            Client_Master,
+            Opportunity_Details.client_id == Client_Master.client_id
+        ).join(
+            Project_Details,
+            Opportunity_Details.opportunity_id == Project_Details.opportunity_id
+        ).filter(
+            Opportunity_Details.tenant_id == tenant_id
+        ).all():
+
+            contact_key = (client.client_contact_name or '').strip().lower()
+            company_key = (client.client_company_name or '').strip().lower()
+            start_key = project.start_date
+            end_key = project.end_date
+
+         # Only use fallback duplicate key when all four fields exist
+            if contact_key and company_key and start_key and end_key:
+                    existing_detail_keys.add(
+                    (contact_key, company_key, start_key, end_key)
+                )
+
         BATCH_SIZE = 50
 
         def gcol(field):
@@ -309,6 +342,7 @@ def import_leads_handler():
                 address_parts = [p for p in [addr1, addr2, town, county] if p]
                 address       = ', '.join(address_parts)
                 site_address  = site_name or address
+
                 business_name = trading_name or client_name
                 contact_person = main_contact or client_name
 
@@ -316,20 +350,68 @@ def import_leads_handler():
                 if not business_name and not tel_no and not email and not mpan_top and not contact_person:
                     continue
 
-                supplier_id     = _get_or_create_supplier(supplier_name, suppliers_dict, session) if supplier_name else 1
-                old_supplier_id = _get_or_create_supplier(old_sup_name, suppliers_dict, session) if old_sup_name else None
+                supplier_id = _get_or_create_supplier(
+                      supplier_name, suppliers_dict, session
+                ) if supplier_name else 1
 
-                # ── MPAN duplicate logic (same as energy-customers) ────
+                old_supplier_id = _get_or_create_supplier(
+                  old_sup_name, suppliers_dict, session
+               ) if old_sup_name else None
+
+               # ── Lead duplicate key ─────────────────────────────────────
+                detail_key = (
+                    contact_person.strip().lower(), 
+                    business_name.strip().lower(),
+                    start_date,
+                    end_date,
+                )
+
+                # ── Duplicate logic ────────────────────────────────────────
+
+                # 1. MPAN exists → duplicate based on MPAN
                 if mpan_top:
                     mpan_key = mpan_top.strip().lower()
+
+                    # Duplicate already present in this import file
+                    if mpan_key in seen_mpans:
+                        duplicate_count += 1
+
+                        duplicate_details.append({
+                            'row': index + 2,
+                            'mpan': mpan_top,
+                            'company': business_name,
+                            'assigned_to': assigned_employee_name or 'Unassigned',
+                            'action': 'Duplicate MPAN in import file',
+                        })
+
+                        continue
+
+                    # Duplicate already exists in database
                     existing_records = existing_mpans.get(mpan_key)
 
                     if existing_records:
                         duplicate_count += 1
-                        cross_rec = next((r for r in existing_records if r['tenant_id'] != tenant_id), None)
-                        same_rec  = next((r for r in existing_records if r['tenant_id'] == tenant_id), None)
 
-                        if cross_rec:
+                        same_rec = next(
+                            (r for r in existing_records if r['tenant_id'] == tenant_id),
+                            None
+                        )
+
+                        cross_rec = next(
+                            (r for r in existing_records if r['tenant_id'] != tenant_id),
+                            None
+                        )
+
+                        if same_rec:
+                            duplicate_details.append({
+                                'row': index + 2,
+                                'mpan': mpan_top,
+                                'company': business_name,
+                                'assigned_to': same_rec['assigned_to_name'],
+                                'action': 'Duplicate MPAN - skipped',
+                            })
+
+                        elif cross_rec:
                             cross_tenant_duplicates.append({
                                 'row': index + 2,
                                 'mpan': mpan_top,
@@ -339,149 +421,52 @@ def import_leads_handler():
                                 'assigned_to': cross_rec['assigned_to_name'],
                                 'is_archived': cross_rec['is_archived'],
                             })
-                            continue
 
-                        if same_rec:
-                            existing_contract = same_rec['contract']
-                            existing_end = existing_contract.contract_end_date
-                            new_end = end_date
+                        continue
 
-                            if existing_end and new_end and existing_end == new_end:
-                                action = 'Exact duplicate - skipped'
-                            elif existing_end and new_end and new_end < existing_end:
-                                action = 'Older record - created as archived'
-                            elif existing_end and new_end and new_end > existing_end:
-                                action = 'Newer record - archived existing'
-                            else:
-                                action = 'Updated existing record'
+                    # First occurrence of this MPAN in this file
+                    seen_mpans.add(mpan_key)
+
+                # 2. MPAN missing → use 4-field duplicate check
+                else:
+                    # Only check fallback duplicate when all 4 values are present
+                    if all([
+                        contact_person.strip(),
+                        business_name.strip(),
+                        start_date,
+                        end_date,
+                    ]):
+
+                        # Duplicate in database
+                        if detail_key in existing_detail_keys:
+                            duplicate_count += 1
 
                             duplicate_details.append({
-                                'row': index + 2, 'mpan': mpan_top,
+                                'row': index + 2,
+                                'mpan': '',
                                 'company': business_name,
-                                'assigned_to': same_rec['assigned_to_name'],
-                                'action': action,
+                                'assigned_to': assigned_employee_name or 'Unassigned',
+                                'action': 'Duplicate details - skipped',
                             })
 
-                            if same_rec['is_archived']:
-                                continue
-                            if not new_end:
-                                continue
+                            continue
 
-                            if existing_end and new_end < existing_end:
-                                # Create as archived
-                                try:
-                                    arc_client = Client_Master(
-                                        tenant_id=tenant_id,
-                                        assigned_employee_id=opportunity_owner_id,
-                                        client_company_name=business_name or '',
-                                        client_contact_name=contact_person or '',
-                                        address=address or '',
-                                        post_code=postcode or '',
-                                        client_phone=tel_no or '',
-                                        client_mobile=mobile_no or None,
-                                        client_email=email or '',
-                                        client_website='',
-                                        default_currency_id=1,
-                                        created_at=datetime.utcnow(),
-                                        is_archived=True,
-                                        archived_at=datetime.utcnow(),
-                                        archived_reason=f"Historical record (ended {new_end}) - superseded by existing contract ending {existing_end}",
-                                    )
-                                    session.add(arc_client)
-                                    session.flush()
+                        # Duplicate within current import file
+                        if detail_key in seen_detail_keys:
+                            duplicate_count += 1
 
-                                    arc_opp = Opportunity_Details(
-                                        client_id=arc_client.client_id,
-                                        opportunity_title=business_name or '',
-                                        opportunity_description='Imported lead (archived)',
-                                        opportunity_date=datetime.utcnow().date(),
-                                        opportunity_owner_employee_id=opportunity_owner_id,
-                                        stage_id=default_stage_id,
-                                        opportunity_value=0,
-                                        currency_id=1,
-                                        created_at=datetime.utcnow(),
-                                    )
-                                    session.add(arc_opp)
-                                    session.flush()
+                            duplicate_details.append({
+                                'row': index + 2,
+                                'mpan': '',
+                                'company': business_name,
+                                'assigned_to': assigned_employee_name or 'Unassigned',
+                                'action': 'Duplicate details in import file',
+                            })
 
-                                    arc_proj = Project_Details(
-                                        client_id=arc_client.client_id,
-                                        opportunity_id=arc_opp.opportunity_id,
-                                        project_title=business_name or '',
-                                        project_description='Imported lead site',
-                                        start_date=start_date or datetime.utcnow().date(),
-                                        end_date=end_date,
-                                        employee_id=employee_id,
-                                        created_at=datetime.utcnow(),
-                                        updated_at=datetime.utcnow(),
-                                        address=site_address or address or '',
-                                        Misc_Col2=int(annual_usage) if annual_usage else None,
-                                        site_name=site_name or None,
-                                        town=town or None,
-                                        county=county or None,
-                                    )
-                                    session.add(arc_proj)
-                                    session.flush()
+                            continue
 
-                                    arc_contract = Energy_Contract_Master(
-                                        project_id=arc_proj.project_id,
-                                        employee_id=employee_id,
-                                        supplier_id=supplier_id,
-                                        old_supplier_id=old_supplier_id,
-                                        contract_start_date=start_date or datetime.utcnow().date(),
-                                        contract_end_date=end_date,
-                                        terms_of_sale='',
-                                        service_id=import_service_id,
-                                        unit_rate=unit_rate or 0.0,
-                                        currency_id=1,
-                                        created_at=datetime.utcnow(),
-                                        updated_at=datetime.utcnow(),
-                                        mpan_number=mpan_top or '',
-                                        mpan_bottom=mpan_bottom or '',
-                                        standing_charge=stand_charge,
-                                        rate_1=unit_rate,
-                                        payment_type=payment_type or None,
-                                    )
-                                    session.add(arc_contract)
-                                    session.flush()
-
-                                    existing_mpans.setdefault(mpan_key, []).append({
-                                        'contract': arc_contract,
-                                        'tenant_id': tenant_id,
-                                        'assigned_to_id': opportunity_owner_id,
-                                        'assigned_to_name': assigned_employee_name or 'Unassigned',
-                                        'company_name': business_name,
-                                        'is_archived': True,
-                                    })
-                                    session.commit()
-                                    success_count += 1
-                                    continue
-                                except Exception as ae:
-                                    session.rollback()
-                                    error_count += 1
-                                    errors.append(f"Row {index + 2}: Archive creation failed - {str(ae)}")
-                                    continue
-
-                            if existing_end and new_end == existing_end:
-                                continue
-
-                            if existing_end and new_end > existing_end:
-                                proj = session.query(Project_Details).filter_by(
-                                    project_id=existing_contract.project_id
-                                ).first()
-                                if proj:
-                                    client_to_arch = session.query(Client_Master).filter_by(
-                                        client_id=proj.client_id
-                                    ).first()
-                                    if client_to_arch:
-                                        client_to_arch.is_archived = True
-                                        client_to_arch.archived_at = datetime.utcnow()
-                                        client_to_arch.archived_reason = f"Superseded by newer contract (ending {new_end})"
-                                        session.flush()
-                                        for r in existing_mpans[mpan_key]:
-                                            if r['contract'].energy_contract_master_id == existing_contract.energy_contract_master_id:
-                                                r['is_archived'] = True
-                                                break
+                        # First occurrence
+                        seen_detail_keys.add(detail_key)
 
                 # ── Create new lead ────────────────────────────────────
                 try:
@@ -571,6 +556,13 @@ def import_leads_handler():
                             'company_name': business_name,
                             'is_archived': False,
                         })
+                    if not mpan_top and all([
+                        contact_person.strip(),
+                        business_name.strip(),
+                        start_date,
+                        end_date,
+                    ]):
+                        existing_detail_keys.add(detail_key)
 
                     success_count += 1
 
@@ -629,6 +621,7 @@ def import_leads_handler():
             'failed': error_count,
             'errors': errors[:50],
             'duplicate_report': duplicate_report,
+            'duplicate_details': duplicate_details + cross_tenant_duplicates,
             'assigned_to': assigned_employee_name,
             'assigned_employee_id': assigned_employee_id,
         }), 200

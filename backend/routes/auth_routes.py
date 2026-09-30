@@ -12,6 +12,10 @@ import jwt
 import os
 
 from ..db import SessionLocal
+from backend.services.search_permission_service import (
+    get_search_permissions,
+    update_search_permissions,
+)
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -1439,6 +1443,8 @@ def list_invites():
                 e.employee_name,
                 e.email,
                 e.phone,
+                e.leads_access,
+                e.renewals_access,
                 u.user_id,
                 u.user_name,
                 u.is_invite_pending,
@@ -1462,6 +1468,8 @@ def list_invites():
                 'employee_name': r['employee_name'],
                 'email': r['email'],
                 'phone': r['phone'],
+                'leads_access': r['leads_access'] or 'partial',
+                'renewals_access': r['renewals_access'] or 'partial',
                 'user_id': r['user_id'],
                 'username': r['user_name'],
                 'role': r['role_name'],
@@ -1497,13 +1505,34 @@ def update_team_member_role(employee_id):
     try:
         admin = request.current_user
         data = request.get_json() or {}
-        role_id = data.get('role_id')
 
-        if not role_id:
-            return jsonify({'error': 'role_id is required'}), 400
+        role_id = data.get('role_id')
+        leads_access = data.get('leads_access')
+        renewals_access = data.get('renewals_access')
+
+        # Validate access values if provided
+        if leads_access is not None:
+            leads_access = str(leads_access).lower().strip()
+            if leads_access not in ('full', 'partial'):
+                return jsonify({
+                    'error': 'leads_access must be either full or partial'
+                }), 400
+
+        if renewals_access is not None:
+            renewals_access = str(renewals_access).lower().strip()
+            if renewals_access not in ('full', 'partial'):
+                return jsonify({
+                    'error': 'renewals_access must be either full or partial'
+                }), 400
+
+        if not role_id and leads_access is None and renewals_access is None:
+            return jsonify({
+                'error': 'At least one of role_id, leads_access or renewals_access is required'
+            }), 400
 
         try:
             role_id = int(role_id)
+
         except (TypeError, ValueError):
             return jsonify({'error': 'Invalid role_id'}), 400
 
@@ -1524,9 +1553,15 @@ def update_team_member_role(employee_id):
             return jsonify({'error': 'Invalid role_id'}), 400
 
         member = session.execute(text("""
-            SELECT e.employee_id, e.tenant_id, u.user_id
+            SELECT
+                e.employee_id,
+                e.tenant_id,
+                e.leads_access,
+                e.renewals_access,
+                u.user_id
             FROM "StreemLyne_MT"."Employee_Master" e
-            LEFT JOIN "StreemLyne_MT"."User_Master" u ON e.employee_id = u.employee_id
+            LEFT JOIN "StreemLyne_MT"."User_Master" u
+                ON e.employee_id = u.employee_id
             WHERE e.employee_id = :employee_id
             LIMIT 1
         """), {'employee_id': employee_id}).mappings().first()
@@ -1537,6 +1572,29 @@ def update_team_member_role(employee_id):
             return jsonify({'error': 'Cannot update employee from another tenant'}), 403
         if not member['user_id']:
             return jsonify({'error': 'Employee does not have a user account'}), 400
+        
+        # Update access restrictions
+        updates = []
+        params = {'employee_id': employee_id}
+
+        if leads_access is not None:
+            updates.append("leads_access = :leads_access")
+            params['leads_access'] = leads_access
+
+        if renewals_access is not None:
+            updates.append("renewals_access = :renewals_access")
+            params['renewals_access'] = renewals_access
+
+        if updates:
+            session.execute(
+                text(f"""
+                    UPDATE "StreemLyne_MT"."Employee_Master"
+                    SET {', '.join(updates)},
+                        updated_on = CURRENT_TIMESTAMP
+                    WHERE employee_id = :employee_id
+                """),
+                params
+            )
 
         session.execute(text("""
             DELETE FROM "StreemLyne_MT"."User_Role_Mapping"
@@ -1555,7 +1613,9 @@ def update_team_member_role(employee_id):
             'employee_id': employee_id,
             'user_id': member['user_id'],
             'role_id': role_id,
-            'role': role_row['role_name'],
+            'role': role_row['role_name'] if role_row else None,
+            'leads_access': leads_access if leads_access is not None else member['leads_access'],
+            'renewals_access': renewals_access if renewals_access is not None else member['renewals_access'],
         }), 200
 
     except Exception as e:
@@ -1683,3 +1743,228 @@ def delete_team_member(employee_id):
         return jsonify({'error': str(e)}), 500
     finally:
         session.close()
+
+# ==========================================
+# CRM SEARCH PERMISSIONS
+# ==========================================
+
+@auth_bp.route('/search-permissions/users', methods=['GET', 'OPTIONS'])
+@platform_admin_required
+def get_search_permission_users():
+    """
+    Return active users from the current admin's tenant
+    with their effective search permissions.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+
+    try:
+        tenant_id = get_tenant_id_from_token()
+
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found in token'}), 400
+
+        rows = session.execute(text("""
+            SELECT
+                u.user_id,
+                u.employee_id,
+                e.employee_name,
+                u.user_name AS username,
+                rm.role_name AS role,
+                COALESCE(sp.can_search_all_leads, FALSE) AS can_search_all_leads,
+                COALESCE(sp.can_search_all_renewals, FALSE) AS can_search_all_renewals
+            FROM "StreemLyne_MT"."User_Master" u
+            JOIN "StreemLyne_MT"."Employee_Master" e
+                ON u.employee_id = e.employee_id
+            LEFT JOIN "StreemLyne_MT"."User_Role_Mapping" urm
+                ON u.user_id = urm.user_id
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm
+                ON urm.role_id = rm.role_id
+            LEFT JOIN "StreemLyne_MT"."User_Search_Permission" sp
+                ON u.user_id = sp.user_id
+            WHERE e.tenant_id = :tenant_id
+              AND COALESCE(u.is_active, TRUE) = TRUE
+            ORDER BY e.employee_name ASC
+        """), {
+            'tenant_id': tenant_id
+        }).mappings().all()
+
+        users = [
+            {
+                'user_id': row['user_id'],
+                'employee_id': row['employee_id'],
+                'employee_name': row['employee_name'],
+                'username': row['username'],
+                'role': row['role'],
+                'can_search_all_leads': bool(row['can_search_all_leads']),
+                'can_search_all_renewals': bool(row['can_search_all_renewals']),
+            }
+            for row in rows
+        ]
+
+        return jsonify({'users': users}), 200
+
+    except Exception:
+        current_app.logger.exception(
+            "Error loading CRM search permission users"
+        )
+        return jsonify({'error': 'Internal server error'}), 500
+
+    finally:
+        session.close()
+
+
+@auth_bp.route('/search-permissions/users/<int:user_id>', methods=['GET', 'OPTIONS'])
+@platform_admin_required
+def get_user_search_permissions(user_id):
+    """
+    Return one user's identity and effective search permissions.
+    The target user must belong to the admin's tenant.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+
+    try:
+        tenant_id = get_tenant_id_from_token()
+
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found in token'}), 400
+
+        row = session.execute(text("""
+            SELECT
+                u.user_id,
+                u.employee_id,
+                e.employee_name,
+                u.user_name AS username,
+                rm.role_name AS role
+            FROM "StreemLyne_MT"."User_Master" u
+            JOIN "StreemLyne_MT"."Employee_Master" e
+                ON u.employee_id = e.employee_id
+            LEFT JOIN "StreemLyne_MT"."User_Role_Mapping" urm
+                ON u.user_id = urm.user_id
+            LEFT JOIN "StreemLyne_MT"."Role_Master" rm
+                ON urm.role_id = rm.role_id
+            WHERE u.user_id = :user_id
+              AND e.tenant_id = :tenant_id
+            LIMIT 1
+        """), {
+            'user_id': user_id,
+            'tenant_id': tenant_id
+        }).mappings().first()
+
+        if not row:
+            return jsonify({'error': 'User not found'}), 404
+
+        permissions = get_search_permissions(
+            user_id,
+            session=session
+        )
+
+        return jsonify({
+            'user_id': row['user_id'],
+            'employee_id': row['employee_id'],
+            'employee_name': row['employee_name'],
+            'username': row['username'],
+            'role': row['role'],
+            'can_search_all_leads': permissions['can_search_all_leads'],
+            'can_search_all_renewals': permissions['can_search_all_renewals'],
+        }), 200
+
+    except Exception:
+        current_app.logger.exception(
+            "Error loading user CRM search permissions"
+        )
+        return jsonify({'error': 'Internal server error'}), 500
+
+    finally:
+        session.close()
+
+
+@auth_bp.route('/search-permissions/users/<int:user_id>', methods=['PUT', 'OPTIONS'])
+@platform_admin_required
+def update_user_search_permissions(user_id):
+    """
+    Update both CRM search permissions for a user.
+    The target user must belong to the admin's tenant.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Request body must be a JSON object'}), 400
+
+    leads_value = data.get('can_search_all_leads')
+    renewals_value = data.get('can_search_all_renewals')
+
+    # bool must be the actual JSON boolean type.
+    # Do not accept "true", "false", 1, or 0.
+    if not isinstance(leads_value, bool):
+        return jsonify({
+            'error': 'can_search_all_leads must be a boolean'
+        }), 400
+
+    if not isinstance(renewals_value, bool):
+        return jsonify({
+            'error': 'can_search_all_renewals must be a boolean'
+        }), 400
+
+    try:
+        result = update_search_permissions(
+            admin_user=request.current_user,
+            target_user_id=user_id,
+            leads_value=leads_value,
+            renewals_value=renewals_value,
+            request_ip=get_client_ip(),
+        )
+
+        return jsonify({
+            'success': True,
+            'message': 'Search permissions updated successfully',
+            'user_id': user_id,
+            'can_search_all_leads': result['can_search_all_leads'],
+            'can_search_all_renewals': result['can_search_all_renewals'],
+        }), 200
+
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    except PermissionError as e:
+        return jsonify({'error': str(e)}), 403
+
+    except LookupError:
+        return jsonify({'error': 'User not found'}), 404
+
+    except Exception:
+        current_app.logger.exception(
+            "Error updating CRM search permissions"
+        )
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@auth_bp.route('/me/search-permissions', methods=['GET', 'OPTIONS'])
+@token_required
+def get_my_search_permissions():
+    """
+    Return the current user's effective CRM search permissions.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    try:
+        permissions = get_search_permissions(
+            request.current_user.user_id
+        )
+
+        return jsonify(permissions), 200
+
+    except Exception:
+        current_app.logger.exception(
+            "Error loading current user's search permissions"
+        )
+        return jsonify({'error': 'Internal server error'}), 500

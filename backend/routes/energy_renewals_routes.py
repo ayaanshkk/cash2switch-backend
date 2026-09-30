@@ -10,6 +10,32 @@ from ..models import (
 from ..db import SessionLocal
 from .auth_helpers import token_required, get_tenant_id_from_user
 
+from backend.crm.utils.role_helpers import is_platform_admin
+
+
+def _get_renewals_access(user):
+    """
+    Returns the effective renewals access for the current user.
+    Admins and users with full access can view all renewals.
+    Partial users can only view their own renewals.
+    """
+    is_admin = is_platform_admin(user)
+    renewals_access = getattr(user, "renewals_access", "partial")
+
+    current_employee_id = (
+        getattr(user, "employee_id", None)
+        or getattr(user, "id", None)
+    )
+
+    can_view_all = is_admin or renewals_access == "full"
+
+    return {
+        "is_admin": is_admin,
+        "renewals_access": renewals_access,
+        "employee_id": current_employee_id,
+        "can_view_all": can_view_all,
+    }
+
 renewals_bp = Blueprint("renewals", __name__)
 
 RENEWAL_RECYCLE_BIN_STATUSES = ("Lost", "Lost COT", "Dead")
@@ -68,18 +94,24 @@ def get_renewals():
         today = datetime.now().date()
         ninety_days_later = today + timedelta(days=90)
 
-        use_current_user = request.args.get('use_current_user', 'false').lower() == 'true'
+        current_user = request.current_user
+        access = _get_renewals_access(current_user)
 
-        if use_current_user:
-            current_user = request.current_user
-            if hasattr(current_user, 'id'):
-                employee_id = current_user.id
-            elif hasattr(current_user, 'employee_id'):
-                employee_id = current_user.employee_id
+        use_current_user = request.args.get(
+            'use_current_user', 'false'
+        ).lower() == 'true'
+
+        requested_employee_id = request.args.get('employee_id', type=int)
+
+        if access["can_view_all"]:
+            if use_current_user:
+                employee_id = access["employee_id"]
             else:
-                employee_id = None
+                employee_id = requested_employee_id
         else:
-            employee_id = request.args.get('employee_id')
+            employee_id = access["employee_id"]
+
+        
 
         employee_filter = "AND pd.assigned_employee_id = :employee_id" if employee_id else ""
 
@@ -175,8 +207,18 @@ def get_renewal_stats():
         if not tenant_id:
             return jsonify({'error': 'Tenant not found'}), 400
 
-        employee_id = request.args.get('employee_id', type=int)
+        access = _get_renewals_access(request.current_user)
+
+        requested_employee_id = request.args.get('employee_id', type=int)
+
+        employee_id = (
+            requested_employee_id
+            if access["can_view_all"]
+            else access["employee_id"]
+        )
+
         today = datetime.utcnow().date()
+
         days_365_later = today + timedelta(days=365)
 
         sync_recycle_bin_renewal_statuses(session, tenant_id, employee_id)
@@ -289,9 +331,18 @@ def get_supplier_breakdown():
         if not tenant_id:
             return jsonify({'error': 'Tenant not found'}), 400
 
-        employee_id = request.args.get('employee_id', type=int)
+        access = _get_renewals_access(request.current_user)
+
+        requested_employee_id = request.args.get('employee_id', type=int)
+
+        employee_id = (
+            requested_employee_id
+            if access["can_view_all"]
+            else access["employee_id"]
+        )
 
         query = session.query(
+
             Supplier_Master.supplier_company_name,
             func.count(Energy_Contract_Master.energy_contract_master_id).label('renewal_count'),
             func.sum(
@@ -370,7 +421,17 @@ def get_period_breakdown():
             return jsonify({'error': 'Tenant not found'}), 400
 
         period = request.args.get('period')
-        employee_id = request.args.get('employee_id', type=int)
+
+        access = _get_renewals_access(request.current_user)
+
+        requested_employee_id = request.args.get('employee_id', type=int)
+
+        employee_id = (
+            requested_employee_id
+            if access["can_view_all"]
+            else access["employee_id"]
+        )
+
         today = datetime.utcnow().date()
 
         if period == 'not-due':
@@ -480,7 +541,16 @@ def get_salesperson_performance():
         if not tenant_id:
             return jsonify({'error': 'Tenant not found'}), 400
 
-        employee_id = request.args.get('employee_id', type=int)
+        access = _get_renewals_access(request.current_user)
+
+        requested_employee_id = request.args.get('employee_id', type=int)
+
+        employee_id = (
+            requested_employee_id
+            if access["can_view_all"]
+            else access["employee_id"]
+        )
+
         period = request.args.get('period', 'month')
         today = datetime.utcnow().date()
 
@@ -629,9 +699,18 @@ def get_aq_breakdown():
         if not tenant_id:
             return jsonify({'error': 'Tenant not found'}), 400
 
-        employee_id = request.args.get('employee_id', type=int)
+        access = _get_renewals_access(request.current_user)
+
+        requested_employee_id = request.args.get('employee_id', type=int)
+
+        employee_id = (
+            requested_employee_id
+            if access["can_view_all"]
+            else access["employee_id"]
+        )
 
         query = session.query(
+
             Employee_Master.employee_id,
             Employee_Master.employee_name,
             func.count(Client_Master.client_id).label('customer_count'),
@@ -764,20 +843,29 @@ def get_renewal_performance():
         stage_filter = request.args.get('stage_filter', '').strip().lower()
         period = request.args.get('period', 'alltime').strip().lower()
 
-        from backend.crm.utils.role_helpers import is_platform_admin
-        use_current_user = request.args.get('use_current_user', 'false').lower() == 'true'
+        access = _get_renewals_access(current_user)
 
-        if is_platform_admin(current_user):
-            requested_employee_id = request.args.get('employee_id', type=int)
-            employee_id = requested_employee_id
-        elif use_current_user:
-            employee_id = getattr(current_user, 'employee_id', None) or getattr(current_user, 'id', None)
-            if not employee_id:
-                return jsonify({'error': 'User employee_id not found'}), 400
+        use_current_user = request.args.get(
+            'use_current_user', 'false'
+        ).lower() == 'true'
+
+        requested_employee_id = request.args.get(
+            'employee_id',
+            type=int
+        )
+
+        if access["can_view_all"]:
+            if use_current_user:
+                employee_id = access["employee_id"]
+            else:
+                employee_id = requested_employee_id
         else:
-            employee_id = getattr(current_user, 'employee_id', None)
-            if not employee_id:
-                return jsonify({'error': 'User employee_id not found'}), 400
+            employee_id = access["employee_id"]
+
+        if not employee_id and not access["can_view_all"]:
+            return jsonify({
+                'error': 'User employee_id not found'
+            }), 400
 
         # ── Period bounds ──────────────────────────────────────────────────
         from datetime import datetime, timedelta
@@ -931,8 +1019,23 @@ def get_staff_status_counts():
         if not tenant_id:
             return jsonify({'error': 'Tenant not found'}), 400
 
-        employee_id = request.args.get('employee_id', type=int)
-        period = request.args.get('period', 'alltime').strip().lower()
+        access = _get_renewals_access(request.current_user)
+
+        requested_employee_id = request.args.get(
+            'employee_id',
+            type=int
+        )
+
+        employee_id = (
+            requested_employee_id
+            if access["can_view_all"]
+            else access["employee_id"]
+        )
+
+        period = request.args.get(
+            'period',
+            'alltime'
+        ).strip().lower()
 
         # ── Period bounds ──────────────────────────────────────────────────
         from datetime import datetime, timedelta
@@ -1051,7 +1154,17 @@ def get_staff_status_counts():
 def debug_statuses():
     session = SessionLocal()
     try:
-        tenant_id = get_tenant_id_from_user(request.current_user)
+        current_user = request.current_user
+        access = _get_renewals_access(current_user)
+
+        if not access["can_view_all"]:
+            return jsonify({
+                "success": False,
+                "error": "Access denied"
+            }), 403
+
+        tenant_id = get_tenant_id_from_user(current_user)
+
         
         results = session.execute(text("""
             SELECT 

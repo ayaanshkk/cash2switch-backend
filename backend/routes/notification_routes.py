@@ -46,10 +46,10 @@ def create_assignment_notification(session, tenant_id: int, client_id: int, assi
         did = display_id or result['display_id'] or client_id
 
         message = (
-            f"📋 New record assigned to you\n"
-            f"👤 Customer: {name}\n"
-            f"🆔 ID: {did}\n"
-            f"👤 Assigned by: {assigned_by_name}"
+            f"New record assigned to you\n"
+            f"Customer: {name}\n"
+            f"ID: {did}\n"
+            f"Assigned by: {assigned_by_name}"
         )
 
         session.add(Notification_Master(
@@ -123,15 +123,45 @@ def get_production_notifications():
                     bg_session.close()
             threading.Thread(target=_bg_generate, args=(tenant_id,), daemon=True).start()
 
-        # ✅ Everyone sees only their own notifications — no admin catch-all
-        notifications = session.execute(text('''
+        # Auto-prune: delete read notifications older than 30 days (run in background)
+        def _bg_prune(tid, eid):
+            prune_session = SessionLocal()
+            try:
+                cutoff = datetime.utcnow() - timedelta(days=30)
+                prune_session.execute(text('''
+                    DELETE FROM "StreemLyne_MT"."Notification_Master"
+                    WHERE tenant_id = :tid
+                      AND employee_id = :eid
+                      AND read = true
+                      AND created_at < :cutoff
+                '''), {'tid': tid, 'eid': eid, 'cutoff': cutoff})
+                prune_session.commit()
+            except Exception:
+                prune_session.rollback()
+            finally:
+                prune_session.close()
+        threading.Thread(target=_bg_prune, args=(tenant_id, employee_id), daemon=True).start()
+
+        # Accurate unread count (cheap — no row fetch)
+        unread_count = session.execute(text('''
+            SELECT COUNT(*) FROM "StreemLyne_MT"."Notification_Master"
+            WHERE tenant_id = :tid
+              AND employee_id = :eid
+              AND dismissed = false
+              AND read = false
+        '''), {'tid': tenant_id, 'eid': employee_id}).scalar() or 0
+
+        # Return newest 75 notifications only — unread first, then by date
+        rows = session.execute(text('''
             SELECT * FROM "StreemLyne_MT"."Notification_Master"
             WHERE tenant_id = :tid
               AND employee_id = :eid
               AND dismissed = false
             ORDER BY
+                CASE WHEN read = false THEN 0 ELSE 1 END,
                 CASE WHEN priority = 'urgent' THEN 0 ELSE 1 END,
                 created_at DESC
+            LIMIT 75
         '''), {'tid': tenant_id, 'eid': employee_id}).mappings().all()
 
         def _serial(v):
@@ -149,13 +179,11 @@ def get_production_notifications():
             'read': r['read'],
             'dismissed': r['dismissed'],
             'created_at': _serial(r['created_at']),
-        } for r in notifications]
-
-        unread_count = sum(1 for n in notifications_data if not n['read'])
+        } for r in rows]
 
         return jsonify({
             'notifications': notifications_data,
-            'unread_count': unread_count,
+            'unread_count': int(unread_count),
         }), 200
 
     except Exception as e:
@@ -213,10 +241,10 @@ def _generate_notifications_for_tenant(session, tenant_id: int) -> int:
 
         if days <= 30:
             ntype = 'contract_expiry_0_30'
-            urgency_text = '🚨 URGENT'
+            urgency_text = 'URGENT'
         elif days <= 60:
             ntype = 'contract_expiry_31_60'
-            urgency_text = '⚠️ ACTION NEEDED'
+            urgency_text = 'ACTION REQUIRED'
         else:
             continue
 
@@ -242,13 +270,13 @@ def _generate_notifications_for_tenant(session, tenant_id: int) -> int:
         display_id = contract.get('display_id') or contract['client_id']
         message = (
             f"{urgency_text}: Contract expiring in {days} day{'s' if days != 1 else ''}\n"
-            f"📋 Customer: {contract['client_company_name']}\n"
-            f"🆔 ID: {display_id}\n"
-            f"📅 Expiry: {end_date.strftime('%d/%m/%Y')}\n"
-            f"📞 Phone: {contract['client_phone'] or '—'}"
+            f"Customer: {contract['client_company_name']}\n"
+            f"ID: {display_id}\n"
+            f"Expiry: {end_date.strftime('%d/%m/%Y')}\n"
+            f"Phone: {contract['client_phone'] or '—'}"
         )
         if contract.get('mpan_number'):
-            message += f"\n🔌 MPAN: {contract['mpan_number']}"
+            message += f"\nMPAN: {contract['mpan_number']}"
 
         # ✅ Only notify the assigned employee — no admin copy with employee_id=None
         session.add(Notification_Master(

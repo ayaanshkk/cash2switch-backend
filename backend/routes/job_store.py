@@ -14,6 +14,7 @@ def create_job(job_id: str, total_rows: int, tenant_id=None) -> dict:
         'processed': 0,
         'successful': 0,
         'duplicates': 0,
+        'duplicate_details': [],
         'errors': [],
         'started_at': datetime.utcnow().isoformat(),
         'finished_at': None,
