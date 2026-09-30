@@ -32,12 +32,12 @@ def is_platform_admin(user) -> bool:
 def is_crm_leads_admin_role(jwt_role: Optional[Any]) -> bool:
     """
     True when the JWT role should grant tenant-wide CRM leads visibility.
-    Only platform admins see all leads — other admin roles see their own only.
+    Admin roles (including tenant admins) can see all leads.
     """
     if jwt_role is None:
         return False
     role = str(jwt_role).strip().lower()
-    return role in PLATFORM_ADMIN_ROLES
+    return role in ADMIN_ROLES or 'admin' in role
 
 
 def is_admin_user(user) -> bool:

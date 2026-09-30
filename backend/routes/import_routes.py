@@ -1379,6 +1379,43 @@ def _run_energy_import(
 
                     # Duplicate against existing database records
                     if mpan_key in existing_mpans:
+                        _update_missing_energy_fields(raw_conn, mpan_key, {
+                            'contact_person':  contact_person,
+                            'tel_no':          tel_no,
+                            'mobile_no':       mobile_no,
+                            'email':           email,
+                            'address':         address,
+                            'postcode':        postcode,
+                            'position':        position,
+                            'company_number':  company_number,
+                            'date_of_birth':   dob,
+                            'charity_ltd':     charity_no,
+                            'partner_details': partner_det,
+                            'bank_name':       bank_name,
+                            'account_number':  ac_number,
+                            'sort_code':       sort_code,
+                            'home_door':       home_door,
+                            'home_street':     home_street,
+                            'partner_dob':     partner_dob,
+                            'credit_score':    credit_score,
+                            'site_name':       site_name,
+                            'month_sold':      month_sold,
+                            'house_name':      house_name,
+                            'house_number':    house_number,
+                            'door_number':     door_number,
+                            'town':            town,
+                            'county':          county,
+                            'rate_1':          rate_1,
+                            'rate_2':          rate_2,
+                            'rate_3':          rate_3,
+                            'stand_charge':    stand_charge,
+                            'net_notch':       net_notch,
+                            'comms_paid':      comms_paid,
+                            'payment_type':    payment_type,
+                            'term_sold':       term_sold,
+                            'aggregator':      aggregator,
+                            'mpan_bottom':     mpan_bottom,
+                        }, tenant_id)
                         duplicate_count += 1
                         duplicate_details.append({
                             'client_name': main_contact,

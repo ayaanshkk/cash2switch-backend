@@ -32,7 +32,8 @@ from backend.models import (
     Client_Interactions,
     Supplier_Master,
     Stage_Master,
-    Role_Master
+    Role_Master,
+    Opportunity_Details,
 )
 
 energy_customer_bp = Blueprint('energy_customers', __name__)
@@ -1374,10 +1375,27 @@ def get_energy_customer_stats():
 @energy_customer_bp.route('/suppliers', methods=['GET'])
 @token_required
 def get_suppliers():
-    """Get all energy suppliers"""
+    """Get suppliers used by the current tenant's clients"""
     session = SessionLocal()
     try:
-        suppliers = session.query(Supplier_Master).all()
+        current_user = request.current_user
+        raw_tenant_id = getattr(current_user, 'tenant_id', None)
+        tenant_id_str = str(raw_tenant_id) if raw_tenant_id is not None else None
+
+        if tenant_id_str:
+            # Return only suppliers used by this tenant's leads/renewals
+            # Opportunity_Details.tenant_id is varchar in the DB — compare as string
+            suppliers = (
+                session.query(Supplier_Master)
+                .join(Opportunity_Details, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
+                .filter(Opportunity_Details.tenant_id == tenant_id_str)
+                .distinct()
+                .order_by(Supplier_Master.supplier_company_name)
+                .all()
+            )
+        else:
+            suppliers = session.query(Supplier_Master).order_by(Supplier_Master.supplier_company_name).all()
+
         result = [{
             'supplier_id': s.supplier_id,
             'supplier_name': s.supplier_company_name,
@@ -1390,7 +1408,7 @@ def get_suppliers():
                 3: 'Electricity & Gas'
             }.get(s.supplier_provisions, 'Unknown')
         } for s in suppliers]
-        
+
         return jsonify(result), 200
     except Exception as e:
         current_app.logger.exception(f"❌ Error fetching suppliers: {e}")
@@ -1443,6 +1461,62 @@ def get_employees():
         return jsonify({'error': 'Failed to fetch employees'}), 500
     finally:
         session.close()
+
+@energy_customer_bp.route('/energy-clients/init-data', methods=['GET', 'OPTIONS'])
+@token_required
+def get_init_data():
+    """Return suppliers, employees and stages in one call for page initialisation."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    session = SessionLocal()
+    try:
+        current_user = request.current_user
+        raw_tenant_id = getattr(current_user, 'tenant_id', None)
+        tenant_id_str = str(raw_tenant_id) if raw_tenant_id is not None else None
+
+        # Suppliers — filtered to this tenant via Opportunity_Details
+        # Opportunity_Details.tenant_id is varchar in the DB — compare as string
+        if tenant_id_str:
+            supplier_rows = (
+                session.query(Supplier_Master)
+                .join(Opportunity_Details, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
+                .filter(Opportunity_Details.tenant_id == tenant_id_str)
+                .distinct()
+                .order_by(Supplier_Master.supplier_company_name)
+                .all()
+            )
+        else:
+            supplier_rows = session.query(Supplier_Master).order_by(Supplier_Master.supplier_company_name).all()
+
+        suppliers = [{
+            'supplier_id': s.supplier_id,
+            'supplier_name': s.supplier_company_name,
+        } for s in supplier_rows]
+
+        # Employees — filtered by tenant
+        tenant_id_for_emp = get_tenant_id_from_user(current_user)
+        employee_rows = session.query(Employee_Master).filter_by(tenant_id=tenant_id_for_emp).all()
+        employees = [{
+            'employee_id': e.employee_id,
+            'employee_name': e.employee_name,
+            'email': e.email,
+        } for e in employee_rows]
+
+        # Stages — global lookup table
+        stage_rows = session.query(Stage_Master).order_by(Stage_Master.stage_id).all()
+        stages = [{
+            'stage_id': s.stage_id,
+            'stage_name': s.stage_name,
+            'description': s.stage_description,
+        } for s in stage_rows]
+
+        return jsonify({'suppliers': suppliers, 'employees': employees, 'stages': stages}), 200
+    except Exception as e:
+        current_app.logger.exception(f"❌ Error fetching init data: {e}")
+        return jsonify({'error': 'Failed to fetch init data'}), 500
+    finally:
+        session.close()
+
 
 @energy_customer_bp.route('/energy-clients/reset-sequence', methods=['POST'])
 @token_required
@@ -2708,6 +2782,13 @@ def energy_client_callback(client_id):
             client.is_deleted     = True
             client.deleted_at     = datetime.utcnow()
             client.deleted_reason = status
+            # Delete any future calendar callbacks for this contact
+            from datetime import date as _date
+            today = _date.today()
+            session.query(Client_Interactions).filter(
+                Client_Interactions.client_id == client.client_id,
+                Client_Interactions.reminder_date >= today,
+            ).delete(synchronize_session=False)
             session.commit()
             return jsonify({
                 'success':            True,

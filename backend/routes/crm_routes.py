@@ -101,8 +101,8 @@ def tenant_from_jwt(f):
                 'error': 'Missing tenant in token',
                 'message': 'Authenticated token must include tenant_id'
             }), 401
-        # Propagate tenant_id to Flask `g` for downstream code that expects it
-        g.tenant_id = getattr(current_user, 'tenant_id')
+        # Propagate tenant_id to Flask `g` as a string — DB columns are varchar(50)
+        g.tenant_id = str(getattr(current_user, 'tenant_id'))
         return f(*args, **kwargs)
     return _wrap
 
@@ -544,7 +544,7 @@ def get_leads():
 
         # ── Pagination ──────────────────────────────────────────────────────
         page      = max(int(request.args.get('page', 1) or 1), 1)
-        page_size = min(max(int(request.args.get('page_size', 50) or 50), 1), 500)
+        page_size = min(max(int(request.args.get('per_page', None) or request.args.get('page_size', 50) or 50), 1), 500)
         offset    = (page - 1) * page_size
 
         # ── Server-side filters ─────────────────────────────────────────────
@@ -552,7 +552,7 @@ def get_leads():
         filter_supplier = request.args.get('supplier_id', type=int)
         filter_status   = (request.args.get('status', '') or '').strip()
         filter_end_date     = (request.args.get('end_date_filter', '') or '').strip()
-        filter_employee     = request.args.get('employee_id', type=int)
+        filter_employee     = request.args.get('salesperson_id', type=int) or request.args.get('employee_id', type=int)
         filter_uploaded_from = (request.args.get('uploaded_from', '') or '').strip()
         filter_uploaded_to   = (request.args.get('uploaded_to',   '') or '').strip()
         filter_upload_sort   = (request.args.get('upload_sort',   '') or '').strip().lower()  # 'asc' | 'desc' | ''
@@ -562,6 +562,7 @@ def get_leads():
         employee_id = getattr(current_user, 'employee_id', None)
         role_name   = getattr(current_user, 'role', None)
         admin_user  = is_crm_leads_admin_role(role_name)
+        platform_admin = str(role_name or '').strip().lower() in {'platform admin', 'platform_admin', 'platformadmin'}
 
         session = SessionLocal()
         try:
@@ -579,7 +580,7 @@ def get_leads():
             admin_user,
             leads_access,
             can_view_all_leads,
-            normalized_role,
+            role_name,
             service_param,
             exclude_stage
         )
@@ -602,20 +603,27 @@ def get_leads():
             today = pydate.today()
 
             def _apply_filters(q):
-                # Tenant scope
-                q = q.filter(
-                    (Opportunity_Details.tenant_id == tenant_id) |
-                    (
-                        (Opportunity_Details.client_id.isnot(None)) &
-                        (Client_Master.tenant_id == tenant_id)
+                # Tenant scope — platform admins see all tenants
+                if not platform_admin:
+                    q = q.filter(
+                        (Opportunity_Details.tenant_id == tenant_id) |
+                        (
+                            (Opportunity_Details.client_id.isnot(None)) &
+                            (Client_Master.tenant_id == tenant_id)
+                        )
                     )
-                )
                 q = q.filter(Opportunity_Details.service_id == service_id)
                 # Allocated/unallocated scoping
                 if filter_unallocated:
+                    # Explicitly requested: show only leads with no owner
                     q = q.filter(Opportunity_Details.opportunity_owner_employee_id.is_(None))
-                else:
-                    q = q.filter(Opportunity_Details.opportunity_owner_employee_id.isnot(None))
+                elif not can_view_all_leads:
+                    # Non-admin: only their own non-allocated leads
+                    q = q.filter(
+                        Opportunity_Details.opportunity_owner_employee_id == employee_id,
+                        (Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None))
+                    )
+                # Admin: no owner filter — sees all leads
                 q = q.filter((Opportunity_Details.is_draft == False) | (Opportunity_Details.is_draft.is_(None)))
                 q = q.filter((Client_Master.is_deleted.is_(None)) | (Client_Master.is_deleted == False))
                 q = q.filter(
@@ -623,13 +631,6 @@ def get_leads():
                     (Client_Master.is_archived.is_(None)) |
                     (Client_Master.is_archived == False)
                 )
-
-                # Non-admin (and not full-access): own leads only
-                if not can_view_all_leads:
-                    q = q.filter(
-                        Opportunity_Details.opportunity_owner_employee_id == employee_id,
-                        (Opportunity_Details.is_allocated == False) | (Opportunity_Details.is_allocated.is_(None))
-                    )
 
                 # Admin: optional salesperson filter
                 if can_view_all_leads and filter_employee:
@@ -1751,6 +1752,15 @@ def update_lead_status(opportunity_id):
                 if hasattr(client, 'is_cleansing'):
                     client.is_cleansing = False
                 session.flush()
+
+            # Delete any future calendar callbacks for this contact
+            from datetime import date as _date
+            today = _date.today()
+            session.query(Client_Interactions).filter(
+                Client_Interactions.client_id == lead_client_id,
+                Client_Interactions.reminder_date >= today,
+            ).delete(synchronize_session=False)
+            session.flush()
 
             session.commit()
             return jsonify({
