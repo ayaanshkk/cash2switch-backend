@@ -1071,22 +1071,24 @@ def delete_lead_history(opportunity_id, interaction_id):
             .first()
         )
  
+        current_app.logger.warning(f"🗑️ DELETE history: opportunity_id={opportunity_id}, interaction_id={interaction_id}, tenant={tenant_id}, lead_found={lead is not None}")
         if not lead:
             return jsonify({'error': 'Lead not found'}), 404
 
         client_id = lead.client_id
+        current_app.logger.warning(f"   client_id={client_id}")
 
         if not client_id:
             return jsonify({'error': 'No client for this lead'}), 400
 
-        # Check interaction exists
+        # Look up interaction by ID only — client_id may differ if created via a different path
         interaction = (
             session.query(Client_Interactions)
             .filter(Client_Interactions.interaction_id == interaction_id)
-            .filter(Client_Interactions.client_id == client_id)
             .first()
         )
- 
+
+        current_app.logger.warning(f"   interaction_found={interaction is not None}, interaction_client_id={interaction.client_id if interaction else None}")
         if not interaction:
             return jsonify({'error': 'Interaction not found'}), 404
  
