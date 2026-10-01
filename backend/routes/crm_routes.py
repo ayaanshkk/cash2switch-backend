@@ -1855,7 +1855,7 @@ def assign_leads_by_filter():
         """), params)
         total_updated = result.rowcount or 0
 
-        if notes and total_updated:
+        if notes and total_updated and total_updated <= 500:
             note_text = f"[Assignment] Assigned to {employee_name}: {notes}"
             now = _dt.utcnow()
             rows = session.execute(_text(f"""
