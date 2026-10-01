@@ -18,6 +18,7 @@ from backend.models import (
     Energy_Contract_Master,
     Opportunity_Details,
     Project_Details,
+    Role_Master,
     Services_Master,
     Supplier_Master,
 )
@@ -238,6 +239,118 @@ def _sync_agent_commission_items_for_receipt(session, receipt: Commission_Paymen
             batch.total_amount = Decimal(str(batch.total_amount or 0)) - previous_commission + new_commission
 
 
+DEFAULT_AGENT_COMMISSION_RATE = Decimal('10.00')
+_ADMIN_ROLE_NAMES = {'platform admin', 'tenant super admin', 'admin', 'superadmin', 'super admin'}
+
+
+def _get_admin_role_ids(session) -> set:
+    """Return a set of role_id strings that correspond to admin roles."""
+    rows = session.query(Role_Master.role_id, Role_Master.role_name).all()
+    return {
+        str(r.role_id)
+        for r in rows
+        if r.role_name and r.role_name.strip().lower() in _ADMIN_ROLE_NAMES
+    }
+
+
+def _is_admin_employee(employee, admin_role_ids: set) -> bool:
+    if employee is None:
+        return False
+    emp_role_ids = set((employee.role_ids or '').replace(' ', '').split(',')) - {''}
+    return bool(emp_role_ids & admin_role_ids)
+
+
+def _effective_commission_rate(employee: Employee_Master) -> Decimal:
+    return DEFAULT_AGENT_COMMISSION_RATE
+
+
+def _auto_create_agent_commission_item(session, receipt: Commission_Payment_Receipt, payment: Commission_Payment) -> None:
+    """Create an Agent_Commission_Batch_Item immediately when a receipt is logged."""
+    if not payment.employee_id or not receipt.amount_received:
+        return
+
+    existing = (
+        session.query(Agent_Commission_Batch_Item.id)
+        .filter(Agent_Commission_Batch_Item.commission_payment_receipt_id == receipt.id)
+        .first()
+    )
+    if existing:
+        return
+
+    employee = session.query(Employee_Master).filter(
+        Employee_Master.employee_id == payment.employee_id
+    ).first()
+    if not employee:
+        return
+
+    admin_role_ids = _get_admin_role_ids(session)
+    if _is_admin_employee(employee, admin_role_ids):
+        return  # admins don't earn commission
+
+    rate = _effective_commission_rate(employee)
+
+    client = session.query(Client_Master).filter(
+        Client_Master.client_id == payment.client_id
+    ).first()
+
+    receipt_date = receipt.date_received or datetime.utcnow().date()
+    batch_month = date(receipt_date.year, receipt_date.month, 1)
+
+    batch = (
+        session.query(Agent_Commission_Batch)
+        .filter(
+            Agent_Commission_Batch.tenant_id == payment.tenant_id,
+            Agent_Commission_Batch.employee_id == payment.employee_id,
+            Agent_Commission_Batch.batch_month == batch_month,
+        )
+        .first()
+    )
+    if batch is None:
+        batch = Agent_Commission_Batch(
+            id=str(uuid.uuid4()),
+            tenant_id=payment.tenant_id,
+            employee_id=payment.employee_id,
+            batch_month=batch_month,
+            total_amount=Decimal('0.00'),
+            status='Awaiting Payment',
+            created_at=datetime.utcnow(),
+        )
+        session.add(batch)
+        session.flush()
+
+    commission_amount = _commission_amount(receipt.amount_received, rate)
+    item = Agent_Commission_Batch_Item(
+        id=str(uuid.uuid4()),
+        batch_id=batch.id,
+        commission_payment_id=payment.id,
+        commission_payment_receipt_id=receipt.id,
+        client_name=_client_name(client, payment.client_id),
+        receipt_amount=Decimal(str(receipt.amount_received or 0)),
+        commission_rate_snapshot=rate,
+        commission_amount=commission_amount,
+        created_at=datetime.utcnow(),
+    )
+    session.add(item)
+    batch.total_amount = Decimal(str(batch.total_amount or 0)) + commission_amount
+
+
+def _remove_agent_commission_item_for_receipt(session, receipt: Commission_Payment_Receipt) -> None:
+    """Remove the batch item for a receipt when that receipt is deleted."""
+    items = (
+        session.query(Agent_Commission_Batch_Item, Agent_Commission_Batch)
+        .outerjoin(Agent_Commission_Batch, Agent_Commission_Batch_Item.batch_id == Agent_Commission_Batch.id)
+        .filter(Agent_Commission_Batch_Item.commission_payment_receipt_id == receipt.id)
+        .all()
+    )
+    for item, batch in items:
+        if batch:
+            batch.total_amount = max(
+                Decimal(str(batch.total_amount or 0)) - Decimal(str(item.commission_amount or 0)),
+                Decimal('0.00'),
+            )
+        session.delete(item)
+
+
 def _commission_amount(receipt_amount, commission_rate) -> Decimal:
     amount = Decimal(str(receipt_amount or 0))
     rate = Decimal(str(commission_rate or 0))
@@ -351,6 +464,155 @@ def _status_code_for_generation(status: str) -> int:
     if status == "not_found":
         return 404
     return 200
+
+
+@commission_bp.route('/recalculate-agent-commissions', methods=['POST'])
+@token_required
+def recalculate_agent_commissions():
+    """
+    POST /api/commission/recalculate-agent-commissions
+    Recalculates commission_amount and commission_rate_snapshot for all existing
+    batch items that have a zero rate, and rebuilds each batch's total_amount.
+    Safe to run multiple times. Also deletes any batch items belonging to admin employees.
+    """
+    admin_error = _require_admin()
+    if admin_error:
+        return admin_error
+    tenant_id, tenant_error = _require_tenant_id()
+    if tenant_error:
+        return tenant_error
+
+    session = SessionLocal()
+    try:
+        admin_role_ids = _get_admin_role_ids(session)
+
+        items = (
+            session.query(Agent_Commission_Batch_Item, Agent_Commission_Batch, Employee_Master)
+            .join(Agent_Commission_Batch, Agent_Commission_Batch_Item.batch_id == Agent_Commission_Batch.id)
+            .join(Employee_Master, Agent_Commission_Batch.employee_id == Employee_Master.employee_id)
+            .filter(Agent_Commission_Batch.tenant_id == tenant_id)
+            .all()
+        )
+
+        # Zero out all batch totals first so we can rebuild from scratch
+        batch_totals = {}
+        for item, batch, employee in items:
+            batch_totals[batch.id] = {'batch': batch, 'total': Decimal('0.00')}
+
+        deleted = 0
+        updated = 0
+        for item, batch, employee in items:
+            if _is_admin_employee(employee, admin_role_ids):
+                session.delete(item)
+                deleted += 1
+                continue
+
+            rate = _effective_commission_rate(employee)
+            new_commission = _commission_amount(item.receipt_amount or 0, rate)
+            item.commission_rate_snapshot = rate
+            item.commission_amount = new_commission
+            batch_totals[batch.id]['total'] += new_commission
+            updated += 1
+
+        for entry in batch_totals.values():
+            entry['batch'].total_amount = entry['total']
+
+        # Delete empty admin batches
+        admin_batches = (
+            session.query(Agent_Commission_Batch)
+            .join(Employee_Master, Agent_Commission_Batch.employee_id == Employee_Master.employee_id)
+            .filter(Agent_Commission_Batch.tenant_id == tenant_id)
+            .all()
+        )
+        deleted_batches = 0
+        for batch in admin_batches:
+            emp = session.query(Employee_Master).filter(
+                Employee_Master.employee_id == batch.employee_id
+            ).first()
+            if emp and _is_admin_employee(emp, admin_role_ids):
+                session.delete(batch)
+                deleted_batches += 1
+
+        session.commit()
+        return jsonify({
+            'success': True,
+            'items_updated': updated,
+            'admin_items_deleted': deleted,
+            'admin_batches_deleted': deleted_batches,
+        }), 200
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+@commission_bp.route('/apply-default-agent-rate', methods=['POST'])
+@token_required
+def apply_default_agent_rate():
+    """
+    POST /api/commission/apply-default-agent-rate
+    Sets commission_percentage = 10.0 for all non-admin employees in the tenant
+    that currently have no rate set (NULL or 0). Admin employees are identified
+    by their role_ids containing an admin role name.
+    Body (optional): { "rate": 10.0 }  — defaults to 10.0 if omitted.
+    """
+    admin_error = _require_admin()
+    if admin_error:
+        return admin_error
+    tenant_id, tenant_error = _require_tenant_id()
+    if tenant_error:
+        return tenant_error
+
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        rate = Decimal(str(data.get('rate', 10.0)))
+    except Exception:
+        return jsonify({'error': 'rate must be a valid number'}), 400
+    if rate <= 0:
+        return jsonify({'error': 'rate must be greater than zero'}), 400
+
+    from backend.crm.utils.role_helpers import ADMIN_ROLES
+
+    session = SessionLocal()
+    try:
+        # Find which role IDs are admin roles
+        role_rows = session.query(Role_Master.role_id, Role_Master.role_name).all()
+        admin_role_ids = {
+            str(r.role_id)
+            for r in role_rows
+            if r.role_name and r.role_name.strip().lower() in ADMIN_ROLES
+        }
+
+        employees = (
+            session.query(Employee_Master)
+            .filter(Employee_Master.tenant_id == tenant_id)
+            .all()
+        )
+
+        updated = []
+        skipped_admin = []
+        for emp in employees:
+            emp_role_ids = set((emp.role_ids or '').replace(' ', '').split(',')) - {''}
+            if emp_role_ids & admin_role_ids:
+                skipped_admin.append(emp.employee_id)
+                continue
+            emp.commission_percentage = float(rate)
+            updated.append(emp.employee_id)
+
+        session.commit()
+        return jsonify({
+            'success': True,
+            'rate_applied': float(rate),
+            'updated_count': len(updated),
+            'updated_employee_ids': updated,
+            'skipped_admin_ids': skipped_admin,
+        }), 200
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 @commission_bp.route('/supplier-terms', methods=['GET'])
@@ -915,11 +1177,14 @@ def list_agent_commissions():
                 .all()
             )
             for item in item_rows:
+                stored_rate = Decimal(str(item.commission_rate_snapshot or 0))
+                display_rate = stored_rate if stored_rate > 0 else DEFAULT_AGENT_COMMISSION_RATE
+                display_commission = _commission_amount(item.receipt_amount or 0, display_rate)
                 payload = {
                     'id': item.id,
                     'client_name': item.client_name,
-                    'commission_rate': _money(item.commission_rate_snapshot),
-                    'commission_amount': _money(item.commission_amount),
+                    'commission_rate': _money(display_rate),
+                    'commission_amount': _money(display_commission),
                     'created_at': _datetime(item.created_at),
                 }
                 if is_admin:
@@ -930,10 +1195,20 @@ def list_agent_commissions():
                     })
                 item_rows_by_batch.setdefault(item.batch_id, []).append(payload)
 
-        batches = [
-            _batch_payload(batch, employee, item_rows_by_batch.get(batch.id, []), include_admin_fields=is_admin)
-            for batch, employee in batch_rows
-        ]
+        admin_role_ids_for_batches = _get_admin_role_ids(session)
+        current_app.logger.warning(f"📋 admin_role_ids={admin_role_ids_for_batches}")
+        for batch, employee in batch_rows:
+            current_app.logger.warning(f"   employee={getattr(employee, 'employee_name', None)} role_ids={getattr(employee, 'role_ids', None)} is_admin={_is_admin_employee(employee, admin_role_ids_for_batches)}")
+        batches = []
+        for batch, employee in batch_rows:
+            if _is_admin_employee(employee, admin_role_ids_for_batches):
+                continue
+            items_for_batch = item_rows_by_batch.get(batch.id, [])
+            # Recalculate total from display values so it reflects 10% even for old zero-rate items
+            display_total = sum(Decimal(str(i['commission_amount'].replace('£', '').replace(',', ''))) for i in items_for_batch)
+            batch_payload = _batch_payload(batch, employee, items_for_batch, include_admin_fields=is_admin)
+            batch_payload['total_amount'] = _money(display_total)
+            batches.append(batch_payload)
 
         receipt_query = (
             session.query(
@@ -964,9 +1239,12 @@ def list_agent_commissions():
             .all()
         )
 
+        admin_role_ids_for_list = _get_admin_role_ids(session)
         unbatched_items = []
         for receipt, payment, employee, client, batch in receipt_rows:
-            rate = Decimal(str(employee.commission_percentage or 0))
+            if _is_admin_employee(employee, admin_role_ids_for_list):
+                continue
+            rate = _effective_commission_rate(employee)
             commission_amount = _commission_amount(receipt.amount_received, rate)
             status = batch.status if batch else 'Awaiting Payment'
             payload = {
@@ -1030,6 +1308,7 @@ def generate_agent_commission_batches():
             .all()
         )
 
+        admin_role_ids = _get_admin_role_ids(session)
         batches_created = 0
         items_created = 0
         skipped_existing = 0
@@ -1037,6 +1316,10 @@ def generate_agent_commission_batches():
 
         for receipt, payment, employee, client in receipt_rows:
             if not payment.employee_id:
+                skipped_existing += 1
+                continue
+
+            if _is_admin_employee(employee, admin_role_ids):
                 skipped_existing += 1
                 continue
 
@@ -1075,7 +1358,7 @@ def generate_agent_commission_batches():
                     batches_created += 1
                 batches_by_employee[payment.employee_id] = batch
 
-            rate = Decimal(str(employee.commission_percentage or 0))
+            rate = _effective_commission_rate(employee)
             commission_amount = _commission_amount(receipt.amount_received, rate)
             item = Agent_Commission_Batch_Item(
                 id=str(uuid.uuid4()),
@@ -1674,6 +1957,7 @@ def create_commission_payment_receipt(payment_id: str):
         # Only refresh payment totals for actual payments, not notes
         if not is_note_only:
             _refresh_payment_totals_from_receipts(session, payment)
+            _auto_create_agent_commission_item(session, receipt, payment)
 
         session.commit()
 
@@ -2356,10 +2640,11 @@ def manage_commission_payment_receipt(payment_id: str, receipt_id: str):
         # ── DELETE ──────────────────────────────────────────────────────────
         if request.method == 'DELETE':
             was_payment = receipt.amount_received is not None
+            if was_payment:
+                _remove_agent_commission_item_for_receipt(session, receipt)
             session.delete(receipt)
             session.flush()
 
-            # Only recalculate totals if it was an actual payment, not a note
             if was_payment:
                 _refresh_payment_totals_from_receipts(session, payment)
 
