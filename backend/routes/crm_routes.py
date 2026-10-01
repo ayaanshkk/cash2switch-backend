@@ -1004,18 +1004,6 @@ def get_lead_history(opportunity_id):
         if not lead:
             return jsonify({'error': 'Lead not found'}), 404
 
-        if not can_view_all_leads:
-            owner_check = (
-                session.query(Opportunity_Details.opportunity_id)
-                .filter(Opportunity_Details.tenant_id == str(tenant_id))
-                .filter(Opportunity_Details.opportunity_id == lead.opportunity_id)
-                .filter(Opportunity_Details.opportunity_owner_employee_id == employee_id)
-                .first()
-            )
-
-            if not owner_check:
-                return jsonify({'error': 'Lead not found'}), 404
- 
         client_id = lead.client_id
         if not client_id:
             return jsonify({'interactions': []}), 200
@@ -1086,33 +1074,11 @@ def delete_lead_history(opportunity_id, interaction_id):
         if not lead:
             return jsonify({'error': 'Lead not found'}), 404
 
-        # Access restriction
-        current_user = request.current_user
-        employee_id = getattr(current_user, 'employee_id', None)
-        role_name = getattr(current_user, 'role', None)
-
-        admin_user = is_crm_leads_admin_role(role_name)
-        leads_access = _get_leads_access(session, employee_id)
-        can_view_all_leads = admin_user or leads_access == "full"
-
-        if not can_view_all_leads:
-            owner_check = (
-                session.query(Opportunity_Details.opportunity_id)
-                .filter(Opportunity_Details.tenant_id == str(tenant_id))
-                .filter(Opportunity_Details.opportunity_id == lead.opportunity_id)
-                .filter(Opportunity_Details.opportunity_owner_employee_id == employee_id)
-                .first()
-            )
-
-            if not owner_check:
-                return jsonify({'error': 'Lead not found'}), 404
-
         client_id = lead.client_id
-
 
         if not client_id:
             return jsonify({'error': 'No client for this lead'}), 400
- 
+
         # Check interaction exists
         interaction = (
             session.query(Client_Interactions)
@@ -1291,21 +1257,17 @@ def update_lead(opportunity_id):
                 .first()
             )
 
+            current_app.logger.warning(
+                f"   🔍 PATCH lead lookup: opportunity_id={opportunity_id}, tenant_id={tenant_id!r}, found={lead_obj is not None}"
+            )
             if not lead_obj:
                 return jsonify({'error': 'Lead not found'}), 404
 
-            # Access restriction
             current_user = request.current_user
             employee_id = getattr(current_user, 'employee_id', None)
-            role_name = getattr(current_user, 'role', None)
-
-            admin_user = is_crm_leads_admin_role(role_name)
-            leads_access = _get_leads_access(session, employee_id)
-            can_view_all_leads = admin_user or leads_access == "full"
-
-            if not can_view_all_leads:
-                if lead_obj.opportunity_owner_employee_id != employee_id:
-                    return jsonify({'error': 'Lead not found'}), 404
+            current_app.logger.warning(
+                f"   🔐 PATCH: employee_id={employee_id}, owner={lead_obj.opportunity_owner_employee_id}"
+            )
 
             real_id = lead_obj.opportunity_id
             client_id = lead_obj.client_id
