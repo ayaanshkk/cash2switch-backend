@@ -1779,6 +1779,7 @@ def assign_leads_by_filter():
     entirely server-side — no need to fetch IDs first.
     Body: { employee_id, count, service, salesperson_filter, assignment_notes }
     """
+    import threading
     from sqlalchemy import text as _text
     from datetime import datetime as _dt
 
@@ -1855,33 +1856,56 @@ def assign_leads_by_filter():
         """), params)
         total_updated = result.rowcount or 0
 
-        if notes and total_updated and total_updated <= 500:
-            note_text = f"[Assignment] Assigned to {employee_name}: {notes}"
-            now = _dt.utcnow()
-            rows = session.execute(_text(f"""
-                SELECT od.client_id
-                FROM   "StreemLyne_MT"."Opportunity_Details" od
-                WHERE  {where_sql}
-                  AND  od.opportunity_owner_employee_id = :emp_id
-                  AND  od.client_id IS NOT NULL
-                {limit_sql}
-            """), params).fetchall()
-            client_ids = [r[0] for r in rows if r[0]]
-            if client_ids:
-                CHUNK = 500
-                for i in range(0, len(client_ids), CHUNK):
-                    chunk = client_ids[i:i + CHUNK]
-                    vals  = ', '.join(f'(:c{j}, CURRENT_DATE, 1, :note, \'Assignment\', :now)' for j, _ in enumerate(chunk))
-                    p2    = {'note': note_text, 'now': now}
-                    for j, cid in enumerate(chunk):
-                        p2[f'c{j}'] = cid
-                    session.execute(_text(f"""
-                        INSERT INTO "StreemLyne_MT"."Client_Interactions"
-                            (client_id, contact_date, contact_method, notes, next_steps, created_at)
-                        VALUES {vals}
-                    """), p2)
-
         session.commit()
+
+        # Insert interaction notes asynchronously so the response returns instantly
+        if notes and total_updated:
+            note_params = dict(params)
+            note_where  = where_sql
+            note_limit  = limit_sql
+            note_text   = f"[Assignment] Assigned to {employee_name}: {notes}"
+            note_emp    = employee_name
+
+            def _insert_notes_bg():
+                from backend.db import SessionLocal as _SL
+                from sqlalchemy import text as _t2
+                from datetime import datetime as _dt2
+                bg = _SL()
+                try:
+                    rows = bg.execute(_t2(f"""
+                        SELECT od.client_id
+                        FROM   "StreemLyne_MT"."Opportunity_Details" od
+                        WHERE  {note_where}
+                          AND  od.opportunity_owner_employee_id = :emp_id
+                          AND  od.client_id IS NOT NULL
+                        {note_limit}
+                    """), note_params).fetchall()
+                    client_ids = [r[0] for r in rows if r[0]]
+                    now = _dt2.utcnow()
+                    CHUNK = 500
+                    for i in range(0, len(client_ids), CHUNK):
+                        chunk = client_ids[i:i + CHUNK]
+                        vals  = ', '.join(
+                            f'(:c{j}, CURRENT_DATE, 1, :note, \'Assignment\', :now)'
+                            for j in range(len(chunk))
+                        )
+                        p2 = {'note': note_text, 'now': now}
+                        for j, cid in enumerate(chunk):
+                            p2[f'c{j}'] = cid
+                        bg.execute(_t2(f"""
+                            INSERT INTO "StreemLyne_MT"."Client_Interactions"
+                                (client_id, contact_date, contact_method, notes, next_steps, created_at)
+                            VALUES {vals}
+                        """), p2)
+                    bg.commit()
+                except Exception as bg_exc:
+                    bg.rollback()
+                    current_app.logger.error('assign notes bg failed: %s', bg_exc)
+                finally:
+                    bg.close()
+
+            threading.Thread(target=_insert_notes_bg, daemon=True).start()
+
         return jsonify({
             'success': True,
             'assigned_count': total_updated,
