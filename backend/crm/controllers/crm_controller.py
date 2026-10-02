@@ -317,6 +317,8 @@ class CRMController:
 
                 total_updated = 0
 
+                tid = tenant_id.strip()
+
                 # ── 2. Bulk UPDATE in chunks ───────────────────────────────────
                 for i in range(0, len(lead_ids), CHUNK_SIZE):
                     chunk = lead_ids[i:i + CHUNK_SIZE]
@@ -325,12 +327,12 @@ class CRMController:
                         SET opportunity_owner_employee_id = :emp_id,
                             is_allocated = :is_allocated,
                             is_draft = FALSE
-                        WHERE TRIM(tenant_id) = :tid
+                        WHERE tenant_id = :tid
                         AND opportunity_id = ANY(:ids)
                     """), {
                         'emp_id': employee_id,
                         'is_allocated': is_allocated,
-                        'tid': tenant_id,
+                        'tid': tid,
                         'ids': chunk,
                     })
                     total_updated += result.rowcount or 0
@@ -346,10 +348,10 @@ class CRMController:
                         # Get client_ids for this chunk in one query
                         rows = session.execute(text("""
                             SELECT client_id FROM "StreemLyne_MT"."Opportunity_Details"
-                            WHERE TRIM(tenant_id) = :tid
+                            WHERE tenant_id = :tid
                             AND opportunity_id = ANY(:ids)
                             AND client_id IS NOT NULL
-                        """), {'tid': tenant_id, 'ids': chunk}).fetchall()
+                        """), {'tid': tid, 'ids': chunk}).fetchall()
 
                         client_ids = [r[0] for r in rows if r[0]]
                         if not client_ids:

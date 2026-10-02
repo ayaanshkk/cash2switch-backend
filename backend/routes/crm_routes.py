@@ -47,6 +47,12 @@ def _iso(v):
         return v.isoformat()
     return v
 
+
+# ── In-memory task progress store ─────────────────────────────────────────────
+# Keyed by task_id (uuid). Entries cleaned up once frontend reads a terminal state.
+import uuid as _uuid
+_TASK_PROGRESS: dict = {}  # task_id -> {done, total, status, assigned_count, employee_name, error}
+
 def _serial(v):
     """Serialize values for JSON response"""
     if v is None:
@@ -1817,12 +1823,13 @@ def assign_leads_by_filter():
         employee_name = emp[0] if emp else 'Unknown'
 
         # Build the subquery that selects which opportunity_ids to update
+        # Use direct equality (not TRIM/COALESCE) so PostgreSQL can use indexes
         filter_clauses = [
-            'TRIM(od.tenant_id) = :tid',
+            'od.tenant_id = :tid',
             'od.service_id = :svc',
-            'COALESCE(od.is_draft, FALSE) = FALSE',
+            'od.is_draft IS NOT TRUE',
         ]
-        params = {'tid': tenant_id, 'svc': service_id, 'emp_id': employee_id, 'is_alloc': is_allocated}
+        params = {'tid': tenant_id.strip(), 'svc': service_id, 'emp_id': employee_id, 'is_alloc': is_allocated}
 
         if exclude_stage:
             filter_clauses.append("""
@@ -1923,6 +1930,179 @@ def assign_leads_by_filter():
         return jsonify({'success': False, 'error': str(exc)}), 500
     finally:
         session.close()
+
+
+@crm_bp.route('/leads/assign-progress', methods=['POST'])
+@token_required
+@tenant_from_jwt
+def assign_leads_progress():
+    """
+    POST /api/crm/leads/assign-progress
+    Async version of assign-by-filter. Kicks off a background thread and
+    returns a task_id immediately. Poll GET /api/crm/tasks/<task_id> for progress.
+    Body: same as assign-by-filter
+    """
+    import threading as _threading
+    from sqlalchemy import text as _text2
+
+    user = getattr(request, 'current_user', None)
+    if not user:
+        return jsonify({'success': False, 'error': 'Authentication required'}), 401
+
+    tenant_id = str(g.tenant_id)
+    payload = request.get_json() or {}
+
+    try:
+        employee_id   = int(payload['employee_id'])
+        count         = int(payload.get('count') or 0) or None
+        service_param = str(payload.get('service', 'energy')).strip().lower()
+        service_id    = 2 if service_param == 'water' else 1
+        salesperson   = payload.get('salesperson_filter')
+        notes         = (payload.get('assignment_notes') or '').strip()
+        exclude_stage = (payload.get('exclude_stage') or 'Lost').strip()
+    except (KeyError, TypeError, ValueError) as exc:
+        return jsonify({'success': False, 'error': f'Invalid payload: {exc}'}), 400
+
+    current_user_employee_id = getattr(user, 'employee_id', None)
+    is_allocated = (current_user_employee_id is None) or (employee_id != current_user_employee_id)
+    tid = tenant_id.strip()
+
+    # ── Step 1: resolve which IDs to assign (fast SELECT) ─────────────────────
+    session = SessionLocal()
+    try:
+        emp = session.execute(_text2("""
+            SELECT employee_name FROM "StreemLyne_MT"."Employee_Master"
+            WHERE employee_id = :id LIMIT 1
+        """), {'id': employee_id}).fetchone()
+        employee_name = emp[0] if emp else 'Unknown'
+
+        filter_clauses = [
+            'od.tenant_id = :tid',
+            'od.service_id = :svc',
+            'od.is_draft IS NOT TRUE',
+        ]
+        params: dict = {'tid': tid, 'svc': service_id}
+
+        if exclude_stage:
+            filter_clauses.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM "StreemLyne_MT"."Stage_Master" sm
+                    WHERE sm.stage_id = od.stage_id
+                      AND LOWER(sm.stage_name) = LOWER(:excl_stage)
+                )
+            """)
+            params['excl_stage'] = exclude_stage
+
+        if salesperson and salesperson != 'All':
+            try:
+                filter_clauses.append('od.opportunity_owner_employee_id = :sp_id')
+                params['sp_id'] = int(salesperson)
+            except (ValueError, TypeError):
+                pass
+
+        where_sql = ' AND '.join(filter_clauses)
+        limit_sql = f'LIMIT {int(count)}' if count else ''
+
+        rows = session.execute(_text2(f"""
+            SELECT od.opportunity_id
+            FROM   "StreemLyne_MT"."Opportunity_Details" od
+            WHERE  {where_sql}
+            ORDER  BY od.created_at ASC, od.opportunity_id ASC
+            {limit_sql}
+        """), params).fetchall()
+        all_ids = [r[0] for r in rows]
+    finally:
+        session.close()
+
+    total = len(all_ids)
+    if total == 0:
+        return jsonify({'success': True, 'task_id': None, 'total': 0,
+                        'assigned_count': 0, 'employee_name': employee_name}), 200
+
+    task_id = str(_uuid.uuid4())
+    _TASK_PROGRESS[task_id] = {
+        'done': 0, 'total': total, 'status': 'running',
+        'assigned_count': 0, 'employee_name': employee_name, 'error': None,
+    }
+
+    # ── Step 2: process in background chunks ──────────────────────────────────
+    CHUNK = 25
+
+    def _run():
+        assigned = 0
+        bg = SessionLocal()
+        try:
+            bg.execute(_text2("SET LOCAL statement_timeout = 0"))
+            for i in range(0, len(all_ids), CHUNK):
+                chunk = all_ids[i:i + CHUNK]
+                result = bg.execute(_text2("""
+                    UPDATE "StreemLyne_MT"."Opportunity_Details"
+                    SET opportunity_owner_employee_id = :emp_id,
+                        is_allocated = :is_alloc,
+                        is_draft     = FALSE
+                    WHERE tenant_id = :tid
+                      AND opportunity_id = ANY(:ids)
+                """), {'emp_id': employee_id, 'is_alloc': is_allocated,
+                       'tid': tid, 'ids': chunk})
+                bg.commit()
+                assigned += result.rowcount or 0
+                _TASK_PROGRESS[task_id]['done']           = min(i + len(chunk), total)
+                _TASK_PROGRESS[task_id]['assigned_count'] = assigned
+
+            # Insert notes in the same background thread (after all updates)
+            if notes and assigned:
+                note_text = f"[Assignment] Assigned to {employee_name}: {notes}"
+                now = __import__('datetime').datetime.utcnow()
+                for i in range(0, len(all_ids), CHUNK):
+                    chunk = all_ids[i:i + CHUNK]
+                    note_rows = bg.execute(_text2("""
+                        SELECT client_id FROM "StreemLyne_MT"."Opportunity_Details"
+                        WHERE tenant_id = :tid AND opportunity_id = ANY(:ids)
+                          AND client_id IS NOT NULL
+                    """), {'tid': tid, 'ids': chunk}).fetchall()
+                    client_ids = [r[0] for r in note_rows if r[0]]
+                    if not client_ids:
+                        continue
+                    vals = ', '.join(
+                        f'(:c{j}, CURRENT_DATE, 1, :note, \'Assignment\', :now)'
+                        for j in range(len(client_ids))
+                    )
+                    p2 = {'note': note_text, 'now': now}
+                    for j, cid in enumerate(client_ids):
+                        p2[f'c{j}'] = cid
+                    bg.execute(_text2(f"""
+                        INSERT INTO "StreemLyne_MT"."Client_Interactions"
+                            (client_id, contact_date, contact_method, notes, next_steps, created_at)
+                        VALUES {vals}
+                    """), p2)
+                    bg.commit()
+
+            _TASK_PROGRESS[task_id]['status'] = 'done'
+        except Exception as exc:
+            bg.rollback()
+            _TASK_PROGRESS[task_id]['status'] = 'error'
+            _TASK_PROGRESS[task_id]['error']  = str(exc)
+            current_app.logger.exception('assign_leads_progress bg failed: %s', exc)
+        finally:
+            bg.close()
+
+    _threading.Thread(target=_run, daemon=True).start()
+
+    return jsonify({'success': True, 'task_id': task_id, 'total': total,
+                    'employee_name': employee_name}), 202
+
+
+@crm_bp.route('/tasks/<task_id>', methods=['GET'])
+@token_required
+def get_task_progress(task_id):
+    """GET /api/crm/tasks/<task_id> — poll progress for a background task."""
+    entry = _TASK_PROGRESS.get(task_id)
+    if not entry:
+        return jsonify({'error': 'Task not found'}), 404
+    # Clean up terminal tasks after the frontend reads them
+    if entry['status'] in ('done', 'error'):
+        _TASK_PROGRESS.pop(task_id, None)
+    return jsonify(entry), 200
 
 
 @crm_bp.route('/leads/<int:opportunity_id>', methods=['DELETE'])
