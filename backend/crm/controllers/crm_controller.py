@@ -302,6 +302,9 @@ class CRMController:
 
             session = SessionLocal()
             try:
+                # Disable per-statement timeout for this bulk operation
+                session.execute(text("SET LOCAL statement_timeout = 0"))
+
                 # ── 1. Get employee name (once) ────────────────────────────────
                 employee_name = "Unassigned"
                 emp_result = session.execute(text("""

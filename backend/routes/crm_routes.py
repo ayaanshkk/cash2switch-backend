@@ -1806,6 +1806,9 @@ def assign_leads_by_filter():
 
     session = SessionLocal()
     try:
+        # Disable per-statement timeout for this bulk operation
+        session.execute(_text("SET LOCAL statement_timeout = 0"))
+
         # Resolve employee name
         emp = session.execute(_text("""
             SELECT employee_name FROM "StreemLyne_MT"."Employee_Master"
