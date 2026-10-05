@@ -43,7 +43,7 @@ PAYMENT_STATUSES = {
 }
 
 ADMIN_SET_STATUSES = {'Chasing Supplier', 'Closed'}
-BATCH_STATUSES = {'Awaiting Payment', 'Commission Paid'}
+BATCH_STATUSES = {'Awaiting Payment', 'Partially Paid', 'Commission Paid'}
 COMMISSION_PAYMENT_TYPES = {
     'annual',
     'upfront_reconciliation',
@@ -380,6 +380,10 @@ def _batch_payload(batch: Agent_Commission_Batch, employee: Employee_Master, ite
         'agent_name': _employee_name(employee),
         'batch_month': _date(batch.batch_month),
         'total_amount': _money(batch.total_amount),
+        'amount_paid': _money(batch.amount_paid or 0),
+        'payment_date': _date(batch.payment_date),
+        'payment_notes': batch.payment_notes,
+        'payment_log': batch.payment_log or [],
         'status': batch.status,
         'paid_at': _datetime(batch.paid_at),
         'paid_by': batch.paid_by if include_admin_fields else None,
@@ -1272,6 +1276,7 @@ def list_agent_commissions():
             payload = {
                 'commission_payment_receipt_id': receipt.id if is_admin else None,
                 'commission_payment_id': payment.id if is_admin else None,
+                'client_id': payment.client_id if is_admin else None,
                 'client_name': _client_name(client, payment.client_id),
                 'agent_name': _employee_name(employee),
                 'employee_id': (employee.employee_id) if is_admin else None,
@@ -1307,13 +1312,15 @@ def generate_agent_commission_batches():
         return tenant_error
 
     data = request.get_json(force=True, silent=True) or {}
-    month_start, next_month, month_error = _parse_month(data.get('month'))
-    if month_error or not month_start:
-        return jsonify({'error': month_error or 'month is required as YYYY-MM'}), 400
+    month_param = data.get('month')
+    month_start, next_month, month_error = _parse_month(month_param)
+    if month_error:
+        return jsonify({'error': month_error}), 400
+    # month_start may be None → generate for ALL unbatched receipts
 
     session = SessionLocal()
     try:
-        receipt_rows = (
+        receipt_q = (
             session.query(Commission_Payment_Receipt, Commission_Payment, Client_Master)
             .join(Commission_Payment, Commission_Payment_Receipt.commission_payment_id == Commission_Payment.id)
             .outerjoin(Client_Master, Commission_Payment.client_id == Client_Master.client_id)
@@ -1321,20 +1328,23 @@ def generate_agent_commission_batches():
             .filter(
                 Commission_Payment.tenant_id == tenant_id,
                 _not_old_payment_filter(),
-                Commission_Payment_Receipt.date_received >= month_start,
-                Commission_Payment_Receipt.date_received < next_month,
                 Agent_Commission_Batch_Item.id.is_(None),
                 Commission_Payment_Receipt.amount_received.isnot(None),
             )
-            .order_by(Commission_Payment_Receipt.date_received)
-            .all()
         )
+        if month_start:
+            receipt_q = receipt_q.filter(
+                Commission_Payment_Receipt.date_received >= month_start,
+                Commission_Payment_Receipt.date_received < next_month,
+            )
+        receipt_rows = receipt_q.order_by(Commission_Payment_Receipt.date_received).all()
 
         admin_role_ids = _get_admin_role_ids(session)
         batches_created = 0
         items_created = 0
         skipped_existing = 0
-        batches_by_employee = {}
+        # key: (employee_id, batch_month_date) → batch
+        batches_by_key: dict = {}
 
         for receipt, payment, client in receipt_rows:
             # Resolve agent: payment → client owner fallback
@@ -1363,14 +1373,22 @@ def generate_agent_commission_batches():
                 skipped_existing += 1
                 continue
 
-            batch = batches_by_employee.get(effective_employee_id)
+            # Derive the batch month from the receipt date when no month filter given
+            if month_start:
+                batch_month = month_start
+            else:
+                rd = receipt.date_received
+                batch_month = date(rd.year, rd.month, 1) if rd else date.today().replace(day=1)
+
+            batch_key = (effective_employee_id, batch_month)
+            batch = batches_by_key.get(batch_key)
             if batch is None:
                 batch = (
                     session.query(Agent_Commission_Batch)
                     .filter(
                         Agent_Commission_Batch.tenant_id == tenant_id,
                         Agent_Commission_Batch.employee_id == effective_employee_id,
-                        Agent_Commission_Batch.batch_month == month_start,
+                        Agent_Commission_Batch.batch_month == batch_month,
                     )
                     .first()
                 )
@@ -1379,7 +1397,7 @@ def generate_agent_commission_batches():
                         id=str(uuid.uuid4()),
                         tenant_id=tenant_id,
                         employee_id=effective_employee_id,
-                        batch_month=month_start,
+                        batch_month=batch_month,
                         total_amount=Decimal('0.00'),
                         status='Awaiting Payment',
                         created_at=datetime.utcnow(),
@@ -1387,7 +1405,7 @@ def generate_agent_commission_batches():
                     session.add(batch)
                     session.flush()
                     batches_created += 1
-                batches_by_employee[effective_employee_id] = batch
+                batches_by_key[batch_key] = batch
 
             rate = _effective_commission_rate(employee)
             commission_amount = _commission_amount(receipt.amount_received, rate)
@@ -1410,7 +1428,7 @@ def generate_agent_commission_batches():
 
         return jsonify({
             'success': True,
-            'month': _date(month_start),
+            'month': _date(month_start) if month_start else None,
             'summary': {
                 'batches_created': batches_created,
                 'items_created': items_created,
@@ -1456,6 +1474,177 @@ def mark_agent_commission_batch_paid(batch_id: str):
                 'status': batch.status,
                 'paid_at': _datetime(batch.paid_at),
                 'paid_by': batch.paid_by,
+            },
+        }), 200
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+@commission_bp.route('/batches/<batch_id>/log-payment', methods=['POST'])
+@token_required
+def log_agent_commission_payment(batch_id: str):
+    admin_error = _require_admin()
+    if admin_error:
+        return admin_error
+    tenant_id, tenant_error = _require_tenant_id()
+    if tenant_error:
+        return tenant_error
+
+    data = request.get_json(force=True, silent=True) or {}
+    raw_amount = str(data.get('amount_paid', '') or '').strip()
+    notes = (data.get('notes') or '').strip() or None
+    raw_date = (data.get('payment_date') or '').strip()
+    receipt_id = (data.get('receipt_id') or '').strip() or None
+
+    if not raw_amount:
+        return jsonify({'error': 'amount_paid is required'}), 400
+    try:
+        amount_paid = Decimal(raw_amount)
+    except Exception:
+        return jsonify({'error': 'amount_paid must be a valid number'}), 400
+    if amount_paid <= 0:
+        return jsonify({'error': 'amount_paid must be greater than zero'}), 400
+
+    payment_date, date_error = _parse_date(raw_date, 'payment_date')
+    if date_error:
+        return jsonify({'error': date_error}), 400
+    if payment_date is None:
+        payment_date = datetime.utcnow().date()
+
+    session = SessionLocal()
+    try:
+        batch = (
+            session.query(Agent_Commission_Batch)
+            .filter(Agent_Commission_Batch.id == batch_id, Agent_Commission_Batch.tenant_id == tenant_id)
+            .first()
+        )
+        if not batch:
+            return jsonify({'error': 'Commission batch not found'}), 404
+
+        total = Decimal(str(batch.total_amount or 0))
+        existing_paid = Decimal(str(batch.amount_paid or 0))
+        new_total_paid = existing_paid + amount_paid
+
+        # Append to audit log
+        log_entry = {
+            'id': str(uuid.uuid4()),
+            'amount': str(amount_paid),
+            'date': payment_date.isoformat(),
+            'notes': notes,
+            'receipt_id': receipt_id,
+            'logged_by': getattr(request.current_user, 'employee_id', None),
+            'logged_at': datetime.utcnow().isoformat(),
+        }
+        current_log = list(batch.payment_log or [])
+        current_log.append(log_entry)
+
+        batch.amount_paid = new_total_paid
+        batch.payment_date = payment_date
+        batch.payment_notes = notes
+        batch.payment_log = current_log
+        batch.paid_by = getattr(request.current_user, 'employee_id', None)
+        batch.paid_at = datetime.utcnow()
+
+        if new_total_paid >= total:
+            batch.status = 'Commission Paid'
+        else:
+            batch.status = 'Partially Paid'
+
+        session.commit()
+
+        outstanding = max(total - new_total_paid, Decimal('0.00'))
+        return jsonify({
+            'success': True,
+            'batch': {
+                'id': batch.id,
+                'status': batch.status,
+                'total_amount': _money(batch.total_amount),
+                'amount_paid': _money(batch.amount_paid),
+                'outstanding': _money(outstanding),
+                'payment_date': _date(batch.payment_date),
+                'payment_notes': batch.payment_notes,
+                'payment_log': batch.payment_log,
+                'paid_at': _datetime(batch.paid_at),
+            },
+        }), 200
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+@commission_bp.route('/batches/<batch_id>/reverse-payment', methods=['POST'])
+@token_required
+def reverse_agent_commission_payment(batch_id: str):
+    admin_error = _require_admin()
+    if admin_error:
+        return admin_error
+    tenant_id, tenant_error = _require_tenant_id()
+    if tenant_error:
+        return tenant_error
+
+    data = request.get_json(force=True, silent=True) or {}
+    log_entry_id = (data.get('log_entry_id') or '').strip()
+
+    session = SessionLocal()
+    try:
+        batch = (
+            session.query(Agent_Commission_Batch)
+            .filter(Agent_Commission_Batch.id == batch_id, Agent_Commission_Batch.tenant_id == tenant_id)
+            .first()
+        )
+        if not batch:
+            return jsonify({'error': 'Commission batch not found'}), 404
+
+        current_log = list(batch.payment_log or [])
+        if not current_log:
+            return jsonify({'error': 'No payment entries to reverse'}), 400
+
+        # Find and remove the specific entry (or last if no id given)
+        if log_entry_id:
+            entry_to_remove = next((e for e in current_log if e.get('id') == log_entry_id), None)
+            if not entry_to_remove:
+                return jsonify({'error': 'Payment entry not found'}), 404
+        else:
+            entry_to_remove = current_log[-1]
+
+        reversed_amount = Decimal(str(entry_to_remove.get('amount', 0)))
+        current_log.remove(entry_to_remove)
+
+        new_total_paid = max(Decimal(str(batch.amount_paid or 0)) - reversed_amount, Decimal('0.00'))
+        batch.payment_log = current_log
+        batch.amount_paid = new_total_paid
+
+        if new_total_paid <= 0:
+            batch.status = 'Awaiting Payment'
+            batch.payment_date = None
+            batch.payment_notes = None
+            batch.paid_at = None
+            batch.paid_by = None
+        elif new_total_paid < Decimal(str(batch.total_amount or 0)):
+            batch.status = 'Partially Paid'
+            # Restore date/notes from previous log entry if available
+            if current_log:
+                last = current_log[-1]
+                batch.payment_date = date.fromisoformat(last['date']) if last.get('date') else None
+                batch.payment_notes = last.get('notes')
+        else:
+            batch.status = 'Commission Paid'
+
+        session.commit()
+
+        return jsonify({
+            'success': True,
+            'reversed_amount': _money(reversed_amount),
+            'batch': {
+                'id': batch.id,
+                'status': batch.status,
+                'amount_paid': _money(batch.amount_paid),
+                'payment_log': batch.payment_log,
             },
         }), 200
     except Exception:
@@ -1520,31 +1709,70 @@ def download_agent_commission_statement(batch_id: str):
             Paragraph(f'Month: {batch.batch_month.strftime("%B %Y")}', styles['Normal']),
             Paragraph(f'Status: {batch.status}', styles['Normal']),
         ]
-        if batch.paid_at:
-            story.append(Paragraph(f'Paid date: {batch.paid_at.strftime("%d/%m/%Y")}', styles['Normal']))
         story.append(Spacer(1, 14))
 
+        amount_paid = Decimal(str(batch.amount_paid or 0))
+        total_amount = Decimal(str(batch.total_amount or 0))
+        outstanding = max(total_amount - amount_paid, Decimal('0.00'))
+        is_partial = batch.status == 'Partially Paid'
+        is_fully_paid = batch.status == 'Commission Paid'
+
+        # Only include items up to the paid amount (pro-rata for partial payments)
+        # For full payment show all; for partial show items in order until paid amount is reached
+        paid_items = []
+        if is_fully_paid:
+            paid_items = list(items)
+        elif is_partial and amount_paid > 0:
+            running = Decimal('0.00')
+            for item in items:
+                item_commission = Decimal(str(item.commission_amount or 0))
+                if running >= amount_paid:
+                    break
+                paid_items.append(item)
+                running += item_commission
+        # If neither paid nor partial, paid_items stays empty (shouldn't reach here due to frontend lock)
+
+        if is_partial:
+            story.append(Paragraph(
+                f'<font color="red"><b>PARTIAL PAYMENT — £{_money(amount_paid)} paid of £{_money(total_amount)} total</b></font>',
+                styles['Normal']
+            ))
+            story.append(Spacer(1, 8))
+
         table_data = [['Client Name', 'Commission Rate', 'Commission Amount']]
-        for item in items:
+        for item in paid_items:
             table_data.append([
                 item.client_name or 'Unknown client',
                 f'{Decimal(str(item.commission_rate_snapshot or 0)).quantize(Decimal("0.01"))}%',
                 f'£{_money(item.commission_amount)}',
             ])
-        table_data.append(['Total', '', f'£{_money(batch.total_amount)}'])
 
+        # Footer rows
+        table_data.append(['Amount Paid', '', f'£{_money(amount_paid)}'])
+        if is_partial:
+            table_data.append(['Outstanding', '', f'£{_money(outstanding)}'])
+
+        footer_rows = 2 if is_partial else 1
         table = Table(table_data, colWidths=[260, 120, 120])
         table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#111827')),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CBD5E1')),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ('FONTNAME', (0, -footer_rows), (-1, -1), 'Helvetica-Bold'),
             ('ALIGN', (1, 1), (-1, -1), 'RIGHT'),
             ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.white, colors.HexColor('#F8FAFC')]),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -(footer_rows + 1)), [colors.white, colors.HexColor('#F8FAFC')]),
+            ('BACKGROUND', (0, -footer_rows), (-1, -1), colors.HexColor('#F1F5F9')),
         ]))
         story.append(table)
+
+        if batch.payment_date:
+            story.append(Spacer(1, 10))
+            story.append(Paragraph(f'Payment date: {batch.payment_date.strftime("%d/%m/%Y")}', styles['Normal']))
+        if batch.payment_notes:
+            story.append(Paragraph(f'Notes: {batch.payment_notes}', styles['Normal']))
+
         doc.build(story)
         buffer.seek(0)
 

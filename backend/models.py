@@ -8,8 +8,9 @@ import secrets
 from datetime import datetime, timedelta
 from sqlalchemy import (
     Column, Integer, BigInteger, SmallInteger, String, Boolean, DateTime, Date,
-    ForeignKey, Text, Float, Numeric, UniqueConstraint, CheckConstraint,func
+    ForeignKey, Text, Float, Numeric, UniqueConstraint, CheckConstraint, func
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -591,7 +592,7 @@ class Agent_Commission_Batch(Base):
             name='uq_agent_commission_batch_tenant_employee_month',
         ),
         CheckConstraint(
-            "status IN ('Awaiting Payment', 'Commission Paid')",
+            "status IN ('Awaiting Payment', 'Partially Paid', 'Commission Paid')",
             name='ck_agent_commission_batch_status',
         ),
         {'schema': SCHEMA},
@@ -602,6 +603,10 @@ class Agent_Commission_Batch(Base):
     employee_id = Column(Integer, ForeignKey(f'{SCHEMA}.Employee_Master.employee_id'), nullable=True)
     batch_month = Column(Date, nullable=False)
     total_amount = Column(Numeric(14, 2), nullable=False, default=0)
+    amount_paid = Column(Numeric(14, 2), nullable=False, default=0)
+    payment_date = Column(Date, nullable=True)
+    payment_notes = Column(Text, nullable=True)
+    payment_log = Column(JSONB, nullable=False, default=list)
     status = Column(String(50), nullable=False, default='Awaiting Payment')
     paid_at = Column(DateTime, nullable=True)
     paid_by = Column(Integer, ForeignKey(f'{SCHEMA}.Employee_Master.employee_id'), nullable=True)
