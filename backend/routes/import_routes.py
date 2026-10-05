@@ -735,24 +735,26 @@ def _load_suppliers(raw_conn) -> dict:
     return result
 
 def _load_existing_lead_mpans(raw_conn, tenant_id) -> dict:
-    """Load existing Lead and Renewal MPANs for this tenant."""
+    """Load existing Lead and Renewal MPANs for this tenant.
+    Returns dict: mpan_lower -> {'opportunity_id': id_or_None}
+    """
     cur = raw_conn.cursor()
     result = {}
 
-    # Existing Leads
+    # Existing Leads — carry opportunity_id so missing-field updates can use it
     cur.execute("""
-        SELECT od.mpan_mpr
+        SELECT od.mpan_mpr, od.opportunity_id
         FROM "StreemLyne_MT"."Opportunity_Details" od
         WHERE od.mpan_mpr IS NOT NULL
           AND od.mpan_mpr != ''
           AND od.tenant_id = %s
     """, (str(tenant_id),))
 
-    for (mpan,) in cur.fetchall():
+    for mpan, opp_id in cur.fetchall():
         if mpan:
-            result[mpan.strip().lower()] = True
+            result[mpan.strip().lower()] = {'opportunity_id': opp_id}
 
-    # Existing Renewals
+    # Existing Renewals (Energy_Contract_Master) — no Opportunity_Details row to update
     cur.execute("""
         SELECT ecm.mpan_number
         FROM "StreemLyne_MT"."Energy_Contract_Master" ecm
@@ -768,7 +770,9 @@ def _load_existing_lead_mpans(raw_conn, tenant_id) -> dict:
 
     for (mpan,) in cur.fetchall():
         if mpan:
-            result[mpan.strip().lower()] = True
+            key = mpan.strip().lower()
+            if key not in result:
+                result[key] = {'opportunity_id': None}
 
     cur.close()
     return result
@@ -1552,15 +1556,14 @@ def _run_energy_import(
                       f"{rate:.0f} rec/s | "
                       f"ETA {eta_s/60:.1f} min")
 
-            # Update progress after every processed row
-            update_job(
-                job_id,
-                processed=i + 1,
-                successful=success_count,
-                duplicates=duplicate_count,
-            )
-
-            time.sleep(0.1)
+            # Update progress every 100 rows to avoid hammering the job store
+            if (i + 1) % 100 == 0:
+                update_job(
+                    job_id,
+                    processed=i + 1,
+                    successful=success_count,
+                    duplicates=duplicate_count,
+                )
 
         # Final batch
         if pending_batch:

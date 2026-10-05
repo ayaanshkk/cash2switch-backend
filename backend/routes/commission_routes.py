@@ -266,7 +266,7 @@ def _effective_commission_rate(employee: Employee_Master) -> Decimal:
 
 def _auto_create_agent_commission_item(session, receipt: Commission_Payment_Receipt, payment: Commission_Payment) -> None:
     """Create an Agent_Commission_Batch_Item immediately when a receipt is logged."""
-    if not payment.employee_id or not receipt.amount_received:
+    if not receipt.amount_received:
         return
 
     existing = (
@@ -277,8 +277,17 @@ def _auto_create_agent_commission_item(session, receipt: Commission_Payment_Rece
     if existing:
         return
 
+    client = session.query(Client_Master).filter(
+        Client_Master.client_id == payment.client_id
+    ).first()
+
+    # Resolve agent: payment → client owner fallback
+    effective_employee_id = payment.employee_id or (client.assigned_employee_id if client else None)
+    if not effective_employee_id:
+        return
+
     employee = session.query(Employee_Master).filter(
-        Employee_Master.employee_id == payment.employee_id
+        Employee_Master.employee_id == effective_employee_id
     ).first()
     if not employee:
         return
@@ -289,10 +298,6 @@ def _auto_create_agent_commission_item(session, receipt: Commission_Payment_Rece
 
     rate = _effective_commission_rate(employee)
 
-    client = session.query(Client_Master).filter(
-        Client_Master.client_id == payment.client_id
-    ).first()
-
     receipt_date = receipt.date_received or datetime.utcnow().date()
     batch_month = date(receipt_date.year, receipt_date.month, 1)
 
@@ -300,7 +305,7 @@ def _auto_create_agent_commission_item(session, receipt: Commission_Payment_Rece
         session.query(Agent_Commission_Batch)
         .filter(
             Agent_Commission_Batch.tenant_id == payment.tenant_id,
-            Agent_Commission_Batch.employee_id == payment.employee_id,
+            Agent_Commission_Batch.employee_id == effective_employee_id,
             Agent_Commission_Batch.batch_month == batch_month,
         )
         .first()
@@ -309,7 +314,7 @@ def _auto_create_agent_commission_item(session, receipt: Commission_Payment_Rece
         batch = Agent_Commission_Batch(
             id=str(uuid.uuid4()),
             tenant_id=payment.tenant_id,
-            employee_id=payment.employee_id,
+            employee_id=effective_employee_id,
             batch_month=batch_month,
             total_amount=Decimal('0.00'),
             status='Awaiting Payment',
@@ -1219,11 +1224,14 @@ def list_agent_commissions():
                 Agent_Commission_Batch,
             )
             .join(Commission_Payment, Commission_Payment_Receipt.commission_payment_id == Commission_Payment.id)
-            .join(Employee_Master, Commission_Payment.employee_id == Employee_Master.employee_id)
+            .outerjoin(Employee_Master, Commission_Payment.employee_id == Employee_Master.employee_id)
             .outerjoin(Client_Master, Commission_Payment.client_id == Client_Master.client_id)
             .outerjoin(Agent_Commission_Batch_Item, Agent_Commission_Batch_Item.commission_payment_receipt_id == Commission_Payment_Receipt.id)
             .outerjoin(Agent_Commission_Batch, Agent_Commission_Batch_Item.batch_id == Agent_Commission_Batch.id)
-            .filter(Commission_Payment.tenant_id == tenant_id)
+            .filter(
+                Commission_Payment.tenant_id == tenant_id,
+                Commission_Payment_Receipt.amount_received.isnot(None),
+            )
         )
         if month_start:
             receipt_query = receipt_query.filter(
@@ -1240,10 +1248,24 @@ def list_agent_commissions():
         )
 
         admin_role_ids_for_list = _get_admin_role_ids(session)
+        employee_cache: dict = {}
         unbatched_items = []
         for receipt, payment, employee, client, batch in receipt_rows:
+            # Resolve agent: payment employee → client owner fallback
+            if employee is None:
+                effective_id = client.assigned_employee_id if client else None
+                if effective_id:
+                    employee = employee_cache.get(effective_id) or session.query(Employee_Master).filter(
+                        Employee_Master.employee_id == effective_id
+                    ).first()
+                    if employee:
+                        employee_cache[effective_id] = employee
+
+            if employee is None:
+                continue
             if _is_admin_employee(employee, admin_role_ids_for_list):
                 continue
+
             rate = _effective_commission_rate(employee)
             commission_amount = _commission_amount(receipt.amount_received, rate)
             status = batch.status if batch else 'Awaiting Payment'
@@ -1252,7 +1274,7 @@ def list_agent_commissions():
                 'commission_payment_id': payment.id if is_admin else None,
                 'client_name': _client_name(client, payment.client_id),
                 'agent_name': _employee_name(employee),
-                'employee_id': payment.employee_id if is_admin else None,
+                'employee_id': (employee.employee_id) if is_admin else None,
                 'date_received': _date(receipt.date_received),
                 'commission_rate': _money(rate),
                 'commission_amount': _money(commission_amount),
@@ -1292,9 +1314,8 @@ def generate_agent_commission_batches():
     session = SessionLocal()
     try:
         receipt_rows = (
-            session.query(Commission_Payment_Receipt, Commission_Payment, Employee_Master, Client_Master)
+            session.query(Commission_Payment_Receipt, Commission_Payment, Client_Master)
             .join(Commission_Payment, Commission_Payment_Receipt.commission_payment_id == Commission_Payment.id)
-            .join(Employee_Master, Commission_Payment.employee_id == Employee_Master.employee_id)
             .outerjoin(Client_Master, Commission_Payment.client_id == Client_Master.client_id)
             .outerjoin(Agent_Commission_Batch_Item, Agent_Commission_Batch_Item.commission_payment_receipt_id == Commission_Payment_Receipt.id)
             .filter(
@@ -1303,8 +1324,9 @@ def generate_agent_commission_batches():
                 Commission_Payment_Receipt.date_received >= month_start,
                 Commission_Payment_Receipt.date_received < next_month,
                 Agent_Commission_Batch_Item.id.is_(None),
+                Commission_Payment_Receipt.amount_received.isnot(None),
             )
-            .order_by(Commission_Payment.employee_id, Commission_Payment_Receipt.date_received)
+            .order_by(Commission_Payment_Receipt.date_received)
             .all()
         )
 
@@ -1314,8 +1336,17 @@ def generate_agent_commission_batches():
         skipped_existing = 0
         batches_by_employee = {}
 
-        for receipt, payment, employee, client in receipt_rows:
-            if not payment.employee_id:
+        for receipt, payment, client in receipt_rows:
+            # Resolve agent: payment → client owner fallback
+            effective_employee_id = payment.employee_id or (client.assigned_employee_id if client else None)
+            if not effective_employee_id:
+                skipped_existing += 1
+                continue
+
+            employee = session.query(Employee_Master).filter(
+                Employee_Master.employee_id == effective_employee_id
+            ).first()
+            if not employee:
                 skipped_existing += 1
                 continue
 
@@ -1332,13 +1363,13 @@ def generate_agent_commission_batches():
                 skipped_existing += 1
                 continue
 
-            batch = batches_by_employee.get(payment.employee_id)
+            batch = batches_by_employee.get(effective_employee_id)
             if batch is None:
                 batch = (
                     session.query(Agent_Commission_Batch)
                     .filter(
                         Agent_Commission_Batch.tenant_id == tenant_id,
-                        Agent_Commission_Batch.employee_id == payment.employee_id,
+                        Agent_Commission_Batch.employee_id == effective_employee_id,
                         Agent_Commission_Batch.batch_month == month_start,
                     )
                     .first()
@@ -1347,7 +1378,7 @@ def generate_agent_commission_batches():
                     batch = Agent_Commission_Batch(
                         id=str(uuid.uuid4()),
                         tenant_id=tenant_id,
-                        employee_id=payment.employee_id,
+                        employee_id=effective_employee_id,
                         batch_month=month_start,
                         total_amount=Decimal('0.00'),
                         status='Awaiting Payment',
@@ -1356,7 +1387,7 @@ def generate_agent_commission_batches():
                     session.add(batch)
                     session.flush()
                     batches_created += 1
-                batches_by_employee[payment.employee_id] = batch
+                batches_by_employee[effective_employee_id] = batch
 
             rate = _effective_commission_rate(employee)
             commission_amount = _commission_amount(receipt.amount_received, rate)
