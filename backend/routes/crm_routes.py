@@ -4895,76 +4895,234 @@ def leads_callback(opportunity_id):
 @token_required
 @tenant_from_jwt
 def get_allocated_leads():
+    from sqlalchemy import text as _text_alloc
     session = SessionLocal()
     try:
-        tenant_id = g.tenant_id
+        tenant_id = str(g.tenant_id).strip()
         current_user = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
+        exclude_stage = (request.args.get('exclude_stage', '') or '').strip()
+        page      = max(int(request.args.get('page', 1) or 1), 1)
+        page_size = min(max(int(request.args.get('page_size', 100) or 100), 1), 500)
+        offset    = (page - 1) * page_size
 
         employee_id = getattr(current_user, 'employee_id', None)
-        role_name = getattr(current_user, 'role', None)
+        role_name   = getattr(current_user, 'role', None)
 
-        admin_user = is_crm_leads_admin_role(role_name)
-        leads_access = _get_leads_access(session, employee_id)
+        admin_user      = is_crm_leads_admin_role(role_name)
+        leads_access    = _get_leads_access(session, employee_id)
+        can_view_all    = admin_user or leads_access == "full"
 
-        can_view_all_leads = admin_user or leads_access == "full"
+        if not employee_id and not can_view_all:
+            return jsonify({'data': [], 'total': 0, 'page': page, 'page_size': page_size}), 200
 
-        import logging
-        logging.getLogger(__name__).warning(
-            '🔍 get_allocated_leads: employee_id=%s is_admin=%s tenant=%s service=%s',
-            employee_id, admin_user, tenant_id, service_param
-        )
+        # ── Optional server-side filters ────────────────────────────────────────
+        search_q        = (request.args.get('search', '') or '').strip().lower()
+        filter_supplier = request.args.get('supplier_id', type=int)
+        filter_status   = (request.args.get('status', '') or '').strip()
+        filter_employee = request.args.get('salesperson_id', type=int)
+        filter_end_date = (request.args.get('end_date_filter', '') or '').strip()
+        upload_sort     = (request.args.get('upload_sort', 'desc') or 'desc').strip().lower()
+        upload_from     = (request.args.get('upload_from', '') or '').strip()
+        upload_to       = (request.args.get('upload_to',   '') or '').strip()
 
-        if not employee_id and not can_view_all_leads:
-            return jsonify([]), 200
+        # ── Build WHERE clauses using only Opportunity_Details columns ──────────
+        # Avoids the slow OR+Client_Master join that was causing full table scans
+        where_parts = [
+            "od.tenant_id = :tid",
+            "od.service_id = :svc",
+            "od.is_allocated = TRUE",
+            "od.is_draft IS NOT TRUE",
+        ]
+        params: dict = {'tid': tenant_id, 'svc': service_id}
 
-        query = (
-            session.query(
-                Opportunity_Details,
-                Stage_Master.stage_name,
-                Employee_Master.employee_name.label('assigned_to_name'),
-                func.coalesce(Opportunity_Details.business_name, Opportunity_Details.opportunity_title).label('business_name'),
-                Supplier_Master.supplier_company_name.label('supplier_name')
-            )
-            .outerjoin(Stage_Master, Opportunity_Details.stage_id == Stage_Master.stage_id)
-            .outerjoin(Employee_Master, Opportunity_Details.opportunity_owner_employee_id == Employee_Master.employee_id)
-            .outerjoin(Supplier_Master, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
-            .outerjoin(Client_Master, Opportunity_Details.client_id == Client_Master.client_id)
-            .filter(
-                (Opportunity_Details.tenant_id == tenant_id) |
-                ((Opportunity_Details.client_id.isnot(None)) & (Client_Master.tenant_id == tenant_id))
-            )
-            .filter(Opportunity_Details.service_id == service_id)
-            .filter(Opportunity_Details.is_allocated == True)
-        )
+        if exclude_stage:
+            where_parts.append("""
+                (od.stage_id IS NULL OR od.stage_id NOT IN (
+                    SELECT stage_id FROM "StreemLyne_MT"."Stage_Master"
+                    WHERE LOWER(stage_name) = LOWER(:excl)
+                ))
+            """)
+            params['excl'] = exclude_stage
 
-        if not can_view_all_leads:
-            query = query.filter(
-                Opportunity_Details.opportunity_owner_employee_id == employee_id
-        )
+        if not can_view_all:
+            where_parts.append("od.opportunity_owner_employee_id = :emp_id")
+            params['emp_id'] = employee_id
+        elif filter_employee:
+            where_parts.append("od.opportunity_owner_employee_id = :filt_emp")
+            params['filt_emp'] = filter_employee
 
-        query = query.order_by(Opportunity_Details.created_at.desc())
-        rows = query.all()
+        if filter_supplier:
+            where_parts.append("od.supplier_id = :sup_id")
+            params['sup_id'] = filter_supplier
+
+        if filter_status and filter_status != 'All':
+            where_parts.append("""
+                od.stage_id IN (
+                    SELECT stage_id FROM "StreemLyne_MT"."Stage_Master"
+                    WHERE LOWER(stage_name) = LOWER(:filt_status)
+                )
+            """)
+            params['filt_status'] = filter_status
+
+        if filter_end_date and filter_end_date != 'all':
+            from datetime import date as _date
+            today = _date.today()
+            if filter_end_date == 'expired':
+                where_parts.append("od.end_date IS NOT NULL AND od.end_date::date < :today")
+                params['today'] = today
+            elif filter_end_date == '30':
+                where_parts.append("od.end_date IS NOT NULL AND od.end_date::date >= :today AND od.end_date::date <= :d30")
+                params['today'] = today
+                params['d30'] = today + __import__('datetime').timedelta(days=30)
+            elif filter_end_date == '60':
+                where_parts.append("od.end_date IS NOT NULL AND od.end_date::date > :d30 AND od.end_date::date <= :d60")
+                params['d30'] = today + __import__('datetime').timedelta(days=30)
+                params['d60'] = today + __import__('datetime').timedelta(days=60)
+            elif filter_end_date == '90':
+                where_parts.append("od.end_date IS NOT NULL AND od.end_date::date > :d60 AND od.end_date::date <= :d90")
+                params['d60'] = today + __import__('datetime').timedelta(days=60)
+                params['d90'] = today + __import__('datetime').timedelta(days=90)
+            elif filter_end_date == '90+':
+                where_parts.append("od.end_date IS NOT NULL AND od.end_date::date > :d90 AND od.end_date::date <= :d365")
+                params['d90']  = today + __import__('datetime').timedelta(days=90)
+                params['d365'] = today + __import__('datetime').timedelta(days=365)
+
+        if search_q:
+            where_parts.append("""
+                (LOWER(COALESCE(od.business_name, od.opportunity_title, '')) LIKE :sq
+                 OR LOWER(COALESCE(od.contact_person, '')) LIKE :sq
+                 OR LOWER(COALESCE(od.tel_number::text, '')) LIKE :sq
+                 OR LOWER(COALESCE(od.email, '')) LIKE :sq
+                 OR LOWER(COALESCE(od.mpan_mpr, '')) LIKE :sq)
+            """)
+            params['sq'] = f'%{search_q}%'
+
+        if upload_from:
+            try:
+                from datetime import datetime as _dt
+                params['uf'] = _dt.strptime(upload_from, '%Y-%m-%d').date()
+                where_parts.append("od.created_at::date >= :uf")
+            except ValueError:
+                pass
+        if upload_to:
+            try:
+                from datetime import datetime as _dt
+                params['ut'] = _dt.strptime(upload_to, '%Y-%m-%d').date()
+                where_parts.append("od.created_at::date <= :ut")
+            except ValueError:
+                pass
+
+        where_sql = " AND ".join(where_parts)
+
+        count_sql = f"""
+            SELECT COUNT(*)
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            WHERE {where_sql}
+        """
+        total = session.execute(_text_alloc(count_sql), params).scalar() or 0
+
+        data_sql = f"""
+            SELECT
+                od.opportunity_id,
+                od.tenant_lead_id,
+                COALESCE(od.business_name, od.opportunity_title) AS business_name,
+                od.contact_person,
+                od.tel_number::text,
+                od.mobile_no,
+                od.email,
+                od.mpan_mpr,
+                od.mpan_bottom,
+                od.start_date,
+                od.end_date,
+                od.service_id,
+                od.stage_id,
+                sm.stage_name,
+                od.opportunity_owner_employee_id,
+                em.employee_name   AS assigned_to_name,
+                od.created_at,
+                od.supplier_id,
+                sup.supplier_company_name AS supplier_name,
+                od.annual_usage,
+                od.stand_charge,
+                od.rate_1,
+                od.net_notch,
+                od.payment_type,
+                od.postcode,
+                od.is_allocated
+            FROM "StreemLyne_MT"."Opportunity_Details" od
+            LEFT JOIN "StreemLyne_MT"."Stage_Master"    sm  ON sm.stage_id    = od.stage_id
+            LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON em.employee_id = od.opportunity_owner_employee_id
+            LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON sup.supplier_id = od.supplier_id
+            WHERE {where_sql}
+            ORDER BY od.created_at {('ASC' if upload_sort == 'asc' else 'DESC')}, od.opportunity_id {('ASC' if upload_sort == 'asc' else 'DESC')}
+            LIMIT :lim OFFSET :off
+        """
+        params['lim'] = page_size
+        params['off'] = offset
+
+        rows = session.execute(_text_alloc(data_sql), params).fetchall()
 
         results = []
-        for row in rows:
-            od = row[0]
-            result_dict = {k: _serial(getattr(od, k)) for k in od.__table__.columns.keys()}
-            result_dict.update({
-                'stage_name': row.stage_name,
-                'assigned_to_name': row.assigned_to_name,
-                'business_name': row.business_name,
-                'supplier_name': row.supplier_name,
+        for r in rows:
+            tel = r[4]
+            results.append({
+                'opportunity_id':                r[0],
+                'tenant_lead_id':                r[1],
+                'business_name':                 r[2],
+                'contact_person':                r[3],
+                'tel_number':                    str(tel).replace('.0', '') if tel else None,
+                'mobile_no':                     r[5],
+                'email':                         r[6],
+                'mpan_mpr':                      r[7],
+                'mpan_bottom':                   r[8],
+                'start_date':                    _iso(r[9]),
+                'end_date':                      _iso(r[10]),
+                'service_id':                    r[11],
+                'stage_id':                      r[12],
+                'stage_name':                    r[13],
+                'opportunity_owner_employee_id': r[14],
+                'assigned_to_name':              r[15],
+                'created_at':                    _iso(r[16]),
+                'supplier_id':                   r[17],
+                'supplier_name':                 r[18],
+                'annual_usage':                  r[19],
+                'stand_charge':                  r[20],
+                'rate_1':                        r[21],
+                'net_notch':                     r[22],
+                'payment_type':                  r[23],
+                'postcode':                      r[24],
+                'is_archived':                   None,
+                'is_allocated':                  r[25],
             })
-            results.append(result_dict)
 
-        logging.getLogger(__name__).warning(
-            '✅ get_allocated_leads returning %d leads for employee_id=%s',
-            len(results), employee_id
-        )
+        # ── Employee stats (admin only, page 1 only) ─────────────────────────
+        team_stats = []
+        if can_view_all and page == 1:
+            stats_sql = """
+                SELECT em.employee_id, em.employee_name, COUNT(*) AS cnt
+                FROM "StreemLyne_MT"."Opportunity_Details" od
+                JOIN "StreemLyne_MT"."Employee_Master" em
+                     ON em.employee_id = od.opportunity_owner_employee_id
+                WHERE od.tenant_id = :tid
+                  AND od.service_id = :svc
+                  AND od.is_allocated = TRUE
+                  AND od.is_draft IS NOT TRUE
+                  AND od.opportunity_owner_employee_id IS NOT NULL
+                GROUP BY em.employee_id, em.employee_name
+                ORDER BY em.employee_name ASC
+            """
+            stats_rows = session.execute(_text_alloc(stats_sql), {'tid': tenant_id, 'svc': service_id}).fetchall()
+            team_stats = [{'employee_id': r[0], 'employee_name': r[1], 'count': int(r[2])} for r in stats_rows]
 
-        return jsonify(results), 200
+        return jsonify({
+            'data':       results,
+            'total':      int(total),
+            'page':       page,
+            'page_size':  page_size,
+            'team_stats': team_stats,
+        }), 200
 
     except Exception as e:
         import traceback; traceback.print_exc()
