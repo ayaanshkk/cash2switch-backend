@@ -1439,7 +1439,8 @@ def get_suppliers():
                 1: 'Electricity Only',
                 2: 'Gas Only',
                 3: 'Electricity & Gas'
-            }.get(s.supplier_provisions, 'Unknown')
+            }.get(s.supplier_provisions, 'Unknown'),
+            'is_owned': bool(tenant_id_str and s.tenant_id == tenant_id_str),
         } for s in suppliers]
 
         return jsonify(result), 200
@@ -1539,6 +1540,160 @@ def delete_supplier(supplier_id):
         session.close()
 
 
+@energy_customer_bp.route('/suppliers/<int:supplier_id>/usage', methods=['GET'])
+@token_required
+def get_supplier_usage(supplier_id):
+    """Return the list of contracts/leads that reference this supplier for the current tenant."""
+    session = SessionLocal()
+    try:
+        current_user = request.current_user
+        raw_tenant_id = getattr(current_user, 'tenant_id', None)
+        tenant_id_str = str(raw_tenant_id) if raw_tenant_id is not None else None
+        tenant_id_int = int(raw_tenant_id) if raw_tenant_id is not None else None
+
+        records = []
+
+        if raw_tenant_id is not None:
+            # Leads (Opportunity_Details) — tenant_id is varchar in this table
+            leads = (
+                session.query(Opportunity_Details)
+                .filter(
+                    Opportunity_Details.supplier_id == supplier_id,
+                    Opportunity_Details.tenant_id == tenant_id_str,
+                )
+                .all()
+            )
+            for lead in leads:
+                records.append({
+                    'id': lead.opportunity_id,
+                    'type': 'lead',
+                    'business_name': lead.business_name or lead.opportunity_title or f'Lead #{lead.opportunity_id}',
+                    'trading_name': lead.site_name or None,
+                    'mpan': lead.mpan_mpr or lead.mpan_bottom or None,
+                })
+
+            # Renewals (Energy_Contract_Master -> Project_Details -> Client_Master)
+            # Client_Master.tenant_id is varchar in the actual DB
+            contract_rows = (
+                session.query(Energy_Contract_Master, Project_Details, Client_Master)
+                .join(Project_Details, Energy_Contract_Master.project_id == Project_Details.project_id)
+                .join(Client_Master, Project_Details.client_id == Client_Master.client_id)
+                .filter(
+                    Energy_Contract_Master.supplier_id == supplier_id,
+                    Client_Master.tenant_id == tenant_id_str,
+                )
+                .all()
+            )
+            for contract, project, client in contract_rows:
+                records.append({
+                    'id': contract.energy_contract_master_id,
+                    'type': 'renewal',
+                    'business_name': client.client_company_name or project.project_title or f'Contract #{contract.energy_contract_master_id}',
+                    'trading_name': project.site_name or None,
+                    'mpan': contract.mpan_number or contract.mpan_bottom or None,
+                })
+
+        return jsonify({'count': len(records), 'contracts': records}), 200
+    except Exception as e:
+        current_app.logger.exception(f"Error checking supplier usage: {e}")
+        return jsonify({'error': 'Failed to check supplier usage'}), 500
+    finally:
+        session.close()
+
+
+@energy_customer_bp.route('/suppliers/<int:supplier_id>/reassign', methods=['POST'])
+@token_required
+def reassign_supplier(supplier_id):
+    """Reassign all contracts/leads from this supplier to another (or None), then delete it."""
+    data = request.get_json() or {}
+    new_supplier_id = data.get('new_supplier_id')  # int or None
+
+    session = SessionLocal()
+    try:
+        current_user = request.current_user
+        raw_tenant_id = getattr(current_user, 'tenant_id', None)
+        tenant_id_str = str(raw_tenant_id) if raw_tenant_id is not None else None
+        tenant_id_int = int(raw_tenant_id) if raw_tenant_id is not None else None
+
+        supplier = session.query(Supplier_Master).filter_by(supplier_id=supplier_id).first()
+        if not supplier:
+            return jsonify({'error': 'Supplier not found'}), 404
+        if supplier.tenant_id != tenant_id_str:
+            return jsonify({'error': 'Cannot delete a supplier not created by your account'}), 403
+
+        old_supplier_name = supplier.supplier_company_name or supplier.supplier_name or f'Supplier #{supplier_id}'
+        new_sup_obj = session.query(Supplier_Master).filter_by(supplier_id=new_supplier_id).first() if new_supplier_id else None
+        new_supplier_name = new_sup_obj.supplier_company_name if new_sup_obj else 'None'
+        interaction_note = f"[Field Update] Supplier: {old_supplier_name} → {new_supplier_name}"
+
+        if raw_tenant_id is not None:
+            # Reassign leads — collect client_ids for interaction logging first
+            affected_leads = (
+                session.query(Opportunity_Details)
+                .filter(
+                    Opportunity_Details.supplier_id == supplier_id,
+                    Opportunity_Details.tenant_id == tenant_id_str,
+                )
+                .all()
+            )
+            lead_client_ids = [l.client_id for l in affected_leads if l.client_id]
+
+            session.query(Opportunity_Details).filter(
+                Opportunity_Details.supplier_id == supplier_id,
+                Opportunity_Details.tenant_id == tenant_id_str,
+            ).update({'supplier_id': new_supplier_id}, synchronize_session=False)
+
+            # Reassign renewals — collect client_ids for interaction logging first
+            renewal_rows = (
+                session.query(Energy_Contract_Master, Project_Details, Client_Master)
+                .join(Project_Details, Energy_Contract_Master.project_id == Project_Details.project_id)
+                .join(Client_Master, Project_Details.client_id == Client_Master.client_id)
+                .filter(
+                    Energy_Contract_Master.supplier_id == supplier_id,
+                    Client_Master.tenant_id == tenant_id_str,
+                )
+                .all()
+            )
+            contract_ids = [c.energy_contract_master_id for c, _p, _cl in renewal_rows]
+            renewal_client_ids = [cl.client_id for _c, _p, cl in renewal_rows]
+
+            if contract_ids:
+                session.query(Energy_Contract_Master).filter(
+                    Energy_Contract_Master.energy_contract_master_id.in_(contract_ids),
+                ).update({'supplier_id': new_supplier_id}, synchronize_session=False)
+
+            # Log interaction for every affected client
+            all_client_ids = list(set(lead_client_ids + renewal_client_ids))
+            for cid in all_client_ids:
+                session.add(Client_Interactions(
+                    client_id=cid,
+                    contact_date=datetime.utcnow().date(),
+                    contact_method=1,
+                    notes=interaction_note,
+                    next_steps='Field Update',
+                    created_at=datetime.utcnow(),
+                ))
+
+        session.commit()
+
+        # Delete (or unlink) the supplier
+        try:
+            session.delete(supplier)
+            session.commit()
+        except Exception:
+            session.rollback()
+            supplier.tenant_id = None
+            session.commit()
+
+        return jsonify({'success': True}), 200
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"Error reassigning supplier: {e}")
+        return jsonify({'error': 'Failed to reassign supplier'}), 500
+    finally:
+        session.close()
+
+
 @energy_customer_bp.route('/stages', methods=['GET'])
 @token_required
 def get_stages():
@@ -1624,6 +1779,7 @@ def get_init_data():
         suppliers = [{
             'supplier_id': s.supplier_id,
             'supplier_name': s.supplier_company_name,
+            'is_owned': bool(tenant_id_str and s.tenant_id == tenant_id_str),
         } for s in supplier_rows]
 
         # Employees — filtered by tenant
