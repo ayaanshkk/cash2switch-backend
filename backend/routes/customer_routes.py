@@ -818,6 +818,7 @@ def update_energy_customer(client_id):
         # ── Contract update with date-change detection ─────────────────────
         old_net_notch = None
         old_aggregator = None
+        old_supplier_id = None
         contract = None
 
         if project:
@@ -828,6 +829,7 @@ def update_energy_customer(client_id):
             if contract:
                 old_net_notch = contract.net_notch
                 old_aggregator = contract.aggregator
+                old_supplier_id = contract.supplier_id
 
                 # ── Capture old dates BEFORE any changes ──────────────────
                 old_start = contract.contract_start_date
@@ -1069,15 +1071,34 @@ def update_energy_customer(client_id):
             })
 
         # Track field changes in history
+        def _norm(v):
+            """Normalise a value for change-comparison (strips float noise, treats None/0/'' as blank)."""
+            if v is None or v == '' or v == 0:
+                return ''
+            try:
+                f = float(v)
+                return str(int(f)) if f == int(f) else str(round(f, 10)).rstrip('0').rstrip('.')
+            except (ValueError, TypeError):
+                return str(v).strip()
+
         changes = []
+        if 'supplier_id' in data and contract:
+            new_supplier_id = data['supplier_id']
+            if str(old_supplier_id or '') != str(new_supplier_id or ''):
+                old_sup = session.query(Supplier_Master).filter_by(supplier_id=old_supplier_id).first() if old_supplier_id else None
+                new_sup = session.query(Supplier_Master).filter_by(supplier_id=new_supplier_id).first() if new_supplier_id else None
+                old_name = old_sup.supplier_company_name if old_sup else 'None'
+                new_name = new_sup.supplier_company_name if new_sup else 'None'
+                if old_name != new_name:
+                    changes.append(f"Supplier: {old_name} → {new_name}")
         if 'net_notch' in data and contract:
             new_val = data['net_notch']
-            if str(old_net_notch or '') != str(new_val or ''):
-                changes.append(f"Net Notch: {old_net_notch or 'None'} → {new_val}")
+            if _norm(old_net_notch) != _norm(new_val):
+                changes.append(f"Net Notch: {old_net_notch if old_net_notch is not None else 'None'} → {new_val if new_val is not None else 'None'}")
         if 'aggregator' in data and contract:
             new_val = data['aggregator']
-            if str(old_aggregator or '') != str(new_val or ''):
-                changes.append(f"Aggregator: {old_aggregator or 'None'} → {new_val}")
+            if _norm(old_aggregator) != _norm(new_val):
+                changes.append(f"Aggregator: {old_aggregator if old_aggregator is not None else 'None'} → {new_val if new_val is not None else 'None'}")
         if 'status' in data and project:
             new_status = project.status
             if old_status_for_log != new_status:
@@ -1383,13 +1404,25 @@ def get_suppliers():
         tenant_id_str = str(raw_tenant_id) if raw_tenant_id is not None else None
 
         if tenant_id_str:
-            # Return only suppliers used by this tenant's leads/renewals
+            # Return suppliers linked to this tenant's opportunities OR directly created by this tenant
             # Opportunity_Details.tenant_id is varchar in the DB — compare as string
+            linked_ids = (
+                session.query(Opportunity_Details.supplier_id)
+                .filter(
+                    Opportunity_Details.tenant_id == tenant_id_str,
+                    Opportunity_Details.supplier_id.isnot(None),
+                )
+                .distinct()
+                .subquery()
+            )
             suppliers = (
                 session.query(Supplier_Master)
-                .join(Opportunity_Details, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
-                .filter(Opportunity_Details.tenant_id == tenant_id_str)
-                .distinct()
+                .filter(
+                    or_(
+                        Supplier_Master.supplier_id.in_(linked_ids),
+                        Supplier_Master.tenant_id == tenant_id_str,
+                    )
+                )
                 .order_by(Supplier_Master.supplier_company_name)
                 .all()
             )
@@ -1413,6 +1446,95 @@ def get_suppliers():
     except Exception as e:
         current_app.logger.exception(f"❌ Error fetching suppliers: {e}")
         return jsonify({'error': 'Failed to fetch suppliers'}), 500
+    finally:
+        session.close()
+
+
+@energy_customer_bp.route('/suppliers', methods=['POST'])
+@token_required
+def create_supplier():
+    """Create a new supplier, or return existing if name already exists (case-insensitive)"""
+    data = request.get_json() or {}
+    supplier_name = (data.get('supplier_name') or '').strip()
+    if not supplier_name:
+        return jsonify({'error': 'supplier_name is required'}), 400
+
+    session = SessionLocal()
+    try:
+        current_user = request.current_user
+        raw_tenant_id = getattr(current_user, 'tenant_id', None)
+        tenant_id_str = str(raw_tenant_id) if raw_tenant_id is not None else None
+
+        existing = session.query(Supplier_Master).filter(
+            Supplier_Master.supplier_company_name.ilike(supplier_name)
+        ).first()
+        if existing:
+            # Claim this supplier for the tenant so it appears in future dropdown fetches
+            if existing.tenant_id is None and tenant_id_str:
+                existing.tenant_id = tenant_id_str
+                session.commit()
+            return jsonify({
+                'supplier_id': existing.supplier_id,
+                'supplier_name': existing.supplier_company_name,
+            }), 200
+
+        new_supplier = Supplier_Master(
+            supplier_company_name=supplier_name,
+            supplier_contact_name=supplier_name,
+            supplier_provisions=3,
+            created_at=datetime.utcnow(),
+            tenant_id=tenant_id_str,
+        )
+        session.add(new_supplier)
+        session.commit()
+        session.refresh(new_supplier)
+        return jsonify({
+            'supplier_id': new_supplier.supplier_id,
+            'supplier_name': new_supplier.supplier_company_name,
+        }), 201
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"Error creating supplier: {e}")
+        return jsonify({'error': 'Failed to create supplier'}), 500
+    finally:
+        session.close()
+
+
+@energy_customer_bp.route('/suppliers/<int:supplier_id>', methods=['DELETE'])
+@token_required
+def delete_supplier(supplier_id):
+    """Delete a supplier created by this tenant.
+    If the supplier is referenced by contracts, clears tenant_id instead so it
+    no longer appears in this tenant's dropdown without breaking existing data."""
+    session = SessionLocal()
+    try:
+        current_user = request.current_user
+        raw_tenant_id = getattr(current_user, 'tenant_id', None)
+        tenant_id_str = str(raw_tenant_id) if raw_tenant_id is not None else None
+
+        supplier = session.query(Supplier_Master).filter_by(supplier_id=supplier_id).first()
+        if not supplier:
+            return jsonify({'error': 'Supplier not found'}), 404
+
+        # Only allow deleting suppliers that belong to this tenant
+        if supplier.tenant_id != tenant_id_str:
+            return jsonify({'error': 'Cannot delete a supplier not created by your account'}), 403
+
+        try:
+            session.delete(supplier)
+            session.commit()
+            return jsonify({'deleted': True, 'supplier_id': supplier_id}), 200
+        except Exception:
+            session.rollback()
+            # Supplier is referenced by contracts — just unlink from this tenant's list
+            supplier.tenant_id = None
+            session.commit()
+            return jsonify({'deleted': False, 'unlinked': True, 'supplier_id': supplier_id}), 200
+
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"Error deleting supplier: {e}")
+        return jsonify({'error': 'Failed to delete supplier'}), 500
     finally:
         session.close()
 
@@ -1474,14 +1596,25 @@ def get_init_data():
         raw_tenant_id = getattr(current_user, 'tenant_id', None)
         tenant_id_str = str(raw_tenant_id) if raw_tenant_id is not None else None
 
-        # Suppliers — filtered to this tenant via Opportunity_Details
-        # Opportunity_Details.tenant_id is varchar in the DB — compare as string
+        # Suppliers — linked to this tenant's opportunities OR directly created by this tenant
         if tenant_id_str:
+            linked_ids = (
+                session.query(Opportunity_Details.supplier_id)
+                .filter(
+                    Opportunity_Details.tenant_id == tenant_id_str,
+                    Opportunity_Details.supplier_id.isnot(None),
+                )
+                .distinct()
+                .subquery()
+            )
             supplier_rows = (
                 session.query(Supplier_Master)
-                .join(Opportunity_Details, Opportunity_Details.supplier_id == Supplier_Master.supplier_id)
-                .filter(Opportunity_Details.tenant_id == tenant_id_str)
-                .distinct()
+                .filter(
+                    or_(
+                        Supplier_Master.supplier_id.in_(linked_ids),
+                        Supplier_Master.tenant_id == tenant_id_str,
+                    )
+                )
                 .order_by(Supplier_Master.supplier_company_name)
                 .all()
             )

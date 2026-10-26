@@ -521,6 +521,7 @@ class Supplier_Master(Base):
     grace_days = Column(Integer, nullable=True)
     commission_payment_frequency = Column(String(20), nullable=True)
     created_at = Column(DateTime)
+    tenant_id = Column('tenant_id', String(50), nullable=True)
 
 
 class Commission_Payment(Base):
