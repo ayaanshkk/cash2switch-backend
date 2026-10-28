@@ -910,10 +910,13 @@ def get_renewal_performance():
                 )
             """
 
+        allocated_only = request.args.get('allocated', 'false').lower() == 'true'
+        allocated_filter = "AND cm.is_allocated = TRUE" if allocated_only else ""
+
         employee_filter = "AND pd.assigned_employee_id = :employee_id" if employee_id else ""
 
         sql = f"""
-            SELECT 
+            SELECT
                 pd.status,
                 cm.client_id,
                 cm.client_company_name as client_name,
@@ -931,6 +934,7 @@ def get_renewal_performance():
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sm ON ecm.supplier_id = sm.supplier_id
             WHERE cm.tenant_id = :tenant_id
             AND ecm.service_id = :service_id
+            {allocated_filter}
             {employee_filter}
             {period_filter}
         """

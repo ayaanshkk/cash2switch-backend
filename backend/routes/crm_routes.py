@@ -537,6 +537,36 @@ def get_renewal_email_logs_summary():
         except Exception:
             pass
 
+LEAD_RECYCLE_BIN_STATUSES = ('Lost', 'Lost COT', 'Meter De-energised', 'Complaint', 'Dead')
+
+
+def sync_recycle_bin_lead_statuses(session, tenant_id):
+    """Move active leads with recycle-bin statuses into the recycle bin."""
+    try:
+        rows = (
+            session.query(Client_Master, Stage_Master.stage_name)
+            .join(Opportunity_Details, Client_Master.client_id == Opportunity_Details.client_id)
+            .join(Stage_Master, Opportunity_Details.stage_id == Stage_Master.stage_id)
+            .filter(
+                Client_Master.tenant_id == tenant_id,
+                Client_Master.is_deleted == False,
+                Stage_Master.stage_name.in_(LEAD_RECYCLE_BIN_STATUSES),
+            )
+            .all()
+        )
+        now = datetime.utcnow()
+        for client, stage_name in rows:
+            client.is_deleted = True
+            client.deleted_at = client.deleted_at or now
+            client.deleted_reason = stage_name
+        if rows:
+            session.commit()
+        return len(rows)
+    except Exception:
+        session.rollback()
+        return 0
+
+
 @crm_bp.route('/leads', methods=['GET'])
 @token_required
 @tenant_from_jwt
@@ -603,6 +633,7 @@ def get_leads():
 
         session = SessionLocal()
         try:
+            sync_recycle_bin_lead_statuses(session, tenant_id)
             from datetime import date as pydate
             from sqlalchemy import cast, Date as SADate
 
@@ -3010,6 +3041,9 @@ def get_leads_performance():
                 )
             """
 
+        allocated_only = request.args.get('allocated', 'false').lower() == 'true'
+        allocated_filter = "AND od.is_allocated = TRUE" if allocated_only else ""
+
         employee_filter = ""
         if employee_id:
             employee_filter = "AND od.opportunity_owner_employee_id = :employee_id"
@@ -3050,6 +3084,7 @@ def get_leads_performance():
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON od.supplier_id = sup.supplier_id
             WHERE od.tenant_id = :tenant_id
             AND od.service_id = :service_id
+            {allocated_filter}
             {employee_filter}
             {period_filter}
         """
@@ -4899,6 +4934,7 @@ def get_allocated_leads():
     session = SessionLocal()
     try:
         tenant_id = str(g.tenant_id).strip()
+        sync_recycle_bin_lead_statuses(session, tenant_id)
         current_user = request.current_user
         service_param = request.args.get('service', 'utilities')
         service_id = 2 if service_param.strip().lower() == 'water' else 1
