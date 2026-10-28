@@ -35,7 +35,7 @@ import_bp = Blueprint('import', __name__)
 
 ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'csv'}
 ENERGY_BATCH_SIZE = 500   # rows per INSERT round-trip
-LEADS_BATCH_SIZE  = 10000  # Opportunity_Details is simpler, can go larger
+LEADS_BATCH_SIZE  = 2000   # flush to DB every 2000 new records
 
 
 # ---------------------------------------------------------------------------
@@ -1805,33 +1805,6 @@ def _run_leads_import(
                     mpan_key = mpan.strip().lower()
 
                     if mpan_key in existing_lead_mpans:
-                        print(f"[DEBUG] Duplicate hit: mpan={mpan_key}, existing={existing_lead_mpans[mpan_key]}")
-                        # ── Try to fill missing fields before skipping ────────
-                        _update_missing_lead_fields(
-                            raw_conn,
-                            mpan_key,
-                            existing_lead_mpans[mpan_key],  # ← pass full entry, not just True
-                            {
-                                'business':    business,
-                                'person':      person,
-                                'tel':         tel,
-                                'mobile':      mobile,
-                                'email':       email,
-                                'postcode':    postcode,
-                                'address':     address,
-                                'start_d':     start_d,
-                                'end_d':       end_d,
-                                'payment':     payment,
-                                'usage':       nn_val(l_usage[i]),
-                                'sc':          nn_val(l_sc[i]),
-                                'r1':          nn_val(l_r1[i]),
-                                'r2':          nn_val(l_r2[i]),
-                                'r3':          nn_val(l_r3[i]),
-                                'nn':          nn_val(l_nn[i]),
-                                'supplier_id': suppliers_dict.get(sup_name.lower().strip()) if sup_name else None,
-                            },
-                            tenant_id,
-                        )
                         duplicate_count += 1
 
                         duplicate_details.append({
@@ -1944,8 +1917,10 @@ def _run_leads_import(
                 duplicate_count += skipped
                 pending_tuples   = []
 
+            # ── Progress update every 200 rows ───────────────────────────────
+            if (i + 1) % 200 == 0 or (i + 1) == total_rows:
                 elapsed = time.time() - start_time
-                rate    = success_count / elapsed if elapsed > 0 else 1
+                rate    = (i + 1) / elapsed if elapsed > 0 else 1
                 eta_s   = (total_rows - i) / rate if rate > 0 else 0
                 update_job(
                     job_id,

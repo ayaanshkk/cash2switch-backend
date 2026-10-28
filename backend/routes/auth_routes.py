@@ -1767,15 +1767,15 @@ def get_search_permission_users():
         rows = session.execute(text("""
             SELECT
                 u.user_id,
-                u.employee_id,
+                e.employee_id,
                 e.employee_name,
                 u.user_name AS username,
                 rm.role_name AS role,
                 COALESCE(sp.can_search_all_leads, FALSE) AS can_search_all_leads,
                 COALESCE(sp.can_search_all_renewals, FALSE) AS can_search_all_renewals
-            FROM "StreemLyne_MT"."User_Master" u
-            JOIN "StreemLyne_MT"."Employee_Master" e
-                ON u.employee_id = e.employee_id
+            FROM "StreemLyne_MT"."Employee_Master" e
+            LEFT JOIN "StreemLyne_MT"."User_Master" u
+                ON e.employee_id = u.employee_id
             LEFT JOIN "StreemLyne_MT"."User_Role_Mapping" urm
                 ON u.user_id = urm.user_id
             LEFT JOIN "StreemLyne_MT"."Role_Master" rm
@@ -1783,7 +1783,6 @@ def get_search_permission_users():
             LEFT JOIN "StreemLyne_MT"."User_Search_Permission" sp
                 ON u.user_id = sp.user_id
             WHERE e.tenant_id = :tenant_id
-              AND COALESCE(u.is_active, TRUE) = TRUE
             ORDER BY e.employee_name ASC
         """), {
             'tenant_id': tenant_id

@@ -1240,6 +1240,61 @@ def delete_energy_customer(client_id):
         session.close()
 
 # ==========================================
+# BULK DELETE CUSTOMERS
+# ==========================================
+
+@energy_customer_bp.route('/energy-clients/bulk-delete', methods=['POST', 'OPTIONS'])
+@token_required
+def bulk_delete_energy_customers():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    session = SessionLocal()
+    try:
+        tenant_id = get_tenant_id_from_user(request.current_user)
+        if not tenant_id:
+            return jsonify({'error': 'Tenant not found'}), 400
+
+        data = request.get_json(silent=True) or {}
+        client_ids = data.get('client_ids', [])
+        deletion_reason = data.get('reason', 'Manually deleted')
+
+        if not client_ids:
+            return jsonify({'error': 'No client IDs provided'}), 400
+
+        clients = (
+            session.query(Client_Master)
+            .filter(
+                Client_Master.tenant_id == tenant_id,
+                Client_Master.client_id.in_(client_ids)
+            )
+            .all()
+        )
+
+        now = datetime.utcnow()
+        deleted_count = 0
+        for client in clients:
+            client.is_deleted = True
+            client.deleted_at = now
+            client.deleted_reason = deletion_reason
+            deleted_count += 1
+
+        session.commit()
+
+        return jsonify({
+            'success': True,
+            'deleted': deleted_count,
+            'message': f'{deleted_count} customer(s) moved to recycle bin'
+        }), 200
+
+    except Exception as e:
+        session.rollback()
+        current_app.logger.exception(f"❌ Error bulk deleting customers: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        session.close()
+
+# ==========================================
 # SEARCH CUSTOMERS
 # ==========================================
 
