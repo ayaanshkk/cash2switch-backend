@@ -4962,6 +4962,7 @@ def get_allocated_leads():
         upload_sort     = (request.args.get('upload_sort', 'desc') or 'desc').strip().lower()
         upload_from     = (request.args.get('upload_from', '') or '').strip()
         upload_to       = (request.args.get('upload_to',   '') or '').strip()
+        usage_sort      = (request.args.get('usage_sort',  '') or '').strip().lower()
 
         # ── Build WHERE clauses using only Opportunity_Details columns ──────────
         # Avoids the slow OR+Client_Master join that was causing full table scans
@@ -5092,7 +5093,13 @@ def get_allocated_leads():
             LEFT JOIN "StreemLyne_MT"."Employee_Master" em  ON em.employee_id = od.opportunity_owner_employee_id
             LEFT JOIN "StreemLyne_MT"."Supplier_Master" sup ON sup.supplier_id = od.supplier_id
             WHERE {where_sql}
-            ORDER BY od.created_at {('ASC' if upload_sort == 'asc' else 'DESC')}, od.opportunity_id {('ASC' if upload_sort == 'asc' else 'DESC')}
+            ORDER BY {
+                "od.annual_usage ASC NULLS LAST, od.opportunity_id ASC"
+                if usage_sort == 'low-high' else
+                "od.annual_usage DESC NULLS LAST, od.opportunity_id DESC"
+                if usage_sort == 'high-low' else
+                f"od.created_at {'ASC' if upload_sort == 'asc' else 'DESC'}, od.opportunity_id {'ASC' if upload_sort == 'asc' else 'DESC'}"
+            }
             LIMIT :lim OFFSET :off
         """
         params['lim'] = page_size

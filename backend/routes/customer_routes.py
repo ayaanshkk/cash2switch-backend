@@ -3192,8 +3192,11 @@ def get_allocated_contacts():
         service_param = request.args.get('service')
         if service_param and isinstance(service_param, str):
             svc = service_param.strip().lower()
-            _service_id = 2 if svc == 'water' else (1 if svc == 'electricity' else None)
- 
+            _service_id = 2 if svc == 'water' else 1
+
+        is_admin = is_admin_user(user)
+        filter_employee = request.args.get('salesperson_id', type=int)
+
         latest_sq = (
             session.query(
                 Client_Interactions.client_id,
@@ -3204,9 +3207,14 @@ def get_allocated_contacts():
         )
         LatestInteraction = aliased(Client_Interactions)
 
-        # ✅ Show contacts that are:
-        # 1. Assigned to THIS user (Project_Details.assigned_employee_id)
-        # 2. Marked as allocated (is_allocated = True)
+        # Build employee assignment filter:
+        # - admins see all allocated records (optionally filtered by salesperson_id)
+        # - non-admins see only records assigned to themselves
+        if is_admin:
+            employee_filters = ([Project_Details.assigned_employee_id == filter_employee] if filter_employee else [])
+        else:
+            employee_filters = [Project_Details.assigned_employee_id == user.employee_id]
+
         query = session.query(
             Client_Master,
             Project_Details,
@@ -3215,10 +3223,10 @@ def get_allocated_contacts():
             Supplier_Master,
             Employee_Master
         ).join(
-            Project_Details, 
+            Project_Details,
             Client_Master.client_id == Project_Details.client_id
         ).outerjoin(
-            Energy_Contract_Master, 
+            Energy_Contract_Master,
             Project_Details.project_id == Energy_Contract_Master.project_id
         ).outerjoin(
             latest_sq,
@@ -3227,25 +3235,23 @@ def get_allocated_contacts():
             LatestInteraction,
             LatestInteraction.interaction_id == latest_sq.c.max_id
         ).outerjoin(
-            Supplier_Master, 
+            Supplier_Master,
             Energy_Contract_Master.supplier_id == Supplier_Master.supplier_id
         ).outerjoin(
-            Employee_Master, 
+            Employee_Master,
             Project_Details.assigned_employee_id == Employee_Master.employee_id
         ).filter(
             and_(
                 Client_Master.tenant_id == tenant_id,
                 Client_Master.is_deleted == False,
                 Client_Master.is_archived == False,
-                # ✅ Assigned to THIS user
-                Project_Details.assigned_employee_id == user.employee_id,
-                # ✅ Marked as allocated
                 Client_Master.is_allocated == True,
                 or_(
                     Project_Details.status == None,
                     ~func.lower(Project_Details.status).in_(['priced', 'lost', 'lost_cot', 'lost cot'])
                 ),
-                *([Energy_Contract_Master.service_id == _service_id] if _service_id is not None else [])
+                Energy_Contract_Master.service_id == _service_id,
+                *employee_filters
             )
         ).order_by(Client_Master.display_order.asc())
  
